@@ -4,8 +4,8 @@
 
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F,
-    D2D1_PIXEL_FORMAT,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -158,7 +158,7 @@ impl Painter {
         unsafe {
             rt.BindDC(dib.dc, &RECT { left: 0, top: 0, right: dib.w, bottom: dib.h }).map_err(|e| format!("BindDC: {e}"))?;
         }
-        Self::paint(rt, false, 1.0, f)
+        self.paint(rt, false, 1.0, f)
     }
 
     /// A render target drawing straight into `hwnd` with per-pixel alpha. The window must
@@ -191,17 +191,32 @@ impl Painter {
 
     /// Redraws a window target from scratch; every color's alpha is scaled by `fade`.
     pub fn render(&self, rt: &ID2D1HwndRenderTarget, fade: f32, f: impl FnOnce(&Canvas)) -> Result<(), String> {
-        Self::paint(rt, true, fade, f)
+        self.paint(rt, true, fade, f)
     }
 
-    fn paint(rt: &ID2D1RenderTarget, clear: bool, fade: f32, f: impl FnOnce(&Canvas)) -> Result<(), String> {
+    fn paint(&self, rt: &ID2D1RenderTarget, clear: bool, fade: f32, f: impl FnOnce(&Canvas)) -> Result<(), String> {
         unsafe {
             let brush = rt.CreateSolidColorBrush(&rgba(0, 0, 0, 0.0), None).map_err(|e| format!("brush: {e}"))?;
+            let round = self
+                .factory
+                .CreateStrokeStyle(
+                    &D2D1_STROKE_STYLE_PROPERTIES {
+                        startCap: D2D1_CAP_STYLE_ROUND,
+                        endCap: D2D1_CAP_STYLE_ROUND,
+                        dashCap: D2D1_CAP_STYLE_ROUND,
+                        lineJoin: D2D1_LINE_JOIN_ROUND,
+                        miterLimit: 10.0,
+                        dashStyle: D2D1_DASH_STYLE_SOLID,
+                        dashOffset: 0.0,
+                    },
+                    None,
+                )
+                .map_err(|e| format!("CreateStrokeStyle: {e}"))?;
             rt.BeginDraw();
             if clear {
                 rt.Clear(Some(&rgba(0, 0, 0, 0.0)));
             }
-            f(&Canvas { rt, brush, fade });
+            f(&Canvas { rt, brush, fade, factory: &self.factory, round });
             rt.EndDraw(None, None).map_err(|e| format!("EndDraw: {e}"))
         }
     }
@@ -220,6 +235,9 @@ pub struct Canvas<'a> {
     rt: &'a ID2D1RenderTarget,
     brush: ID2D1SolidColorBrush,
     fade: f32,
+    factory: &'a ID2D1Factory,
+    /// Round caps and joins, for strokes drawn by hand.
+    round: ID2D1StrokeStyle,
 }
 
 fn rect_f(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
@@ -244,6 +262,60 @@ impl Canvas<'_> {
         unsafe {
             self.rt.DrawLine(Vector2 { X: x0, Y: y0 }, Vector2 { X: x1, Y: y1 }, &self.brush, width, None);
         }
+    }
+
+    /// An open path through `points` with round caps and joins, drawn as one shape so a
+    /// translucent stroke doesn't darken where it overlaps itself.
+    pub fn polyline(&self, points: &[(f32, f32)], width: f32, color: D2D1_COLOR_F) {
+        if let Some(path) = self.path(points, false) {
+            self.color(color);
+            unsafe { self.rt.DrawGeometry(&path, &self.brush, width, &self.round) };
+        }
+    }
+
+    /// A filled closed polygon.
+    pub fn polygon(&self, points: &[(f32, f32)], color: D2D1_COLOR_F) {
+        if let Some(path) = self.path(points, true) {
+            self.color(color);
+            unsafe { self.rt.FillGeometry(&path, &self.brush, None) };
+        }
+    }
+
+    fn path(&self, points: &[(f32, f32)], closed: bool) -> Option<ID2D1PathGeometry> {
+        let (&(x0, y0), rest) = points.split_first()?;
+        unsafe {
+            let path = self.factory.CreatePathGeometry().ok()?;
+            let sink = path.Open().ok()?;
+            let begin = if closed { D2D1_FIGURE_BEGIN_FILLED } else { D2D1_FIGURE_BEGIN_HOLLOW };
+            sink.BeginFigure(Vector2 { X: x0, Y: y0 }, begin);
+            if rest.is_empty() {
+                sink.AddLine(Vector2 { X: x0, Y: y0 }); // a dot: the round caps draw it
+            }
+            for &(x, y) in rest {
+                sink.AddLine(Vector2 { X: x, Y: y });
+            }
+            sink.EndFigure(if closed { D2D1_FIGURE_END_CLOSED } else { D2D1_FIGURE_END_OPEN });
+            sink.Close().ok()?;
+            Some(path)
+        }
+    }
+
+    /// Rectangle outline whose stroke is centred on the edges.
+    pub fn rect_outline(&self, x: f32, y: f32, w: f32, h: f32, width: f32, color: D2D1_COLOR_F) {
+        self.color(color);
+        unsafe { self.rt.DrawRectangle(&rect_f(x, y, w, h), &self.brush, width, None) };
+    }
+
+    pub fn circle(&self, (x, y): (f32, f32), r: f32, color: D2D1_COLOR_F) {
+        self.color(color);
+        let e = D2D1_ELLIPSE { point: Vector2 { X: x, Y: y }, radiusX: r, radiusY: r };
+        unsafe { self.rt.FillEllipse(&e, &self.brush) };
+    }
+
+    pub fn ring(&self, (x, y): (f32, f32), r: f32, width: f32, color: D2D1_COLOR_F) {
+        self.color(color);
+        let e = D2D1_ELLIPSE { point: Vector2 { X: x, Y: y }, radiusX: r, radiusY: r };
+        unsafe { self.rt.DrawEllipse(&e, &self.brush, width, None) };
     }
 
     /// Draws `text` left-aligned and vertically centered in the box `[x, y, w, h]`.
