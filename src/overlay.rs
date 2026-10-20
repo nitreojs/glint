@@ -46,7 +46,8 @@ const FADE_IN_MS: f32 = 140.0;
 const FADE_OUT_MS: f32 = 110.0;
 /// The hover highlight glides from one window to the next.
 const GLIDE_MS: f32 = 120.0;
-/// A drag box that flips across its start point (the encoder minimum makes it jump) glides.
+/// Jumps of the drag box glide too: from the hover highlight when the drag starts, and to
+/// the other side of the start point when it flips (the encoder minimum makes both jump).
 const FLIP_MS: f32 = 120.0;
 /// Posted to the picker once per composed frame while a glide runs.
 const WM_GLIDE: u32 = WM_APP + 40;
@@ -450,8 +451,8 @@ impl State {
 
     /// Shows what the mouse at `cur` would pick: the drag selection while dragging, otherwise
     /// the window (or monitor) under the cursor, gliding there from the last one. A drag
-    /// follows the cursor instantly, except that a box flipping across the start point (the
-    /// encoder minimum makes it jump) glides to its new side.
+    /// follows the cursor instantly, except for jumps (the drag starting, the box flipping
+    /// across its start point), which glide.
     fn update_selection(&mut self, cur: (i32, i32)) {
         let drag = self.drag_start.filter(|_| self.dragging);
         let target = match drag {
@@ -466,9 +467,11 @@ impl State {
         let glide = match (drag, self.sel, target) {
             (Some(start), Some(from), Some(_)) => {
                 let side = (cur.0 < start.0, cur.1 < start.1);
-                let flipped = self.side.replace(side).is_some_and(|s| s != side);
+                // The first drag frame turns the hover highlight into the drag box; a flip moves
+                // the box to the other side of its start. Both glide, following the cursor.
+                let jumped = self.side.replace(side).is_none_or(|s| s != side);
                 match self.glide {
-                    _ if flipped => Some(Glide { from, start: Instant::now(), ms: FLIP_MS, flip: true }),
+                    _ if jumped => Some(Glide { from, start: Instant::now(), ms: FLIP_MS, flip: true }),
                     Some(g) if g.flip => Some(g), // keep gliding toward the moving box
                     _ => None,
                 }
