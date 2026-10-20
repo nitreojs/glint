@@ -7,6 +7,8 @@
 //! showing until the owner calls [`dismiss`], so the fade-out can overlap other work.
 
 use std::cell::{Cell, RefCell};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
@@ -42,6 +44,20 @@ const PILL_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.86);
 const PILL_TEXT: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
 const FADE_IN_MS: f32 = 140.0;
 const FADE_OUT_MS: f32 = 110.0;
+/// The hover highlight glides from one window to the next.
+const GLIDE_MS: f32 = 120.0;
+/// Posted to the picker once per composed frame while a glide runs.
+const WM_GLIDE: u32 = WM_APP + 40;
+
+/// Vsync pacing for the glide: a thread waits on DwmFlush (one return per composed frame)
+/// and posts [`WM_GLIDE`], so the highlight moves once per refresh. WM_TIMER can't do
+/// that: it never fires faster than ~10 ms and drifts against the refresh.
+struct Ticker {
+    run: AtomicBool,
+    /// A tick is queued and not yet handled; keeps a slow frame from piling up ticks.
+    pending: AtomicBool,
+}
+
 const HINT: &str = "Drag to select a region   ·   Click to record the highlighted window or monitor   ·   Esc to cancel";
 
 /// A pre-rendered pill (label or hint) and where it sits, in client coordinates.
@@ -70,9 +86,15 @@ struct State {
     drag_start: Option<(i32, i32)>,
     /// The mouse moved past [`CLICK_SLOP`] since the button went down.
     dragging: bool,
-    /// Current (fitted) selection or hover highlight in client coordinates.
+    /// Current (fitted) selection or hover highlight in client coordinates, as displayed.
     sel: Option<Rect>,
     label: Option<Pill>,
+    /// What the highlight shows or glides to (client coordinates) and the output it's on.
+    target: Option<(Rect, usize)>,
+    /// Where the running glide started, and when.
+    glide: Option<(Rect, Instant)>,
+    /// Runs while a glide is in flight.
+    ticker: Option<Arc<Ticker>>,
     /// A result was posted; ignore input until dismissed.
     done: bool,
     /// Input outranks WM_PAINT, so while the mouse moves the picker paints itself, at most
@@ -86,6 +108,9 @@ impl Drop for State {
         unsafe {
             let _ = DeleteObject(self.white.into());
             let _ = DeleteObject(self.black.into());
+            if let Some(t) = &self.ticker {
+                t.run.store(false, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -213,6 +238,9 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
                 dragging: false,
                 sel: None,
                 label: None,
+                target: None,
+                glide: None,
+                ticker: None,
                 done: false,
                 last_paint: Cell::new(Instant::now()),
                 frame,
@@ -402,19 +430,75 @@ impl State {
         }
     }
 
-    /// Shows what the mouse at `cur` would pick: the drag selection while dragging,
-    /// otherwise the window (or monitor) under the cursor.
+    /// Shows what the mouse at `cur` would pick: the drag selection while dragging (instantly),
+    /// otherwise the window (or monitor) under the cursor, gliding there from the last one.
     fn update_selection(&mut self, cur: (i32, i32)) {
-        let fitted = match self.drag_start {
-            Some(start) if self.dragging => self.fitted(start, cur),
+        let dragging = self.dragging && self.drag_start.is_some();
+        let target = match self.drag_start {
+            Some(start) if dragging => self.fitted(start, cur),
             _ => self.target_at(cur),
+        }
+        .map(|(r, oi)| (self.to_client(r), oi));
+        if target == self.target {
+            return; // unchanged, or already gliding there
+        }
+        self.target = target;
+        self.glide = match (self.sel, target) {
+            (Some(from), Some((to, _))) if !dragging && from != to => Some((from, Instant::now())),
+            _ => None,
         };
-        let Some((r, oi)) = fitted else {
+        if self.glide.is_some() {
+            self.set_gliding(true);
+        } else {
+            self.show(target.map(|(r, _)| r));
+        }
+    }
+
+    /// Shows the next glide frame; returns whether the glide is still running.
+    fn step_glide(&mut self) -> bool {
+        let (Some((from, start)), Some((to, _))) = (self.glide, self.target) else { return false };
+        let t = (start.elapsed().as_secs_f32() * 1000.0 / GLIDE_MS).min(1.0);
+        let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
+        let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;
+        self.show(Some(Rect { x: mix(from.x, to.x), y: mix(from.y, to.y), w: mix(from.w, to.w), h: mix(from.h, to.h) }));
+        if t >= 1.0 {
+            self.glide = None;
+        }
+        self.glide.is_some()
+    }
+
+    fn set_gliding(&mut self, on: bool) {
+        if !on {
+            if let Some(t) = self.ticker.take() {
+                t.run.store(false, Ordering::Relaxed);
+            }
+            return;
+        }
+        if self.ticker.is_some() {
+            return;
+        }
+        let t = Arc::new(Ticker { run: AtomicBool::new(true), pending: AtomicBool::new(false) });
+        let (ticker, hwnd) = (t.clone(), self.hwnd.0 as isize);
+        std::thread::spawn(move || {
+            while ticker.run.load(Ordering::Relaxed) {
+                if unsafe { DwmFlush() }.is_err() {
+                    std::thread::sleep(Duration::from_millis(7));
+                }
+                if ticker.run.load(Ordering::Relaxed) && !ticker.pending.swap(true, Ordering::Relaxed) {
+                    let _ = unsafe { PostMessageW(Some(HWND(hwnd as _)), WM_GLIDE, WPARAM(0), LPARAM(0)) };
+                }
+            }
+        });
+        self.ticker = Some(t);
+    }
+
+    /// Displays the highlight at `sel` (client coordinates), labelled with the target's size.
+    fn show(&mut self, sel: Option<Rect>) {
+        let (Some(sel), Some((target, oi))) = (sel, self.target) else {
             return self.set_selection(None, Some(None));
         };
-        let sel = self.to_client(r);
         let mon = self.to_client(self.outputs[oi].rect);
-        let text = format!("{} × {}   ·   {} fps", r.w, r.h, self.outputs[oi].native_fps());
+        let text = format!("{} × {}   ·   {} fps", target.w, target.h, self.outputs[oi].native_fps());
         let same_text = self.label.as_ref().filter(|l| l.text == text);
         let (lw, lh) = match same_text {
             Some(l) => (l.rect.w, l.rect.h),
@@ -489,6 +573,15 @@ impl State {
         if msg == WM_PAINT {
             unsafe { self.paint() };
             return Action::Handled;
+        }
+        if msg == WM_GLIDE {
+            if let Some(t) = &self.ticker {
+                t.pending.store(false, Ordering::Relaxed);
+            }
+            if !self.step_glide() {
+                self.set_gliding(false);
+            }
+            return Action::Paint;
         }
         if self.done {
             return match msg {
