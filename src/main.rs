@@ -3,13 +3,13 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
-use hzrec::indicator::Indicator;
-use hzrec::config::{Config, parse_hotkey};
-use hzrec::overlay::{self, Selection};
-use hzrec::recorder::{Outcome, Params, Recorder};
-use hzrec::tray::Tray;
-use hzrec::util::{human_duration, human_size, log, log_path, timestamp, wide};
-use hzrec::monitors;
+use glint::indicator::Indicator;
+use glint::config::{Config, parse_hotkey};
+use glint::overlay::{self, Selection};
+use glint::recorder::{Outcome, Params, Recorder};
+use glint::tray::Tray;
+use glint::util::{human_duration, human_size, log, log_path, timestamp, wide};
+use glint::monitors;
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -91,7 +91,7 @@ impl App {
                     "{} is already used by another app (ShareX?). Change \"hotkey\" in settings, or use the tray menu.",
                     self.cfg.hotkey
                 );
-                self.notify("hzrec: hotkey unavailable", &text, true, ClickTarget::None);
+                self.notify("glint: hotkey unavailable", &text, true, ClickTarget::None);
             }
         }
     }
@@ -110,7 +110,7 @@ impl App {
                     self.notify("Settings reloaded", &text, false, ClickTarget::None);
                 }
             }
-            Err(e) => self.notify("hzrec: settings error", &e, true, ClickTarget::None),
+            Err(e) => self.notify("glint: settings error", &e, true, ClickTarget::None),
         }
     }
 
@@ -127,12 +127,12 @@ impl App {
         self.reload(false);
         let outputs = match monitors::enumerate() {
             Ok(o) if !o.is_empty() => o,
-            Ok(_) => return self.notify("hzrec", "No monitors found.", true, ClickTarget::None),
-            Err(e) => return self.notify("hzrec: can't list monitors", &e.message(), true, ClickTarget::None),
+            Ok(_) => return self.notify("glint", "No monitors found.", true, ClickTarget::None),
+            Err(e) => return self.notify("glint: can't list monitors", &e.message(), true, ClickTarget::None),
         };
         match overlay::open(self.hwnd, WM_APP_SELECTION, outputs) {
             Ok(h) => self.state = State::Selecting(h),
-            Err(e) => self.notify("hzrec: can't open the selection overlay", &e, true, ClickTarget::Log),
+            Err(e) => self.notify("glint: can't open the selection overlay", &e, true, ClickTarget::Log),
         }
     }
 
@@ -149,12 +149,12 @@ impl App {
         };
         let dir = self.cfg.output_dir();
         let stamp = timestamp();
-        let mut path = dir.join(format!("hzrec_{stamp}.mp4"));
+        let mut path = dir.join(format!("glint_{stamp}.mp4"));
         for n in 2.. {
             if !path.exists() {
                 break;
             }
-            path = dir.join(format!("hzrec_{stamp}_{n}.mp4"));
+            path = dir.join(format!("glint_{stamp}_{n}.mp4"));
         }
         let params = Params {
             adapter_idx: out.adapter_idx,
@@ -182,13 +182,13 @@ impl App {
                 let indicator = Indicator::show(sel.rect, out.rect, self.hwnd, WM_APP_STOP)
                     .map_err(|e| log(&format!("indicator unavailable: {e}")))
                     .ok();
-                let tip = format!("hzrec: recording {}×{} @ {:.0} fps", sel.rect.w, sel.rect.h, fps);
+                let tip = format!("glint: recording {}×{} @ {:.0} fps", sel.rect.w, sel.rect.h, fps);
                 self.tray.set_recording(true, &tip);
                 self.state = State::Recording { rec, _indicator: indicator, size: (sel.rect.w, sel.rect.h), fps };
             }
             Err(e) => {
                 log(&format!("start failed: {e}"));
-                self.notify("hzrec: couldn't start recording", &e, true, ClickTarget::Log);
+                self.notify("glint: couldn't start recording", &e, true, ClickTarget::Log);
             }
         }
     }
@@ -199,10 +199,10 @@ impl App {
             // The indicator fades out as the old state drops.
             if discard {
                 rec.abort();
-                self.tray.set_recording(true, "hzrec: discarding…");
+                self.tray.set_recording(true, "glint: discarding…");
             } else {
                 rec.stop();
-                self.tray.set_recording(true, "hzrec: saving…");
+                self.tray.set_recording(true, "glint: saving…");
             }
             self.state = State::Stopping { size, fps };
         }
@@ -214,7 +214,7 @@ impl App {
             _ => ((0, 0), 0.0),
         };
         self.state = State::Idle; // drops the indicator if capture ended on its own
-        self.tray.set_recording(false, "hzrec");
+        self.tray.set_recording(false, "glint");
         match res {
             Ok(Outcome::Discarded) => {
                 self.notify("Recording discarded", "Nothing was saved.", false, ClickTarget::None);
@@ -240,7 +240,7 @@ impl App {
             }
             Err(e) => {
                 log(&format!("recording failed: {e}"));
-                self.notify("hzrec: recording failed", &e, true, ClickTarget::Log);
+                self.notify("glint: recording failed", &e, true, ClickTarget::Log);
             }
         }
         if self.exiting {
@@ -416,15 +416,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 fn main() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let _mutex = CreateMutexW(None, false, w!("Local\\hzrec-single-instance"));
+        let _mutex = CreateMutexW(None, false, w!("Local\\glint-single-instance"));
         if GetLastError() == ERROR_ALREADY_EXISTS {
-            MessageBoxW(None, w!("hzrec is already running (see the tray icon)."), w!("hzrec"), MB_ICONINFORMATION);
+            MessageBoxW(None, w!("glint is already running (see the tray icon)."), w!("glint"), MB_ICONINFORMATION);
             return;
         }
         let _ = std::fs::write(log_path(), ""); // fresh log per run
 
         let hinst = GetModuleHandleW(None).expect("module handle");
-        let class = w!("hzrec_main");
+        let class = w!("glint_main");
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
@@ -436,7 +436,7 @@ fn main() {
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW,
             class,
-            w!("hzrec"),
+            w!("glint"),
             WS_POPUP,
             0,
             0,
@@ -465,10 +465,10 @@ fn main() {
         };
         app.register_hotkey();
         match cfg_err {
-            Some(e) => app.notify("hzrec: settings error (using defaults)", &e, true, ClickTarget::None),
+            Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
             None if app.hotkey.is_some() => {
                 let text = format!("Press {} to record a region. Tray icon → settings.", app.cfg.hotkey);
-                app.notify("hzrec is running", &text, false, ClickTarget::None);
+                app.notify("glint is running", &text, false, ClickTarget::None);
             }
             None => {}
         }

@@ -47,7 +47,7 @@ impl Default for Config {
     }
 }
 
-const TEMPLATE: &str = r#"# hzrec settings. After editing, pick "Reload settings" in the tray menu.
+const TEMPLATE: &str = r#"# glint settings. After editing, pick "Reload settings" in the tray menu.
 
 # Starts region selection; pressing it again stops the recording.
 # Modifiers: Ctrl, Alt, Shift, Win. Keys: A-Z, 0-9, F1-F24, PrintScreen, Pause, ScrollLock,
@@ -55,7 +55,7 @@ const TEMPLATE: &str = r#"# hzrec settings. After editing, pick "Reload settings
 # Right, Num0-Num9.
 hotkey = "Ctrl+Alt+PrintScreen"
 
-# Folder for recordings. Empty = <Videos>\hzrec
+# Folder for recordings. Empty = <Videos>\glint
 output_dir = ""
 
 # Frame rate cap. 0 = the native refresh rate of the monitor being recorded.
@@ -98,7 +98,7 @@ impl Config {
 
     pub fn output_dir(&self) -> PathBuf {
         if self.output_dir.trim().is_empty() {
-            videos_dir().join("hzrec")
+            videos_dir().join("glint")
         } else {
             PathBuf::from(self.output_dir.trim())
         }

@@ -47,7 +47,7 @@ impl Tray {
         d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         d.uCallbackMessage = self.callback;
         d.hIcon = if self.recording { self.rec } else { self.idle };
-        copy_wstr(&mut d.szTip, if self.recording { "hzrec: recording" } else { "hzrec" });
+        copy_wstr(&mut d.szTip, if self.recording { "glint: recording" } else { "glint" });
         d.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &d);

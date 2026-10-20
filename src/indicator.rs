@@ -126,7 +126,7 @@ fn popup(class: PCWSTR, ex: WINDOW_EX_STYLE, r: Rect) -> Option<HWND> {
         let hwnd = CreateWindowExW(
             ex | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             class,
-            w!("hzrec recording"),
+            w!("glint recording"),
             WS_POPUP,
             r.x,
             r.y,
@@ -184,7 +184,7 @@ fn mark(pos: Rect, parts: &[Rect], alpha: u8) -> Option<(HWND, u8)> {
         return None;
     }
     let (fill, rim) = if luminance_under(pos) > 0.55 { DARK } else { LIGHT };
-    let hwnd = popup(w!("hzrec_mark"), WS_EX_LAYERED | WS_EX_TRANSPARENT, pos)?;
+    let hwnd = popup(w!("glint_mark"), WS_EX_LAYERED | WS_EX_TRANSPARENT, pos)?;
     let dib = Dib::new(pos.w, pos.h).ok()?;
     unsafe {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
@@ -215,8 +215,8 @@ impl Indicator {
     pub fn show(capture: Rect, monitor: Rect, owner: HWND, msg: u32) -> Result<Indicator, String> {
         let painter = Painter::new()?;
         let px = |v: f32| painter.px(v) as i32;
-        register(w!("hzrec_mark"), Some(mark_proc), IDC_ARROW);
-        register(w!("hzrec_pill"), Some(pill_proc), IDC_ARROW);
+        register(w!("glint_mark"), Some(mark_proc), IDC_ARROW);
+        register(w!("glint_pill"), Some(pill_proc), IDC_ARROW);
 
         // The frame sits just outside the region; where that is off the monitor it is pushed
         // inside (it is excluded from capture, so it never shows up in the video).
@@ -265,7 +265,7 @@ impl Indicator {
             (x, y) = (capture.x + px(12.0), capture.y + px(12.0));
         }
         let pos = clamp_into(x, y, pw, ph, monitor);
-        let pill = popup(w!("hzrec_pill"), WINDOW_EX_STYLE(0), pos).ok_or("can't create the indicator window")?;
+        let pill = popup(w!("glint_pill"), WINDOW_EX_STYLE(0), pos).ok_or("can't create the indicator window")?;
         make_glass(pill);
         exclude_from_capture(pill);
         let rt = painter.window_target(pill, pw, ph)?;

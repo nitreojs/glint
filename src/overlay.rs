@@ -148,7 +148,7 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
         let _ = GdiFlush();
 
         let hinst = GetModuleHandleW(None).map_err(|e| e.to_string())?;
-        let class = w!("hzrec_overlay");
+        let class = w!("glint_overlay");
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
@@ -161,7 +161,7 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
             class,
-            w!("hzrec"),
+            w!("glint"),
             WS_POPUP,
             vx,
             vy,

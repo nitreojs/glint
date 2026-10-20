@@ -120,7 +120,7 @@ impl Recorder {
         let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
         let (st, ab) = (stop.clone(), abort.clone());
         thread::Builder::new()
-            .name("hzrec-encode".into())
+            .name("glint-encode".into())
             .spawn(move || unsafe {
                 set_priority(THREAD_PRIORITY_ABOVE_NORMAL);
                 let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
@@ -176,7 +176,7 @@ unsafe fn run_session(cap: Capture, mut enc: Encoder, stop: &Arc<AtomicBool>, ab
     let cap = SendCapture(cap);
     let st = stop.clone();
     let capture = thread::Builder::new()
-        .name("hzrec-capture".into())
+        .name("glint-capture".into())
         .spawn(move || {
             let mut cap = cap;
             unsafe {

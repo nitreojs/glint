@@ -72,10 +72,10 @@ pub fn from_wstr(buf: &[u16]) -> String {
     String::from_utf16_lossy(&buf[..n])
 }
 
-/// `%APPDATA%\hzrec`, created on demand.
+/// `%APPDATA%\glint`, created on demand.
 pub fn app_dir() -> PathBuf {
     let base = std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    let dir = base.join("hzrec");
+    let dir = base.join("glint");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -116,7 +116,7 @@ pub fn human_duration(secs: f64) -> String {
     format!("{}:{:02}", s / 60, s % 60)
 }
 
-/// Appends a line to `%APPDATA%\hzrec\hzrec.log`.
+/// Appends a line to `%APPDATA%\glint\glint.log`.
 pub fn log(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log_path()) {
@@ -125,5 +125,5 @@ pub fn log(msg: &str) {
 }
 
 pub fn log_path() -> PathBuf {
-    app_dir().join("hzrec.log")
+    app_dir().join("glint.log")
 }
