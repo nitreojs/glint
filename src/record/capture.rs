@@ -4,11 +4,11 @@ use std::thread;
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, HANDLE, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED};
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::core::Interface;
 
+use super::rotate::{Rotation, Rotator, surface_rect, texel_map};
 use super::{Ctx, INFINITE, Msg, Params, RING, adapter, create_device, qpc, texture_desc};
 use crate::platform::log::log;
 use crate::platform::rect::Rect;
@@ -23,9 +23,12 @@ struct Feed {
     output: IDXGIOutput1,
     dupl: Option<IDXGIOutputDuplication>,
     desktop: Rect,
+    rotation: Rotation,
     /// Covered part of the region, in output pixels.
+    part: Rect,
+    /// `part` in the duplicated surface, which rotated outputs deliver in panel orientation.
     src: Rect,
-    /// Where `src` lands in the region image.
+    /// Where `part` lands in the region image.
     dst: (u32, u32),
     /// An image of this output has been captured.
     seen: bool,
@@ -69,6 +72,8 @@ pub(super) struct Capture {
     /// straight into the ring.
     compose: Option<ID3D11Texture2D>,
     ring: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
+    /// Present when an output is rotated.
+    rotator: Option<Rotator>,
     pub(super) handles: Vec<HANDLE>,
     free: Vec<usize>,
     meta: Vec<u32>,
@@ -95,22 +100,19 @@ impl Capture {
                     adapter.EnumOutputs(s.output_idx).ctx("EnumOutputs")?.cast().ctx("IDXGIOutput1")?;
                 let dupl = output.DuplicateOutput(&device).ctx("DuplicateOutput")?;
                 let dd = dupl.GetDesc();
-                if dd.Rotation != DXGI_MODE_ROTATION_IDENTITY && dd.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED {
-                    return Err("rotated (portrait) monitors are not supported yet".into());
-                }
                 let desktop = Rect::from_win(&output.GetDesc().ctx("IDXGIOutput::GetDesc")?.DesktopCoordinates);
-                if desktop != s.desktop
-                    || (dd.ModeDesc.Width, dd.ModeDesc.Height) != (desktop.w as u32, desktop.h as u32)
-                {
+                if desktop != s.desktop {
                     return Err("the monitor layout changed; select the region again".into());
                 }
-                let Some((src, dst)) = copy_rect(r, desktop) else {
+                let Some((part, dst)) = copy_rect(r, desktop) else {
                     return Err(format!("region {r:?} misses the monitor at {desktop:?}"));
                 };
+                let rotation = Rotation::from_dxgi(dd.Rotation);
+                let src = surface_rect(rotation, part, (desktop.w, desktop.h));
                 let rate = dd.ModeDesc.RefreshRate;
                 rates.push(if rate.Denominator != 0 { rate.Numerator as f64 / rate.Denominator as f64 } else { 0.0 });
                 let pointer = Pointer::default();
-                feeds.push(Feed { output, dupl: Some(dupl), desktop, src, dst, seen: false, pointer });
+                feeds.push(Feed { output, dupl: Some(dupl), desktop, rotation, part, src, dst, seen: false, pointer });
             }
 
             let compose = if feeds.len() > 1 {
@@ -142,6 +144,12 @@ impl Capture {
                 handles.push(t.cast::<IDXGIResource>().ctx("IDXGIResource")?.GetSharedHandle().ctx("GetSharedHandle")?);
                 ring.push((t, km));
             }
+            let rotator = if feeds.iter().any(|f| f.rotation != Rotation::Identity) {
+                let targets: Vec<ID3D11Texture2D> = ring.iter().map(|(t, _)| t.clone()).collect();
+                Some(Rotator::new(&device, &targets, compose.as_ref())?)
+            } else {
+                None
+            };
             Ok(Capture {
                 region: r,
                 draw_cursor: p.draw_cursor,
@@ -153,6 +161,7 @@ impl Capture {
                 feeds,
                 compose,
                 ring,
+                rotator,
                 handles,
                 free: (0..RING).rev().collect(),
                 meta: Vec::new(),
@@ -256,25 +265,18 @@ impl Capture {
                     self.stats.coalesced += info.AccumulatedFrames as u64 - 1;
                 }
                 let desk: ID3D11Texture2D = res.cast().ctx("desktop texture")?;
-                let bx = D3D11_BOX {
-                    left: f.src.x as u32,
-                    top: f.src.y as u32,
-                    front: 0,
-                    right: f.src.right() as u32,
-                    bottom: f.src.bottom() as u32,
-                    back: 1,
-                };
-                let (dx, dy) = f.dst;
+                let rot = self.rotator.as_ref();
                 if let Some(compose) = &self.compose {
-                    self.ctx.CopySubresourceRegion(compose, 0, dx, dy, 0, &desk, 0, Some(&bx));
+                    put(&self.device, &self.ctx, rot, f, &desk, compose, None)?;
                     f.seen = true;
                     tick.composed = true;
                     tick.stamp = tick.stamp.max(info.LastPresentTime);
                 } else if let Some(s) = self.free.pop() {
                     let (tex, km) = &self.ring[s];
                     km.AcquireSync(0, INFINITE).ctx("AcquireSync")?;
-                    self.ctx.CopySubresourceRegion(tex, 0, dx, dy, 0, &desk, 0, Some(&bx));
+                    let placed = put(&self.device, &self.ctx, rot, f, &desk, tex, Some(s));
                     km.ReleaseSync(1).ctx("ReleaseSync")?;
+                    placed?;
                     f.seen = true;
                     tick.slot = Some(s);
                     tick.stamp = tick.stamp.max(info.LastPresentTime);
@@ -333,12 +335,15 @@ impl Capture {
             while !stop.load(Ordering::SeqCst) {
                 match f.output.DuplicateOutput(&self.device) {
                     Ok(d) => {
-                        let dd = d.GetDesc();
-                        if (dd.ModeDesc.Width, dd.ModeDesc.Height) != (f.desktop.w as u32, f.desktop.h as u32) {
-                            return Err("display resolution changed".into());
+                        if Rotation::from_dxgi(d.GetDesc().Rotation) != f.rotation {
+                            return Err("display orientation changed".into());
                         }
                         let desc = f.output.GetDesc().ctx("IDXGIOutput::GetDesc")?;
-                        if Rect::from_win(&desc.DesktopCoordinates) != f.desktop {
+                        let desktop = Rect::from_win(&desc.DesktopCoordinates);
+                        if (desktop.w, desktop.h) != (f.desktop.w, f.desktop.h) {
+                            return Err("display resolution changed".into());
+                        }
+                        if desktop != f.desktop {
                             return Err("monitor arrangement changed".into());
                         }
                         f.dupl = Some(d);
@@ -377,6 +382,38 @@ unsafe fn clear(device: &ID3D11Device, ctx: &ID3D11DeviceContext, tex: &ID3D11Te
         let mut rtv = None;
         device.CreateRenderTargetView(tex, None, Some(&mut rtv)).ctx("CreateRenderTargetView")?;
         ctx.ClearRenderTargetView(rtv.as_ref().unwrap(), &[0.0, 0.0, 0.0, 1.0]);
+        Ok(())
+    }
+}
+
+/// Puts `f`'s part of the desktop image `desk` into `target`: ring texture `slot`, or the
+/// composed image when `slot` is `None`.
+unsafe fn put(
+    device: &ID3D11Device,
+    ctx: &ID3D11DeviceContext,
+    rotator: Option<&Rotator>,
+    f: &Feed,
+    desk: &ID3D11Texture2D,
+    target: &ID3D11Texture2D,
+    slot: Option<usize>,
+) -> Result<(), String> {
+    unsafe {
+        if f.rotation != Rotation::Identity
+            && let Some(r) = rotator
+        {
+            let map = texel_map(f.rotation, f.part, (f.desktop.w, f.desktop.h));
+            let viewport = Rect { x: f.dst.0 as i32, y: f.dst.1 as i32, w: f.part.w, h: f.part.h };
+            return r.draw(device, ctx, slot, desk, map, viewport);
+        }
+        let bx = D3D11_BOX {
+            left: f.src.x as u32,
+            top: f.src.y as u32,
+            front: 0,
+            right: f.src.right() as u32,
+            bottom: f.src.bottom() as u32,
+            back: 1,
+        };
+        ctx.CopySubresourceRegion(target, 0, f.dst.0, f.dst.1, 0, desk, 0, Some(&bx));
         Ok(())
     }
 }

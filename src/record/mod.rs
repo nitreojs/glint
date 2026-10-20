@@ -33,6 +33,7 @@ mod capture;
 mod cursor;
 mod encoder;
 pub(crate) mod indicator;
+mod rotate;
 
 use capture::Capture;
 use encoder::Encoder;

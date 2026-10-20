@@ -46,13 +46,13 @@ pub(crate) struct CursorRenderer {
     shape: Option<Shape>,
 }
 
-fn compile(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
+pub(super) fn compile(source: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     let mut code = None;
     let mut errors = None;
     let r = unsafe {
         D3DCompile(
-            SHADER.as_ptr() as _,
-            SHADER.len(),
+            source.as_ptr() as _,
+            source.len(),
             None,
             None,
             None,
@@ -76,15 +76,15 @@ fn compile(entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     code.ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_FAIL))
 }
 
-fn blob_bytes(b: &ID3DBlob) -> &[u8] {
+pub(super) fn blob_bytes(b: &ID3DBlob) -> &[u8] {
     unsafe { std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()) }
 }
 
 impl CursorRenderer {
     pub(crate) fn new(dev: &ID3D11Device) -> Result<Self> {
         unsafe {
-            let vsb = compile(s!("vs_main"), s!("vs_4_0"))?;
-            let psb = compile(s!("ps_main"), s!("ps_4_0"))?;
+            let vsb = compile(SHADER, s!("vs_main"), s!("vs_4_0"))?;
+            let psb = compile(SHADER, s!("ps_main"), s!("ps_4_0"))?;
             let mut vs = None;
             dev.CreateVertexShader(blob_bytes(&vsb), None, Some(&mut vs))?;
             let mut ps = None;
