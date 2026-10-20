@@ -43,8 +43,6 @@ pub struct Palette {
     pub line: Color32,
     pub line2: Color32,
     pub line3: Color32,
-    pub frame: Color32,
-    pub framei: Color32,
     pub t1: Color32,
     pub t2: Color32,
     pub t3: Color32,
@@ -80,8 +78,6 @@ pub const DARK: Palette = Palette {
     line: white(18),
     line2: white(33),
     line3: white(66),
-    frame: rgb(0x434341),
-    framei: rgb(0x333332),
     t1: rgb(0xEDEBE7),
     t2: rgb(0xB0ADA7),
     t3: rgb(0x8E8B85),
@@ -107,8 +103,6 @@ pub const LIGHT: Palette = Palette {
     line: Color32::from_black_alpha(20),
     line2: Color32::from_black_alpha(38),
     line3: Color32::from_black_alpha(77),
-    frame: Color32::from_black_alpha(61),
-    framei: Color32::from_black_alpha(36),
     t1: rgb(0x1C1B19),
     t2: rgb(0x4F4C47),
     t3: rgb(0x68655F),
@@ -190,6 +184,31 @@ pub fn ease(t: f32) -> f32 {
 
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     a.lerp_to_gamma(b, t.clamp(0.0, 1.0))
+}
+
+#[derive(Clone, Copy)]
+struct Glide {
+    from: f32,
+    to: f32,
+    start: f64,
+}
+
+/// `target`, reached with the design's ease-out over `secs`; when the target changes mid-way
+/// the motion restarts from wherever it is, so it never jumps. `secs` 0 follows exactly.
+pub fn glide(ui: &Ui, id: Id, target: f32, secs: f32) -> f32 {
+    let now = ui.input(|i| i.time);
+    let ctx = ui.ctx();
+    let progress = |g: &Glide| if *MOTION && secs > 0.0 { ((now - g.start) as f32 / secs).clamp(0.0, 1.0) } else { 1.0 };
+    let value = |g: &Glide| g.from + (g.to - g.from) * ease(progress(g));
+    let mut g = ctx.data_mut(|d| *d.get_temp_mut_or_insert_with(id, || Glide { from: target, to: target, start: now }));
+    if g.to != target {
+        g = Glide { from: value(&g), to: target, start: now };
+        ctx.data_mut(|d| d.insert_temp(id, g));
+    }
+    if progress(&g) < 1.0 {
+        ctx.request_repaint();
+    }
+    value(&g)
 }
 
 /// 2 px ring in text colour with a 1 px gap, only after keyboard navigation.
@@ -295,20 +314,28 @@ pub fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, active: f32, radius: u8) 
     }
 }
 
-/// A sidebar entry: mono index, label, and a dot while the section has unsaved changes.
-pub fn nav_item(ui: &mut Ui, look: &Look, rect: Rect, index: usize, label: &str, selected: bool, dirty: bool) -> Response {
+/// A sidebar entry: mono index, label, and a dot while the section has unsaved changes. The
+/// selection background is drawn by the caller and slides between entries; `near` (0..=1)
+/// says how close it is, for the colours.
+pub fn nav_item(
+    ui: &mut Ui,
+    look: &Look,
+    rect: Rect,
+    index: usize,
+    label: &str,
+    (selected, near): (bool, f32),
+    dirty: bool,
+) -> Response {
     let p = &look.p;
     let resp = ui.interact(rect, Id::unique(("nav", index)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-    let s = ease(anim(ui, resp.id.with("sel"), selected, 0.1));
     let h = anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
     let dot = anim(ui, resp.id.with("dirty"), dirty, 0.12);
     let painter = ui.painter();
-    painter.rect_filled(rect, 5, mix(Color32::TRANSPARENT, p.hov, h * (1.0 - s)));
-    painter.rect_filled(rect, 5, p.sel.gamma_multiply(s));
+    painter.rect_filled(rect, 5, mix(Color32::TRANSPARENT, p.hov, h * (1.0 - near)));
     let y = rect.center().y;
     let (num_font, text_font) = if selected { (mono_medium(11.0), medium(13.0)) } else { (mono(11.0), sans(13.0)) };
-    painter.text(pos2(rect.left() + 10.0, y), Align2::LEFT_CENTER, index.to_string(), num_font, mix(p.t3, p.acct, s));
-    painter.text(pos2(rect.left() + 32.0, y), Align2::LEFT_CENTER, label, text_font, mix(p.t2, p.t1, s));
+    painter.text(pos2(rect.left() + 10.0, y), Align2::LEFT_CENTER, index.to_string(), num_font, mix(p.t3, p.acct, near));
+    painter.text(pos2(rect.left() + 32.0, y), Align2::LEFT_CENTER, label, text_font, mix(p.t2, p.t1, near));
     if dot > 0.0 {
         painter.circle_filled(pos2(rect.right() - 12.5, y), 2.5, p.t2.gamma_multiply(dot));
     }
@@ -483,16 +510,17 @@ pub fn segmented<T: Copy + PartialEq>(
             ui.memory_mut(|m| m.request_focus(resp.id.with(j)));
         }
     }
+    // The selected segment's highlight slides; labels light up as it passes.
+    let selected = options.iter().position(|(v, _)| *v == *value).unwrap_or(0);
+    let pos = glide(ui, resp.id.with("pos"), selected as f32, 0.16);
     let painter = ui.painter();
-    for ((v, label), (r, cell)) in options.iter().zip(&cells) {
-        let selected = *value == *v;
-        let s = anim(ui, cell.id.with("sel"), selected, 0.08);
+    let highlight = Rect::from_min_size(pos2(inner.left() + pos * (seg_w + 2.0), inner.top()), vec2(seg_w, 26.0));
+    painter.rect(highlight, 4, p.ctlh, Stroke::new(1.0, p.line2), StrokeKind::Inside);
+    for (i, ((_, label), (r, cell))) in options.iter().zip(&cells).enumerate() {
+        let near = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
         let h = anim(ui, cell.id.with("hov"), cell.hovered(), 0.08);
-        if s > 0.0 {
-            painter.rect(*r, 4, p.ctlh.gamma_multiply(s), Stroke::new(1.0, p.line2.gamma_multiply(s)), StrokeKind::Inside);
-        }
-        let font = if selected { medium(13.0) } else { sans(13.0) };
-        painter.text(r.center(), Align2::CENTER_CENTER, *label, font, mix(p.t2, p.t1, s.max(h)));
+        let font = if i == selected { medium(13.0) } else { sans(13.0) };
+        painter.text(r.center(), Align2::CENTER_CENTER, *label, font, mix(p.t2, p.t1, near.max(h)));
     }
     if look.keyboard && focused.is_some() {
         painter.rect_stroke(rect.expand(2.0), 8.0, Stroke::new(2.0, p.focus), StrokeKind::Middle);
@@ -577,7 +605,9 @@ pub fn slider(
         painter.text(pos2(readout.left(), y), Align2::LEFT_CENTER, value.to_string(), mono_medium(12.0), p.t1);
         painter.text(pos2(readout.left() + 28.0, y), Align2::LEFT_CENTER, word, sans(13.0), p.t2);
 
-        let t = (*value - min) as f32 / (max - min) as f32;
+        // The thumb glides to clicks, keys and resets, and follows the pointer while dragged.
+        let target = (*value - min) as f32 / (max - min) as f32;
+        let t = glide(ui, resp.id.with("pos"), target, if resp.dragged() { 0.0 } else { 0.14 });
         let kx = track.left() + t * track.width();
         let line = |x0: f32, x1: f32, c: Color32| {
             painter.rect_filled(Rect::from_min_max(pos2(x0, track.top() + 9.0), pos2(x1, track.top() + 11.0)), 1, c)

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Id, Key, Layout, Rect, RichText,
-    Stroke, StrokeKind, TextStyle, Ui, UiBuilder, pos2, vec2,
+    Stroke, TextStyle, Ui, UiBuilder, pos2, vec2,
 };
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
@@ -594,11 +594,14 @@ impl eframe::App for SettingsApp {
         // Sidebar: shares the bar's fill, so the two read as one L-shaped frame.
         let side = Rect::from_min_max(pos2(full.left(), bar.bottom()), pos2(full.left() + SIDEBAR_W, full.bottom()));
         ui.painter().rect_filled(side, CornerRadius { nw: 0, ne: 0, sw: radius, se: 0 }, p.side);
+        let item = |i: f32| Rect::from_min_size(pos2(side.left() + 8.0, side.top() + 6.0 + i * 34.0), vec2(SIDEBAR_W - 16.0, 32.0));
+        let current = SECTIONS.iter().position(|&s| s == self.section).unwrap_or(0);
+        let pos = widgets::glide(ui, Id::unique("nav-selection"), current as f32, 0.18);
+        ui.painter().rect_filled(item(pos), 5, p.sel);
         for (i, &s) in SECTIONS.iter().enumerate() {
-            let top = side.top() + 6.0 + i as f32 * 34.0;
-            let r = Rect::from_min_size(pos2(side.left() + 8.0, top), vec2(SIDEBAR_W - 16.0, 32.0));
+            let near = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
             let dirty = s.changes(&self.cfg, &self.saved) > 0;
-            if widgets::nav_item(ui, &look, r, i + 1, s.name(), s == self.section, dirty).clicked() {
+            if widgets::nav_item(ui, &look, item(i as f32), i + 1, s.name(), (i == current, near), dirty).clicked() {
                 self.go(s);
             }
         }
@@ -633,10 +636,6 @@ impl eframe::App for SettingsApp {
         if esc && !had_dialog && self.listening.is_none() {
             self.request_close(&ctx);
         }
-
-        // One 1 px edge inside the client area, over everything; it dims with the window.
-        let edge = p.framei.lerp_to_gamma(p.frame, active);
-        ui.painter().rect_stroke(full, radius, Stroke::new(1.0, edge), StrokeKind::Inside);
     }
 }
 
