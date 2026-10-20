@@ -47,35 +47,6 @@ impl Default for Config {
     }
 }
 
-const TEMPLATE: &str = r#"# glint settings. After editing, pick "Reload settings" in the tray menu.
-
-# Starts region selection; pressing it again stops the recording.
-# Modifiers: Ctrl, Alt, Shift, Win. Keys: A-Z, 0-9, F1-F24, PrintScreen, Pause, ScrollLock,
-# Insert, Delete, Home, End, PageUp, PageDown, Space, Tab, Enter, Backspace, Up, Down, Left,
-# Right, Num0-Num9.
-hotkey = "Ctrl+Alt+PrintScreen"
-
-# Folder for recordings. Empty = <Videos>\glint
-output_dir = ""
-
-# Frame rate cap. 0 = the native refresh rate of the monitor being recorded.
-fps = 0
-
-# "h264" plays everywhere; "hevc" is ~30% smaller at the same quality (Telegram, Discord,
-# browsers with hardware decoding, VLC/mpv).
-codec = "h264"
-
-# Constant quality (QP, 0-51): lower = sharper and bigger. 18 is near-lossless,
-# 22 is the default, 26-28 gives small files.
-quality = 22
-
-# Encoder effort 0-100: higher compresses a bit better but loads the GPU more. If the
-# "saved" notification reports dropped frames, lower this.
-effort = 50
-
-draw_cursor = true
-"#;
-
 impl Config {
     pub fn path() -> PathBuf {
         app_dir().join("config.toml")
@@ -85,7 +56,7 @@ impl Config {
     pub fn load() -> Result<Config, String> {
         let path = Self::path();
         if !path.exists() {
-            std::fs::write(&path, TEMPLATE).map_err(|e| format!("can't create {}: {e}", path.display()))?;
+            Config::default().save()?;
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -94,6 +65,60 @@ impl Config {
             return Err(format!("quality must be 0-51, got {}", cfg.quality));
         }
         Ok(cfg)
+    }
+
+    /// Writes the settings file (with its explanatory comments).
+    pub fn save(&self) -> Result<(), String> {
+        let path = Self::path();
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, self.render())
+            .and_then(|_| std::fs::rename(&tmp, &path))
+            .map_err(|e| format!("can't write {}: {e}", path.display()))
+    }
+
+    fn render(&self) -> String {
+        let q = |s: &str| toml::Value::String(s.to_string()).to_string();
+        let codec = match self.codec {
+            CodecName::H264 => "h264",
+            CodecName::Hevc => "hevc",
+        };
+        format!(
+            r#"# glint settings. "Settings…" in the tray menu edits this file; hand edits apply the
+# next time a recording starts.
+
+# Starts region selection; pressing it again stops the recording.
+# Modifiers: Ctrl, Alt, Shift, Win. Keys: A-Z, 0-9, F1-F24, PrintScreen, Pause, ScrollLock,
+# Insert, Delete, Home, End, PageUp, PageDown, Space, Tab, Enter, Backspace, Up, Down, Left,
+# Right, Num0-Num9.
+hotkey = {hotkey}
+
+# Folder for recordings. Empty = <Videos>\glint
+output_dir = {output_dir}
+
+# Frame rate cap. 0 = the native refresh rate of the monitor being recorded.
+fps = {fps}
+
+# "h264" plays everywhere; "hevc" is ~30% smaller at the same quality (Telegram, Discord,
+# browsers with hardware decoding, VLC/mpv).
+codec = "{codec}"
+
+# Constant quality (QP, 0-51): lower = sharper and bigger. 18 is near-lossless,
+# 22 is the default, 26-28 gives small files.
+quality = {quality}
+
+# Encoder effort 0-100: higher compresses a bit better but loads the GPU more. If the
+# "saved" notification reports dropped frames, lower this.
+effort = {effort}
+
+draw_cursor = {draw_cursor}
+"#,
+            hotkey = q(&self.hotkey),
+            output_dir = q(&self.output_dir),
+            fps = self.fps,
+            quality = self.quality,
+            effort = self.effort,
+            draw_cursor = self.draw_cursor,
+        )
     }
 
     pub fn output_dir(&self) -> PathBuf {
@@ -136,6 +161,27 @@ pub fn parse_hotkey(s: &str) -> Result<(u32, u32), String> {
     Ok((mods, vk))
 }
 
+/// Keys with a name of their own (the first spelling is canonical), by virtual-key code.
+const NAMED_KEYS: &[(&[&str], u32)] = &[
+    (&["PrintScreen", "PrtSc", "Print", "Snapshot"], 0x2C),
+    (&["Pause", "Break"], 0x13),
+    (&["ScrollLock"], 0x91),
+    (&["Insert", "Ins"], 0x2D),
+    (&["Delete", "Del"], 0x2E),
+    (&["Home"], 0x24),
+    (&["End"], 0x23),
+    (&["PageUp", "PgUp"], 0x21),
+    (&["PageDown", "PgDn"], 0x22),
+    (&["Space"], 0x20),
+    (&["Tab"], 0x09),
+    (&["Enter", "Return"], 0x0D),
+    (&["Backspace"], 0x08),
+    (&["Up"], 0x26),
+    (&["Down"], 0x28),
+    (&["Left"], 0x25),
+    (&["Right"], 0x27),
+];
+
 fn vk_from_name(p: &str) -> Option<u32> {
     let b = p.as_bytes();
     if b.len() == 1 && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit()) {
@@ -147,24 +193,71 @@ fn vk_from_name(p: &str) -> Option<u32> {
     if let Some(n) = p.strip_prefix("num").and_then(|n| n.parse::<u32>().ok()) {
         return (n <= 9).then(|| 0x60 + n);
     }
-    Some(match p {
-        "printscreen" | "prtsc" | "print" | "snapshot" => 0x2C,
-        "pause" | "break" => 0x13,
-        "scrolllock" => 0x91,
-        "insert" | "ins" => 0x2D,
-        "delete" | "del" => 0x2E,
-        "home" => 0x24,
-        "end" => 0x23,
-        "pageup" | "pgup" => 0x21,
-        "pagedown" | "pgdn" => 0x22,
-        "space" => 0x20,
-        "tab" => 0x09,
-        "enter" | "return" => 0x0D,
-        "backspace" => 0x08,
-        "up" => 0x26,
-        "down" => 0x28,
-        "left" => 0x25,
-        "right" => 0x27,
-        _ => return None,
-    })
+    NAMED_KEYS.iter().find(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(p))).map(|&(_, vk)| vk)
+}
+
+/// Canonical name of a virtual key, if hotkeys support it.
+pub fn key_name(vk: u32) -> Option<String> {
+    match vk {
+        0x30..=0x39 | 0x41..=0x5A => Some(char::from(vk as u8).to_string()),
+        0x70..=0x87 => Some(format!("F{}", vk - 0x6F)),
+        0x60..=0x69 => Some(format!("Num{}", vk - 0x60)),
+        _ => NAMED_KEYS.iter().find(|&&(_, v)| v == vk).map(|(names, _)| names[0].to_string()),
+    }
+}
+
+/// Formats modifiers + key the way [`parse_hotkey`] reads them, e.g. "Ctrl+Alt+PrintScreen".
+pub fn hotkey_string(mods: u32, vk: u32) -> Option<String> {
+    let mut s = String::new();
+    for (bit, name) in [(MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Shift"), (MOD_WIN, "Win")] {
+        if mods & bit != 0 {
+            s += name;
+            s += "+";
+        }
+    }
+    Some(s + &key_name(vk)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hotkeys_round_trip_to_canonical_spelling() {
+        for (input, canonical) in [
+            ("Ctrl+Alt+PrintScreen", "Ctrl+Alt+PrintScreen"),
+            ("alt + ctrl + prtsc", "Ctrl+Alt+PrintScreen"),
+            ("shift+win+f12", "Shift+Win+F12"),
+            ("Ctrl+num7", "Ctrl+Num7"),
+            ("Pause", "Pause"),
+            ("ctrl+x", "Ctrl+X"),
+        ] {
+            let (mods, vk) = parse_hotkey(input).unwrap();
+            assert_eq!(hotkey_string(mods, vk).as_deref(), Some(canonical), "{input}");
+        }
+    }
+
+    #[test]
+    fn bad_hotkeys_are_rejected() {
+        for bad in ["Ctrl+Alt", "Ctrl+Bogus", "A+B", "F25", ""] {
+            assert!(parse_hotkey(bad).is_err(), "{bad}");
+        }
+        assert_eq!(hotkey_string(MOD_CONTROL, 0xFF), None); // keys without a name can't be saved
+    }
+
+    #[test]
+    fn saved_file_parses_back_to_the_same_settings() {
+        let cfg = Config {
+            hotkey: "Shift+Pause".into(),
+            output_dir: r#"D:\clips\"quoted" dir\"#.into(),
+            fps: 60,
+            codec: CodecName::Hevc,
+            quality: 18,
+            effort: 75,
+            draw_cursor: false,
+        };
+        let back: Config = toml::from_str(&cfg.render()).unwrap();
+        assert_eq!(back, cfg);
+        assert_eq!(toml::from_str::<Config>(&Config::default().render()).unwrap(), Config::default());
+    }
 }
