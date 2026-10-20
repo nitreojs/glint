@@ -2,6 +2,7 @@
 name = "glint"
 version = "0.1.0"
 edition = "2024"
+repository = "https://github.com/nitreojs/glint"
 
 [dependencies]
 eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow"] }
