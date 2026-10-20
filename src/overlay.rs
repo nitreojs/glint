@@ -1,6 +1,7 @@
 //! Full-screen region picker in the style of ShareX: a frozen, dimmed screenshot of the
-//! whole virtual desktop that fades in. Drag to select (the selection shows undimmed), click
-//! to pick a whole monitor, Esc / right-click to cancel.
+//! whole virtual desktop that fades in. Hovering highlights the window under the cursor (or
+//! the whole monitor over the desktop) and a click picks it; dragging selects a region (the
+//! selection shows undimmed). Esc / right-click cancels.
 //!
 //! The result is posted to the owner as `Box<Option<Selection>>` in LPARAM; the picker keeps
 //! showing until the owner calls [`dismiss`], so the fade-out can overlap other work.
@@ -8,10 +9,13 @@
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, TRUE, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmGetWindowAttribute,
+    DwmSetWindowAttribute,
+};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
@@ -19,7 +23,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, w};
 
 use crate::gfx::{Dib, Painter, animate, rgba};
-use crate::monitors::{Output, fit_drag, output_at};
+use crate::monitors::{Output, fit_drag, fit_rect, output_at};
 use crate::util::Rect;
 
 #[derive(Clone, Debug)]
@@ -38,7 +42,7 @@ const PILL_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.86);
 const PILL_TEXT: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
 const FADE_IN_MS: f32 = 140.0;
 const FADE_OUT_MS: f32 = 110.0;
-const HINT: &str = "Drag to select a region   ·   Click to record the whole monitor   ·   Esc to cancel";
+const HINT: &str = "Drag to select a region   ·   Click to record the highlighted window or monitor   ·   Esc to cancel";
 
 /// A pre-rendered pill (label or hint) and where it sits, in client coordinates.
 struct Pill {
@@ -59,8 +63,14 @@ struct State {
     white: HBRUSH,
     black: HBRUSH,
     outputs: Vec<Output>,
+    /// Visible top-level windows when the picker opened, topmost first (desktop coordinates).
+    windows: Vec<Rect>,
+    /// Last mouse position (client coordinates).
+    cursor: (i32, i32),
     drag_start: Option<(i32, i32)>,
-    /// Current (fitted) selection in client coordinates.
+    /// The mouse moved past [`CLICK_SLOP`] since the button went down.
+    dragging: bool,
+    /// Current (fitted) selection or hover highlight in client coordinates.
     sel: Option<Rect>,
     label: Option<Pill>,
     /// A result was posted; ignore input until dismissed.
@@ -129,6 +139,7 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
         let screen = GetDC(None);
         let _ = BitBlt(bright.dc, 0, 0, vw, vh, Some(screen), vx, vy, ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0));
         ReleaseDC(None, screen);
+        let windows = visible_windows();
         let _ = GdiFlush();
         for (d, &s) in dim.pixels_mut().iter_mut().zip(bright.pixels()) {
             let rb = (((s & 0x00FF_00FF) * DIM) >> 8) & 0x00FF_00FF;
@@ -139,11 +150,15 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
         let painter = Painter::new()?;
         let font = painter.font(13.0)?;
         let (hw, _) = pill_size(&painter, &font, HINT);
+        // The hint goes into both images so a highlighted window doesn't hide it.
         for o in &outputs {
             let r = o.rect.offset(-vx, -vy);
-            let hint = render_pill(&painter, &font, HINT, &dim, r.x + (r.w - hw) / 2, r.y + painter.px(28.0) as i32)?;
-            let p = hint.rect;
-            let _ = BitBlt(dim.dc, p.x, p.y, p.w, p.h, Some(hint.dib.dc), 0, 0, SRCCOPY);
+            let (x, y) = (r.x + (r.w - hw) / 2, r.y + painter.px(28.0) as i32);
+            for img in [&dim, &bright] {
+                let hint = render_pill(&painter, &font, HINT, img, x, y)?;
+                let p = hint.rect;
+                let _ = BitBlt(img.dc, p.x, p.y, p.w, p.h, Some(hint.dib.dc), 0, 0, SRCCOPY);
+            }
         }
         let _ = GdiFlush();
 
@@ -180,7 +195,7 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
         let max_hz = outputs.iter().map(|o| o.refresh_hz).fold(60.0, f64::max);
         let frame = Duration::from_secs_f64(0.9 / max_hz);
         STATE.with(|s| {
-            *s.borrow_mut() = Some(State {
+            let mut st = State {
                 hwnd,
                 owner,
                 msg,
@@ -192,13 +207,23 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
                 white: CreateSolidBrush(COLORREF(0x00FFFFFF)),
                 black: CreateSolidBrush(COLORREF(0)),
                 outputs,
+                windows,
+                cursor: (0, 0),
                 drag_start: None,
+                dragging: false,
                 sel: None,
                 label: None,
                 done: false,
                 last_paint: Cell::new(Instant::now()),
                 frame,
-            })
+            };
+            // Highlight what's under the cursor right away, before the first paint.
+            let mut p = POINT::default();
+            if GetCursorPos(&mut p).is_ok() {
+                st.cursor = (p.x - vx, p.y - vy);
+                st.update_selection(st.cursor);
+            }
+            *s.borrow_mut() = Some(st);
         });
         let _ = ShowWindow(hwnd, SW_SHOW);
         let _ = UpdateWindow(hwnd);
@@ -252,6 +277,69 @@ fn ring(outer: Rect, inner: Rect) -> [RECT; 4] {
     ]
 }
 
+/// Visible top-level windows, topmost first, by their visible DWM frame (without the
+/// invisible resize borders). Taken together with the screenshot, so hovering matches it.
+fn visible_windows() -> Vec<Rect> {
+    unsafe extern "system" fn add(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let list = unsafe { &mut *(lp.0 as *mut Vec<Rect>) };
+        list.extend(unsafe { window_rect(hwnd) });
+        TRUE
+    }
+    let mut list = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(add), LPARAM(&mut list as *mut Vec<Rect> as isize));
+    }
+    list
+}
+
+/// Windows thinner than this (physical px) in either direction are never picked.
+const MIN_PICK: i32 = 24;
+
+/// Where `hwnd` appears on screen, or None if the user can't see it as a window.
+unsafe fn window_rect(hwnd: HWND) -> Option<Rect> {
+    unsafe {
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return None;
+        }
+        let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        // Click-through windows are overlays (GPU, game, recording), not something to pick.
+        if ex & WS_EX_TRANSPARENT.0 != 0 {
+            return None;
+        }
+        // Fully transparent layered windows (e.g. the idle GeForce overlay) can't be seen.
+        if ex & WS_EX_LAYERED.0 != 0 {
+            let (mut alpha, mut flags) = (255u8, LAYERED_WINDOW_ATTRIBUTES_FLAGS(0));
+            if GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)).is_ok()
+                && flags.contains(LWA_ALPHA)
+                && alpha == 0
+            {
+                return None;
+            }
+        }
+        // Cloaked: on another virtual desktop, a suspended UWP app, or a shell surface.
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut u32 as _, 4);
+        if cloaked != 0 {
+            return None;
+        }
+        // The desktop itself; hovering it highlights the whole monitor instead.
+        let mut buf = [0u16; 16];
+        let n = GetClassNameW(hwnd, &mut buf).max(0) as usize;
+        let class = &buf[..n];
+        if [w!("Progman"), w!("WorkerW")].iter().any(|c| c.as_wide() == class) {
+            return None;
+        }
+        let mut rc = RECT::default();
+        let size = size_of::<RECT>() as u32;
+        if DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &mut rc as *mut RECT as _, size).is_err() {
+            GetWindowRect(hwnd, &mut rc).ok()?;
+        }
+        let r = Rect::from_win(&rc);
+        // Slivers are drop shadows, borders and helper windows, not pick targets.
+        (r.w >= MIN_PICK && r.h >= MIN_PICK).then_some(r)
+    }
+}
+
 impl State {
     fn to_client(&self, r: Rect) -> Rect {
         r.offset(-self.origin.0, -self.origin.1)
@@ -261,6 +349,14 @@ impl State {
     fn fitted(&self, a: (i32, i32), b: (i32, i32)) -> Option<(Rect, usize)> {
         let (ox, oy) = self.origin;
         fit_drag((a.0 + ox, a.1 + oy), (b.0 + ox, b.1 + oy), &self.outputs)
+    }
+
+    /// What a click at `p` (client coords) picks: the topmost window under it, else its monitor.
+    fn target_at(&self, p: (i32, i32)) -> Option<(Rect, usize)> {
+        let d = (p.0 + self.origin.0, p.1 + self.origin.1);
+        let mon = self.outputs[output_at(&self.outputs, d.0, d.1)?].rect;
+        let rect = self.windows.iter().find(|w| w.contains(d.0, d.1)).copied().unwrap_or(mon);
+        fit_rect(rect, d, &self.outputs)
     }
 
     /// Replaces the selection and, if `label` is Some, the label; invalidates exactly the
@@ -306,9 +402,14 @@ impl State {
         }
     }
 
+    /// Shows what the mouse at `cur` would pick: the drag selection while dragging,
+    /// otherwise the window (or monitor) under the cursor.
     fn update_selection(&mut self, cur: (i32, i32)) {
-        let Some(start) = self.drag_start else { return };
-        let Some((r, oi)) = self.fitted(start, cur) else {
+        let fitted = match self.drag_start {
+            Some(start) if self.dragging => self.fitted(start, cur),
+            _ => self.target_at(cur),
+        };
+        let Some((r, oi)) = fitted else {
             return self.set_selection(None, Some(None));
         };
         let sel = self.to_client(r);
@@ -336,16 +437,7 @@ impl State {
 
     fn finish_drag(&mut self, end: (i32, i32)) -> Option<Selection> {
         let start = self.drag_start.take()?;
-        let click = (end.0 - start.0).abs() < CLICK_SLOP && (end.1 - start.1).abs() < CLICK_SLOP;
-        let fitted = if click {
-            let (dx, dy) = (end.0 + self.origin.0, end.1 + self.origin.1);
-            output_at(&self.outputs, dx, dy).and_then(|i| {
-                let m = self.outputs[i].rect;
-                fit_drag((m.x, m.y), (m.right(), m.bottom()), &self.outputs)
-            })
-        } else {
-            self.fitted(start, end)
-        };
+        let fitted = if std::mem::take(&mut self.dragging) { self.fitted(start, end) } else { self.target_at(end) };
         fitted.map(|(rect, oi)| Selection { rect, output: self.outputs[oi].clone() })
     }
 
@@ -406,37 +498,46 @@ impl State {
         }
         match msg {
             WM_LBUTTONDOWN => {
-                self.set_selection(None, Some(None));
                 self.drag_start = Some(point(lp));
+                self.dragging = false;
                 Action::Capture
             }
             WM_MOUSEMOVE => {
-                if self.drag_start.is_none() {
-                    return Action::Handled;
+                let p = point(lp);
+                self.cursor = p;
+                if let Some(s) = self.drag_start
+                    && !self.dragging
+                {
+                    self.dragging = (p.0 - s.0).abs() >= CLICK_SLOP || (p.1 - s.1).abs() >= CLICK_SLOP;
                 }
-                self.update_selection(point(lp));
+                self.update_selection(p);
                 if self.last_paint.get().elapsed() >= self.frame { Action::Paint } else { Action::Handled }
             }
             WM_LBUTTONUP => match self.finish_drag(point(lp)) {
                 Some(sel) => Action::Finish(Some(sel)),
                 None => {
-                    self.set_selection(None, Some(None));
+                    self.update_selection(point(lp));
                     Action::Release
                 }
             },
             WM_RBUTTONUP => {
                 if self.drag_start.take().is_some() {
-                    self.set_selection(None, Some(None));
+                    self.dragging = false;
+                    self.update_selection(point(lp));
                     Action::Release
                 } else {
                     Action::Finish(None)
                 }
             }
             WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => Action::Finish(None),
-            WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize => match (self.drag_start, self.sel) {
-                (Some(_), Some(s)) => Action::Finish(self.finish_drag((s.right(), s.bottom()))),
-                _ => Action::Handled,
-            },
+            // Enter confirms the drag in progress, or picks what's highlighted.
+            WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize => {
+                self.drag_start.get_or_insert(self.cursor);
+                match self.finish_drag(self.cursor) {
+                    Some(sel) => Action::Finish(Some(sel)),
+                    None => Action::Handled,
+                }
+            }
             WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => Action::Finish(None),
             WM_CLOSE => Action::Finish(None),
             _ => Action::Default,

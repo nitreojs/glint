@@ -140,6 +140,14 @@ pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output]) -> O
     Some((Rect { x, y, w, h }, idx))
 }
 
+/// Maps a fixed rectangle (a window, a monitor) onto the output under `at`: clipped to it,
+/// then grown to the encoder minimum and trimmed to even size like [`fit_drag`].
+pub fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output]) -> Option<(Rect, usize)> {
+    let mon = outputs[output_at(outputs, at.0, at.1)?].rect;
+    let r = rect.intersect(&mon)?;
+    fit_drag((r.x, r.y), (r.right(), r.bottom()), outputs)
+}
+
 pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
     outputs.iter().position(|o| o.rect.contains(x, y))
 }
@@ -188,5 +196,19 @@ mod tests {
         // A drag that starts on the right monitor and crosses into the left one is clipped to the right one.
         let (r, i) = fit_drag((300, 600), (-500, 900), &outs).unwrap();
         assert_eq!((i, r.x, r.right()), (1, 0, 300));
+    }
+
+    #[test]
+    fn windows_are_clipped_to_the_monitor_under_the_cursor() {
+        let outs = [output(-1920, 540, 1920, 1080), output(0, 0, 3440, 1440)];
+        // A window straddling both monitors, odd-sized: only the part on the cursor's monitor, even.
+        let win = Rect { x: -301, y: 600, w: 1001, h: 501 };
+        let (r, i) = fit_rect(win, (-100, 700), &outs).unwrap();
+        assert_eq!((i, r), (0, Rect { x: -301, y: 600, w: 300, h: 500 }));
+        let (r, i) = fit_rect(win, (100, 700), &outs).unwrap();
+        assert_eq!((i, r), (1, Rect { x: 0, y: 600, w: 700, h: 500 }));
+        // A maximized window's frame overhangs the monitor; the pick is exactly the monitor.
+        let max = Rect { x: -8, y: -8, w: 3456, h: 1456 };
+        assert_eq!(fit_rect(max, (10, 10), &outs).unwrap().0, outs[1].rect);
     }
 }
