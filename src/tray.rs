@@ -95,9 +95,9 @@ impl Drop for Tray {
     }
 }
 
-/// "Record" glyph: a ring with a dot, anti-aliased, with a thin dark outline so it reads on
-/// both light and dark taskbars.
-fn make_icon(size: i32, rgb: [u8; 3]) -> HICON {
+/// The app's "record" glyph as straight-alpha ARGB pixels: a ring with a dot, anti-aliased,
+/// with a thin dark outline so it reads on both light and dark backgrounds.
+pub fn icon_pixels(size: i32, rgb: [u8; 3]) -> Vec<u32> {
     let s = size as f32;
     let c = s / 2.0;
     let (r_out, r_in, r_dot) = (s * 0.46, s * 0.34, s * 0.2);
@@ -122,6 +122,11 @@ fn make_icon(size: i32, rgb: [u8; 3]) -> HICON {
                 ((a * 255.0).round() as u32) << 24 | ch(rgb[0]) << 16 | ch(rgb[1]) << 8 | ch(rgb[2]);
         }
     }
+    px
+}
+
+fn make_icon(size: i32, rgb: [u8; 3]) -> HICON {
+    let px = icon_pixels(size, rgb);
     unsafe {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {

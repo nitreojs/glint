@@ -9,7 +9,7 @@ use glint::overlay::{self, Selection};
 use glint::recorder::{Outcome, Params, Recorder};
 use glint::tray::Tray;
 use glint::util::{human_duration, human_size, log, log_path, timestamp, wide};
-use glint::monitors;
+use glint::{ipc, monitors};
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -33,9 +33,8 @@ const HOTKEY_ID: i32 = 1;
 const ID_RECORD: usize = 100;
 const ID_FOLDER: usize = 101;
 const ID_SETTINGS: usize = 102;
-const ID_RELOAD: usize = 103;
-const ID_LOG: usize = 104;
-const ID_EXIT: usize = 105;
+const ID_LOG: usize = 103;
+const ID_EXIT: usize = 104;
 
 enum State {
     Idle,
@@ -88,7 +87,7 @@ impl App {
                 self.hotkey = Some(self.cfg.hotkey.clone());
             } else {
                 let text = format!(
-                    "{} is already used by another app (ShareX?). Change \"hotkey\" in settings, or use the tray menu.",
+                    "{} is already used by another app (ShareX?). Pick another in Settings, or use the tray menu.",
                     self.cfg.hotkey
                 );
                 self.notify("glint: hotkey unavailable", &text, true, ClickTarget::None);
@@ -96,18 +95,23 @@ impl App {
         }
     }
 
-    /// Re-reads settings; re-registers the hotkey when it changed.
-    fn reload(&mut self, announce: bool) {
+    /// Releases the hotkey while the settings window records a new one.
+    fn pause_hotkey(&mut self) {
+        if self.hotkey.take().is_some() {
+            unsafe {
+                let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+            }
+        }
+    }
+
+    /// Re-reads settings; (re-)registers the hotkey when it changed or isn't held.
+    fn reload(&mut self) {
         match Config::load() {
             Ok(cfg) => {
                 let hotkey_changed = self.hotkey.as_deref() != Some(cfg.hotkey.as_str());
                 self.cfg = cfg;
                 if hotkey_changed {
                     self.register_hotkey();
-                }
-                if announce {
-                    let text = format!("Hotkey: {}", self.cfg.hotkey);
-                    self.notify("Settings reloaded", &text, false, ClickTarget::None);
                 }
             }
             Err(e) => self.notify("glint: settings error", &e, true, ClickTarget::None),
@@ -124,7 +128,7 @@ impl App {
     }
 
     fn start_selection(&mut self) {
-        self.reload(false);
+        self.reload();
         let outputs = match monitors::enumerate() {
             Ok(o) if !o.is_empty() => o,
             Ok(_) => return self.notify("glint", "No monitors found.", true, ClickTarget::None),
@@ -287,6 +291,20 @@ fn shell(file: &str, params: &str) {
     }
 }
 
+/// Brings the settings window forward, or starts it (`glint.exe --settings`).
+fn open_settings() {
+    if let Some(h) = ipc::find_settings() {
+        unsafe {
+            let _ = SetForegroundWindow(h);
+        }
+        return;
+    }
+    let spawned = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn());
+    if let Err(e) = spawned {
+        with_app(|a| a.notify("glint: can't open settings", &e.to_string(), true, ClickTarget::None));
+    }
+}
+
 fn show_menu(hwnd: HWND) {
     let Some((recording, busy, hotkey)) = with_app(|a| {
         let recording = matches!(a.state, State::Recording { .. });
@@ -308,8 +326,7 @@ fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, flags, ID_RECORD, PCWSTR(label.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open recordings folder"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Edit settings"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, w!("Reload settings"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings…"));
         let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
@@ -331,13 +348,7 @@ fn show_menu(hwnd: HWND) {
                 shell("explorer.exe", &format!("\"{}\"", dir.display()));
             }
         }
-        ID_SETTINGS => {
-            let _ = Config::load(); // make sure the file exists
-            shell("notepad.exe", &format!("\"{}\"", Config::path().display()));
-        }
-        ID_RELOAD => {
-            with_app(|a| a.reload(true));
-        }
+        ID_SETTINGS => open_settings(),
         ID_LOG => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
         ID_EXIT => {
             with_app(|a| a.exit());
@@ -355,6 +366,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         // From the indicator pill: WPARAM 0 = stop and save, 1 = discard.
         WM_APP_STOP => {
             with_app(|a| a.stop_recording(wp.0 == 1));
+            return LRESULT(0);
+        }
+        ipc::WM_RELOAD => {
+            with_app(|a| a.reload());
+            return LRESULT(0);
+        }
+        ipc::WM_HOTKEY_PAUSE => {
+            with_app(|a| if wp.0 == 1 { a.pause_hotkey() } else { a.register_hotkey() });
             return LRESULT(0);
         }
         WM_APP_TRAY => {
@@ -414,6 +433,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 fn main() {
+    if std::env::args().any(|a| a == "--settings") {
+        glint::settings::run();
+        return;
+    }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let _mutex = CreateMutexW(None, false, w!("Local\\glint-single-instance"));
@@ -424,7 +447,7 @@ fn main() {
         let _ = std::fs::write(log_path(), ""); // fresh log per run
 
         let hinst = GetModuleHandleW(None).expect("module handle");
-        let class = w!("glint_main");
+        let class = ipc::MAIN_CLASS;
         let wc = WNDCLASSEXW {
             cbSize: size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(wndproc),
