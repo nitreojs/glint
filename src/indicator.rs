@@ -16,6 +16,7 @@ use windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
@@ -29,6 +30,9 @@ const FADE_IN_MS: f32 = 160.0;
 const FADE_OUT_MS: f32 = 120.0;
 const PULSE_S: f32 = 1.6;
 const TIMER_ID: usize = 1;
+/// Fast timer that runs only while a hover transition is in flight.
+const ANIM_TIMER_ID: usize = 2;
+const HOVER_MS: f32 = 140.0;
 /// Bracket colors (BGR): light brackets over dark content, dark over bright content.
 const LIGHT: (COLORREF, COLORREF) = (COLORREF(0x00F4F4F4), COLORREF(0x00303030));
 const DARK: (COLORREF, COLORREF) = (COLORREF(0x00181614), COLORREF(0x00B0B0B0));
@@ -51,6 +55,11 @@ struct PillState {
     layout: Layout,
     started: Instant,
     hover: Option<Button>,
+    /// Hover progress of [stop, discard], 0 (idle) ..= 1 (hovered).
+    hover_t: [f32; 2],
+    last_frame: Instant,
+    /// The fast timer and 1 ms timer resolution are active.
+    animating: bool,
     fade: f32,
 }
 
@@ -279,6 +288,9 @@ impl Indicator {
                 layout,
                 started: Instant::now(),
                 hover: None,
+                hover_t: [0.0; 2],
+                last_frame: Instant::now(),
+                animating: false,
                 fade: 0.0,
             })
         });
@@ -298,7 +310,13 @@ impl Drop for Indicator {
             let _ = KillTimer(Some(self.pill), TIMER_ID);
         }
         animate(FADE_OUT_MS, |t| set_fade(&self.marks, 1.0 - t));
-        PILL.with(|p| p.borrow_mut().take());
+        if let Some(st) = PILL.with(|p| p.borrow_mut().take())
+            && st.animating
+        {
+            unsafe {
+                timeEndPeriod(1);
+            }
+        }
         unsafe {
             for h in self.marks.iter().map(|m| m.0).chain([self.pill]) {
                 let _ = DestroyWindow(h);
@@ -331,11 +349,27 @@ fn set_fade(marks: &[(HWND, u8)], fade: f32) {
     render_pill();
 }
 
-/// Redraws the pill: clock, pulse, hovered button and current fade.
-fn render_pill() {
+/// Moves hover progress toward the hovered button; returns whether anything is still moving.
+fn advance_hover(st: &mut PillState) -> bool {
+    let now = Instant::now();
+    let step = (now - st.last_frame).as_secs_f32() * 1000.0 / HOVER_MS;
+    st.last_frame = now;
+    let mut moving = false;
+    for (t, button) in st.hover_t.iter_mut().zip([Button::Stop, Button::Discard]) {
+        let target = if st.hover == Some(button) { 1.0 } else { 0.0 };
+        *t = if *t < target { (*t + step).min(target) } else { (*t - step).max(target) };
+        moving |= *t != target;
+    }
+    moving
+}
+
+/// Redraws the pill: clock, pulse, hover transitions and current fade. Returns whether a
+/// hover transition is still running.
+fn render_pill() -> bool {
     PILL.with(|p| {
-        let Ok(g) = p.try_borrow() else { return };
-        let Some(st) = g.as_ref() else { return };
+        let Ok(mut g) = p.try_borrow_mut() else { return false };
+        let Some(st) = g.as_mut() else { return false };
+        let moving = advance_hover(st);
         let px = |v: f32| st.painter.px(v);
         let l = &st.layout;
         let t = st.started.elapsed().as_secs_f32();
@@ -347,14 +381,16 @@ fn render_pill() {
             c.round_rect(0.0, 0.0, l.w, l.h, l.h / 2.0, rgba(16, 16, 20, 0.88));
             c.round_rect(px(12.0), (l.h - l.dot) / 2.0, l.dot, l.dot, l.dot / 2.0, rgba(255, 69, 58, pulse));
             c.text(&clock, &st.font, [l.text_x, 0.0, l.time_w + 2.0, l.h], white(0.96));
-            for (button, x) in [(Button::Stop, l.stop_x), (Button::Discard, l.discard_x)] {
-                let hovered = st.hover == Some(button);
+            for ((button, x), &h) in [(Button::Stop, l.stop_x), (Button::Discard, l.discard_x)].into_iter().zip(&st.hover_t) {
+                let e = h * h * (3.0 - 2.0 * h); // smoothstep
                 let (cx, cy) = (x + l.button / 2.0, l.top + l.button / 2.0);
-                if hovered {
-                    let ring = if button == Button::Discard { rgba(255, 69, 58, 0.9) } else { white(0.16) };
-                    c.round_rect(x, l.top, l.button, l.button, l.button / 2.0, ring);
+                if e > 0.0 {
+                    // The hover circle grows out of the glyph while fading in.
+                    let ring = if button == Button::Discard { rgba(255, 69, 58, 0.9 * e) } else { white(0.16 * e) };
+                    let r = l.button / 2.0 * (0.6 + 0.4 * e);
+                    c.round_rect(cx - r, cy - r, r * 2.0, r * 2.0, r, ring);
                 }
-                let a = if hovered { 1.0 } else { 0.8 };
+                let a = 0.8 + 0.2 * e;
                 match button {
                     Button::Stop => {
                         let s = px(10.0);
@@ -368,6 +404,30 @@ fn render_pill() {
                 }
             }
         });
+        moving
+    })
+}
+
+/// Runs the fast animation timer (with 1 ms timer resolution, so it actually ticks every
+/// ~8 ms instead of every 15.6 ms) until hover transitions settle.
+fn set_animating(hwnd: HWND, on: bool) {
+    PILL.with(|p| {
+        let Ok(mut g) = p.try_borrow_mut() else { return };
+        let Some(st) = g.as_mut() else { return };
+        if st.animating == on {
+            return;
+        }
+        st.animating = on;
+        unsafe {
+            if on {
+                st.last_frame = Instant::now();
+                timeBeginPeriod(1);
+                SetTimer(Some(hwnd), ANIM_TIMER_ID, 8, None);
+            } else {
+                let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
+                timeEndPeriod(1);
+            }
+        }
     });
 }
 
@@ -408,7 +468,14 @@ unsafe extern "system" fn mark_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 
 unsafe extern "system" fn pill_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_TIMER if wp.0 == TIMER_ID => render_pill(),
+        WM_TIMER if wp.0 == TIMER_ID => {
+            render_pill();
+        }
+        WM_TIMER if wp.0 == ANIM_TIMER_ID => {
+            if !render_pill() {
+                set_animating(hwnd, false);
+            }
+        }
         WM_PAINT => unsafe {
             let mut ps = PAINTSTRUCT::default();
             BeginPaint(hwnd, &mut ps);
@@ -429,12 +496,12 @@ unsafe extern "system" fn pill_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 let _ = TrackMouseEvent(&mut tme);
             }
             if set_hover(hit) {
-                render_pill();
+                set_animating(hwnd, true);
             }
         }
         WM_MOUSELEAVE => {
             if set_hover(None) {
-                render_pill();
+                set_animating(hwnd, true);
             }
         }
         WM_SETCURSOR => unsafe {
