@@ -444,6 +444,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 fn main() {
+    if std::env::args().any(|a| a == glint::settings::CAPTURE_ARG) {
+        glint::settings::capture_keys();
+        return;
+    }
     if std::env::args().any(|a| a == "--settings") {
         glint::settings::run();
         return;

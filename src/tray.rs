@@ -20,12 +20,13 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(hwnd: HWND, callback: u32) -> Tray {
-        let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16) * 2;
+        // Drawn at the exact small-icon size (16 / 20 / 24 / 32 px), not scaled down.
+        let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16);
         let tray = Tray {
             hwnd,
             callback,
-            idle: make_icon(size, [235, 235, 235]),
-            rec: make_icon(size, [235, 45, 45]),
+            idle: make_icon(size, true),
+            rec: make_icon(size, false),
             recording: false,
         };
         tray.add();
@@ -95,38 +96,37 @@ impl Drop for Tray {
     }
 }
 
-/// The app's "record" glyph as straight-alpha ARGB pixels: a ring with a dot, anti-aliased,
-/// with a thin dark outline so it reads on both light and dark backgrounds.
-pub fn icon_pixels(size: i32, rgb: [u8; 3]) -> Vec<u32> {
+/// The glint mark as straight-alpha ARGB pixels: a red disc with a white highlight in the
+/// upper right ("a glint on a lens"); without the highlight it's the plain recording dot.
+/// Geometry is snapped to whole pixels so it stays crisp at 16 px.
+pub fn icon_pixels(size: i32, highlight: bool) -> Vec<u32> {
+    const RED: [u8; 3] = [0xE5, 0x40, 0x2F];
     let s = size as f32;
-    let c = s / 2.0;
-    let (r_out, r_in, r_dot) = (s * 0.46, s * 0.34, s * 0.2);
-    let disc = |d: f32, r: f32| (r - d + 0.5).clamp(0.0, 1.0);
-    let shape = |d: f32, grow: f32| {
-        let ring = (disc(d, r_out + grow) - disc(d, r_in - grow)).max(0.0);
-        ring.max(disc(d, r_dot + grow))
-    };
+    let unit = |n: f32| (n * s / 16.0).round();
+    let (c, r) = (s / 2.0, s / 2.0 - unit(1.0).max(1.0)); // 14 px disc on a 16 px grid
+    // 3 px highlight whose box ends 2 px inside the disc's top-right corner.
+    let hd = unit(3.0);
+    let (hx, hy) = (s - unit(3.0) - hd / 2.0, unit(3.0) + hd / 2.0);
+    let cover = |d: f32, r: f32| (r - d + 0.5).clamp(0.0, 1.0);
     let mut px = vec![0u32; (size * size) as usize];
     for y in 0..size {
         for x in 0..size {
-            let d = ((x as f32 + 0.5 - c).powi(2) + (y as f32 + 0.5 - c).powi(2)).sqrt();
-            let fill = shape(d, 0.0);
-            let outline = (shape(d, s / 32.0 + 0.6) - fill).max(0.0) * 0.55;
-            let a = fill + outline * (1.0 - fill);
+            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+            let a = cover(((fx - c).powi(2) + (fy - c).powi(2)).sqrt(), r);
             if a <= 0.0 {
                 continue;
             }
-            let k = fill / a; // straight alpha: color share vs. black outline
-            let ch = |v: u8| (v as f32 * k).round() as u32;
+            let w = if highlight { cover(((fx - hx).powi(2) + (fy - hy).powi(2)).sqrt(), hd / 2.0) } else { 0.0 };
+            let ch = |v: u8| (v as f32 + (255.0 - v as f32) * w).round() as u32;
             px[(y * size + x) as usize] =
-                ((a * 255.0).round() as u32) << 24 | ch(rgb[0]) << 16 | ch(rgb[1]) << 8 | ch(rgb[2]);
+                ((a * 255.0).round() as u32) << 24 | ch(RED[0]) << 16 | ch(RED[1]) << 8 | ch(RED[2]);
         }
     }
     px
 }
 
-fn make_icon(size: i32, rgb: [u8; 3]) -> HICON {
-    let px = icon_pixels(size, rgb);
+fn make_icon(size: i32, highlight: bool) -> HICON {
+    let px = icon_pixels(size, highlight);
     unsafe {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
