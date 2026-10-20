@@ -109,15 +109,12 @@ fn gdi_refresh(device: &str) -> f64 {
     60.0
 }
 
-/// Minimum capture size; hardware encoders reject tiny frames.
-pub const MIN_W: i32 = 160;
-pub const MIN_H: i32 = 64;
-
 /// Maps a drag from `anchor` to `cursor` (desktop coordinates) onto one output: the output
 /// under the anchor (or, failing that, the one overlapping the drag most), clipped to it.
 /// Tiny selections grow to the encoder minimum *away from the anchor* and odd sizes lose
 /// their last pixel on the cursor side, so the corner where the drag started never moves.
-pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output]) -> Option<(Rect, usize)> {
+/// `min` is the encoder's smallest frame (see `Codec::min_size`).
+pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], min: (i32, i32)) -> Option<(Rect, usize)> {
     let raw = Rect::from_points(anchor.0, anchor.1, cursor.0, cursor.1);
     let idx = output_at(outputs, anchor.0, anchor.1).or_else(|| {
         let overlap = |o: &Output| o.rect.intersect(&raw).map_or(0, |r| r.area());
@@ -135,17 +132,17 @@ pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output]) -> O
             (end - len, len)
         }
     };
-    let (x, w) = axis(anchor.0, cursor.0, mon.x, mon.right(), MIN_W);
-    let (y, h) = axis(anchor.1, cursor.1, mon.y, mon.bottom(), MIN_H);
+    let (x, w) = axis(anchor.0, cursor.0, mon.x, mon.right(), min.0);
+    let (y, h) = axis(anchor.1, cursor.1, mon.y, mon.bottom(), min.1);
     Some((Rect { x, y, w, h }, idx))
 }
 
 /// Maps a fixed rectangle (a window, a monitor) onto the output under `at`: clipped to it,
 /// then grown to the encoder minimum and trimmed to even size like [`fit_drag`].
-pub fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output]) -> Option<(Rect, usize)> {
+pub fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output], min: (i32, i32)) -> Option<(Rect, usize)> {
     let mon = outputs[output_at(outputs, at.0, at.1)?].rect;
     let r = rect.intersect(&mon)?;
-    fit_drag((r.x, r.y), (r.right(), r.bottom()), outputs)
+    fit_drag((r.x, r.y), (r.right(), r.bottom()), outputs, min)
 }
 
 pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
@@ -155,6 +152,8 @@ pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Unequal sides, so a mixed-up axis shows.
+    const MIN: (i32, i32) = (130, 34);
 
     fn output(x: i32, y: i32, w: i32, h: i32) -> Output {
         Output {
@@ -171,30 +170,30 @@ mod tests {
     fn tiny_drags_grow_away_from_the_anchor() {
         let outs = [output(0, 0, 3440, 1440)];
         // A few pixels above the start point: the bottom edge stays at the anchor.
-        let (r, _) = fit_drag((500, 400), (530, 390), &outs).unwrap();
-        assert_eq!((r.x, r.bottom(), r.w, r.h), (500, 400, MIN_W, MIN_H));
+        let (r, _) = fit_drag((500, 400), (530, 390), &outs, MIN).unwrap();
+        assert_eq!((r.x, r.bottom(), r.w, r.h), (500, 400, MIN.0, MIN.1));
         // Moving further up (still under the minimum) must not move the box at all.
-        let (r2, _) = fit_drag((500, 400), (530, 350), &outs).unwrap();
+        let (r2, _) = fit_drag((500, 400), (530, 380), &outs, MIN).unwrap();
         assert_eq!(r2, r);
         // Down-right: the top-left corner stays at the anchor.
-        let (r, _) = fit_drag((500, 400), (510, 410), &outs).unwrap();
-        assert_eq!((r.x, r.y, r.w, r.h), (500, 400, MIN_W, MIN_H));
+        let (r, _) = fit_drag((500, 400), (510, 410), &outs, MIN).unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (500, 400, MIN.0, MIN.1));
     }
 
     #[test]
     fn odd_sizes_trim_the_cursor_side() {
         let outs = [output(0, 0, 3440, 1440)];
-        let (r, _) = fit_drag((1000, 800), (499, 299), &outs).unwrap(); // up-left, 501 x 501
+        let (r, _) = fit_drag((1000, 800), (499, 299), &outs, MIN).unwrap(); // up-left, 501 x 501
         assert_eq!((r.right(), r.bottom(), r.w, r.h), (1000, 800, 500, 500));
     }
 
     #[test]
     fn growth_is_pushed_inside_the_monitor_and_stays_on_the_anchor_monitor() {
         let outs = [output(-1920, 540, 1920, 1080), output(0, 0, 3440, 1440)];
-        let (r, i) = fit_drag((3430, 1435), (3436, 1438), &outs).unwrap();
-        assert_eq!((i, r.right(), r.bottom(), r.w, r.h), (1, 3440, 1440, MIN_W, MIN_H));
+        let (r, i) = fit_drag((3430, 1435), (3436, 1438), &outs, MIN).unwrap();
+        assert_eq!((i, r.right(), r.bottom(), r.w, r.h), (1, 3440, 1440, MIN.0, MIN.1));
         // A drag that starts on the right monitor and crosses into the left one is clipped to the right one.
-        let (r, i) = fit_drag((300, 600), (-500, 900), &outs).unwrap();
+        let (r, i) = fit_drag((300, 600), (-500, 900), &outs, MIN).unwrap();
         assert_eq!((i, r.x, r.right()), (1, 0, 300));
     }
 
@@ -203,12 +202,12 @@ mod tests {
         let outs = [output(-1920, 540, 1920, 1080), output(0, 0, 3440, 1440)];
         // A window straddling both monitors, odd-sized: only the part on the cursor's monitor, even.
         let win = Rect { x: -301, y: 600, w: 1001, h: 501 };
-        let (r, i) = fit_rect(win, (-100, 700), &outs).unwrap();
+        let (r, i) = fit_rect(win, (-100, 700), &outs, MIN).unwrap();
         assert_eq!((i, r), (0, Rect { x: -301, y: 600, w: 300, h: 500 }));
-        let (r, i) = fit_rect(win, (100, 700), &outs).unwrap();
+        let (r, i) = fit_rect(win, (100, 700), &outs, MIN).unwrap();
         assert_eq!((i, r), (1, Rect { x: 0, y: 600, w: 700, h: 500 }));
         // A maximized window's frame overhangs the monitor; the pick is exactly the monitor.
         let max = Rect { x: -8, y: -8, w: 3456, h: 1456 };
-        assert_eq!(fit_rect(max, (10, 10), &outs).unwrap().0, outs[1].rect);
+        assert_eq!(fit_rect(max, (10, 10), &outs, MIN).unwrap().0, outs[1].rect);
     }
 }

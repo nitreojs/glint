@@ -46,6 +46,8 @@ const FADE_IN_MS: f32 = 140.0;
 const FADE_OUT_MS: f32 = 110.0;
 /// The hover highlight glides from one window to the next.
 const GLIDE_MS: f32 = 120.0;
+/// A drag box that flips across its start point (the encoder minimum makes it jump) glides.
+const FLIP_MS: f32 = 120.0;
 /// Posted to the picker once per composed frame while a glide runs.
 const WM_GLIDE: u32 = WM_APP + 40;
 
@@ -67,6 +69,16 @@ struct Pill {
     text: String,
 }
 
+/// The highlight moving from `from` to the current target.
+#[derive(Clone, Copy)]
+struct Glide {
+    from: Rect,
+    start: Instant,
+    ms: f32,
+    /// A drag box flipping across its start point (it keeps following the drag).
+    flip: bool,
+}
+
 struct State {
     hwnd: HWND,
     owner: HWND,
@@ -86,13 +98,17 @@ struct State {
     drag_start: Option<(i32, i32)>,
     /// The mouse moved past [`CLICK_SLOP`] since the button went down.
     dragging: bool,
+    /// Which side of the drag start the cursor is on (left, above); a change flips the box.
+    side: Option<(bool, bool)>,
+    /// The encoder's smallest frame; selections grow to it.
+    min: (i32, i32),
     /// Current (fitted) selection or hover highlight in client coordinates, as displayed.
     sel: Option<Rect>,
     label: Option<Pill>,
     /// What the highlight shows or glides to (client coordinates) and the output it's on.
     target: Option<(Rect, usize)>,
-    /// Where the running glide started, and when.
-    glide: Option<(Rect, Instant)>,
+    /// The running glide, if any.
+    glide: Option<Glide>,
     /// Runs while a glide is in flight.
     ticker: Option<Arc<Ticker>>,
     /// A result was posted; ignore input until dismissed.
@@ -152,7 +168,7 @@ fn pill_size(painter: &Painter, font: &IDWriteTextFormat, text: &str) -> (i32, i
 }
 
 /// Takes a screenshot and fades the picker in. `msg` is posted to `owner` with the result.
-pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String> {
+pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>, min: (i32, i32)) -> Result<HWND, String> {
     unsafe {
         let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
         let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -236,6 +252,8 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>) -> Result<HWND, String>
                 cursor: (0, 0),
                 drag_start: None,
                 dragging: false,
+                side: None,
+                min,
                 sel: None,
                 label: None,
                 target: None,
@@ -376,7 +394,7 @@ impl State {
     /// The selection that would be recorded for a drag from `a` to `b` (client coords).
     fn fitted(&self, a: (i32, i32), b: (i32, i32)) -> Option<(Rect, usize)> {
         let (ox, oy) = self.origin;
-        fit_drag((a.0 + ox, a.1 + oy), (b.0 + ox, b.1 + oy), &self.outputs)
+        fit_drag((a.0 + ox, a.1 + oy), (b.0 + ox, b.1 + oy), &self.outputs, self.min)
     }
 
     /// What a click at `p` (client coords) picks: the topmost window under it, else its monitor.
@@ -384,7 +402,7 @@ impl State {
         let d = (p.0 + self.origin.0, p.1 + self.origin.1);
         let mon = self.outputs[output_at(&self.outputs, d.0, d.1)?].rect;
         let rect = self.windows.iter().find(|w| w.contains(d.0, d.1)).copied().unwrap_or(mon);
-        fit_rect(rect, d, &self.outputs)
+        fit_rect(rect, d, &self.outputs, self.min)
     }
 
     /// Replaces the selection and, if `label` is Some, the label; invalidates exactly the
@@ -430,23 +448,37 @@ impl State {
         }
     }
 
-    /// Shows what the mouse at `cur` would pick: the drag selection while dragging (instantly),
-    /// otherwise the window (or monitor) under the cursor, gliding there from the last one.
+    /// Shows what the mouse at `cur` would pick: the drag selection while dragging, otherwise
+    /// the window (or monitor) under the cursor, gliding there from the last one. A drag
+    /// follows the cursor instantly, except that a box flipping across the start point (the
+    /// encoder minimum makes it jump) glides to its new side.
     fn update_selection(&mut self, cur: (i32, i32)) {
-        let dragging = self.dragging && self.drag_start.is_some();
-        let target = match self.drag_start {
-            Some(start) if dragging => self.fitted(start, cur),
-            _ => self.target_at(cur),
+        let drag = self.drag_start.filter(|_| self.dragging);
+        let target = match drag {
+            Some(start) => self.fitted(start, cur),
+            None => self.target_at(cur),
         }
         .map(|(r, oi)| (self.to_client(r), oi));
         if target == self.target {
             return; // unchanged, or already gliding there
         }
         self.target = target;
-        self.glide = match (self.sel, target) {
-            (Some(from), Some((to, _))) if !dragging && from != to => Some((from, Instant::now())),
+        let glide = match (drag, self.sel, target) {
+            (Some(start), Some(from), Some(_)) => {
+                let side = (cur.0 < start.0, cur.1 < start.1);
+                let flipped = self.side.replace(side).is_some_and(|s| s != side);
+                match self.glide {
+                    _ if flipped => Some(Glide { from, start: Instant::now(), ms: FLIP_MS, flip: true }),
+                    Some(g) if g.flip => Some(g), // keep gliding toward the moving box
+                    _ => None,
+                }
+            }
+            (None, Some(from), Some((to, _))) if from != to => {
+                Some(Glide { from, start: Instant::now(), ms: GLIDE_MS, flip: false })
+            }
             _ => None,
         };
+        self.glide = glide;
         if self.glide.is_some() {
             self.set_gliding(true);
         } else {
@@ -456,8 +488,8 @@ impl State {
 
     /// Shows the next glide frame; returns whether the glide is still running.
     fn step_glide(&mut self) -> bool {
-        let (Some((from, start)), Some((to, _))) = (self.glide, self.target) else { return false };
-        let t = (start.elapsed().as_secs_f32() * 1000.0 / GLIDE_MS).min(1.0);
+        let (Some(Glide { from, start, ms, .. }), Some((to, _))) = (self.glide, self.target) else { return false };
+        let t = (start.elapsed().as_secs_f32() * 1000.0 / ms).min(1.0);
         let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
         let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;
         self.show(Some(Rect { x: mix(from.x, to.x), y: mix(from.y, to.y), w: mix(from.w, to.w), h: mix(from.h, to.h) }));
@@ -593,6 +625,7 @@ impl State {
             WM_LBUTTONDOWN => {
                 self.drag_start = Some(point(lp));
                 self.dragging = false;
+                self.side = None;
                 Action::Capture
             }
             WM_MOUSEMOVE => {
