@@ -12,7 +12,7 @@ use windows::core::{GUID, HSTRING, Interface, PWSTR};
 
 use super::capture::Capture;
 use super::cursor::CursorRenderer;
-use super::{Codec, Ctx, INFINITE, Msg, Params, RING, adapter_and_output, create_device, qpc, texture_desc};
+use super::{Codec, Ctx, INFINITE, Msg, Params, RING, create_device, qpc, texture_desc};
 use crate::platform::log::log;
 
 fn pack(hi: u32, lo: u32) -> u64 {
@@ -37,8 +37,7 @@ pub(super) struct Encoder {
 impl Encoder {
     pub(super) unsafe fn new(p: Params, cap: &Capture) -> Result<Self, String> {
         unsafe {
-            let (adapter, _) = adapter_and_output(&p)?;
-            let (device, ctx) = create_device(&adapter, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)?;
+            let (device, ctx) = create_device(&cap.adapter, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)?;
             // Media Foundation uses this device from its own worker threads.
             let mt: ID3D11Multithread = ctx.cast().ctx("ID3D11Multithread")?;
             let _ = mt.SetMultithreadProtected(true);

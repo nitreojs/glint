@@ -33,6 +33,7 @@ impl SettingsApp {
     pub(in crate::settings) fn general(&mut self, ui: &mut Ui, look: &Look) {
         self.hotkey_row(ui, look, "record hotkey", HotkeyField::Record);
         self.hotkey_row(ui, look, "screenshot hotkey", HotkeyField::Screenshot);
+        self.hotkey_row(ui, look, "all screens hotkey", HotkeyField::Fullscreen);
         row(ui, look, "launch at startup", 1.0, |ui| {
             let text = if self.cfg.launch_at_startup { "on" } else { "off" };
             widgets::toggle(ui, look, &mut self.cfg.launch_at_startup, text);

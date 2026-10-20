@@ -15,6 +15,7 @@ use hotkeys::parse_hotkey;
 pub(crate) struct Config {
     pub hotkey: String,
     pub screenshot_hotkey: String,
+    pub fullscreen_hotkey: String,
     pub launch_at_startup: bool,
     pub freeze_screen: bool,
     pub output_dir: String,
@@ -64,6 +65,7 @@ impl Default for Config {
         Config {
             hotkey: "Ctrl+Alt+PrintScreen".into(),
             screenshot_hotkey: "Ctrl+PrintScreen".into(),
+            fullscreen_hotkey: "PrintScreen".into(),
             launch_at_startup: false,
             freeze_screen: true,
             output_dir: String::new(),
@@ -94,9 +96,18 @@ impl Config {
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let record = parse_hotkey(&cfg.hotkey)?;
-        if parse_hotkey(&cfg.screenshot_hotkey).map_err(|e| format!("screenshot_hotkey: {e}"))? == record {
-            return Err("hotkey and screenshot_hotkey must differ".into());
+        let hotkeys = [
+            ("hotkey", &cfg.hotkey),
+            ("screenshot_hotkey", &cfg.screenshot_hotkey),
+            ("fullscreen_hotkey", &cfg.fullscreen_hotkey),
+        ];
+        let mut combos = Vec::with_capacity(hotkeys.len());
+        for (name, combo) in hotkeys {
+            let parsed = parse_hotkey(combo).map_err(|e| format!("{name}: {e}"))?;
+            if let Some((other, _)) = combos.iter().find(|(_, c)| *c == parsed) {
+                return Err(format!("{other} and {name} must differ"));
+            }
+            combos.push((name, parsed));
         }
         if cfg.quality > 51 {
             return Err(format!("quality must be 0-51, got {}", cfg.quality));
@@ -142,6 +153,9 @@ hotkey = {hotkey}
 # Starts a screenshot: select a region or window, mark it up, Enter to finish.
 screenshot_hotkey = {screenshot_hotkey}
 
+# Screenshots every monitor at once, straight to the clipboard / folder, without selecting.
+fullscreen_hotkey = {fullscreen_hotkey}
+
 # Start glint (in the tray) when you sign in to Windows.
 launch_at_startup = {launch_at_startup}
 
@@ -182,6 +196,7 @@ screenshot_save = {screenshot_save}
 "#,
             hotkey = q(&self.hotkey),
             screenshot_hotkey = q(&self.screenshot_hotkey),
+            fullscreen_hotkey = q(&self.fullscreen_hotkey),
             launch_at_startup = self.launch_at_startup,
             freeze_screen = self.freeze_screen,
             output_dir = q(&self.output_dir),
@@ -243,6 +258,7 @@ mod tests {
         let cfg = Config {
             hotkey: "Shift+Pause".into(),
             screenshot_hotkey: "Win+Shift+S".into(),
+            fullscreen_hotkey: "Alt+F12".into(),
             launch_at_startup: true,
             freeze_screen: false,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),

@@ -19,9 +19,6 @@ impl Rect {
     pub(crate) fn bottom(&self) -> i32 {
         self.y + self.h
     }
-    pub(crate) fn area(&self) -> i64 {
-        self.w.max(0) as i64 * self.h.max(0) as i64
-    }
     pub(crate) fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x && y >= self.y && x < self.right() && y < self.bottom()
     }

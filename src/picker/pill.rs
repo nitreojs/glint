@@ -10,9 +10,6 @@ use crate::platform::rect::Rect;
 const PILL_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.86);
 const PILL_TEXT: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
 
-const HINT_RECORD: &str = "Drag to select a region   ·   Click to record the highlighted window or monitor   ·   Esc to cancel";
-const HINT_SHOT: &str = "Drag to select a region   ·   Click to capture the highlighted window or monitor   ·   Esc to cancel";
-
 /// A pre-rendered pill (label or hint) and where it sits, in client coordinates.
 pub(super) struct Pill {
     pub(super) rect: Rect,
@@ -42,11 +39,14 @@ pub(super) fn pill_size(painter: &Painter, font: &IDWriteTextFormat, text: &str)
     ((tw.ceil() + painter.px(11.0) * 2.0) as i32, painter.px(26.0) as i32)
 }
 
-pub(super) fn hint_text(purpose: Purpose) -> &'static str {
-    match purpose {
-        Purpose::Record { .. } => HINT_RECORD,
-        Purpose::Shot => HINT_SHOT,
-    }
+/// The hint for `purpose`; Ctrl+A is mentioned only with more than one monitor.
+pub(super) fn hint_text(purpose: Purpose, monitors: usize) -> String {
+    let verb = match purpose {
+        Purpose::Record { .. } => "record",
+        Purpose::Shot => "capture",
+    };
+    let all = if monitors > 1 { "   ·   Ctrl+A for all screens" } else { "" };
+    format!("Drag to select a region   ·   Click to {verb} the highlighted window or monitor{all}   ·   Esc to cancel")
 }
 
 pub(super) fn hint_rects(painter: &Painter, font: &IDWriteTextFormat, hint: &str, outputs: &[Monitor], origin: (i32, i32)) -> Vec<Rect> {

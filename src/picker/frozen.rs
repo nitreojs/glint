@@ -1,8 +1,9 @@
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::Graphics::Gdi::*;
 
-use super::DIM;
 use super::pill::{Pill, render_pill};
+use super::{DIM, Monitor};
+use crate::platform::capture;
 use crate::platform::gfx::{Dib, Painter};
 use crate::platform::rect::Rect;
 
@@ -14,14 +15,20 @@ pub(super) struct Frozen {
 }
 
 impl Frozen {
-    pub(super) fn capture(area: Rect, hints: &[Rect], hint: &str, painter: &Painter, font: &IDWriteTextFormat) -> Result<Frozen, String> {
+    /// Freezes the virtual screen `area`; what no output shows is black.
+    pub(super) fn capture(
+        area: Rect,
+        outputs: &[Monitor],
+        hints: &[Rect],
+        hint: &str,
+        painter: &Painter,
+        font: &IDWriteTextFormat,
+    ) -> Result<Frozen, String> {
+        let monitors: Vec<Rect> = outputs.iter().map(|o| o.rect).collect();
+        let mut bright = Dib::new(area.w, area.h)?;
+        capture::grab(&mut bright, area, &monitors)?;
         unsafe {
-            let bright = Dib::new(area.w, area.h)?;
             let mut dim = Dib::new(area.w, area.h)?;
-            let screen = GetDC(None);
-            let _ = BitBlt(bright.dc, 0, 0, area.w, area.h, Some(screen), area.x, area.y, ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0));
-            ReleaseDC(None, screen);
-            let _ = GdiFlush();
             for (d, &s) in dim.pixels_mut().iter_mut().zip(bright.pixels()) {
                 let rb = (((s & 0x00FF_00FF) * DIM) >> 8) & 0x00FF_00FF;
                 let g = (((s & 0x0000_FF00) * DIM) >> 8) & 0x0000_FF00;

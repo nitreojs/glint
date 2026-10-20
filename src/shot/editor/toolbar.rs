@@ -57,19 +57,9 @@ impl Editor {
         let n: i32 = groups.iter().map(|g| g.len() as i32).sum();
         let w = pad * 2 + n * cell + gap * (groups.len() as i32 - 1);
         let h = cell + pad * 2;
-        let margin = self.px(10.0) as i32;
-        let b = self.bounds;
-        let x = (self.sel.x + self.sel.w / 2 - w / 2).clamp(b.x + margin, (b.right() - w - margin).max(b.x));
-        let below = self.sel.bottom() + margin;
-        let above = self.sel.y - margin - h;
-        let y = if below + h <= b.bottom() - margin {
-            below
-        } else if above >= b.y + margin {
-            above
-        } else {
-            self.sel.bottom() - margin - h
-        };
-        let bar = Rect { x, y, w, h };
+        let (bar, monitor) = place(self.sel, (w, h), self.px(10.0) as i32, &self.monitors);
+        self.bar_monitor = monitor;
+        let (x, y) = (bar.x, bar.y);
         if bar == self.bar && !self.cells.is_empty() {
             return;
         }
@@ -97,10 +87,11 @@ impl Editor {
         let gap = self.px(6.0) as i32;
         let below_sel = b.y >= self.sel.bottom();
         let mut y = if below_sel { b.bottom() + gap } else { b.y - gap - h };
-        if y < self.bounds.y || y + h > self.bounds.bottom() {
+        let m = self.bar_monitor;
+        if y < m.y || y + h > m.bottom() {
             y = if below_sel { b.y - gap - h } else { b.bottom() + gap };
         }
-        let x = (cell.x + cell.w / 2 - w / 2).clamp(self.bounds.x, (self.bounds.right() - w).max(self.bounds.x));
+        let x = (cell.x + cell.w / 2 - w / 2).clamp(m.x, (m.right() - w).max(m.x));
         Rect { x, y, w, h }
     }
 
@@ -149,6 +140,33 @@ impl Editor {
             draw_icon(c, item, (x + cw / 2.0, y + ch / 2.0), s, ink, color);
         }
     }
+}
+
+/// The bar and the monitor it lies on; it never straddles monitors or sits in a gap.
+fn place(sel: Rect, (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect, Rect) {
+    let cx = sel.x + sel.w / 2;
+    let on = |m: Rect, y: i32| Rect { x: (cx - w / 2).clamp(m.x + margin, (m.right() - w - margin).max(m.x)), y, w, h };
+    let low = nearest(monitors, (cx, sel.bottom() - 1));
+    let below = (sel.bottom() + margin).max(low.y + margin);
+    if below + h <= low.bottom() - margin {
+        return (on(low, below), low);
+    }
+    let high = nearest(monitors, (cx, sel.y));
+    let above = (sel.y - margin - h).min(high.bottom() - margin - h);
+    if above >= high.y + margin {
+        return (on(high, above), high);
+    }
+    let inside = (sel.bottom() - margin - h).min(low.bottom() - margin - h).max(low.y + margin);
+    (on(low, inside), low)
+}
+
+fn nearest(monitors: &[Rect], (x, y): (i32, i32)) -> Rect {
+    let gap = |m: &&Rect| {
+        let dx = (m.x - x).max(x - (m.right() - 1)).max(0) as i64;
+        let dy = (m.y - y).max(y - (m.bottom() - 1)).max(0) as i64;
+        dx * dx + dy * dy
+    };
+    *monitors.iter().min_by_key(gap).expect("at least one monitor")
 }
 
 fn draw_icon(
@@ -216,6 +234,53 @@ fn draw_icon(
         Item::Close => {
             c.polyline(&[p(-5.0, -5.0), p(5.0, 5.0)], 1.6 * s, ink);
             c.polyline(&[p(-5.0, 5.0), p(5.0, -5.0)], 1.6 * s, ink);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SIZE: (i32, i32) = (556, 40);
+    const MARGIN: i32 = 10;
+    /// Desktop layout with gaps: a wide monitor, one to its lower left, one above it.
+    const MONITORS: [Rect; 3] = [
+        Rect { x: 0, y: 0, w: 3440, h: 1440 },
+        Rect { x: -1920, y: 540, w: 1920, h: 1080 },
+        Rect { x: 365, y: -1440, w: 2560, h: 1440 },
+    ];
+
+    fn bar(sel: Rect) -> (Rect, Rect) {
+        place(sel, SIZE, MARGIN, &MONITORS)
+    }
+
+    #[test]
+    fn bar_goes_below_then_above_then_inside() {
+        let sel = Rect { x: 1000, y: 200, w: 800, h: 600 };
+        assert_eq!(bar(sel), (Rect { x: 1122, y: 810, w: 556, h: 40 }, MONITORS[0]));
+        let low = Rect { x: -1800, y: 1000, w: 800, h: 610 };
+        assert_eq!(bar(low), (Rect { x: -1678, y: 950, w: 556, h: 40 }, MONITORS[1]));
+        let top = (Rect { x: 1367, y: -50, w: 556, h: 40 }, MONITORS[2]);
+        assert_eq!(bar(MONITORS[2]), top, "not on the monitor below");
+        let both = Rect { x: 0, y: -1440, w: 3440, h: 2880 };
+        assert_eq!(bar(both), (Rect { x: 1442, y: 1390, w: 556, h: 40 }, MONITORS[0]));
+    }
+
+    #[test]
+    fn bar_avoids_gaps() {
+        // bottom centre in the gap under the wide monitor; the left one has no room below
+        let sel = Rect { x: -500, y: 1000, w: 1000, h: 600 };
+        assert_eq!(bar(sel), (Rect { x: 10, y: 950, w: 556, h: 40 }, MONITORS[0]));
+        for x in (-1920..3440).step_by(97) {
+            for y in (-1440..1620).step_by(89) {
+                for (w, h) in [(40, 30), (700, 500), (2600, 1700), (5360, 3060)] {
+                    let sel = Rect { x, y, w, h };
+                    let (b, m) = bar(sel);
+                    assert!(MONITORS.contains(&m));
+                    assert_eq!(m.intersect(&b), Some(b), "{sel:?} put the bar at {b:?}");
+                }
+            }
         }
     }
 }

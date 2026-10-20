@@ -1,8 +1,9 @@
 //! Screen recording pipeline.
 //!
-//! * Capture thread: Desktop Duplication on its own D3D11 device. Frames arrive at the
-//!   monitor's refresh rate; the region is cropped on the GPU into a small ring of shared
-//!   textures. Nothing else touches this device, so the encoder can never stall capture.
+//! * Capture thread: Desktop Duplication of every monitor the region overlaps, on its own
+//!   D3D11 device. Frames arrive at the monitors' refresh rates; the region is cropped (and,
+//!   across monitors, composed) on the GPU into a small ring of shared textures. Nothing else
+//!   touches this device, so the encoder can never stall capture.
 //! * Encoder thread: a second device shared with Media Foundation. It pulls frames from
 //!   the ring, draws the cursor, snaps timestamps to the frame grid and feeds the hardware
 //!   encoder MFT, which writes the MP4.
@@ -24,7 +25,6 @@ use windows::Win32::System::Performance::QueryPerformanceCounter;
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
 };
-use windows::core::Interface;
 
 use crate::platform::log::log;
 use crate::platform::rect::Rect;
@@ -60,12 +60,13 @@ impl Codec {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Params {
-    pub adapter_idx: u32,
-    pub output_idx: u32,
-    /// Capture region in output-local pixels; width and height must be even.
+    /// Every output the region overlaps, all on one adapter.
+    pub sources: Vec<Source>,
+    /// Capture region in desktop pixels; width and height must be even. Parts no source
+    /// covers stay black.
     pub region: Rect,
-    /// Stream frame rate: the monitor's exact refresh rate, or a lower cap. Captures that
-    /// land in the same 1/fps slot are merged, so a cap simply keeps the latest image.
+    /// Stream frame rate: the fastest source's exact refresh rate, or a lower cap. Captures
+    /// that land in the same 1/fps slot are merged, so a cap simply keeps the latest image.
     pub fps: f64,
     pub codec: Codec,
     /// Constant quantizer: lower = better quality and bigger files.
@@ -74,6 +75,14 @@ pub(crate) struct Params {
     pub effort: u32,
     pub draw_cursor: bool,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Source {
+    pub adapter_idx: u32,
+    pub output_idx: u32,
+    /// The output's desktop rectangle when the region was picked.
+    pub desktop: Rect,
 }
 
 #[derive(Clone, Debug)]
@@ -265,12 +274,10 @@ unsafe fn create_device(adapter: &IDXGIAdapter1, flags: D3D11_CREATE_DEVICE_FLAG
     Ok((device.unwrap(), ctx.unwrap()))
 }
 
-unsafe fn adapter_and_output(p: &Params) -> Result<(IDXGIAdapter1, IDXGIOutput1), String> {
+unsafe fn adapter(idx: u32) -> Result<IDXGIAdapter1, String> {
     unsafe {
         let factory: IDXGIFactory1 = CreateDXGIFactory1().ctx("CreateDXGIFactory1")?;
-        let adapter = factory.EnumAdapters1(p.adapter_idx).ctx("EnumAdapters1")?;
-        let output = adapter.EnumOutputs(p.output_idx).ctx("EnumOutputs")?.cast().ctx("IDXGIOutput1")?;
-        Ok((adapter, output))
+        factory.EnumAdapters1(idx).ctx("EnumAdapters1")
     }
 }
 
@@ -291,7 +298,7 @@ fn texture_desc(r: Rect, bind: D3D11_BIND_FLAG, misc: D3D11_RESOURCE_MISC_FLAG) 
 
 enum Msg {
     /// A new state of the region: `slot` is a ring texture with a fresh image (None when only
-    /// the cursor moved), `qpc` the capture time, `cursor` the pointer position if visible.
+    /// the cursor moved), `qpc` the capture time, `cursor` the pointer's desktop position if visible.
     Frame { slot: Option<usize>, qpc: i64, cursor: Option<(i32, i32)> },
     Shape(DXGI_OUTDUPL_POINTER_SHAPE_INFO, Vec<u8>),
     End { qpc: i64 },

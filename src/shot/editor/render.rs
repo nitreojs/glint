@@ -1,28 +1,39 @@
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-use windows::Win32::Graphics::Gdi::{BitBlt, FillRect, GdiFlush, HBRUSH, HDC, RectVisible, SRCCOPY};
+use windows::Win32::Graphics::Gdi::{
+    BLACK_BRUSH, BitBlt, CombineRgn, CreateRectRgn, DeleteObject, ExtSelectClipRgn, FillRect, GdiFlush, GetStockObject,
+    HBRUSH, HDC, RGN_AND, RGN_OR, RestoreDC, SRCCOPY, SaveDC, WHITE_BRUSH,
+};
 
 use super::effects::apply_effect;
 use super::marks::{GRIPS, Mark, draw_mark, edge_point};
 use super::toolbar::{BAR_BG, WHITE};
-use super::{Drag, Editor};
+use super::{Drag, Editor, hull};
 use crate::platform::gfx::{Dib, Painter, rgba};
 use crate::platform::rect::{Rect, ring};
 
 const GRIP_EDGE: D2D1_COLOR_F = rgba(20, 20, 24, 0.9);
 
 impl Editor {
-    /// Brings `view` and the pill's placement up to date. `bright` is the frozen screen.
-    pub(crate) fn render(&mut self, bright: &Dib, painter: &Painter, font: &IDWriteTextFormat) -> Result<(), String> {
+    /// Brings `view` and the pill's placement up to date. `bright` is the frozen screen. Returns
+    /// the pixels a moved pill changes.
+    pub(crate) fn render(
+        &mut self,
+        bright: &Dib,
+        painter: &Painter,
+        font: &IDWriteTextFormat,
+    ) -> Result<Vec<Rect>, String> {
         if self.view_dirty {
             self.render_view(bright, painter)?;
             self.view_dirty = false;
         }
         let want = self.pill_text();
-        if self.pill.as_ref().map(|(_, item, text)| (*item, text)) != want.as_ref().map(|(item, text)| (*item, text)) {
-            self.pill = want.map(|(item, text)| (self.place_pill(item, &text, painter, font), item, text));
+        if self.pill.as_ref().map(|(_, item, text)| (*item, text)) == want.as_ref().map(|(item, text)| (*item, text)) {
+            return Ok(Vec::new());
         }
-        Ok(())
+        let old = self.pill.take().map(|(r, ..)| r);
+        self.pill = want.map(|(item, text)| (self.place_pill(item, &text, painter, font), item, text));
+        Ok(old.into_iter().chain(self.pill.as_ref().map(|(r, ..)| *r)).collect())
     }
 
     fn render_view(&mut self, bright: &Dib, painter: &Painter) -> Result<(), String> {
@@ -70,24 +81,63 @@ impl Editor {
         })
     }
 
-    /// Paints the selection (with marks), its handles, the picked mark's handles, the toolbar and the pill.
+    /// Paints the editor's part of `rp` over `dim`, composed off-screen so each window pixel is written once.
     pub(crate) fn paint(
-        &self,
+        &mut self,
         hdc: HDC,
+        rp: Rect,
+        dim: &Dib,
         painter: &Painter,
         font: &IDWriteTextFormat,
-        white: HBRUSH,
-        black: HBRUSH,
     ) -> Result<(), String> {
+        let extent = self.extent();
+        let hit = extent[1..].iter().filter(|r| r.intersect(&rp).is_some());
+        let area = hit.fold(extent[0].intersect(&rp), |a, r| Some(a.map_or(*r, |a| hull(a, *r))));
+        let Some(area) = area else { return Ok(()) };
+        let (bw, bh) = self.back.as_ref().map_or((0, 0), |b| (b.w, b.h));
+        if bw < area.w || bh < area.h {
+            self.back = Some(Dib::new(bw.max(area.w), bh.max(area.h))?);
+        }
+        let back = self.back.as_ref().expect("allocated above");
         unsafe {
-            let s = self.sel;
+            let _ = BitBlt(back.dc, 0, 0, area.w, area.h, Some(dim.dc), area.x, area.y, SRCCOPY);
+            self.draw(back.dc, area, rp, painter, font)?;
+            let clip = CreateRectRgn(0, 0, 0, 0);
+            for r in &extent {
+                let part = CreateRectRgn(r.x, r.y, r.right(), r.bottom());
+                CombineRgn(Some(clip), Some(clip), Some(part), RGN_OR);
+                let _ = DeleteObject(part.into());
+            }
+            let saved = SaveDC(hdc);
+            ExtSelectClipRgn(hdc, Some(clip), RGN_AND);
+            let _ = DeleteObject(clip.into());
+            let _ = BitBlt(hdc, area.x, area.y, area.w, area.h, Some(back.dc), 0, 0, SRCCOPY);
+            let _ = RestoreDC(hdc, saved);
+        }
+        Ok(())
+    }
+
+    /// Draws the editor onto `dc`, which shows client `area`; overlays not reaching `rp` are skipped.
+    unsafe fn draw(
+        &self,
+        dc: HDC,
+        area: Rect,
+        rp: Rect,
+        painter: &Painter,
+        font: &IDWriteTextFormat,
+    ) -> Result<(), String> {
+        let local = |r: Rect| r.offset(-area.x, -area.y);
+        let visible = |r: Rect| r.intersect(&rp).is_some();
+        unsafe {
+            let (white, black) = (HBRUSH(GetStockObject(WHITE_BRUSH).0), HBRUSH(GetStockObject(BLACK_BRUSH).0));
+            let s = local(self.sel);
             if let Some(v) = &self.view {
-                let _ = BitBlt(hdc, s.x, s.y, s.w, s.h, Some(v.dc), 0, 0, SRCCOPY);
+                let _ = BitBlt(dc, s.x, s.y, s.w, s.h, Some(v.dc), 0, 0, SRCCOPY);
             }
             // 1 px white inside 1 px black, outside the shot, like the picker.
             for (outer, inner, brush) in [(s.inflate(1), s, white), (s.inflate(2), s.inflate(1), black)] {
                 for e in ring(outer, inner) {
-                    FillRect(hdc, &e, brush);
+                    FillRect(dc, &e, brush);
                 }
             }
             // Handles at the corners and edge midpoints.
@@ -96,20 +146,19 @@ impl Editor {
                 let (x, y) = edge_point(s, e);
                 let (x, y) = (x as i32, y as i32);
                 let outer = Rect { x: x - hs / 2 - 1, y: y - hs / 2 - 1, w: hs + 2, h: hs + 2 };
-                FillRect(hdc, &outer.to_win(), black);
-                FillRect(hdc, &outer.inflate(-1).to_win(), white);
+                FillRect(dc, &outer.to_win(), black);
+                FillRect(dc, &outer.inflate(-1).to_win(), white);
             }
-            let visible = |r: Rect| RectVisible(hdc, &r.to_win()).as_bool();
             if let Some(m) = self.picked_mark() {
                 if let Mark::Stroke { .. } = m {
-                    dashed_box(hdc, self.outline(m), white, black, self.px(4.0) as i32);
+                    dashed_box(dc, local(self.outline(m)), white, black, self.px(4.0) as i32);
                 }
                 let (r, edge) = (4.5 * self.scale, 1.5 * self.scale);
                 for (_, q) in m.grips() {
                     let gb = self.grip_box(q);
                     if visible(gb) {
                         let at = (q.0 - gb.x as f32, q.1 - gb.y as f32);
-                        painter.draw_on(hdc, gb.to_win(), |c| {
+                        painter.draw_on(dc, local(gb).to_win(), |c| {
                             c.circle(at, r + edge, GRIP_EDGE);
                             c.circle(at, r, WHITE);
                         })?;
@@ -117,13 +166,13 @@ impl Editor {
                 }
             }
             if visible(self.bar) {
-                painter.draw_on(hdc, self.bar.to_win(), |c| self.draw_bar(c))?;
+                painter.draw_on(dc, local(self.bar).to_win(), |c| self.draw_bar(c))?;
             }
             if let Some((r, _, text)) = &self.pill
                 && visible(*r)
             {
                 let (w, h, pad) = (r.w as f32, r.h as f32, self.px(10.0));
-                painter.draw_on(hdc, r.to_win(), |c| {
+                painter.draw_on(dc, local(*r).to_win(), |c| {
                     c.round_rect(0.0, 0.0, w, h, h / 2.0, BAR_BG);
                     c.text(text, font, [pad, 0.0, w - pad, h], WHITE);
                 })?;

@@ -39,7 +39,7 @@ pub(super) struct Glide {
 impl State {
     /// Shows the next glide frame; returns whether the glide is still running.
     pub(super) fn step_glide(&mut self) -> bool {
-        let (Some(Glide { from, start, ms, .. }), Some((to, _))) = (self.glide, self.target) else { return false };
+        let (Some(Glide { from, start, ms, .. }), Some(to)) = (self.glide, self.target) else { return false };
         let t = (start.elapsed().as_secs_f32() * 1000.0 / ms).min(1.0);
         let e = 1.0 - (1.0 - t).powi(3); // ease-out cubic
         let mix = |a: i32, b: i32| a + ((b - a) as f32 * e).round() as i32;

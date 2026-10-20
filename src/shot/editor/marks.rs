@@ -154,6 +154,19 @@ impl Mark {
         }
     }
 
+    /// Every pixel drawing the mark can touch (client coordinates).
+    pub(super) fn ink(&self, scale: f32) -> Rect {
+        let reach = match self {
+            Mark::Stroke { width, .. } | Mark::Rectangle { width, .. } => ink_width(*width, scale) / 2.0,
+            Mark::Arrow { width, .. } => {
+                let w = ink_width(*width, scale);
+                (w / 2.0).max(arrow_head(w, f32::MAX) * 0.55)
+            }
+            Mark::Blur { .. } | Mark::Pixelate { .. } => 0.0,
+        };
+        self.bbox().inflate(reach.ceil() as i32 + 1)
+    }
+
     pub(super) fn shifted(&self, dx: i32, dy: i32) -> Mark {
         let shift = |p: &mut (f32, f32)| *p = (p.0 + dx as f32, p.1 + dy as f32);
         let mut m = self.clone();

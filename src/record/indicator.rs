@@ -220,41 +220,43 @@ fn mark(pos: Rect, parts: &[Rect], alpha: u8) -> Option<(HWND, u8)> {
 }
 
 impl Indicator {
-    /// `capture` and `monitor` are in desktop coordinates. The pill's buttons post `msg` to
-    /// `owner` with WPARAM 0 (stop and save) or 1 (discard). Fades in before returning.
-    pub(crate) fn show(capture: Rect, monitor: Rect, owner: HWND, msg: u32) -> Result<Indicator, String> {
+    /// `capture` and `monitors` (the recorded outputs) are in desktop coordinates. The pill's
+    /// buttons post `msg` to `owner` with WPARAM 0 (stop and save) or 1 (discard). Fades in
+    /// before returning.
+    pub(crate) fn show(capture: Rect, monitors: &[Rect], owner: HWND, msg: u32) -> Result<Indicator, String> {
         let painter = Painter::new()?;
         let px = |v: f32| painter.px(v) as i32;
         register(w!("glint_mark"), Some(mark_proc), IDC_ARROW);
         register(w!("glint_pill"), Some(pill_proc), IDC_ARROW);
 
-        // The frame sits just outside the region; where that is off the monitor it is pushed
+        // The frame sits just outside the region; where that is off the monitors it is pushed
         // inside (it is excluded from capture, so it never shows up in the video).
         let (arm, th, gap) = (px(20.0), px(3.0), px(4.0));
+        let (dash, space, inset) = (px(8.0), px(6.0), arm + px(6.0));
         let outer = capture.inflate(gap + th);
-        let f = outer.intersect(&monitor.inflate(-1)).unwrap_or(outer);
+        let (corners, sides) = frame(outer, monitors, inset);
+        let Some(&anchor) = corners.first() else { return Err("the recorded region is on no monitor".into()) };
         let size = arm + 2; // + rim on both sides
-        let mut marks = Vec::with_capacity(8);
-        for (right, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
-            let x = if right { f.right() + 1 - size } else { f.x - 1 };
-            let y = if bottom { f.bottom() + 1 - size } else { f.y - 1 };
+        let mut marks = Vec::with_capacity(corners.len() + sides.len());
+        for c in &corners {
+            let x = if c.right { c.x + 1 - size } else { c.x - 1 };
+            let y = if c.bottom { c.y + 1 - size } else { c.y - 1 };
             let near = |far: bool, len: i32| if far { size - 1 - len } else { 1 };
-            let horizontal = Rect { x: near(right, arm), y: near(bottom, th), w: arm, h: th };
-            let vertical = Rect { x: near(right, th), y: near(bottom, arm), w: th, h: arm };
+            let horizontal = Rect { x: near(c.right, arm), y: near(c.bottom, th), w: arm, h: th };
+            let vertical = Rect { x: near(c.right, th), y: near(c.bottom, arm), w: th, h: arm };
             marks.extend(mark(Rect { x, y, w: size, h: size }, &[horizontal, vertical], CORNER_ALPHA));
         }
         // Dashed sides between the brackets.
-        let (dash, space, inset) = (px(8.0), px(6.0), arm + px(6.0));
-        let (hw, vh) = (f.w - 2 * inset, f.h - 2 * inset);
-        for (pos, horizontal) in [
-            (Rect { x: f.x + inset - 1, y: f.y - 1, w: hw + 2, h: th + 2 }, true),
-            (Rect { x: f.x + inset - 1, y: f.bottom() - th - 1, w: hw + 2, h: th + 2 }, true),
-            (Rect { x: f.x - 1, y: f.y + inset - 1, w: th + 2, h: vh + 2 }, false),
-            (Rect { x: f.right() - th - 1, y: f.y + inset - 1, w: th + 2, h: vh + 2 }, false),
-        ] {
-            let len = if horizontal { hw } else { vh };
+        for s in &sides {
+            let len = s.to - s.from;
+            let across = if s.far { s.at - th - 1 } else { s.at - 1 };
+            let pos = if s.horizontal {
+                Rect { x: s.from - 1, y: across, w: len + 2, h: th + 2 }
+            } else {
+                Rect { x: across, y: s.from - 1, w: th + 2, h: len + 2 }
+            };
             let parts: Vec<Rect> = dashes(len, dash, space)
-                .map(|off| if horizontal {
+                .map(|off| if s.horizontal {
                     Rect { x: 1 + off, y: 1, w: dash, h: th }
                 } else {
                     Rect { x: 1, y: 1 + off, w: th, h: dash }
@@ -262,6 +264,9 @@ impl Indicator {
                 .collect();
             marks.extend(mark(pos, &parts, DASH_ALPHA));
         }
+
+        let monitor = monitors[anchor.monitor];
+        let f = outer.intersect(&monitor.inflate(-1)).unwrap_or(outer);
 
         let font = painter.font(13.0)?;
         let time_w = painter.measure("88:88", &font).0.ceil();
@@ -332,6 +337,111 @@ fn dashes(len: i32, dash: i32, space: i32) -> impl Iterator<Item = i32> {
     let n = ((len + space) / (dash + space)).max(0);
     let start = (len - (n * dash + (n - 1).max(0) * space)) / 2;
     (0..n).map(move |i| start + i * (dash + space))
+}
+
+/// A corner bracket at frame corner (x, y), drawn on `monitors[monitor]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Corner {
+    x: i32,
+    y: i32,
+    right: bool,
+    bottom: bool,
+    monitor: usize,
+}
+
+/// A dashed side along frame edge `at` (a y for horizontal sides, an x for vertical ones)
+/// over `from..to`; `far` marks bottom/right edges, whose line lies before `at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Side {
+    horizontal: bool,
+    far: bool,
+    at: i32,
+    from: i32,
+    to: i32,
+}
+
+/// Frame pieces for `outer` across `monitors`: each monitor shows its part of the frame,
+/// pushed 1 px inside its edges, without the edges it shares with a neighbor. Each corner
+/// bracket sits on the monitor whose part comes closest to that corner (TL, TR, BL, BR), and
+/// dashed sides keep `inset` clear of the brackets.
+fn frame(outer: Rect, monitors: &[Rect], inset: i32) -> (Vec<Corner>, Vec<Side>) {
+    let parts: Vec<(usize, Rect, Rect)> = monitors
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| Some((i, outer.intersect(m)?, outer.intersect(&m.inflate(-1))?)))
+        .collect();
+    let mut corners = Vec::with_capacity(4);
+    for (right, bottom) in [(false, false), (true, false), (false, true), (true, true)] {
+        let corner = |r: &Rect| (if right { r.right() } else { r.x }, if bottom { r.bottom() } else { r.y });
+        let (tx, ty) = corner(&outer);
+        let best = parts.iter().min_by_key(|(_, _, f)| {
+            let (x, y) = corner(f);
+            (x - tx) as i64 * (x - tx) as i64 + (y - ty) as i64 * (y - ty) as i64
+        });
+        if let Some((monitor, _, f)) = best {
+            let (x, y) = corner(f);
+            corners.push(Corner { x, y, right, bottom, monitor: *monitor });
+        }
+    }
+
+    let mut sides = Vec::new();
+    for &(i, q, f) in &parts {
+        for (horizontal, far) in [(true, false), (true, true), (false, false), (false, true)] {
+            let edge = |r: &Rect, far: bool| match (horizontal, far) {
+                (true, false) => r.y,
+                (true, true) => r.bottom(),
+                (false, false) => r.x,
+                (false, true) => r.right(),
+            };
+            let span = |r: &Rect| if horizontal { (r.x, r.right()) } else { (r.y, r.bottom()) };
+            let mut spans = vec![span(&q)];
+            for (j, m) in monitors.iter().enumerate() {
+                if j != i
+                    && let Some(n) = outer.intersect(m)
+                    && edge(&n, !far) == edge(&q, far)
+                {
+                    spans = subtract(&spans, span(&n));
+                }
+            }
+            let at = edge(&f, far);
+            for c in &corners {
+                let (on_line, along, toward_far) = if horizontal {
+                    (c.bottom == far && c.y == at, c.x, c.right)
+                } else {
+                    (c.right == far && c.x == at, c.y, c.bottom)
+                };
+                if on_line {
+                    spans = subtract(&spans, if toward_far { (along - inset, along) } else { (along, along + inset) });
+                }
+            }
+            let (lo, hi) = span(&f);
+            for (a, b) in spans {
+                let (from, to) = (a.max(lo), b.min(hi));
+                if to > from {
+                    sides.push(Side { horizontal, far, at, from, to });
+                }
+            }
+        }
+    }
+    (corners, sides)
+}
+
+/// `spans` (half-open intervals) minus `c0..c1`.
+fn subtract(spans: &[(i32, i32)], (c0, c1): (i32, i32)) -> Vec<(i32, i32)> {
+    let mut out = Vec::with_capacity(spans.len() + 1);
+    for &(a, b) in spans {
+        if c1 <= a || c0 >= b {
+            out.push((a, b));
+            continue;
+        }
+        if a < c0 {
+            out.push((a, c0));
+        }
+        if c1 < b {
+            out.push((c1, b));
+        }
+    }
+    out
 }
 
 fn set_fade(marks: &[(HWND, u8)], fade: f32) {
@@ -525,4 +635,90 @@ unsafe extern "system" fn pill_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
     }
     LRESULT(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAIN: Rect = Rect { x: 0, y: 0, w: 3440, h: 1440 };
+    const LEFT: Rect = Rect { x: -1920, y: 540, w: 1920, h: 1080 };
+    const TOP: Rect = Rect { x: 365, y: -1440, w: 2560, h: 1440 };
+
+    fn c(x: i32, y: i32, right: bool, bottom: bool, monitor: usize) -> Corner {
+        Corner { x, y, right, bottom, monitor }
+    }
+    fn s(horizontal: bool, far: bool, at: i32, from: i32, to: i32) -> Side {
+        Side { horizontal, far, at, from, to }
+    }
+
+    #[test]
+    fn one_monitor() {
+        let (corners, sides) = frame(Rect { x: 100, y: 100, w: 200, h: 100 }, &[MAIN], 10);
+        let tl = c(100, 100, false, false, 0);
+        assert_eq!(corners, [tl, c(300, 100, true, false, 0), c(100, 200, false, true, 0), c(300, 200, true, true, 0)]);
+        assert_eq!(
+            sides,
+            [
+                s(true, false, 100, 110, 290),
+                s(true, true, 200, 110, 290),
+                s(false, false, 100, 110, 190),
+                s(false, true, 300, 110, 190),
+            ]
+        );
+    }
+
+    #[test]
+    fn pushed_inside_the_monitor() {
+        let (corners, sides) = frame(Rect { x: -5, y: -5, w: 100, h: 100 }, &[MAIN], 10);
+        assert_eq!(corners[0], c(1, 1, false, false, 0));
+        assert_eq!(corners[3], c(95, 95, true, true, 0));
+        assert_eq!(sides[0], s(true, false, 1, 11, 85));
+    }
+
+    #[test]
+    fn side_by_side_with_a_gap_corner() {
+        let (corners, sides) = frame(Rect { x: -1000, y: 600, w: 2000, h: 900 }, &[MAIN, LEFT, TOP], 10);
+        let (tl, bl) = (c(-1000, 600, false, false, 1), c(-1000, 1500, false, true, 1));
+        assert_eq!(corners, [tl, c(1000, 600, true, false, 0), bl, c(1000, 1439, true, true, 0)]);
+        assert_eq!(
+            sides,
+            [
+                s(true, false, 600, 1, 990),
+                s(true, true, 1439, 1, 990),
+                s(false, true, 1000, 610, 1429),
+                s(true, false, 600, -990, -1),
+                s(true, true, 1500, -990, -1),
+                s(false, false, -1000, 610, 1490),
+                s(false, true, -1, 1440, 1500),
+            ]
+        );
+    }
+
+    #[test]
+    fn stacked_monitors_share_no_edge() {
+        let (corners, sides) = frame(Rect { x: 1000, y: -500, w: 1000, h: 1000 }, &[MAIN, LEFT, TOP], 10);
+        let (tl, tr) = (c(1000, -500, false, false, 2), c(2000, -500, true, false, 2));
+        assert_eq!(corners, [tl, tr, c(1000, 500, false, true, 0), c(2000, 500, true, true, 0)]);
+        assert_eq!(
+            sides,
+            [
+                s(true, true, 500, 1010, 1990),
+                s(false, false, 1000, 1, 490),
+                s(false, true, 2000, 1, 490),
+                s(true, false, -500, 1010, 1990),
+                s(false, false, 1000, -490, -1),
+                s(false, true, 2000, -490, -1),
+            ]
+        );
+    }
+
+    #[test]
+    fn subtract_spans() {
+        assert_eq!(subtract(&[(0, 10)], (3, 5)), [(0, 3), (5, 10)]);
+        assert_eq!(subtract(&[(0, 10)], (-5, 5)), [(5, 10)]);
+        assert_eq!(subtract(&[(0, 10)], (10, 20)), [(0, 10)]);
+        assert_eq!(subtract(&[(0, 4), (6, 10)], (2, 8)), [(0, 2), (8, 10)]);
+        assert_eq!(subtract(&[(0, 10)], (0, 10)), []);
+    }
 }

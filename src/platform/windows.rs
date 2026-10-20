@@ -24,7 +24,7 @@ pub(crate) fn visible_windows() -> Vec<Rect> {
 }
 
 /// Windows thinner than this (physical px) in either direction are never picked.
-const MIN_PICK: i32 = 24;
+pub(crate) const MIN_PICK: i32 = 24;
 
 /// Where `hwnd` appears on screen, or None if the user can't see it as a window.
 unsafe fn window_rect(hwnd: HWND) -> Option<Rect> {

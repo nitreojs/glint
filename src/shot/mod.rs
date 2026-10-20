@@ -10,7 +10,7 @@ mod output;
 use editor::Output;
 use output::ImageFormat;
 
-/// A finished screenshot as 0x00RRGGBB rows, and what to do with it.
+/// A finished screenshot as 0xXXRRGGBB rows (the top byte is ignored), and what to do with it.
 pub(crate) struct Shot {
     pub pixels: Vec<u32>,
     pub w: u32,

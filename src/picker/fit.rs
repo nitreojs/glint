@@ -1,5 +1,6 @@
 use crate::platform::monitors::Output;
 use crate::platform::rect::Rect;
+use crate::platform::windows::MIN_PICK;
 
 /// How a selection is sized: recordings need the encoder's minimum and even sides,
 /// screenshots take any size.
@@ -13,40 +14,48 @@ impl Fit {
     pub(super) const ANY: Fit = Fit { min: (1, 1), even: false };
 }
 
-/// Maps a drag from `anchor` to `cursor` (desktop coordinates) onto one output: the output
-/// under the anchor (or, failing that, the one overlapping the drag most), clipped to it.
-/// Selections below `fit.min` grow *away from the anchor*, and with `fit.even` odd sizes lose
-/// their last pixel on the cursor side, so the corner where the drag started never moves.
-pub(super) fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
-    let raw = Rect::from_points(anchor.0, anchor.1, cursor.0, cursor.1);
-    let idx = output_at(outputs, anchor.0, anchor.1).or_else(|| {
-        let overlap = |o: &Output| o.rect.intersect(&raw).map_or(0, |r| r.area());
-        outputs.iter().enumerate().filter(|(_, o)| overlap(o) > 0).max_by_key(|(_, o)| overlap(o)).map(|(i, _)| i)
-    })?;
-    let mon = outputs[idx].rect;
+/// Maps a drag from `anchor` to `cursor` (desktop coordinates) onto the virtual screen `area`,
+/// clipped to it; the drag may cross monitors. Selections below `fit.min` grow *away from the
+/// anchor* (pushed back only at the edge of `area`), and with `fit.even` odd sizes lose their
+/// last pixel on the cursor side, so the corner where the drag started never moves.
+pub(super) fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), area: Rect, fit: Fit) -> Rect {
     let axis = |a: i32, c: i32, lo: i32, hi: i32, min: i32| -> (i32, i32) {
         let (a, c) = (a.clamp(lo, hi), c.clamp(lo, hi));
         let len = (c - a).abs().max(min.min(hi - lo));
         let len = if fit.even { len & !1 } else { len };
         if c >= a {
-            let start = a.min(hi - len); // pushed back only when the monitor edge forces it
+            let start = a.min(hi - len);
             (start, len)
         } else {
             let end = a.max(lo + len);
             (end - len, len)
         }
     };
-    let (x, w) = axis(anchor.0, cursor.0, mon.x, mon.right(), fit.min.0);
-    let (y, h) = axis(anchor.1, cursor.1, mon.y, mon.bottom(), fit.min.1);
-    Some((Rect { x, y, w, h }, idx))
+    let (x, w) = axis(anchor.0, cursor.0, area.x, area.right(), fit.min.0);
+    let (y, h) = axis(anchor.1, cursor.1, area.y, area.bottom(), fit.min.1);
+    Rect { x, y, w, h }
 }
 
-/// Maps a fixed rectangle (a window, a monitor) onto the output under `at`: clipped to it,
-/// then sized like [`fit_drag`].
-pub(super) fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
-    let mon = outputs[output_at(outputs, at.0, at.1)?].rect;
-    let r = rect.intersect(&mon)?;
-    fit_drag((r.x, r.y), (r.right(), r.bottom()), outputs, fit)
+/// Maps a fixed rectangle (a window, a monitor, the virtual screen) into `area`: clipped to
+/// it, then sized like [`fit_drag`] from its top-left corner.
+pub(super) fn fit_rect(rect: Rect, area: Rect, fit: Fit) -> Rect {
+    fit_drag((rect.x, rect.y), (rect.right(), rect.bottom()), area, fit)
+}
+
+/// What picking window `win` takes: the whole window across every output it shows on.
+/// Strips thinner than [`MIN_PICK`] on an output (a maximized window's frame overhanging onto
+/// its neighbours) don't count; None if nothing else is left.
+pub(super) fn window_pick(win: Rect, outputs: &[Output]) -> Option<Rect> {
+    outputs
+        .iter()
+        .filter_map(|o| win.intersect(&o.rect))
+        .filter(|r| r.w >= MIN_PICK && r.h >= MIN_PICK)
+        .reduce(|a, b| Rect::from_points(a.x.min(b.x), a.y.min(b.y), a.right().max(b.right()), a.bottom().max(b.bottom())))
+}
+
+/// The outputs `rect` overlaps, in enumeration order.
+pub(super) fn overlapped(rect: Rect, outputs: &[Output]) -> impl Iterator<Item = &Output> {
+    outputs.iter().filter(move |o| o.rect.intersect(&rect).is_some())
 }
 
 pub(super) fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
@@ -58,62 +67,106 @@ mod tests {
     use super::*;
     /// Unequal sides, so a mixed-up axis shows.
     const MIN: Fit = Fit { min: (130, 34), even: true };
+    const SINGLE: Rect = Rect { x: 0, y: 0, w: 3440, h: 1440 };
+    /// The bounding box of [`layout`].
+    const AREA: Rect = Rect { x: -1920, y: -1440, w: 5360, h: 3060 };
 
     fn output(x: i32, y: i32, w: i32, h: i32) -> Output {
         Output { adapter_idx: 0, output_idx: 0, rect: Rect { x, y, w, h }, refresh_hz: 144.0 }
     }
 
+    /// A wide main monitor, one to its lower left and one above it, with gaps between them.
+    fn layout() -> [Output; 3] {
+        [output(0, 0, 3440, 1440), output(-1920, 540, 1920, 1080), output(365, -1440, 2560, 1440)]
+    }
+
+    fn on(rect: Rect, outs: &[Output]) -> Vec<Rect> {
+        overlapped(rect, outs).map(|o| o.rect).collect()
+    }
+
     #[test]
     fn tiny_drags_grow_away_from_the_anchor() {
-        let outs = [output(0, 0, 3440, 1440)];
         // A few pixels above the start point: the bottom edge stays at the anchor.
-        let (r, _) = fit_drag((500, 400), (530, 390), &outs, MIN).unwrap();
+        let r = fit_drag((500, 400), (530, 390), SINGLE, MIN);
         assert_eq!((r.x, r.bottom(), r.w, r.h), (500, 400, MIN.min.0, MIN.min.1));
         // Moving further up (still under the minimum) must not move the box at all.
-        let (r2, _) = fit_drag((500, 400), (530, 380), &outs, MIN).unwrap();
-        assert_eq!(r2, r);
+        assert_eq!(fit_drag((500, 400), (530, 380), SINGLE, MIN), r);
         // Down-right: the top-left corner stays at the anchor.
-        let (r, _) = fit_drag((500, 400), (510, 410), &outs, MIN).unwrap();
+        let r = fit_drag((500, 400), (510, 410), SINGLE, MIN);
         assert_eq!((r.x, r.y, r.w, r.h), (500, 400, MIN.min.0, MIN.min.1));
     }
 
     #[test]
     fn screenshots_keep_exact_sizes() {
-        let outs = [output(0, 0, 3440, 1440)];
-        let (r, _) = fit_drag((500, 400), (503, 401), &outs, Fit::ANY).unwrap();
+        let r = fit_drag((500, 400), (503, 401), SINGLE, Fit::ANY);
         assert_eq!((r.w, r.h), (3, 1));
         let win = Rect { x: 101, y: 50, w: 701, h: 333 };
-        assert_eq!(fit_rect(win, (300, 100), &outs, Fit::ANY).unwrap().0, win);
+        assert_eq!(fit_rect(win, SINGLE, Fit::ANY), win);
     }
 
     #[test]
     fn odd_sizes_trim_the_cursor_side() {
-        let outs = [output(0, 0, 3440, 1440)];
-        let (r, _) = fit_drag((1000, 800), (499, 299), &outs, MIN).unwrap(); // up-left, 501 x 501
+        let r = fit_drag((1000, 800), (499, 299), SINGLE, MIN); // up-left, 501 x 501
         assert_eq!((r.right(), r.bottom(), r.w, r.h), (1000, 800, 500, 500));
     }
 
     #[test]
-    fn growth_is_pushed_inside_the_monitor_and_stays_on_the_anchor_monitor() {
-        let outs = [output(-1920, 540, 1920, 1080), output(0, 0, 3440, 1440)];
-        let (r, i) = fit_drag((3430, 1435), (3436, 1438), &outs, MIN).unwrap();
-        assert_eq!((i, r.right(), r.bottom(), r.w, r.h), (1, 3440, 1440, MIN.min.0, MIN.min.1));
-        // A drag that starts on the right monitor and crosses into the left one is clipped to the right one.
-        let (r, i) = fit_drag((300, 600), (-500, 900), &outs, MIN).unwrap();
-        assert_eq!((i, r.x, r.right()), (1, 0, 300));
+    fn growth_crosses_monitor_edges_and_is_pushed_back_only_at_the_virtual_screen_edge() {
+        let outs = layout();
+        // Bottom right of the main monitor: the right edge is the virtual screen's, the bottom isn't.
+        let r = fit_drag((3430, 1435), (3436, 1438), AREA, MIN);
+        assert_eq!((r.right(), r.y, r.w, r.h), (3440, 1435, MIN.min.0, MIN.min.1));
+        assert_eq!(on(r, &outs), [outs[0].rect]);
+        // Bottom left of the left monitor: both are virtual screen edges.
+        let r = fit_drag((-1915, 1615), (-1910, 1618), AREA, MIN);
+        assert_eq!((r.x, r.bottom(), r.w, r.h), (-1915, 1620, MIN.min.0, MIN.min.1));
+        assert_eq!(on(r, &outs), [outs[1].rect]);
     }
 
     #[test]
-    fn windows_are_clipped_to_the_monitor_under_the_cursor() {
-        let outs = [output(-1920, 540, 1920, 1080), output(0, 0, 3440, 1440)];
-        // A window straddling both monitors, odd-sized: only the part on the cursor's monitor, even.
+    fn drags_span_monitors() {
+        let outs = layout();
+        // From the main monitor up onto the one above it, across the gap at its left.
+        let r = fit_drag((500, 1000), (2000, -1000), AREA, MIN);
+        assert_eq!(r, Rect { x: 500, y: -1000, w: 1500, h: 2000 });
+        assert_eq!(on(r, &outs), [outs[0].rect, outs[2].rect]);
+        // Past the virtual screen: clipped to it.
+        let r = fit_drag((500, 1000), (9999, -9999), AREA, MIN);
+        assert_eq!(r, Rect { x: 500, y: -1440, w: 2940, h: 2440 });
+        // Onto the left monitor, odd-sized: trimmed on the cursor side.
+        let r = fit_drag((300, 600), (-501, 901), AREA, MIN);
+        assert_eq!(r, Rect { x: -500, y: 600, w: 800, h: 300 });
+        assert_eq!(on(r, &outs), [outs[0].rect, outs[1].rect]);
+        // Into the gap at the top left: the selection still lies on the anchor's monitor.
+        let r = fit_drag((100, 100), (-1000, -1000), AREA, Fit::ANY);
+        assert_eq!(r, Rect { x: -1000, y: -1000, w: 1100, h: 1100 });
+        assert_eq!(on(r, &outs), [outs[0].rect]);
+    }
+
+    #[test]
+    fn windows_are_picked_whole_across_monitors() {
+        let outs = layout();
+        // Straddling the main and the left monitor, odd-sized: all of it, even.
         let win = Rect { x: -301, y: 600, w: 1001, h: 501 };
-        let (r, i) = fit_rect(win, (-100, 700), &outs, MIN).unwrap();
-        assert_eq!((i, r), (0, Rect { x: -301, y: 600, w: 300, h: 500 }));
-        let (r, i) = fit_rect(win, (100, 700), &outs, MIN).unwrap();
-        assert_eq!((i, r), (1, Rect { x: 0, y: 600, w: 700, h: 500 }));
-        // A maximized window's frame overhangs the monitor; the pick is exactly the monitor.
+        let r = fit_rect(window_pick(win, &outs).unwrap(), AREA, MIN);
+        assert_eq!(r, Rect { x: -301, y: 600, w: 1000, h: 500 });
+        assert_eq!(on(r, &outs), [outs[0].rect, outs[1].rect]);
+        // Straddling the main and the upper monitor next to the gap: whole, gap included.
+        let win = Rect { x: 300, y: -500, w: 700, h: 1000 };
+        assert_eq!(window_pick(win, &outs), Some(win));
+        // Hanging off the virtual screen: clipped to it.
+        let win = Rect { x: 3000, y: 100, w: 1000, h: 500 };
+        assert_eq!(window_pick(win, &outs), Some(Rect { x: 3000, y: 100, w: 440, h: 500 }));
+        // Only a sliver shows: not a pick.
+        assert_eq!(window_pick(Rect { x: 3430, y: 100, w: 500, h: 500 }, &outs), None);
+    }
+
+    #[test]
+    fn a_maximized_windows_frame_overhang_stays_off_the_neighbours() {
+        let outs = layout();
         let max = Rect { x: -8, y: -8, w: 3456, h: 1456 };
-        assert_eq!(fit_rect(max, (10, 10), &outs, MIN).unwrap().0, outs[1].rect);
+        assert_eq!(fit_rect(window_pick(max, &outs).unwrap(), AREA, MIN), outs[0].rect);
+        let max = Rect { x: 357, y: -1448, w: 2576, h: 1456 };
+        assert_eq!(window_pick(max, &outs), Some(outs[2].rect));
     }
 }

@@ -1,3 +1,4 @@
+pub(crate) mod capture;
 pub(crate) mod format;
 pub(crate) mod gfx;
 pub(crate) mod log;

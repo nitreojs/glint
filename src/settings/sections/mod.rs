@@ -36,6 +36,7 @@ impl Section {
             Section::General => {
                 n(a.hotkey == b.hotkey)
                     + n(a.screenshot_hotkey == b.screenshot_hotkey)
+                    + n(a.fullscreen_hotkey == b.fullscreen_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
                     + n(a.freeze_screen == b.freeze_screen)
             }
@@ -64,6 +65,7 @@ impl Section {
             Section::General => {
                 cfg.hotkey = d.hotkey;
                 cfg.screenshot_hotkey = d.screenshot_hotkey;
+                cfg.fullscreen_hotkey = d.fullscreen_hotkey;
                 cfg.launch_at_startup = d.launch_at_startup;
                 cfg.freeze_screen = d.freeze_screen;
             }

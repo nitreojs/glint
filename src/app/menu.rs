@@ -8,16 +8,17 @@ use crate::platform::wide::wide;
 
 const ID_RECORD: usize = 100;
 const ID_SHOT: usize = 105;
+const ID_SHOT_ALL: usize = 106;
 const ID_FOLDER: usize = 101;
 const ID_SETTINGS: usize = 102;
 const ID_LOG: usize = 103;
 const ID_EXIT: usize = 104;
 
 pub(super) fn show_menu(hwnd: HWND) {
-    let Some((recording, busy, hotkey, shot_hotkey)) = with_app(|a| {
+    let Some((recording, busy, hotkey, shot_hotkey, full_hotkey)) = with_app(|a| {
         let recording = matches!(a.state, State::Recording { .. });
         let busy = matches!(a.state, State::Stopping { .. } | State::Selecting(_));
-        (recording, busy, a.hotkey.clone(), a.shot_hotkey.clone())
+        (recording, busy, a.hotkey.clone(), a.shot_hotkey.clone(), a.full_hotkey.clone())
     }) else {
         return;
     };
@@ -27,13 +28,15 @@ pub(super) fn show_menu(hwnd: HWND) {
     };
     let label = with_key(if recording { "Stop recording" } else { "Record region" }, hotkey);
     let shot_label = with_key("Take screenshot", shot_hotkey);
+    let full_label = with_key("Screenshot all screens", full_hotkey);
     let cmd = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let (label, shot_label) = (wide(&label), wide(&shot_label));
+        let (label, shot_label, full_label) = (wide(&label), wide(&shot_label), wide(&full_label));
         let flags = if busy { MF_STRING | MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(menu, flags, ID_RECORD, PCWSTR(label.as_ptr()));
         let shot_flags = if busy || recording { MF_STRING | MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(menu, shot_flags, ID_SHOT, PCWSTR(shot_label.as_ptr()));
+        let _ = AppendMenuW(menu, shot_flags, ID_SHOT_ALL, PCWSTR(full_label.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open output folder"));
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings…"));
@@ -54,6 +57,9 @@ pub(super) fn show_menu(hwnd: HWND) {
         }
         ID_SHOT => {
             with_app(|a| a.toggle(true));
+        }
+        ID_SHOT_ALL => {
+            with_app(|a| a.shot_all_screens());
         }
         ID_FOLDER => {
             if let Some(dir) = with_app(|a| a.cfg.output_dir()) {

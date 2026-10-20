@@ -156,25 +156,22 @@ impl Listener {
     }
 }
 
-/// The two hotkeys the general section edits.
+/// The hotkeys the general section edits.
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum HotkeyField {
     Record,
     Screenshot,
+    Fullscreen,
 }
 
 impl HotkeyField {
+    const ALL: [HotkeyField; 3] = [HotkeyField::Record, HotkeyField::Screenshot, HotkeyField::Fullscreen];
+
     fn name(self) -> &'static str {
         match self {
             HotkeyField::Record => "record",
             HotkeyField::Screenshot => "screenshot",
-        }
-    }
-
-    fn other(self) -> HotkeyField {
-        match self {
-            HotkeyField::Record => HotkeyField::Screenshot,
-            HotkeyField::Screenshot => HotkeyField::Record,
+            HotkeyField::Fullscreen => "all screens",
         }
     }
 
@@ -182,6 +179,7 @@ impl HotkeyField {
         match self {
             HotkeyField::Record => &mut cfg.hotkey,
             HotkeyField::Screenshot => &mut cfg.screenshot_hotkey,
+            HotkeyField::Fullscreen => &mut cfg.fullscreen_hotkey,
         }
     }
 }
@@ -242,8 +240,12 @@ impl SettingsApp {
             self.hotkey_error = Some((keys, msg));
             return;
         }
-        let other = self.listen_for.other();
-        if parse_hotkey(other.of(&mut self.cfg)).is_ok_and(|combo| combo == (mods, vk)) {
+        let field = self.listen_for;
+        let taken_by = HotkeyField::ALL
+            .into_iter()
+            .filter(|&f| f != field)
+            .find(|f| parse_hotkey(f.of(&mut self.cfg)).is_ok_and(|combo| combo == (mods, vk)));
+        if let Some(other) = taken_by {
             let msg = format!("{} is already the {} hotkey.", keys.join(" + "), other.name());
             self.hotkey_error = Some((keys, msg));
             return;

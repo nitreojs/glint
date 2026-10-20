@@ -93,21 +93,27 @@ struct Look {
     pill: Option<(Item, String)>,
 }
 
-#[derive(PartialEq)]
 pub(crate) struct Frame {
-    canvas: Vec<Rect>,
+    canvas: Rect,
+    picked: Option<(usize, Rect)>,
+    ink: Vec<Rect>,
+    rev: u64,
     chrome: Vec<Rect>,
-    picked: Option<usize>,
     look: Look,
 }
 
 type Snapshot = (Vec<Mark>, Option<usize>);
 
+fn hull(a: Rect, b: Rect) -> Rect {
+    Rect::from_points(a.x.min(b.x), a.y.min(b.y), a.right().max(b.right()), a.bottom().max(b.bottom()))
+}
+
 pub(crate) struct Editor {
     /// The shot's region (client coordinates).
     pub sel: Rect,
-    /// The monitor the selection stays on.
-    bounds: Rect,
+    monitors: Vec<Rect>,
+    area: Rect,
+    bar_monitor: Rect,
     marks: Vec<Mark>,
     picked: Option<usize>,
     history: Vec<Snapshot>,
@@ -126,6 +132,9 @@ pub(crate) struct Editor {
     /// What shows inside the selection: `base` plus shapes. Rebuilt when `view_dirty`.
     view: Option<Dib>,
     view_dirty: bool,
+    /// Bumped by every view change other than the dragged mark's own.
+    rev: u64,
+    back: Option<Dib>,
     /// Toolbar cells (client coordinates).
     cells: Vec<(Item, Rect)>,
     pub bar: Rect,
@@ -133,10 +142,13 @@ pub(crate) struct Editor {
 }
 
 impl Editor {
-    pub(crate) fn new(sel: Rect, bounds: Rect, scale: f32) -> Editor {
+    pub(crate) fn new(sel: Rect, monitors: Vec<Rect>, scale: f32) -> Editor {
+        let area = monitors.iter().copied().reduce(hull).expect("at least one monitor");
         let mut ed = Editor {
             sel,
-            bounds,
+            monitors,
+            area,
+            bar_monitor: area,
             marks: Vec::new(),
             picked: None,
             history: Vec::new(),
@@ -153,6 +165,8 @@ impl Editor {
             base: None,
             view: None,
             view_dirty: true,
+            rev: 0,
+            back: None,
             cells: Vec::new(),
             bar: Rect::default(),
             pill: None,
@@ -167,15 +181,14 @@ impl Editor {
 
     /// Everything the editor draws.
     pub(crate) fn extent(&self) -> Vec<Rect> {
-        let mut v = self.canvas();
+        let mut v = vec![self.canvas()];
+        v.extend(self.picked_extent());
         v.extend(self.chrome());
         v
     }
 
-    fn canvas(&self) -> Vec<Rect> {
-        let mut v = vec![self.sel.inflate(self.px(8.0) as i32)];
-        v.extend(self.picked_extent());
-        v
+    fn canvas(&self) -> Rect {
+        self.sel.inflate(self.px(8.0) as i32)
     }
 
     fn chrome(&self) -> Vec<Rect> {
@@ -184,16 +197,48 @@ impl Editor {
         v
     }
 
+    /// What the dragged mark can repaint; editing an effect reorders the whole effect stack.
+    fn ink(&self) -> Vec<Rect> {
+        let (m, edit) = match &self.drag {
+            Some(Drag::Mark { mark, .. }) => (mark, false),
+            Some(Drag::Edit { index, .. }) => (&self.marks[*index], true),
+            _ => return Vec::new(),
+        };
+        let mut v = vec![m.ink(self.scale)];
+        if edit && m.is_effect() {
+            v.extend(self.marks.iter().filter(|m| m.is_effect()).map(Mark::bbox));
+        }
+        v
+    }
+
+    fn touch(&mut self) {
+        self.view_dirty = true;
+        self.rev += 1;
+    }
+
     pub(crate) fn frame(&self) -> Frame {
-        Frame { canvas: self.canvas(), chrome: self.chrome(), picked: self.picked, look: self.look() }
+        Frame {
+            canvas: self.canvas(),
+            picked: self.picked.zip(self.picked_extent()),
+            ink: self.ink(),
+            rev: self.rev,
+            chrome: self.chrome(),
+            look: self.look(),
+        }
     }
 
     pub(crate) fn damage(&self, before: &Frame) -> Vec<Rect> {
         let now = self.frame();
         let mut v = Vec::new();
-        if self.view_dirty || now.canvas != before.canvas || now.picked != before.picked {
-            v.extend(&before.canvas);
-            v.extend(&now.canvas);
+        if now.canvas != before.canvas || now.rev != before.rev {
+            v.extend([before.canvas, now.canvas]);
+        } else if self.view_dirty {
+            v.extend(&before.ink);
+            v.extend(&now.ink);
+        }
+        if now.picked != before.picked {
+            v.extend(before.picked.map(|(_, r)| r));
+            v.extend(now.picked.map(|(_, r)| r));
         }
         if now.chrome != before.chrome || now.look != before.look {
             v.extend(&before.chrome);
@@ -364,7 +409,7 @@ impl Editor {
     }
 
     pub(crate) fn mouse_move(&mut self, p: (i32, i32)) -> Event {
-        let b = self.bounds;
+        let b = self.area;
         match &mut self.drag {
             Some(Drag::Mark { mark, anchor }) => {
                 let q = (p.0.clamp(b.x, b.right()), p.1.clamp(b.y, b.bottom()));
@@ -488,7 +533,7 @@ impl Editor {
         to.push((std::mem::replace(&mut self.marks, marks), self.picked));
         self.picked = picked.filter(|&i| self.tool.is_none_or(|t| self.marks.get(i).is_some_and(|m| m.tool() == t)));
         self.wheel_group = None;
-        self.view_dirty = true;
+        self.touch();
         Event::Repaint
     }
 
@@ -497,7 +542,7 @@ impl Editor {
         self.remember();
         self.marks.remove(i);
         self.picked = None;
-        self.view_dirty = true;
+        self.touch();
         Event::Repaint
     }
 
@@ -508,7 +553,7 @@ impl Editor {
         if let Some(Drag::Edit { index, from, .. }) = self.drag.take() {
             self.marks[index] = from;
         }
-        self.view_dirty = true;
+        self.touch();
         Event::Repaint
     }
 
@@ -529,7 +574,7 @@ impl Editor {
                     if let Some(slot) = self.marks[i].color_mut() {
                         *slot = c;
                     }
-                    self.view_dirty = true;
+                    self.touch();
                 }
             }
             Item::Size(n) => match self.current() {
@@ -562,7 +607,7 @@ impl Editor {
             if wheel {
                 self.wheel_group = Some((i, Instant::now()));
             }
-            self.view_dirty = true;
+            self.touch();
         }
         if wheel {
             self.notice = Some((format!("{}  ·  {v}", spec.name), Instant::now()));
@@ -636,7 +681,24 @@ mod tests {
     use super::*;
 
     fn editor() -> Editor {
-        Editor::new(Rect { x: 0, y: 0, w: 400, h: 300 }, Rect { x: 0, y: 0, w: 1920, h: 1080 }, 1.0)
+        Editor::new(Rect { x: 0, y: 0, w: 400, h: 300 }, vec![Rect { x: 0, y: 0, w: 1920, h: 1080 }], 1.0)
+    }
+
+    #[test]
+    fn dragging_a_mark_repaints_only_around_it() {
+        let screen = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+        let mut ed = Editor::new(screen, vec![screen], 1.0);
+        assert_eq!(screen.intersect(&ed.bar), Some(ed.bar), "a full-screen shot keeps the bar inside");
+        ed.marks.push(Mark::Rectangle { rect: Rect { x: 100, y: 100, w: 200, h: 100 }, color: 0, width: 4.0 });
+        ed.mouse_down((100, 150));
+        for x in 101..140 {
+            let before = ed.frame();
+            assert!(matches!(ed.mouse_move((x, 160)), Event::Repaint));
+            let damage = ed.damage(&before);
+            let now = ed.marks[0].bbox();
+            assert!(damage.iter().any(|r| r.intersect(&now) == Some(now)));
+            assert!(damage.iter().all(|r| r.intersect(&ed.bar).is_none() && r.w < 400 && r.h < 300), "{damage:?}");
+        }
     }
 
     #[test]

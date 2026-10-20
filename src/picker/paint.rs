@@ -84,13 +84,9 @@ impl State {
         }
         // Rendering can change what the editor covers (a tooltip appears): paint that too.
         if let (Some(ed), Screen::Frozen(f)) = (self.edit.as_mut(), &self.screen) {
-            let before = ed.extent();
-            if let Err(e) = ed.render(&f.bright, &self.painter, &self.font) {
-                log(&format!("editor render failed: {e}"));
-            }
-            let after = ed.extent();
-            if after != before {
-                self.invalidate(&after);
+            match ed.render(&f.bright, &self.painter, &self.font) {
+                Ok(moved) => self.invalidate(&moved),
+                Err(e) => log(&format!("editor render failed: {e}")),
             }
         }
         let Screen::Frozen(f) = &self.screen else { return };
@@ -103,7 +99,10 @@ impl State {
 
             // Dimmed screen around everything else.
             let saved = SaveDC(hdc);
-            let mut holes: Vec<Rect> = self.sel.iter().map(|s| s.inflate(RING)).collect();
+            let mut holes = match &self.edit {
+                Some(ed) => ed.extent(),
+                None => self.sel.iter().map(|s| s.inflate(RING)).collect(),
+            };
             holes.extend(label.map(|l| l.rect));
             for h in &holes {
                 ExcludeClipRect(hdc, h.x, h.y, h.right(), h.bottom());
@@ -111,10 +110,15 @@ impl State {
             let _ = BitBlt(hdc, rp.x, rp.y, rp.w, rp.h, Some(f.dim.dc), rp.x, rp.y, SRCCOPY);
             let _ = RestoreDC(hdc, saved);
 
-            if let Some(ed) = &self.edit {
-                if let Err(e) = ed.paint(hdc, &self.painter, &self.font, self.white, self.black) {
+            if let Some(ed) = self.edit.as_mut() {
+                let saved = SaveDC(hdc);
+                if let Some(l) = label {
+                    ExcludeClipRect(hdc, l.rect.x, l.rect.y, l.rect.right(), l.rect.bottom());
+                }
+                if let Err(e) = ed.paint(hdc, rp, &f.dim, &self.painter, &self.font) {
                     log(&format!("editor paint failed: {e}"));
                 }
+                let _ = RestoreDC(hdc, saved);
             } else if let Some(s) = self.sel {
                 let saved = SaveDC(hdc);
                 if let Some(l) = label {
