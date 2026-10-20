@@ -22,13 +22,13 @@ use windows::Win32::System::Variant::{VARIANT, VT_R4};
 use windows::core::{Error, PWSTR, w};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageFormat {
+pub(crate) enum ImageFormat {
     Png,
     Jpg,
 }
 
 impl ImageFormat {
-    pub fn extension(self) -> &'static str {
+    pub(crate) fn extension(self) -> &'static str {
         match self {
             ImageFormat::Png => "png",
             ImageFormat::Jpg => "jpg",
@@ -38,7 +38,7 @@ impl ImageFormat {
 
 /// `pixels`: top-down rows of 0x00RRGGBB (the high byte is garbage/ignored; the image is opaque), `w * h` long.
 /// `quality` 1..=100 applies to JPG only.
-pub fn encode(pixels: &[u32], w: u32, h: u32, format: ImageFormat, quality: u8) -> Result<Vec<u8>, String> {
+pub(crate) fn encode(pixels: &[u32], w: u32, h: u32, format: ImageFormat, quality: u8) -> Result<Vec<u8>, String> {
     check_size(pixels, w, h)?;
     let _com = Com::init()?;
     encode_wic(pixels, w, h, format, quality)
@@ -46,7 +46,7 @@ pub fn encode(pixels: &[u32], w: u32, h: u32, format: ImageFormat, quality: u8) 
 
 /// Puts the image on the clipboard as CF_DIBV5 (so every app can paste it) and as the registered
 /// "PNG" format (what Telegram, browsers, Office prefer). `owner` may be the caller's window.
-pub fn copy_to_clipboard(owner: Option<HWND>, pixels: &[u32], w: u32, h: u32) -> Result<(), String> {
+pub(crate) fn copy_to_clipboard(owner: Option<HWND>, pixels: &[u32], w: u32, h: u32) -> Result<(), String> {
     // Everything slow happens before OpenClipboard so other apps are locked out only briefly.
     let png = encode(pixels, w, h, ImageFormat::Png, 100)?;
     let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };

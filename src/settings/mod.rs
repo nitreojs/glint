@@ -5,46 +5,34 @@
 //! The window draws its own title bar (egui-winit keeps the DWM shadow for undecorated
 //! windows) and follows the Windows light / dark app setting.
 
-mod widgets;
-
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Id, Key, Layout, Rect, RichText,
     Stroke, TextStyle, Ui, UiBuilder, pos2, vec2,
 };
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-use windows::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey};
-use windows::Win32::UI::Shell::{
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-    SIGDN_FILESYSPATH, ShellExecuteW,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, SW_SHOWNORMAL, SetForegroundWindow,
-    SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
-};
-use windows::core::{HSTRING, w};
+use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+use windows::core::w;
 
-use crate::config::{
-    CodecName, Config, DEFAULT_FILE_NAME, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, ShotFormat, file_name_problem,
-    hotkey_string, parse_hotkey,
-};
-use crate::ipc::{self, SETTINGS_TITLE, WM_HOTKEY_PAUSE, WM_RELOAD};
-use crate::tray::icon_pixels;
-use crate::util::{date_time, from_wstr};
+use crate::app::ipc::{self, SETTINGS_TITLE, WM_RELOAD};
+use crate::app::tray::icon_pixels;
+use crate::config::{Config, file_name_problem};
+use crate::platform::wide::from_wstr;
+
+mod hotkey_capture;
+mod sections;
+mod widgets;
+
+pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
+use hotkey_capture::{HotkeyField, Listener};
+use sections::{SECTIONS, Section};
 use widgets::{
-    BAR_H, CONTENT_X, FOOTER_H, HotkeyState, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, medium, mono, row, sans,
-    semibold,
+    BAR_H, CONTENT_X, FOOTER_H, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, medium, mono, sans, semibold,
 };
 
-pub const REPO_URL: &str = "https://github.com/nitreojs/glint";
-const FPS_PRESETS: [u32; 6] = [0, 30, 60, 120, 144, 240];
 /// IBM Plex Sans and Mono, unmodified (SIL Open Font License, see assets/fonts/OFL.txt).
 const FONTS: [(&str, &[u8]); 5] = [
     ("sans", include_bytes!("../../assets/fonts/IBMPlexSans-Regular.ttf")),
@@ -107,119 +95,6 @@ pub fn run() {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Section {
-    General,
-    Recording,
-    Screenshots,
-    Output,
-    About,
-}
-
-const SECTIONS: [Section; 5] =
-    [Section::General, Section::Recording, Section::Screenshots, Section::Output, Section::About];
-
-/// The two hotkeys the general section edits.
-#[derive(Clone, Copy, PartialEq)]
-enum HotkeyField {
-    Record,
-    Screenshot,
-}
-
-impl HotkeyField {
-    fn name(self) -> &'static str {
-        match self {
-            HotkeyField::Record => "record",
-            HotkeyField::Screenshot => "screenshot",
-        }
-    }
-
-    fn other(self) -> HotkeyField {
-        match self {
-            HotkeyField::Record => HotkeyField::Screenshot,
-            HotkeyField::Screenshot => HotkeyField::Record,
-        }
-    }
-
-    fn of(self, cfg: &mut Config) -> &mut String {
-        match self {
-            HotkeyField::Record => &mut cfg.hotkey,
-            HotkeyField::Screenshot => &mut cfg.screenshot_hotkey,
-        }
-    }
-}
-
-impl Section {
-    fn name(self) -> &'static str {
-        match self {
-            Section::General => "general",
-            Section::Recording => "recording",
-            Section::Screenshots => "screenshots",
-            Section::Output => "output",
-            Section::About => "about",
-        }
-    }
-
-    /// How many of this section's settings differ between `a` and `b`.
-    fn changes(self, a: &Config, b: &Config) -> usize {
-        let n = |same: bool| usize::from(!same);
-        match self {
-            Section::General => {
-                n(a.hotkey == b.hotkey)
-                    + n(a.screenshot_hotkey == b.screenshot_hotkey)
-                    + n(a.launch_at_startup == b.launch_at_startup)
-                    + n(a.freeze_screen == b.freeze_screen)
-            }
-            Section::Recording => {
-                n(a.fps == b.fps)
-                    + n(a.codec == b.codec)
-                    + n(a.quality == b.quality)
-                    + n(a.effort == b.effort)
-                    + n(a.draw_cursor == b.draw_cursor)
-            }
-            Section::Screenshots => {
-                n(a.screenshot_format == b.screenshot_format)
-                    + n(a.screenshot_quality == b.screenshot_quality)
-                    + n(a.screenshot_copy == b.screenshot_copy)
-                    + n(a.screenshot_save == b.screenshot_save)
-            }
-            Section::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
-            Section::About => 0,
-        }
-    }
-
-    /// Puts this section's settings back to their defaults.
-    fn reset(self, cfg: &mut Config) {
-        let d = Config::default();
-        match self {
-            Section::General => {
-                cfg.hotkey = d.hotkey;
-                cfg.screenshot_hotkey = d.screenshot_hotkey;
-                cfg.launch_at_startup = d.launch_at_startup;
-                cfg.freeze_screen = d.freeze_screen;
-            }
-            Section::Recording => {
-                cfg.fps = d.fps;
-                cfg.codec = d.codec;
-                cfg.quality = d.quality;
-                cfg.effort = d.effort;
-                cfg.draw_cursor = d.draw_cursor;
-            }
-            Section::Screenshots => {
-                cfg.screenshot_format = d.screenshot_format;
-                cfg.screenshot_quality = d.screenshot_quality;
-                cfg.screenshot_copy = d.screenshot_copy;
-                cfg.screenshot_save = d.screenshot_save;
-            }
-            Section::Output => {
-                cfg.output_dir = d.output_dir;
-                cfg.file_name = d.file_name;
-            }
-            Section::About => {}
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
 enum Dialog {
     /// Closing with unsaved changes.
     SaveChanges,
@@ -249,34 +124,7 @@ struct SettingsApp {
     closing: bool,
 }
 
-// ---- hotkey recording -----------------------------------------------------------------------
-//
-// A low-level keyboard hook sees every key before global hotkeys fire (PrintScreen included,
-// which never reaches a window as WM_KEYDOWN), so it can record combos other apps have taken.
-// Key-downs are swallowed while recording; key-ups pass through so no key gets stuck.
-//
-// The hook lives in a windowless helper, `glint.exe --capture-keys`: installed in this process
-// it was never called while the settings window had focus (Windows 10), though a hook in any
-// other process saw the same keys. The helper reports over stdout and quits when its stdin
-// closes, so it can't outlive the settings window.
-
-pub const CAPTURE_ARG: &str = "--capture-keys";
-
 static CTX: OnceLock<egui::Context> = OnceLock::new();
-/// Modifier keys currently held, as MOD_* bits.
-static HELD: AtomicU32 = AtomicU32::new(0);
-/// (modifiers, virtual key) of the first non-modifier key pressed while recording.
-static CAPTURED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
-
-fn modifier_bit(vk: u32) -> u32 {
-    match vk {
-        0x10 | 0xA0 | 0xA1 => MOD_SHIFT,
-        0x11 | 0xA2 | 0xA3 => MOD_CONTROL,
-        0x12 | 0xA4 | 0xA5 => MOD_ALT,
-        0x5B | 0x5C => MOD_WIN,
-        _ => 0,
-    }
-}
 
 fn repaint() {
     if let Some(ctx) = CTX.get() {
@@ -284,188 +132,7 @@ fn repaint() {
     }
 }
 
-/// Helper side: one line per event, flushed at once.
-fn report(line: &str) {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
-}
-
-unsafe extern "system" fn capture_hook(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    unsafe {
-        if code == HC_ACTION as i32 {
-            let kb = &*(lp.0 as *const KBDLLHOOKSTRUCT);
-            let down = wp.0 == WM_KEYDOWN as usize || wp.0 == WM_SYSKEYDOWN as usize;
-            let bit = modifier_bit(kb.vkCode);
-            let held = HELD.load(Ordering::SeqCst);
-            if bit != 0 {
-                let now = if down { held | bit } else { held & !bit };
-                if now != held {
-                    HELD.store(now, Ordering::SeqCst);
-                    report(&format!("held {now}"));
-                }
-            } else if down {
-                report(&format!("key {held} {}", kb.vkCode));
-            }
-            if down {
-                return LRESULT(1);
-            }
-        }
-        CallNextHookEx(None, code, wp, lp)
-    }
-}
-
-/// `glint.exe --capture-keys`: hooks the keyboard until stdin closes or the process is killed.
-pub fn capture_keys() {
-    std::thread::spawn(|| {
-        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]); // EOF (or no stdin at all)
-        std::process::exit(0);
-    });
-    unsafe {
-        let module = GetModuleHandleW(None).ok().map(HINSTANCE::from);
-        let Ok(hook) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(capture_hook), module, 0) else { return };
-        report("ready");
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {}
-        let _ = UnhookWindowsHookEx(hook);
-    }
-}
-
-/// "Ctrl+Alt+PrintScreen" as keycap labels.
-fn key_names(hotkey: &str) -> Vec<String> {
-    hotkey.split('+').map(|k| k.trim().to_lowercase()).collect()
-}
-
-/// The modifiers held right now, as keycap labels.
-fn held_names() -> Vec<String> {
-    let held = HELD.load(Ordering::SeqCst);
-    [(MOD_CONTROL, "ctrl"), (MOD_ALT, "alt"), (MOD_SHIFT, "shift"), (MOD_WIN, "win")]
-        .into_iter()
-        .filter(|(bit, _)| held & bit != 0)
-        .map(|(_, name)| name.to_string())
-        .collect()
-}
-
-/// The running capture helper; its reports land in [`HELD`] and [`CAPTURED`].
-struct Listener {
-    child: std::process::Child,
-}
-
-impl Listener {
-    fn start() -> Result<Listener, String> {
-        use std::io::BufRead;
-        use std::os::windows::process::CommandExt;
-        use std::process::{Command, Stdio};
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let mut child = Command::new(exe)
-            .arg(CAPTURE_ARG)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-            .map_err(|e| e.to_string())?;
-        let mut lines = std::io::BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
-        // Keys pressed before the hook is in place would slip through, so wait for it.
-        if !matches!(lines.next(), Some(Ok(l)) if l == "ready") {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err("the key capture helper didn't start".into());
-        }
-        std::thread::spawn(move || {
-            for line in lines.map_while(Result::ok) {
-                let mut words = line.split(' ');
-                let kind = words.next();
-                let nums: Vec<u32> = words.filter_map(|w| w.parse().ok()).collect();
-                match (kind, nums.as_slice()) {
-                    (Some("held"), &[mods]) => HELD.store(mods, Ordering::SeqCst),
-                    (Some("key"), &[mods, vk]) => {
-                        let mut c = CAPTURED.lock().unwrap();
-                        if c.is_none() {
-                            *c = Some((mods, vk));
-                        }
-                    }
-                    _ => continue,
-                }
-                repaint();
-            }
-        });
-        Ok(Listener { child })
-    }
-
-    fn stop(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 impl SettingsApp {
-    fn start_listening(&mut self, field: HotkeyField) {
-        if self.listening.is_some() {
-            return;
-        }
-        self.listen_for = field;
-        HELD.store(0, Ordering::SeqCst);
-        *CAPTURED.lock().unwrap() = None;
-        self.hotkey_error = None;
-        // The tray app lets go of its hotkey so pressing it records it instead of firing.
-        ipc::post_to_main(WM_HOTKEY_PAUSE, 1);
-        match Listener::start() {
-            Ok(l) => self.listening = Some(l),
-            Err(e) => {
-                ipc::post_to_main(WM_HOTKEY_PAUSE, 0);
-                self.error = Some(format!("can't record keys: {e}"));
-            }
-        }
-    }
-
-    fn stop_listening(&mut self) {
-        self.hotkey_error = None;
-        if let Some(l) = self.listening.take() {
-            l.stop();
-            ipc::post_to_main(WM_HOTKEY_PAUSE, 0);
-        }
-    }
-
-    fn poll_capture(&mut self) {
-        if self.listening.is_none() {
-            return;
-        }
-        let Some((mods, vk)) = CAPTURED.lock().unwrap().take() else {
-            return;
-        };
-        // Esc / Backspace on their own cancel.
-        if mods == 0 && (vk == 0x1B || vk == 0x08) {
-            return self.stop_listening();
-        }
-        // Anything that can't be used keeps listening, so the next combo retries.
-        let Some(text) = hotkey_string(mods, vk) else {
-            self.hotkey_error = Some((Vec::new(), "that key can't be part of a hotkey. try another.".into()));
-            return;
-        };
-        let keys = key_names(&text);
-        let standalone = (0x70..=0x87).contains(&vk) || matches!(vk, 0x13 | 0x2C | 0x91); // F1-F24, Pause, PrtSc, ScrLk
-        if mods == 0 && !standalone {
-            let msg = format!("{} alone would fire while you type. add ctrl, alt, shift or win.", keys[0]);
-            self.hotkey_error = Some((keys, msg));
-            return;
-        }
-        if !hotkey_available(mods, vk) {
-            let msg = format!("{} is already used by another app. try a different shortcut.", keys.join(" + "));
-            self.hotkey_error = Some((keys, msg));
-            return;
-        }
-        let other = self.listen_for.other();
-        if parse_hotkey(other.of(&mut self.cfg)).is_ok_and(|combo| combo == (mods, vk)) {
-            let msg = format!("{} is already the {} hotkey.", keys.join(" + "), other.name());
-            self.hotkey_error = Some((keys, msg));
-            return;
-        }
-        self.stop_listening();
-        *self.listen_for.of(&mut self.cfg) = text;
-    }
-
     fn changes(&self) -> usize {
         SECTIONS.iter().map(|s| s.changes(&self.cfg, &self.saved)).sum()
     }
@@ -521,41 +188,6 @@ impl Drop for SettingsApp {
     }
 }
 
-/// Whether nobody else holds this combo (the tray app has released its own meanwhile).
-fn hotkey_available(mods: u32, vk: u32) -> bool {
-    const PROBE_ID: i32 = 0x6C69;
-    unsafe {
-        let ok = RegisterHotKey(None, PROBE_ID, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk).is_ok();
-        if ok {
-            let _ = UnregisterHotKey(None, PROBE_ID);
-        }
-        ok
-    }
-}
-
-fn pick_folder(start: &Path) -> Option<PathBuf> {
-    unsafe {
-        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let opts = dialog.GetOptions().ok()?;
-        dialog.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
-        if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(start.as_os_str()), None) {
-            let _ = dialog.SetFolder(&item);
-        }
-        let parent: Option<HWND> = ipc::find_settings();
-        dialog.Show(parent).ok()?; // Err when cancelled
-        let path = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let s = path.to_string().ok();
-        CoTaskMemFree(Some(path.0 as _));
-        s.map(PathBuf::from)
-    }
-}
-
-fn open_url(url: &str) {
-    unsafe {
-        ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
-    }
-}
-
 fn windows_build() -> u32 {
     let mut buf = [0u16; 16];
     let mut bytes = size_of_val(&buf) as u32;
@@ -586,41 +218,6 @@ fn round_corners() -> Option<bool> {
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const _ as _, size_of_val(&pref) as u32)
     };
     Some(set.is_ok())
-}
-
-fn fps_label(fps: u32) -> String {
-    match fps {
-        0 => "native".into(),
-        n => n.to_string(),
-    }
-}
-
-fn quality_word(q: u32) -> &'static str {
-    match q {
-        0..=14 => "near lossless",
-        15..=20 => "very sharp",
-        21..=24 => "sharp",
-        25..=29 => "balanced",
-        _ => "small files",
-    }
-}
-
-fn shot_quality_word(q: u32) -> &'static str {
-    match q {
-        95.. => "near lossless",
-        85..=94 => "high",
-        70..=84 => "good",
-        _ => "small files",
-    }
-}
-
-fn effort_word(e: u32) -> &'static str {
-    match e {
-        0..=24 => "fastest, least gpu load",
-        25..=49 => "fast",
-        50..=69 => "balanced",
-        _ => "best compression, more gpu load",
-    }
 }
 
 impl eframe::App for SettingsApp {
@@ -712,180 +309,6 @@ impl eframe::App for SettingsApp {
 }
 
 impl SettingsApp {
-    /// One hotkey row: the field, and the reason the last combo can't be used.
-    fn hotkey_row(&mut self, ui: &mut Ui, look: &Look, label: &str, field: HotkeyField) {
-        let keys = key_names(field.of(&mut self.cfg));
-        let held = held_names();
-        let mine = self.listening.is_some() && self.listen_for == field;
-        let state = match (mine, &self.hotkey_error) {
-            (true, Some((keys, _))) => HotkeyState::Error { keys },
-            (true, None) => HotkeyState::Listening { held: &held },
-            _ => HotkeyState::Idle,
-        };
-        let mut clicked = false;
-        row(ui, look, label, 7.0, |ui| {
-            clicked = widgets::hotkey_field(ui, look, &keys, state).clicked();
-            if let Some((_, msg)) = self.hotkey_error.as_ref().filter(|_| mine) {
-                hint(ui, msg.clone(), look.p.warn);
-            }
-        });
-        if clicked {
-            self.stop_listening();
-            if !mine {
-                self.start_listening(field);
-            }
-        }
-    }
-
-    fn general(&mut self, ui: &mut Ui, look: &Look) {
-        self.hotkey_row(ui, look, "record hotkey", HotkeyField::Record);
-        self.hotkey_row(ui, look, "screenshot hotkey", HotkeyField::Screenshot);
-        row(ui, look, "launch at startup", 1.0, |ui| {
-            let text = if self.cfg.launch_at_startup { "on" } else { "off" };
-            widgets::toggle(ui, look, &mut self.cfg.launch_at_startup, text);
-            hint(ui, "glint starts in the tray when you sign in to windows", look.p.t3);
-        });
-        row(ui, look, "freeze screen", 1.0, |ui| {
-            let text = if self.cfg.freeze_screen { "on" } else { "off" };
-            widgets::toggle(ui, look, &mut self.cfg.freeze_screen, text);
-            hint(ui, "while selecting a region, show a still image instead of the live screen", look.p.t3);
-        });
-    }
-
-    fn recording(&mut self, ui: &mut Ui, look: &Look) {
-        let t3 = look.p.t3;
-        let mut presets = FPS_PRESETS.to_vec();
-        if !presets.contains(&self.cfg.fps) {
-            presets.push(self.cfg.fps); // a hand-edited value stays selectable
-            presets.sort_unstable();
-        }
-        let labels: Vec<String> = presets.iter().map(|&f| fps_label(f)).collect();
-        let fps: Vec<(u32, &str)> = presets.iter().copied().zip(labels.iter().map(String::as_str)).collect();
-        row(ui, look, "frame rate", 7.0, |ui| {
-            widgets::segmented(ui, look, &mut self.cfg.fps, &fps, None);
-            let text = match self.cfg.fps {
-                0 => "native follows each monitor's refresh rate".to_string(),
-                n => format!("{n} fps, or less on slower monitors"),
-            };
-            hint(ui, text, t3);
-        });
-        row(ui, look, "codec", 7.0, |ui| {
-            let codecs = [(CodecName::H264, "h.264"), (CodecName::Hevc, "hevc")];
-            widgets::segmented(ui, look, &mut self.cfg.codec, &codecs, Some(168.0));
-            hint(ui, "h.264 — plays everywhere · hevc — ~30 % smaller files", t3);
-        });
-        row(ui, look, "quality", 0.0, |ui| {
-            let word = quality_word(self.cfg.quality);
-            widgets::slider(ui, look, &mut self.cfg.quality, 12..=36, word, "12 ← sharper, bigger", "smaller, softer → 36");
-        });
-        row(ui, look, "encoder effort", 0.0, |ui| {
-            let word = effort_word(self.cfg.effort);
-            widgets::slider(ui, look, &mut self.cfg.effort, 0..=100, word, "0 ← faster", "smaller files → 100");
-        });
-        row(ui, look, "mouse cursor", 1.0, |ui| {
-            let text = if self.cfg.draw_cursor { "shown in captures" } else { "hidden" };
-            widgets::toggle(ui, look, &mut self.cfg.draw_cursor, text);
-        });
-    }
-
-    fn screenshots(&mut self, ui: &mut Ui, look: &Look) {
-        let p = look.p;
-        row(ui, look, "format", 7.0, |ui| {
-            let formats = [(ShotFormat::Png, "png"), (ShotFormat::Jpg, "jpg")];
-            widgets::segmented(ui, look, &mut self.cfg.screenshot_format, &formats, Some(168.0));
-            hint(ui, "png — lossless · jpg — smaller files", p.t3);
-        });
-        // The quality row only matters for jpg; it fades in and out with the choice.
-        let jpg = self.cfg.screenshot_format == ShotFormat::Jpg;
-        let shown = widgets::glide(ui, Id::unique("jpg-quality"), if jpg { 1.0 } else { 0.0 }, 0.12);
-        if shown > 0.0 {
-            ui.scope(|ui| {
-                ui.multiply_opacity(shown);
-                row(ui, look, "quality", 0.0, |ui| {
-                    let word = shot_quality_word(self.cfg.screenshot_quality);
-                    let q = &mut self.cfg.screenshot_quality;
-                    widgets::slider(ui, look, q, 50..=100, word, "50 ← smaller", "sharper → 100");
-                });
-            });
-        }
-        row(ui, look, "after capture", 1.0, |ui| {
-            ui.spacing_mut().item_spacing.y = 10.0;
-            widgets::checkbox(ui, look, &mut self.cfg.screenshot_copy, "copy to clipboard");
-            widgets::checkbox(ui, look, &mut self.cfg.screenshot_save, "save to the output folder");
-            if !self.cfg.screenshot_copy && !self.cfg.screenshot_save {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                hint(ui, "with both off, enter still copies", p.warn);
-            }
-        });
-        row(ui, look, "in the editor", 0.0, |ui| {
-            hint(ui, "enter does the above · ctrl+c copies · ctrl+s saves · esc cancels", p.t3);
-        });
-    }
-
-    fn output(&mut self, ui: &mut Ui, look: &Look) {
-        let p = look.p;
-        let default_dir = Config { output_dir: String::new(), ..Config::default() }.output_dir();
-        row(ui, look, "folder", 7.0, |ui| {
-            widgets::text_field(ui, look, &mut self.cfg.output_dir, &default_dir.display().to_string(), false);
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                if widgets::button(ui, look, "browse…", Kind::Secondary, 28.0, true).clicked()
-                    && let Some(dir) = pick_folder(&self.cfg.output_dir())
-                {
-                    self.cfg.output_dir = dir.display().to_string();
-                }
-                if widgets::button(ui, look, "open folder", Kind::Secondary, 28.0, true).clicked() {
-                    let dir = self.cfg.output_dir();
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
-                }
-            });
-            ui.add_space(2.0);
-            hint(ui, "recordings and screenshots are saved here. leave empty for the default.", p.t3);
-        });
-        let problem = file_name_problem(&self.cfg.file_name);
-        row(ui, look, "file names", 7.0, |ui| {
-            widgets::text_field(ui, look, &mut self.cfg.file_name, DEFAULT_FILE_NAME, problem.is_some());
-            let (date, time) = date_time();
-            let example = format!("{}.mp4", self.cfg.file_stem(&date, &time));
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(RichText::new("→").font(mono(12.0)).color(p.t3));
-                ui.add(egui::Label::new(RichText::new(example).font(mono(12.0)).color(p.t2)).truncate());
-            });
-            match problem {
-                Some(msg) => hint(ui, msg, p.warn),
-                None => hint(ui, "{date} and {time} are filled in when the file is saved", p.t3),
-            }
-        });
-    }
-
-    fn about(&mut self, ui: &mut Ui, look: &Look) {
-        let p = look.p;
-        row(ui, look, "version", 0.0, |ui| {
-            let version = concat!("v", env!("CARGO_PKG_VERSION"));
-            ui.label(RichText::new(version).font(widgets::mono_medium(13.0)).color(p.t1));
-        });
-        row(ui, look, "source code", 0.0, |ui| {
-            if widgets::link(ui, look, "github.com/nitreojs/glint ↗").clicked() {
-                open_url(REPO_URL);
-            }
-        });
-        row(ui, look, "licences", 0.0, |ui| {
-            if widgets::link(ui, look, "open-source licences").clicked() {
-                self.dialog = Some(Dialog::Licences);
-            }
-        });
-        row(ui, look, "all settings", 5.0, |ui| {
-            let any = self.cfg != Config::default();
-            if widgets::button(ui, look, "reset everything to defaults", Kind::Secondary, 28.0, any).clicked() {
-                self.cfg = Config::default();
-            }
-            hint(ui, "every section at once. nothing changes until you save.", p.t3);
-        });
-    }
-
     fn footer(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
         let ctx = ui.ctx().clone();
         ui.painter().hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, look.p.line));

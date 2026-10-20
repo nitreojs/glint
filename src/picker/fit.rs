@@ -1,131 +1,23 @@
-use windows::Win32::Devices::Display::{
-    DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO,
-    DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QDC_ONLY_ACTIVE_PATHS,
-    QueryDisplayConfig,
-};
-use windows::Win32::Foundation::ERROR_SUCCESS;
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED};
-use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
-use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
-use windows::core::PCWSTR;
-
-use crate::util::{Rect, from_wstr, wide};
-
-/// A desktop-attached DXGI output (monitor).
-#[derive(Clone, Debug)]
-pub struct Output {
-    pub adapter_idx: u32,
-    pub output_idx: u32,
-    pub device_name: String,
-    /// Desktop coordinates in physical pixels.
-    pub rect: Rect,
-    pub refresh_hz: f64,
-    pub rotated: bool,
-}
-
-impl Output {
-    /// Native frame rate rounded to an integer (143.98 Hz -> 144).
-    pub fn native_fps(&self) -> u32 {
-        (self.refresh_hz.round() as u32).max(1)
-    }
-}
-
-pub fn enumerate() -> windows::core::Result<Vec<Output>> {
-    let rates = refresh_rates();
-    let mut out = Vec::new();
-    unsafe {
-        let factory: IDXGIFactory1 = CreateDXGIFactory1()?;
-        let mut ai = 0;
-        while let Ok(adapter) = factory.EnumAdapters1(ai) {
-            let mut oi = 0;
-            while let Ok(output) = adapter.EnumOutputs(oi) {
-                let d = output.GetDesc()?;
-                if d.AttachedToDesktop.as_bool() {
-                    let device_name = from_wstr(&d.DeviceName);
-                    let refresh_hz = rates
-                        .iter()
-                        .find(|(n, _)| n.eq_ignore_ascii_case(&device_name))
-                        .map(|(_, hz)| *hz)
-                        .unwrap_or_else(|| gdi_refresh(&device_name));
-                    out.push(Output {
-                        adapter_idx: ai,
-                        output_idx: oi,
-                        device_name,
-                        rect: Rect::from_win(&d.DesktopCoordinates),
-                        refresh_hz,
-                        rotated: d.Rotation != DXGI_MODE_ROTATION_IDENTITY && d.Rotation != DXGI_MODE_ROTATION_UNSPECIFIED,
-                    });
-                }
-                oi += 1;
-            }
-            ai += 1;
-        }
-    }
-    Ok(out)
-}
-
-/// Exact (rational) refresh rates of active display paths, keyed by GDI device name.
-fn refresh_rates() -> Vec<(String, f64)> {
-    let mut res = Vec::new();
-    unsafe {
-        let (mut np, mut nm) = (0u32, 0u32);
-        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != ERROR_SUCCESS {
-            return res;
-        }
-        let mut paths = vec![DISPLAYCONFIG_PATH_INFO::default(); np as usize];
-        let mut modes = vec![DISPLAYCONFIG_MODE_INFO::default(); nm as usize];
-        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), None)
-            != ERROR_SUCCESS
-        {
-            return res;
-        }
-        for p in &paths[..np as usize] {
-            let mut src = DISPLAYCONFIG_SOURCE_DEVICE_NAME::default();
-            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-            src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
-            src.header.adapterId = p.sourceInfo.adapterId;
-            src.header.id = p.sourceInfo.id;
-            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
-                continue;
-            }
-            let rr = p.targetInfo.refreshRate;
-            if rr.Denominator != 0 && rr.Numerator != 0 {
-                res.push((from_wstr(&src.viewGdiDeviceName), rr.Numerator as f64 / rr.Denominator as f64));
-            }
-        }
-    }
-    res
-}
-
-fn gdi_refresh(device: &str) -> f64 {
-    let name = wide(device);
-    let mut dm = DEVMODEW { dmSize: size_of::<DEVMODEW>() as u16, ..Default::default() };
-    unsafe {
-        if EnumDisplaySettingsW(PCWSTR(name.as_ptr()), ENUM_CURRENT_SETTINGS, &mut dm).as_bool() && dm.dmDisplayFrequency > 1
-        {
-            return dm.dmDisplayFrequency as f64;
-        }
-    }
-    60.0
-}
+use crate::platform::monitors::Output;
+use crate::platform::rect::Rect;
 
 /// How a selection is sized: recordings need the encoder's minimum and even sides,
 /// screenshots take any size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Fit {
+pub(super) struct Fit {
     pub min: (i32, i32),
     pub even: bool,
 }
 
 impl Fit {
-    pub const ANY: Fit = Fit { min: (1, 1), even: false };
+    pub(super) const ANY: Fit = Fit { min: (1, 1), even: false };
 }
 
 /// Maps a drag from `anchor` to `cursor` (desktop coordinates) onto one output: the output
 /// under the anchor (or, failing that, the one overlapping the drag most), clipped to it.
 /// Selections below `fit.min` grow *away from the anchor*, and with `fit.even` odd sizes lose
 /// their last pixel on the cursor side, so the corner where the drag started never moves.
-pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
+pub(super) fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
     let raw = Rect::from_points(anchor.0, anchor.1, cursor.0, cursor.1);
     let idx = output_at(outputs, anchor.0, anchor.1).or_else(|| {
         let overlap = |o: &Output| o.rect.intersect(&raw).map_or(0, |r| r.area());
@@ -151,13 +43,13 @@ pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], fit:
 
 /// Maps a fixed rectangle (a window, a monitor) onto the output under `at`: clipped to it,
 /// then sized like [`fit_drag`].
-pub fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
+pub(super) fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
     let mon = outputs[output_at(outputs, at.0, at.1)?].rect;
     let r = rect.intersect(&mon)?;
     fit_drag((r.x, r.y), (r.right(), r.bottom()), outputs, fit)
 }
 
-pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
+pub(super) fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
     outputs.iter().position(|o| o.rect.contains(x, y))
 }
 
@@ -168,14 +60,7 @@ mod tests {
     const MIN: Fit = Fit { min: (130, 34), even: true };
 
     fn output(x: i32, y: i32, w: i32, h: i32) -> Output {
-        Output {
-            adapter_idx: 0,
-            output_idx: 0,
-            device_name: String::new(),
-            rect: Rect { x, y, w, h },
-            refresh_hz: 144.0,
-            rotated: false,
-        }
+        Output { adapter_idx: 0, output_idx: 0, rect: Rect { x, y, w, h }, refresh_hz: 144.0 }
     }
 
     #[test]

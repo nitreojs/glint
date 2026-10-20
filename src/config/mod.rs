@@ -2,12 +2,17 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use crate::recorder::Codec;
-use crate::util::{app_dir, videos_dir};
+use crate::platform::format::date_time;
+use crate::platform::paths::{app_dir, videos_dir};
+use crate::record::Codec;
+
+pub(crate) mod hotkeys;
+
+use hotkeys::parse_hotkey;
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
-pub struct Config {
+pub(crate) struct Config {
     pub hotkey: String,
     pub screenshot_hotkey: String,
     pub launch_at_startup: bool,
@@ -27,26 +32,26 @@ pub struct Config {
     pub screenshot_save: bool,
 }
 
-pub const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
+pub(crate) const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
 /// Characters Windows doesn't allow in file names.
-pub const BAD_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
+pub(crate) const BAD_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum CodecName {
+pub(crate) enum CodecName {
     H264,
     Hevc,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ShotFormat {
+pub(crate) enum ShotFormat {
     Png,
     Jpg,
 }
 
 impl CodecName {
-    pub fn codec(self) -> Codec {
+    pub(crate) fn codec(self) -> Codec {
         match self {
             CodecName::H264 => Codec::H264,
             CodecName::Hevc => Codec::Hevc,
@@ -77,12 +82,12 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn path() -> PathBuf {
+    pub(crate) fn path() -> PathBuf {
         app_dir().join("config.toml")
     }
 
     /// Loads the settings file, creating it with defaults on first run.
-    pub fn load() -> Result<Config, String> {
+    pub(crate) fn load() -> Result<Config, String> {
         let path = Self::path();
         if !path.exists() {
             Config::default().save()?;
@@ -106,7 +111,7 @@ impl Config {
     }
 
     /// Writes the settings file (with its explanatory comments).
-    pub fn save(&self) -> Result<(), String> {
+    pub(crate) fn save(&self) -> Result<(), String> {
         let path = Self::path();
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, self.render())
@@ -191,7 +196,7 @@ screenshot_save = {screenshot_save}
         )
     }
 
-    pub fn output_dir(&self) -> PathBuf {
+    pub(crate) fn output_dir(&self) -> PathBuf {
         if self.output_dir.trim().is_empty() {
             videos_dir().join("glint")
         } else {
@@ -200,134 +205,38 @@ screenshot_save = {screenshot_save}
     }
 
     /// File name (without extension) for a capture made at `date` / `time`.
-    pub fn file_stem(&self, date: &str, time: &str) -> String {
+    pub(crate) fn file_stem(&self, date: &str, time: &str) -> String {
         let pattern = match self.file_name.trim() {
             "" => DEFAULT_FILE_NAME,
             p => p,
         };
         pattern.replace("{date}", date).replace("{time}", time).trim_end_matches(['.', ' ']).to_string()
     }
+
+    /// A new file in the output folder named by the settings' pattern, never overwriting.
+    pub(crate) fn unique_path(&self, ext: &str) -> PathBuf {
+        let dir = self.output_dir();
+        let (date, time) = date_time();
+        let stem = self.file_stem(&date, &time);
+        let mut path = dir.join(format!("{stem}.{ext}"));
+        for n in 2.. {
+            if !path.exists() {
+                break;
+            }
+            path = dir.join(format!("{stem}_{n}.{ext}"));
+        }
+        path
+    }
 }
 
 /// Why `pattern` can't name files, if it can't.
-pub fn file_name_problem(pattern: &str) -> Option<&'static str> {
+pub(crate) fn file_name_problem(pattern: &str) -> Option<&'static str> {
     pattern.contains(BAD_NAME_CHARS).then_some("file names can't contain \\ / : * ? \" < > |")
-}
-
-pub const MOD_ALT: u32 = 0x1;
-pub const MOD_CONTROL: u32 = 0x2;
-pub const MOD_SHIFT: u32 = 0x4;
-pub const MOD_WIN: u32 = 0x8;
-
-/// Parses "Ctrl+Alt+PrintScreen" into (RegisterHotKey modifiers, virtual key).
-pub fn parse_hotkey(s: &str) -> Result<(u32, u32), String> {
-    let mut mods = 0;
-    let mut key = None;
-    for part in s.split('+').map(str::trim).filter(|p| !p.is_empty()) {
-        let p = part.to_ascii_lowercase();
-        let m = match p.as_str() {
-            "ctrl" | "control" => MOD_CONTROL,
-            "alt" => MOD_ALT,
-            "shift" => MOD_SHIFT,
-            "win" | "windows" | "super" => MOD_WIN,
-            _ => 0,
-        };
-        if m != 0 {
-            mods |= m;
-            continue;
-        }
-        if key.is_some() {
-            return Err(format!("hotkey \"{s}\" has more than one non-modifier key"));
-        }
-        key = Some(vk_from_name(&p).ok_or_else(|| format!("unknown key \"{part}\" in hotkey \"{s}\""))?);
-    }
-    let vk = key.ok_or_else(|| format!("hotkey \"{s}\" has no key, only modifiers"))?;
-    Ok((mods, vk))
-}
-
-/// Keys with a name of their own (the first spelling is canonical), by virtual-key code.
-const NAMED_KEYS: &[(&[&str], u32)] = &[
-    (&["PrintScreen", "PrtSc", "Print", "Snapshot"], 0x2C),
-    (&["Pause", "Break"], 0x13),
-    (&["ScrollLock"], 0x91),
-    (&["Insert", "Ins"], 0x2D),
-    (&["Delete", "Del"], 0x2E),
-    (&["Home"], 0x24),
-    (&["End"], 0x23),
-    (&["PageUp", "PgUp"], 0x21),
-    (&["PageDown", "PgDn"], 0x22),
-    (&["Space"], 0x20),
-    (&["Tab"], 0x09),
-    (&["Enter", "Return"], 0x0D),
-    (&["Backspace"], 0x08),
-    (&["Up"], 0x26),
-    (&["Down"], 0x28),
-    (&["Left"], 0x25),
-    (&["Right"], 0x27),
-];
-
-fn vk_from_name(p: &str) -> Option<u32> {
-    let b = p.as_bytes();
-    if b.len() == 1 && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit()) {
-        return Some(b[0].to_ascii_uppercase() as u32);
-    }
-    if let Some(n) = p.strip_prefix('f').and_then(|n| n.parse::<u32>().ok()) {
-        return (1..=24).contains(&n).then(|| 0x70 + n - 1);
-    }
-    if let Some(n) = p.strip_prefix("num").and_then(|n| n.parse::<u32>().ok()) {
-        return (n <= 9).then(|| 0x60 + n);
-    }
-    NAMED_KEYS.iter().find(|(names, _)| names.iter().any(|n| n.eq_ignore_ascii_case(p))).map(|&(_, vk)| vk)
-}
-
-/// Canonical name of a virtual key, if hotkeys support it.
-pub fn key_name(vk: u32) -> Option<String> {
-    match vk {
-        0x30..=0x39 | 0x41..=0x5A => Some(char::from(vk as u8).to_string()),
-        0x70..=0x87 => Some(format!("F{}", vk - 0x6F)),
-        0x60..=0x69 => Some(format!("Num{}", vk - 0x60)),
-        _ => NAMED_KEYS.iter().find(|&&(_, v)| v == vk).map(|(names, _)| names[0].to_string()),
-    }
-}
-
-/// Formats modifiers + key the way [`parse_hotkey`] reads them, e.g. "Ctrl+Alt+PrintScreen".
-pub fn hotkey_string(mods: u32, vk: u32) -> Option<String> {
-    let mut s = String::new();
-    for (bit, name) in [(MOD_CONTROL, "Ctrl"), (MOD_ALT, "Alt"), (MOD_SHIFT, "Shift"), (MOD_WIN, "Win")] {
-        if mods & bit != 0 {
-            s += name;
-            s += "+";
-        }
-    }
-    Some(s + &key_name(vk)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn hotkeys_round_trip_to_canonical_spelling() {
-        for (input, canonical) in [
-            ("Ctrl+Alt+PrintScreen", "Ctrl+Alt+PrintScreen"),
-            ("alt + ctrl + prtsc", "Ctrl+Alt+PrintScreen"),
-            ("shift+win+f12", "Shift+Win+F12"),
-            ("Ctrl+num7", "Ctrl+Num7"),
-            ("Pause", "Pause"),
-            ("ctrl+x", "Ctrl+X"),
-        ] {
-            let (mods, vk) = parse_hotkey(input).unwrap();
-            assert_eq!(hotkey_string(mods, vk).as_deref(), Some(canonical), "{input}");
-        }
-    }
-
-    #[test]
-    fn bad_hotkeys_are_rejected() {
-        for bad in ["Ctrl+Alt", "Ctrl+Bogus", "A+B", "F25", ""] {
-            assert!(parse_hotkey(bad).is_err(), "{bad}");
-        }
-        assert_eq!(hotkey_string(MOD_CONTROL, 0xFF), None); // keys without a name can't be saved
-    }
 
     #[test]
     fn saved_file_parses_back_to_the_same_settings() {

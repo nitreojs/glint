@@ -35,7 +35,7 @@ struct Shape {
     invert: Option<ID3D11ShaderResourceView>,
 }
 
-pub struct CursorRenderer {
+pub(crate) struct CursorRenderer {
     vs: ID3D11VertexShader,
     ps: ID3D11PixelShader,
     cb: ID3D11Buffer,
@@ -81,7 +81,7 @@ fn blob_bytes(b: &ID3DBlob) -> &[u8] {
 }
 
 impl CursorRenderer {
-    pub fn new(dev: &ID3D11Device) -> Result<Self> {
+    pub(crate) fn new(dev: &ID3D11Device) -> Result<Self> {
         unsafe {
             let vsb = compile(s!("vs_main"), s!("vs_4_0"))?;
             let psb = compile(s!("ps_main"), s!("ps_4_0"))?;
@@ -162,12 +162,12 @@ impl CursorRenderer {
     }
 
     /// Pointer size (w, h) of the current shape, if any.
-    pub fn size(&self) -> Option<(i32, i32)> {
+    pub(crate) fn size(&self) -> Option<(i32, i32)> {
         self.shape.as_ref().map(|s| (s.w, s.h))
     }
 
     /// Converts a Desktop Duplication pointer shape into BGRA textures.
-    pub fn set_shape(&mut self, dev: &ID3D11Device, info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO, buf: &[u8]) -> Result<()> {
+    pub(crate) fn set_shape(&mut self, dev: &ID3D11Device, info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO, buf: &[u8]) -> Result<()> {
         let w = info.Width as usize;
         let pitch = info.Pitch as usize;
         let ty = info.Type as i32;
@@ -258,7 +258,7 @@ impl CursorRenderer {
     }
 
     /// Draws the pointer with its top-left corner at (x, y) in render-target pixels.
-    pub fn draw(&self, ctx: &ID3D11DeviceContext, rtv: &ID3D11RenderTargetView, tw: i32, th: i32, x: i32, y: i32) {
+    pub(crate) fn draw(&self, ctx: &ID3D11DeviceContext, rtv: &ID3D11RenderTargetView, tw: i32, th: i32, x: i32, y: i32) {
         let Some(shape) = &self.shape else { return };
         if x >= tw || y >= th || x + shape.w <= 0 || y + shape.h <= 0 {
             return;

@@ -23,8 +23,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, Tr
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
-use crate::gfx::{Dib, Painter, animate, make_glass, rgba};
-use crate::util::{Rect, log};
+use crate::platform::gfx::{Dib, Painter, animate, make_glass, rgba};
+use crate::platform::log::log;
+use crate::platform::rect::Rect;
 
 const FADE_IN_MS: f32 = 160.0;
 const FADE_OUT_MS: f32 = 120.0;
@@ -40,7 +41,7 @@ const DARK: (COLORREF, COLORREF) = (COLORREF(0x00181614), COLORREF(0x00B0B0B0));
 const CORNER_ALPHA: u8 = 255;
 const DASH_ALPHA: u8 = 150;
 
-pub struct Indicator {
+pub(crate) struct Indicator {
     /// Brackets and dashed sides with their full opacity.
     marks: Vec<(HWND, u8)>,
     pill: HWND,
@@ -221,7 +222,7 @@ fn mark(pos: Rect, parts: &[Rect], alpha: u8) -> Option<(HWND, u8)> {
 impl Indicator {
     /// `capture` and `monitor` are in desktop coordinates. The pill's buttons post `msg` to
     /// `owner` with WPARAM 0 (stop and save) or 1 (discard). Fades in before returning.
-    pub fn show(capture: Rect, monitor: Rect, owner: HWND, msg: u32) -> Result<Indicator, String> {
+    pub(crate) fn show(capture: Rect, monitor: Rect, owner: HWND, msg: u32) -> Result<Indicator, String> {
         let painter = Painter::new()?;
         let px = |v: f32| painter.px(v) as i32;
         register(w!("glint_mark"), Some(mark_proc), IDC_ARROW);

@@ -8,9 +8,9 @@ use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO, SM_CXSMICON};
 
-use crate::util::copy_wstr;
+use crate::platform::wide::copy_wstr;
 
-pub struct Tray {
+pub(crate) struct Tray {
     hwnd: HWND,
     callback: u32,
     idle: HICON,
@@ -19,7 +19,7 @@ pub struct Tray {
 }
 
 impl Tray {
-    pub fn new(hwnd: HWND, callback: u32) -> Tray {
+    pub(crate) fn new(hwnd: HWND, callback: u32) -> Tray {
         // Drawn at the exact small-icon size (16 / 20 / 24 / 32 px), not scaled down.
         let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16);
         let tray = Tray {
@@ -43,7 +43,7 @@ impl Tray {
     }
 
     /// Adds the icon; also used after Explorer restarts (TaskbarCreated).
-    pub fn add(&self) {
+    pub(crate) fn add(&self) {
         let mut d = self.data();
         d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         d.uCallbackMessage = self.callback;
@@ -56,7 +56,7 @@ impl Tray {
         }
     }
 
-    pub fn set_recording(&mut self, on: bool, tip: &str) {
+    pub(crate) fn set_recording(&mut self, on: bool, tip: &str) {
         self.recording = on;
         let mut d = self.data();
         d.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
@@ -67,7 +67,7 @@ impl Tray {
         }
     }
 
-    pub fn notify(&self, title: &str, text: &str, error: bool) {
+    pub(crate) fn notify(&self, title: &str, text: &str, error: bool) {
         let mut d = self.data();
         d.uFlags = NIF_INFO;
         copy_wstr(&mut d.szInfoTitle, title);
@@ -78,7 +78,7 @@ impl Tray {
         }
     }
 
-    pub fn remove(&self) {
+    pub(crate) fn remove(&self) {
         let d = self.data();
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &d);
@@ -99,7 +99,7 @@ impl Drop for Tray {
 /// The glint mark as straight-alpha ARGB pixels: a red disc with a white highlight in the
 /// upper right ("a glint on a lens"); without the highlight it's the plain recording dot.
 /// Geometry is snapped to whole pixels so it stays crisp at 16 px.
-pub fn icon_pixels(size: i32, highlight: bool) -> Vec<u32> {
+pub(crate) fn icon_pixels(size: i32, highlight: bool) -> Vec<u32> {
     const RED: [u8; 3] = [0xE5, 0x40, 0x2F];
     let s = size as f32;
     let unit = |n: f32| (n * s / 16.0).round();

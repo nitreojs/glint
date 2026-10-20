@@ -8,9 +8,11 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, w};
 
-use super::{DIM, Pill, RING, draw_pill, rgn, ring};
-use crate::gfx::{Painter, make_glass};
-use crate::util::{Rect, log};
+use super::pill::{Pill, draw_pill};
+use super::{DIM, RING, rgn};
+use crate::platform::gfx::{Painter, make_glass};
+use crate::platform::log::log;
+use crate::platform::rect::{Rect, ring};
 
 const DIM_ALPHA: f32 = (256 - DIM) as f32;
 

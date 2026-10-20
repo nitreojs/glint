@@ -4,13 +4,13 @@ use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
 use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
 use windows::core::w;
 
-use crate::util::wide;
+use crate::platform::wide::wide;
 
 /// Passed by the Run entry, so a sign-in launch skips the "glint is running" balloon.
-pub const ARG: &str = "--autostart";
+pub(crate) const ARG: &str = "--autostart";
 
 /// Adds or removes the Run entry. Adding rewrites the command, so a moved exe still starts.
-pub fn sync(enabled: bool) -> Result<(), String> {
+pub(crate) fn sync(enabled: bool) -> Result<(), String> {
     let key = w!(r"Software\Microsoft\Windows\CurrentVersion\Run");
     let err = unsafe {
         if enabled {
