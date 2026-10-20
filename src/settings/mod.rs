@@ -2,34 +2,40 @@
 //! winit allows only one event loop per process and the window can be opened many times.
 //! It edits config.toml and asks the tray app to apply it.
 
+mod widgets;
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use eframe::egui::{
-    self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, RichText, Stroke, TextStyle,
+    self, Align, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Layout, RichText, Stroke, TextStyle,
 };
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey};
 use windows::Win32::UI::Shell::{
     FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-    SIGDN_FILESYSPATH,
+    SIGDN_FILESYSPATH, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, SetForegroundWindow, SetWindowsHookExW, UnhookWindowsHookEx,
-    WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
+    CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, SW_SHOWNORMAL, SetForegroundWindow, SetWindowsHookExW,
+    UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
-use windows::core::HSTRING;
+use windows::core::{HSTRING, w};
 
 use crate::config::{CodecName, Config, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, hotkey_string};
 use crate::ipc::{self, SETTINGS_TITLE, WM_HOTKEY_PAUSE, WM_RELOAD};
 use crate::tray::icon_pixels;
+use widgets::{CONTROL_W, FAINT, Kind, MUTED, TEXT, TWINKLE_EVERY, TWINKLE_LEN, WARN};
 
-const ACCENT: Color32 = Color32::from_rgb(0, 145, 255);
-const WARN: Color32 = Color32::from_rgb(255, 176, 64);
-const MUTED: Color32 = Color32::from_rgb(140, 140, 150);
-const FPS_PRESETS: [u32; 8] = [0, 24, 30, 60, 120, 144, 165, 240];
+pub const REPO_URL: &str = "https://github.com/nitreojs/glint";
+const FPS_PRESETS: [u32; 6] = [0, 30, 60, 120, 144, 240];
+/// Wordmark font (SIL Open Font License, see assets/fonts/OFL.txt).
+const DISPLAY_FONT: &[u8] = include_bytes!("../../assets/fonts/DMSerifDisplay-Italic.ttf");
+/// Seconds for the header and cards to cascade in when the window opens.
+const INTRO_S: f64 = 0.9;
 
 pub fn run() {
     if let Some(h) = ipc::find_settings() {
@@ -50,14 +56,26 @@ pub fn run() {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(SETTINGS_TITLE)
-            .with_inner_size([520.0, 640.0])
+            .with_inner_size([520.0, 790.0])
             .with_resizable(false)
             .with_maximize_button(false)
             .with_icon(egui::IconData { rgba, width: size as u32, height: size as u32 }),
         centered: true,
         ..Default::default()
     };
-    let app = SettingsApp { saved: cfg.clone(), cfg, error: load_error, listening: None, hotkey_note: None };
+    let mut refresh_rates: Vec<u32> =
+        crate::monitors::enumerate().unwrap_or_default().iter().map(|o| o.native_fps()).collect();
+    refresh_rates.sort_unstable_by(|a, b| b.cmp(a));
+    refresh_rates.dedup();
+    let app = SettingsApp {
+        saved: cfg.clone(),
+        cfg,
+        error: load_error,
+        listening: None,
+        hotkey_note: None,
+        refresh_rates,
+        opened_at: None,
+    };
     let _ = eframe::run_native(
         SETTINGS_TITLE,
         options,
@@ -79,6 +97,10 @@ struct SettingsApp {
     listening: Option<HHOOK>,
     /// Outcome of the last hotkey recording (text, is a warning).
     hotkey_note: Option<(String, bool)>,
+    /// Distinct refresh rates of the connected monitors, for the "native" hint.
+    refresh_rates: Vec<u32>,
+    /// `egui` time of the first frame (drives the intro animation).
+    opened_at: Option<f64>,
 }
 
 // ---- hotkey recording -----------------------------------------------------------------------
@@ -238,8 +260,8 @@ fn pick_folder(start: &Path) -> Option<PathBuf> {
 
 fn fps_label(fps: u32) -> String {
     match fps {
-        0 => "Native (monitor refresh rate)".into(),
-        n => format!("{n} fps"),
+        0 => "native".into(),
+        n => n.to_string(),
     }
 }
 
@@ -257,61 +279,46 @@ fn effort_label(e: u32) -> &'static str {
     match e {
         0..=33 => "fastest",
         34..=66 => "balanced",
-        _ => "best compression, more GPU load",
+        _ => "best compression, more gpu load",
     }
 }
 
-/// A two-column row: label on the left, control on the right, optional hint below.
-fn row(ui: &mut egui::Ui, label: &str, hint: Option<&str>, control: impl FnOnce(&mut egui::Ui)) {
-    ui.horizontal(|ui| {
-        ui.allocate_ui_with_layout(egui::vec2(128.0, 24.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.set_min_width(128.0);
-            ui.label(label);
-        });
-        ui.vertical(|ui| {
-            control(ui);
-            if let Some(h) = hint {
-                ui.label(RichText::new(h).small().color(MUTED));
-            }
-        });
-    });
-    ui.add_space(6.0);
-}
-
-fn section(ui: &mut egui::Ui, title: &str) {
-    ui.add_space(4.0);
-    ui.label(RichText::new(title).text_style(TextStyle::Name("section".into())).color(Color32::WHITE));
-    ui.add_space(4.0);
+fn open_url(url: &str) {
+    unsafe {
+        ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
+    }
 }
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_capture();
         let ctx = ui.ctx().clone();
+        let time = ctx.input(|i| i.time);
+        let since = time - *self.opened_at.get_or_insert(time);
         if self.listening.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        widgets::backdrop(ui.painter(), ui.max_rect());
+        // Header, cards and footer cascade in, each a little after the previous one.
+        let appear = |i: usize| ((since - 0.07 * i as f64) / 0.4).clamp(0.0, 1.0) as f32;
 
         egui::Panel::bottom("buttons")
-            .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(20, 14)))
-            .show_separator_line(true)
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 22, top: 8, bottom: 16 }))
+            .show_separator_line(false)
             .show(ui, |ui| {
+                ui.multiply_opacity(widgets::ease(appear(4)));
                 ui.horizontal(|ui| {
-                    if ui.button("Reset to defaults").clicked() {
+                    let not_default = self.cfg != Config::default();
+                    if widgets::button(ui, "reset to defaults", Kind::Ghost, not_default).clicked() {
                         self.cfg = Config::default();
                         self.hotkey_note = None;
                     }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let dirty = self.cfg != self.saved;
-                        let save = egui::Button::new(RichText::new("Save").color(Color32::WHITE)).fill(if dirty {
-                            ACCENT
-                        } else {
-                            ui.visuals().widgets.inactive.weak_bg_fill
-                        });
-                        if ui.add_enabled(dirty && self.listening.is_none(), save).clicked() {
+                        if widgets::button(ui, "save", Kind::Primary, dirty && self.listening.is_none()).clicked() {
                             self.save(&ctx);
                         }
-                        if ui.button("Cancel").clicked() {
+                        if widgets::button(ui, "cancel", Kind::Secondary, true).clicked() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     });
@@ -319,104 +326,121 @@ impl eframe::App for SettingsApp {
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(egui::Margin::symmetric(20, 16)))
+            .frame(egui::Frame::new().inner_margin(egui::Margin { left: 22, right: 22, top: 16, bottom: 0 }))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.contents(ui));
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.contents(ui, time, &appear));
             });
 
-        if self.listening.is_some() {
-            ctx.request_repaint(); // keep polling the hook
+        // Repaint only while something moves (hover transitions schedule their own frames).
+        let phase = time % TWINKLE_EVERY;
+        if since < INTRO_S || self.listening.is_some() || phase < TWINKLE_LEN {
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(Duration::from_secs_f64(TWINKLE_EVERY - phase));
         }
     }
 }
 
 impl SettingsApp {
-    fn contents(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("glint").text_style(TextStyle::Heading));
-        ui.label(RichText::new("Screen recording at your monitor's native refresh rate").color(MUTED));
-        if let Some(e) = &self.error {
-            ui.add_space(6.0);
-            ui.label(RichText::new(e).color(WARN));
-        }
-        ui.add_space(10.0);
-
-        section(ui, "Shortcut");
-        let listening = self.listening.is_some();
-        let mut toggle = false;
-        let note = self.hotkey_note.clone();
-        row(ui, "Hotkey", None, |ui| {
-            let text =
-                if listening { "Press a shortcut…  (Esc to cancel)".to_string() } else { self.cfg.hotkey.clone() };
-            let button = egui::Button::new(RichText::new(text).monospace()).min_size(egui::vec2(280.0, 28.0));
-            let button = if listening { button.stroke(Stroke::new(1.5, ACCENT)) } else { button };
-            toggle = ui.add(button).on_hover_text("Click, then press the new shortcut").clicked();
-            match &note {
-                Some((n, warn)) => {
-                    ui.label(RichText::new(n).small().color(if *warn { WARN } else { MUTED }));
-                }
-                None => {
-                    ui.label(RichText::new("Starts region selection; press again to stop").small().color(MUTED));
-                }
+    fn contents(&mut self, ui: &mut egui::Ui, time: f64, appear: &dyn Fn(usize) -> f32) {
+        let semibold = FontFamily::Name("semibold".into());
+        ui.scope(|ui| {
+            ui.multiply_opacity(widgets::ease(appear(0)));
+            ui.horizontal(|ui| {
+                widgets::title(ui, "glint", FontFamily::Name("display".into()), 46.0, time);
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    ui.add_space(2.0);
+                    if widgets::link(ui, "github ↗").clicked() {
+                        open_url(REPO_URL);
+                    }
+                    ui.label(RichText::new(concat!("v", env!("CARGO_PKG_VERSION"))).small().color(FAINT));
+                });
+            });
+            ui.label(RichText::new("screen recording at your monitor's native refresh rate").color(MUTED));
+            if let Some(e) = &self.error {
+                ui.add_space(6.0);
+                ui.label(RichText::new(e).color(WARN));
             }
         });
-        if toggle {
-            if listening { self.stop_listening() } else { self.start_listening() }
-        }
+        ui.add_space(14.0);
 
-        section(ui, "Recording");
-        row(ui, "Frame rate", None, |ui| {
+        widgets::card(ui, "shortcut", semibold.clone(), appear(1), |ui| {
+            let listening = self.listening.is_some();
+            let hint = match &self.hotkey_note {
+                Some((n, warn)) => (n.clone(), if *warn { WARN } else { MUTED }),
+                None => ("starts region selection; press again to stop".into(), MUTED),
+            };
+            let mut clicked = false;
+            widgets::row(ui, "hotkey", Some(hint), |ui| {
+                clicked = widgets::hotkey_field(ui, &self.cfg.hotkey, listening, time).clicked();
+            });
+            if clicked {
+                if listening { self.stop_listening() } else { self.start_listening() }
+            }
+        });
+
+        widgets::card(ui, "recording", semibold.clone(), appear(2), |ui| {
             let mut presets = FPS_PRESETS.to_vec();
             if !presets.contains(&self.cfg.fps) {
                 presets.push(self.cfg.fps);
-                presets.sort();
+                presets.sort_unstable();
             }
-            egui::ComboBox::from_id_salt("fps").width(280.0).selected_text(fps_label(self.cfg.fps)).show_ui(ui, |ui| {
-                for p in presets {
-                    ui.selectable_value(&mut self.cfg.fps, p, fps_label(p));
+            let options: Vec<(u32, String)> = presets.iter().map(|&p| (p, fps_label(p))).collect();
+            let hint = match (self.cfg.fps, self.refresh_rates.as_slice()) {
+                (0, []) => "native follows the monitor's refresh rate".to_string(),
+                (0, rates) => {
+                    let rates: Vec<String> = rates.iter().map(|r| r.to_string()).collect();
+                    format!("native follows the monitor: {} hz", rates.join(" · "))
                 }
+                (n, _) => format!("capped at {n} fps, never above the monitor's rate"),
+            };
+            widgets::row(ui, "frame rate", Some((hint, MUTED)), |ui| {
+                widgets::segmented(ui, "fps", &mut self.cfg.fps, &options);
             });
-        });
-        let codec_hint = match self.cfg.codec {
-            CodecName::H264 => "Plays everywhere",
-            CodecName::Hevc => "About 30% smaller at the same quality; Telegram, Discord, browsers, VLC",
-        };
-        row(ui, "Codec", Some(codec_hint), |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.cfg.codec, CodecName::H264, "  H.264  ");
-                ui.selectable_value(&mut self.cfg.codec, CodecName::Hevc, "  HEVC  ");
+            let codec_hint = match self.cfg.codec {
+                CodecName::H264 => "plays everywhere",
+                CodecName::Hevc => "~30% smaller at the same quality; telegram, discord, browsers, vlc",
+            };
+            widgets::row(ui, "codec", Some((codec_hint.into(), MUTED)), |ui| {
+                let codecs = [(CodecName::H264, "h.264".to_string()), (CodecName::Hevc, "hevc".to_string())];
+                widgets::segmented(ui, "codec", &mut self.cfg.codec, &codecs);
             });
-        });
-        let q = self.cfg.quality;
-        row(ui, "Quality", Some(&format!("{q}: {}  ·  lower is sharper and bigger", quality_label(q))), |ui| {
-            ui.add(egui::Slider::new(&mut self.cfg.quality, 12..=36).show_value(false));
-        });
-        let e = self.cfg.effort;
-        row(ui, "Encoder effort", Some(&format!("{e}: {}", effort_label(e))), |ui| {
-            ui.add(egui::Slider::new(&mut self.cfg.effort, 0..=100).show_value(false));
-        });
-        row(ui, "Cursor", None, |ui| {
-            ui.checkbox(&mut self.cfg.draw_cursor, "Show the mouse cursor in recordings");
+            let q = self.cfg.quality;
+            let hint = format!("{q} · {} · lower is sharper and bigger", quality_label(q));
+            widgets::row(ui, "quality", Some((hint, MUTED)), |ui| {
+                widgets::slider(ui, &mut self.cfg.quality, 12..=36);
+            });
+            let e = self.cfg.effort;
+            widgets::row(ui, "encoder effort", Some((format!("{e} · {}", effort_label(e)), MUTED)), |ui| {
+                widgets::slider(ui, &mut self.cfg.effort, 0..=100);
+            });
+            widgets::row(ui, "cursor", None, |ui| {
+                widgets::toggle(ui, &mut self.cfg.draw_cursor, "show the mouse cursor");
+            });
         });
 
-        section(ui, "Output");
-        let default_dir = Config { output_dir: String::new(), ..self.cfg.clone() }.output_dir();
-        row(ui, "Folder", None, |ui| {
-            ui.horizontal(|ui| {
+        widgets::card(ui, "output", semibold, appear(3), |ui| {
+            let default_dir = Config { output_dir: String::new(), ..self.cfg.clone() }.output_dir();
+            widgets::row(ui, "folder", None, |ui| {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.cfg.output_dir)
                         .hint_text(default_dir.display().to_string())
-                        .desired_width(196.0),
+                        .desired_width(CONTROL_W)
+                        .margin(egui::Margin::symmetric(10, 7)),
                 );
-                if ui.button("Browse…").clicked()
-                    && let Some(p) = pick_folder(&self.cfg.output_dir())
-                {
-                    self.cfg.output_dir = p.display().to_string();
-                }
-                if ui.button("Open").clicked() {
-                    let dir = self.cfg.output_dir();
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
-                }
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    if widgets::button(ui, "browse…", Kind::Secondary, true).clicked()
+                        && let Some(p) = pick_folder(&self.cfg.output_dir())
+                    {
+                        self.cfg.output_dir = p.display().to_string();
+                    }
+                    if widgets::button(ui, "open", Kind::Ghost, true).clicked() {
+                        let dir = self.cfg.output_dir();
+                        let _ = std::fs::create_dir_all(&dir);
+                        let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
+                    }
+                });
             });
         });
     }
@@ -424,6 +448,7 @@ impl SettingsApp {
 
 fn style(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
+    let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
     let fonts_dir = Path::new(&windir).join("Fonts");
     for (name, file) in [("segoe", "segoeui.ttf"), ("segoe-semibold", "seguisb.ttf")] {
@@ -431,53 +456,47 @@ fn style(ctx: &egui::Context) {
             fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
         }
     }
-    let fallback = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    if fonts.font_data.contains_key("segoe") {
-        fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "segoe".into());
-    }
-    let semibold = FontFamily::Name("semibold".into());
-    let mut sb = vec![];
-    if fonts.font_data.contains_key("segoe-semibold") {
-        sb.push("segoe-semibold".to_string());
-    }
-    sb.extend(fallback);
-    fonts.families.insert(semibold.clone(), sb);
+    fonts.font_data.insert("display".into(), Arc::new(FontData::from_static(DISPLAY_FONT)));
+    let family = |first: &str| {
+        let mut list: Vec<String> = fonts.font_data.contains_key(first).then(|| first.to_string()).into_iter().collect();
+        list.extend(fallback.iter().cloned());
+        list
+    };
+    let (body, semibold, display) = (family("segoe"), family("segoe-semibold"), family("display"));
+    fonts.families.insert(FontFamily::Proportional, body);
+    fonts.families.insert(FontFamily::Name("semibold".into()), semibold);
+    fonts.families.insert(FontFamily::Name("display".into()), display);
     ctx.set_fonts(fonts);
 
     ctx.set_theme(egui::Theme::Dark);
     let mut v = egui::Visuals::dark();
-    let panel = Color32::from_rgb(22, 22, 27);
-    v.panel_fill = panel;
-    v.window_fill = panel;
-    v.extreme_bg_color = Color32::from_rgb(13, 13, 17);
-    v.selection.bg_fill = ACCENT;
-    v.selection.stroke = Stroke::new(1.0, Color32::WHITE);
-    v.hyperlink_color = ACCENT;
-    let radius = CornerRadius::same(6);
-    for (w, fill) in [
-        (&mut v.widgets.inactive, Color32::from_rgb(40, 40, 47)),
-        (&mut v.widgets.hovered, Color32::from_rgb(52, 52, 61)),
-        (&mut v.widgets.active, Color32::from_rgb(62, 62, 72)),
-        (&mut v.widgets.open, Color32::from_rgb(52, 52, 61)),
+    v.panel_fill = Color32::from_rgb(16, 16, 22);
+    v.window_fill = v.panel_fill;
+    v.extreme_bg_color = Color32::from_black_alpha(70); // text fields
+    v.selection.bg_fill = widgets::ACCENT.gamma_multiply(0.6);
+    v.selection.stroke = Stroke::new(1.0, widgets::ACCENT);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT);
+    let radius = CornerRadius::same(9);
+    for (w, stroke) in [
+        (&mut v.widgets.inactive, 0.08),
+        (&mut v.widgets.hovered, 0.16),
+        (&mut v.widgets.active, 0.2),
+        (&mut v.widgets.open, 0.16),
     ] {
-        w.bg_fill = fill;
-        w.weak_bg_fill = fill;
+        w.bg_fill = Color32::from_white_alpha(12);
+        w.weak_bg_fill = Color32::from_white_alpha(12);
         w.corner_radius = radius;
-        w.bg_stroke = Stroke::NONE;
+        w.bg_stroke = Stroke::new(1.0, Color32::from_white_alpha((stroke * 255.0) as u8));
+        w.expansion = 0.0;
     }
-    v.widgets.noninteractive.corner_radius = radius;
     ctx.set_visuals(v);
 
     ctx.all_styles_mut(|s| {
+        s.interaction.selectable_labels = false;
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        s.spacing.button_padding = egui::vec2(12.0, 5.0);
-        s.spacing.slider_width = 280.0;
-        s.spacing.interact_size.y = 26.0;
+        s.spacing.interact_size.y = 28.0;
         s.text_styles.insert(TextStyle::Body, FontId::proportional(14.0));
         s.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
         s.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
-        s.text_styles.insert(TextStyle::Monospace, FontId::proportional(14.0));
-        s.text_styles.insert(TextStyle::Heading, FontId::new(24.0, semibold.clone()));
-        s.text_styles.insert(TextStyle::Name("section".into()), FontId::new(15.0, semibold.clone()));
     });
 }
