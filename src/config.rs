@@ -9,6 +9,7 @@ use crate::util::{app_dir, videos_dir};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub hotkey: String,
+    pub screenshot_hotkey: String,
     pub launch_at_startup: bool,
     pub output_dir: String,
     /// File name pattern without the extension; see [`Config::file_stem`].
@@ -18,6 +19,11 @@ pub struct Config {
     pub quality: u32,
     pub effort: u32,
     pub draw_cursor: bool,
+    pub screenshot_format: ShotFormat,
+    /// JPG quality, 50-100.
+    pub screenshot_quality: u32,
+    pub screenshot_copy: bool,
+    pub screenshot_save: bool,
 }
 
 pub const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
@@ -29,6 +35,13 @@ pub const BAD_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '
 pub enum CodecName {
     H264,
     Hevc,
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ShotFormat {
+    Png,
+    Jpg,
 }
 
 impl CodecName {
@@ -44,6 +57,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hotkey: "Ctrl+Alt+PrintScreen".into(),
+            screenshot_hotkey: "Ctrl+PrintScreen".into(),
             launch_at_startup: false,
             output_dir: String::new(),
             file_name: DEFAULT_FILE_NAME.into(),
@@ -52,6 +66,10 @@ impl Default for Config {
             quality: 22,
             effort: 50,
             draw_cursor: true,
+            screenshot_format: ShotFormat::Png,
+            screenshot_quality: 90,
+            screenshot_copy: true,
+            screenshot_save: true,
         }
     }
 }
@@ -69,9 +87,15 @@ impl Config {
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        parse_hotkey(&cfg.hotkey)?;
+        let record = parse_hotkey(&cfg.hotkey)?;
+        if parse_hotkey(&cfg.screenshot_hotkey).map_err(|e| format!("screenshot_hotkey: {e}"))? == record {
+            return Err("hotkey and screenshot_hotkey must differ".into());
+        }
         if cfg.quality > 51 {
             return Err(format!("quality must be 0-51, got {}", cfg.quality));
+        }
+        if !(50..=100).contains(&cfg.screenshot_quality) {
+            return Err(format!("screenshot_quality must be 50-100, got {}", cfg.screenshot_quality));
         }
         if let Some(problem) = file_name_problem(&cfg.file_name) {
             return Err(format!("file_name {}: {problem}", toml::Value::String(cfg.file_name.clone())));
@@ -94,6 +118,10 @@ impl Config {
             CodecName::H264 => "h264",
             CodecName::Hevc => "hevc",
         };
+        let format = match self.screenshot_format {
+            ShotFormat::Png => "png",
+            ShotFormat::Jpg => "jpg",
+        };
         format!(
             r#"# glint settings. "Settings…" in the tray menu edits this file; hand edits apply the
 # next time a recording starts.
@@ -104,10 +132,13 @@ impl Config {
 # Right, Num0-Num9.
 hotkey = {hotkey}
 
+# Starts a screenshot: select a region or window, mark it up, Enter to finish.
+screenshot_hotkey = {screenshot_hotkey}
+
 # Start glint (in the tray) when you sign in to Windows.
 launch_at_startup = {launch_at_startup}
 
-# Folder for recordings. Empty = <Videos>\glint
+# Folder for recordings and screenshots. Empty = <Videos>\glint
 output_dir = {output_dir}
 
 # File names, without the extension. {{date}} becomes 2026-10-20 and {{time}} 14-32-07
@@ -130,8 +161,16 @@ quality = {quality}
 effort = {effort}
 
 draw_cursor = {draw_cursor}
+
+# Screenshots: "png" (lossless) or "jpg" (smaller; screenshot_quality 50-100 applies).
+screenshot_format = "{format}"
+screenshot_quality = {screenshot_quality}
+# What happens when a screenshot is finished: copy it, save it to the folder, or both.
+screenshot_copy = {screenshot_copy}
+screenshot_save = {screenshot_save}
 "#,
             hotkey = q(&self.hotkey),
+            screenshot_hotkey = q(&self.screenshot_hotkey),
             launch_at_startup = self.launch_at_startup,
             output_dir = q(&self.output_dir),
             file_name = q(&self.file_name),
@@ -139,6 +178,9 @@ draw_cursor = {draw_cursor}
             quality = self.quality,
             effort = self.effort,
             draw_cursor = self.draw_cursor,
+            screenshot_quality = self.screenshot_quality,
+            screenshot_copy = self.screenshot_copy,
+            screenshot_save = self.screenshot_save,
         )
     }
 
@@ -284,6 +326,7 @@ mod tests {
     fn saved_file_parses_back_to_the_same_settings() {
         let cfg = Config {
             hotkey: "Shift+Pause".into(),
+            screenshot_hotkey: "Win+Shift+S".into(),
             launch_at_startup: true,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),
             file_name: "clip {date} at {time}".into(),
@@ -292,6 +335,10 @@ mod tests {
             quality: 18,
             effort: 75,
             draw_cursor: false,
+            screenshot_format: ShotFormat::Jpg,
+            screenshot_quality: 75,
+            screenshot_copy: false,
+            screenshot_save: true,
         };
         let back: Config = toml::from_str(&cfg.render()).unwrap();
         assert_eq!(back, cfg);

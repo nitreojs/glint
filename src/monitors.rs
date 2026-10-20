@@ -109,12 +109,23 @@ fn gdi_refresh(device: &str) -> f64 {
     60.0
 }
 
+/// How a selection is sized: recordings need the encoder's minimum and even sides,
+/// screenshots take any size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fit {
+    pub min: (i32, i32),
+    pub even: bool,
+}
+
+impl Fit {
+    pub const ANY: Fit = Fit { min: (1, 1), even: false };
+}
+
 /// Maps a drag from `anchor` to `cursor` (desktop coordinates) onto one output: the output
 /// under the anchor (or, failing that, the one overlapping the drag most), clipped to it.
-/// Tiny selections grow to the encoder minimum *away from the anchor* and odd sizes lose
+/// Selections below `fit.min` grow *away from the anchor*, and with `fit.even` odd sizes lose
 /// their last pixel on the cursor side, so the corner where the drag started never moves.
-/// `min` is the encoder's smallest frame (see `Codec::min_size`).
-pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], min: (i32, i32)) -> Option<(Rect, usize)> {
+pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
     let raw = Rect::from_points(anchor.0, anchor.1, cursor.0, cursor.1);
     let idx = output_at(outputs, anchor.0, anchor.1).or_else(|| {
         let overlap = |o: &Output| o.rect.intersect(&raw).map_or(0, |r| r.area());
@@ -123,7 +134,8 @@ pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], min:
     let mon = outputs[idx].rect;
     let axis = |a: i32, c: i32, lo: i32, hi: i32, min: i32| -> (i32, i32) {
         let (a, c) = (a.clamp(lo, hi), c.clamp(lo, hi));
-        let len = ((c - a).abs().max(min.min(hi - lo))) & !1;
+        let len = (c - a).abs().max(min.min(hi - lo));
+        let len = if fit.even { len & !1 } else { len };
         if c >= a {
             let start = a.min(hi - len); // pushed back only when the monitor edge forces it
             (start, len)
@@ -132,17 +144,17 @@ pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output], min:
             (end - len, len)
         }
     };
-    let (x, w) = axis(anchor.0, cursor.0, mon.x, mon.right(), min.0);
-    let (y, h) = axis(anchor.1, cursor.1, mon.y, mon.bottom(), min.1);
+    let (x, w) = axis(anchor.0, cursor.0, mon.x, mon.right(), fit.min.0);
+    let (y, h) = axis(anchor.1, cursor.1, mon.y, mon.bottom(), fit.min.1);
     Some((Rect { x, y, w, h }, idx))
 }
 
 /// Maps a fixed rectangle (a window, a monitor) onto the output under `at`: clipped to it,
-/// then grown to the encoder minimum and trimmed to even size like [`fit_drag`].
-pub fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output], min: (i32, i32)) -> Option<(Rect, usize)> {
+/// then sized like [`fit_drag`].
+pub fn fit_rect(rect: Rect, at: (i32, i32), outputs: &[Output], fit: Fit) -> Option<(Rect, usize)> {
     let mon = outputs[output_at(outputs, at.0, at.1)?].rect;
     let r = rect.intersect(&mon)?;
-    fit_drag((r.x, r.y), (r.right(), r.bottom()), outputs, min)
+    fit_drag((r.x, r.y), (r.right(), r.bottom()), outputs, fit)
 }
 
 pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
@@ -153,7 +165,7 @@ pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
 mod tests {
     use super::*;
     /// Unequal sides, so a mixed-up axis shows.
-    const MIN: (i32, i32) = (130, 34);
+    const MIN: Fit = Fit { min: (130, 34), even: true };
 
     fn output(x: i32, y: i32, w: i32, h: i32) -> Output {
         Output {
@@ -171,13 +183,22 @@ mod tests {
         let outs = [output(0, 0, 3440, 1440)];
         // A few pixels above the start point: the bottom edge stays at the anchor.
         let (r, _) = fit_drag((500, 400), (530, 390), &outs, MIN).unwrap();
-        assert_eq!((r.x, r.bottom(), r.w, r.h), (500, 400, MIN.0, MIN.1));
+        assert_eq!((r.x, r.bottom(), r.w, r.h), (500, 400, MIN.min.0, MIN.min.1));
         // Moving further up (still under the minimum) must not move the box at all.
         let (r2, _) = fit_drag((500, 400), (530, 380), &outs, MIN).unwrap();
         assert_eq!(r2, r);
         // Down-right: the top-left corner stays at the anchor.
         let (r, _) = fit_drag((500, 400), (510, 410), &outs, MIN).unwrap();
-        assert_eq!((r.x, r.y, r.w, r.h), (500, 400, MIN.0, MIN.1));
+        assert_eq!((r.x, r.y, r.w, r.h), (500, 400, MIN.min.0, MIN.min.1));
+    }
+
+    #[test]
+    fn screenshots_keep_exact_sizes() {
+        let outs = [output(0, 0, 3440, 1440)];
+        let (r, _) = fit_drag((500, 400), (503, 401), &outs, Fit::ANY).unwrap();
+        assert_eq!((r.w, r.h), (3, 1));
+        let win = Rect { x: 101, y: 50, w: 701, h: 333 };
+        assert_eq!(fit_rect(win, (300, 100), &outs, Fit::ANY).unwrap().0, win);
     }
 
     #[test]
@@ -191,7 +212,7 @@ mod tests {
     fn growth_is_pushed_inside_the_monitor_and_stays_on_the_anchor_monitor() {
         let outs = [output(-1920, 540, 1920, 1080), output(0, 0, 3440, 1440)];
         let (r, i) = fit_drag((3430, 1435), (3436, 1438), &outs, MIN).unwrap();
-        assert_eq!((i, r.right(), r.bottom(), r.w, r.h), (1, 3440, 1440, MIN.0, MIN.1));
+        assert_eq!((i, r.right(), r.bottom(), r.w, r.h), (1, 3440, 1440, MIN.min.0, MIN.min.1));
         // A drag that starts on the right monitor and crosses into the left one is clipped to the right one.
         let (r, i) = fit_drag((300, 600), (-500, 900), &outs, MIN).unwrap();
         assert_eq!((i, r.x, r.right()), (1, 0, 300));

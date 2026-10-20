@@ -1,9 +1,10 @@
 //! Full-screen region picker in the style of ShareX: a frozen, dimmed screenshot of the
 //! whole virtual desktop that fades in. Hovering highlights the window under the cursor (or
 //! the whole monitor over the desktop) and a click picks it; dragging selects a region (the
-//! selection shows undimmed). Esc / right-click cancels.
+//! selection shows undimmed). Esc / right-click cancels. For screenshots the picked region
+//! then opens in the markup editor ([`crate::editor`]) on the same frozen screen.
 //!
-//! The result is posted to the owner as `Box<Option<Selection>>` in LPARAM; the picker keeps
+//! The result is posted to the owner as `Box<Option<Picked>>` in LPARAM; the picker keeps
 //! showing until the owner calls [`dismiss`], so the fade-out can overlap other work.
 
 use std::cell::{Cell, RefCell};
@@ -20,19 +21,44 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, VK_ESCAPE, VK_RETURN};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{BOOL, w};
+use windows::core::{BOOL, PCWSTR, w};
 
+use crate::editor::{self, Editor, Output};
 use crate::gfx::{Dib, Painter, animate, rgba};
-use crate::monitors::{Output, fit_drag, fit_rect, output_at};
-use crate::util::Rect;
+use crate::monitors::{Fit, Output as Monitor, fit_drag, fit_rect, output_at};
+use crate::util::{Rect, log};
 
 #[derive(Clone, Debug)]
 pub struct Selection {
     /// Desktop coordinates, already clipped to `output` with even size.
     pub rect: Rect,
+    pub output: Monitor,
+}
+
+/// What the picker is for.
+#[derive(Clone, Copy, Debug)]
+pub enum Purpose {
+    /// Selections are sized for the encoder: its smallest frame (`min`), even sides.
+    Record { min: (i32, i32) },
+    /// The picked region opens in the markup editor.
+    Shot,
+}
+
+/// A finished screenshot as 0x00RRGGBB rows, and what to do with it.
+pub struct Shot {
+    pub pixels: Vec<u32>,
+    pub w: u32,
+    pub h: u32,
     pub output: Output,
+}
+
+pub enum Picked {
+    Region(Selection),
+    Shot(Shot),
 }
 
 /// Selection outline: 1 px white inside 1 px black, both outside the selected pixels.
@@ -61,7 +87,8 @@ struct Ticker {
     pending: AtomicBool,
 }
 
-const HINT: &str = "Drag to select a region   ·   Click to record the highlighted window or monitor   ·   Esc to cancel";
+const HINT_RECORD: &str = "Drag to select a region   ·   Click to record the highlighted window or monitor   ·   Esc to cancel";
+const HINT_SHOT: &str = "Drag to select a region   ·   Click to capture the highlighted window or monitor   ·   Esc to cancel";
 
 /// A pre-rendered pill (label or hint) and where it sits, in client coordinates.
 struct Pill {
@@ -91,7 +118,7 @@ struct State {
     font: IDWriteTextFormat,
     white: HBRUSH,
     black: HBRUSH,
-    outputs: Vec<Output>,
+    outputs: Vec<Monitor>,
     /// Visible top-level windows when the picker opened, topmost first (desktop coordinates).
     windows: Vec<Rect>,
     /// Last mouse position (client coordinates).
@@ -101,11 +128,16 @@ struct State {
     dragging: bool,
     /// Which side of the drag start the cursor is on (left, above); a change flips the box.
     side: Option<(bool, bool)>,
-    /// The encoder's smallest frame; selections grow to it.
-    min: (i32, i32),
+    purpose: Purpose,
+    /// How selections are sized (from the purpose).
+    fit: Fit,
     /// Current (fitted) selection or hover highlight in client coordinates, as displayed.
     sel: Option<Rect>,
     label: Option<Pill>,
+    /// The hint pills drawn over the bright image, shown where a highlight covers a hint.
+    hints: Vec<Pill>,
+    /// Markup editor, once a screenshot region is picked.
+    edit: Option<Editor>,
     /// What the highlight shows or glides to (client coordinates) and the output it's on.
     target: Option<(Rect, usize)>,
     /// The running glide, if any.
@@ -143,7 +175,9 @@ enum Action {
     /// Handled; repaint right away (outside the state borrow).
     Paint,
     Release,
-    Finish(Option<Selection>),
+    Finish(Option<Picked>),
+    /// WM_SETCURSOR: show this system cursor.
+    Cursor(PCWSTR),
 }
 
 /// Renders a pill with `text` over a copy of `bg` at (x, y).
@@ -169,7 +203,7 @@ fn pill_size(painter: &Painter, font: &IDWriteTextFormat, text: &str) -> (i32, i
 }
 
 /// Takes a screenshot and fades the picker in. `msg` is posted to `owner` with the result.
-pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>, min: (i32, i32)) -> Result<HWND, String> {
+pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> Result<HWND, String> {
     unsafe {
         let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
         let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
@@ -191,16 +225,21 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>, min: (i32, i32)) -> Res
 
         let painter = Painter::new()?;
         let font = painter.font(13.0)?;
-        let (hw, _) = pill_size(&painter, &font, HINT);
-        // The hint goes into both images so a highlighted window doesn't hide it.
+        let hint = match purpose {
+            Purpose::Record { .. } => HINT_RECORD,
+            Purpose::Shot => HINT_SHOT,
+        };
+        let (hw, _) = pill_size(&painter, &font, hint);
+        // The hint is baked into the dimmed image only: the bright one is what a screenshot
+        // captures. A copy drawn over the bright image shows where a highlight covers it.
+        let mut hints = Vec::with_capacity(outputs.len());
         for o in &outputs {
             let r = o.rect.offset(-vx, -vy);
             let (x, y) = (r.x + (r.w - hw) / 2, r.y + painter.px(28.0) as i32);
-            for img in [&dim, &bright] {
-                let hint = render_pill(&painter, &font, HINT, img, x, y)?;
-                let p = hint.rect;
-                let _ = BitBlt(img.dc, p.x, p.y, p.w, p.h, Some(hint.dib.dc), 0, 0, SRCCOPY);
-            }
+            let on_dim = render_pill(&painter, &font, hint, &dim, x, y)?;
+            let p = on_dim.rect;
+            let _ = BitBlt(dim.dc, p.x, p.y, p.w, p.h, Some(on_dim.dib.dc), 0, 0, SRCCOPY);
+            hints.push(render_pill(&painter, &font, hint, &bright, x, y)?);
         }
         let _ = GdiFlush();
 
@@ -254,9 +293,15 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Output>, min: (i32, i32)) -> Res
                 drag_start: None,
                 dragging: false,
                 side: None,
-                min,
+                purpose,
+                fit: match purpose {
+                    Purpose::Record { min } => Fit { min, even: true },
+                    Purpose::Shot => Fit::ANY,
+                },
                 sel: None,
                 label: None,
+                hints,
+                edit: None,
                 target: None,
                 glide: None,
                 ticker: None,
@@ -315,7 +360,7 @@ fn rgn(r: Rect) -> HRGN {
 }
 
 /// The four strips between `outer` and `inner`.
-fn ring(outer: Rect, inner: Rect) -> [RECT; 4] {
+pub(crate) fn ring(outer: Rect, inner: Rect) -> [RECT; 4] {
     [
         RECT { left: outer.x, top: outer.y, right: outer.right(), bottom: inner.y },
         RECT { left: outer.x, top: inner.bottom(), right: outer.right(), bottom: outer.bottom() },
@@ -395,7 +440,7 @@ impl State {
     /// The selection that would be recorded for a drag from `a` to `b` (client coords).
     fn fitted(&self, a: (i32, i32), b: (i32, i32)) -> Option<(Rect, usize)> {
         let (ox, oy) = self.origin;
-        fit_drag((a.0 + ox, a.1 + oy), (b.0 + ox, b.1 + oy), &self.outputs, self.min)
+        fit_drag((a.0 + ox, a.1 + oy), (b.0 + ox, b.1 + oy), &self.outputs, self.fit)
     }
 
     /// What a click at `p` (client coords) picks: the topmost window under it, else its monitor.
@@ -403,7 +448,7 @@ impl State {
         let d = (p.0 + self.origin.0, p.1 + self.origin.1);
         let mon = self.outputs[output_at(&self.outputs, d.0, d.1)?].rect;
         let rect = self.windows.iter().find(|w| w.contains(d.0, d.1)).copied().unwrap_or(mon);
-        fit_rect(rect, d, &self.outputs, self.min)
+        fit_rect(rect, d, &self.outputs, self.fit)
     }
 
     /// Replaces the selection and, if `label` is Some, the label; invalidates exactly the
@@ -533,7 +578,10 @@ impl State {
             return self.set_selection(None, Some(None));
         };
         let mon = self.to_client(self.outputs[oi].rect);
-        let text = format!("{} × {}   ·   {} fps", target.w, target.h, self.outputs[oi].native_fps());
+        let text = match self.purpose {
+            Purpose::Record { .. } => format!("{} × {}   ·   {} fps", target.w, target.h, self.outputs[oi].native_fps()),
+            Purpose::Shot => format!("{} × {}", target.w, target.h),
+        };
         let same_text = self.label.as_ref().filter(|l| l.text == text);
         let (lw, lh) = match same_text {
             Some(l) => (l.rect.w, l.rect.h),
@@ -541,7 +589,9 @@ impl State {
         };
         let gap = self.painter.px(6.0) as i32;
         let above = sel.y - RING - gap - lh;
-        let (x, y, bg) = if above >= mon.y {
+        // In the editor the toolbar may sit above the shot; the label then goes inside.
+        let bar_above = self.edit.as_ref().is_some_and(|e| e.bar.bottom() <= sel.y);
+        let (x, y, bg) = if above >= mon.y && !bar_above {
             (sel.x - RING, above, &self.dim)
         } else {
             (sel.x + gap + 2, sel.y + gap + 2, &self.bright)
@@ -554,14 +604,78 @@ impl State {
         self.set_selection(Some(sel), Some(label));
     }
 
-    fn finish_drag(&mut self, end: (i32, i32)) -> Option<Selection> {
+    /// The region a release at `end` picks: the drag, or what's highlighted after a click.
+    fn finish_drag(&mut self, end: (i32, i32)) -> Option<(Rect, usize)> {
         let start = self.drag_start.take()?;
-        let fitted = if std::mem::take(&mut self.dragging) { self.fitted(start, end) } else { self.target_at(end) };
-        fitted.map(|(rect, oi)| Selection { rect, output: self.outputs[oi].clone() })
+        if std::mem::take(&mut self.dragging) { self.fitted(start, end) } else { self.target_at(end) }
+    }
+
+    /// Recording: done. Screenshot: the region opens in the editor.
+    fn picked(&mut self, (rect, oi): (Rect, usize)) -> Action {
+        match self.purpose {
+            Purpose::Record { .. } => Action::Finish(Some(Picked::Region(Selection { rect, output: self.outputs[oi].clone() }))),
+            Purpose::Shot => {
+                self.set_gliding(false);
+                self.glide = None;
+                let sel = self.to_client(rect);
+                let ed = Editor::new(sel, self.to_client(self.outputs[oi].rect), self.painter.scale);
+                self.invalidate(&ed.extent());
+                self.edit = Some(ed);
+                self.target = Some((sel, oi));
+                self.show(Some(sel));
+                Action::Release
+            }
+        }
+    }
+
+    fn invalidate(&self, rects: &[Rect]) {
+        for r in rects {
+            unsafe {
+                let _ = InvalidateRect(Some(self.hwnd), Some(&r.to_win()), false);
+            }
+        }
+    }
+
+    /// Runs an editor call and turns its outcome into repaints or the picker's result.
+    fn edit_event(&mut self, call: impl FnOnce(&mut Editor) -> editor::Event) -> Action {
+        let Some(ed) = self.edit.as_mut() else { return Action::Handled };
+        let before = ed.extent();
+        match call(ed) {
+            editor::Event::None => Action::Handled,
+            editor::Event::Repaint => {
+                let (after, sel) = (ed.extent(), ed.sel);
+                self.invalidate(&before);
+                self.invalidate(&after);
+                if let Some((_, oi)) = self.target {
+                    self.target = Some((sel, oi));
+                    self.show(Some(sel));
+                }
+                if self.last_paint.get().elapsed() >= self.frame { Action::Paint } else { Action::Handled }
+            }
+            editor::Event::Cancel => Action::Finish(None),
+            editor::Event::Finish(output) => match ed.pixels(&self.bright, &self.painter) {
+                Ok((pixels, w, h)) => Action::Finish(Some(Picked::Shot(Shot { pixels, w, h, output }))),
+                Err(e) => {
+                    log(&format!("screenshot failed: {e}"));
+                    Action::Finish(None)
+                }
+            },
+        }
     }
 
     /// Every pixel is written exactly once per paint, so nothing flickers.
-    unsafe fn paint(&self) {
+    unsafe fn paint(&mut self) {
+        // Rendering can change what the editor covers (a tooltip appears): paint that too.
+        if let Some(ed) = self.edit.as_mut() {
+            let before = ed.extent();
+            if let Err(e) = ed.render(&self.bright, &self.dim, &self.painter, &self.font) {
+                log(&format!("editor render failed: {e}"));
+            }
+            let after = ed.extent();
+            if after != before {
+                self.invalidate(&after);
+            }
+        }
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
@@ -569,18 +683,23 @@ impl State {
             let rp = Rect::from_win(&ps.rcPaint);
             let label = self.label.as_ref();
 
+            // Dimmed screen around everything else.
             let saved = SaveDC(hdc);
-            if let Some(s) = self.sel {
-                let o = s.inflate(RING);
-                ExcludeClipRect(hdc, o.x, o.y, o.right(), o.bottom());
+            let mut holes: Vec<Rect> = self.sel.iter().map(|s| s.inflate(RING)).collect();
+            holes.extend(label.map(|l| l.rect));
+            if let Some(ed) = &self.edit {
+                holes.push(ed.bar);
+                holes.extend(ed.tip());
             }
-            if let Some(l) = label {
-                ExcludeClipRect(hdc, l.rect.x, l.rect.y, l.rect.right(), l.rect.bottom());
+            for h in &holes {
+                ExcludeClipRect(hdc, h.x, h.y, h.right(), h.bottom());
             }
             let _ = BitBlt(hdc, rp.x, rp.y, rp.w, rp.h, Some(self.dim.dc), rp.x, rp.y, SRCCOPY);
             let _ = RestoreDC(hdc, saved);
 
-            if let Some(s) = self.sel {
+            if let Some(ed) = &self.edit {
+                ed.paint(hdc, self.white, self.black);
+            } else if let Some(s) = self.sel {
                 let saved = SaveDC(hdc);
                 if let Some(l) = label {
                     ExcludeClipRect(hdc, l.rect.x, l.rect.y, l.rect.right(), l.rect.bottom());
@@ -594,6 +713,11 @@ impl State {
                 for r in ring(s.inflate(2), s.inflate(1)) {
                     FillRect(hdc, &r, self.black);
                 }
+                IntersectClipRect(hdc, s.x, s.y, s.right(), s.bottom());
+                for h in self.hints.iter().filter(|h| h.rect.intersect(&s).is_some()) {
+                    let r = h.rect;
+                    let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(h.dib.dc), 0, 0, SRCCOPY);
+                }
                 let _ = RestoreDC(hdc, saved);
             }
             if let Some(l) = label {
@@ -601,6 +725,50 @@ impl State {
                 let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(l.dib.dc), 0, 0, SRCCOPY);
             }
             let _ = EndPaint(self.hwnd, &ps);
+        }
+    }
+
+    /// Input while the markup editor is open.
+    fn handle_edit(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Action {
+        match msg {
+            WM_LBUTTONDOWN => {
+                let p = point(lp);
+                match self.edit_event(|e| e.mouse_down(p)) {
+                    Action::Finish(r) => Action::Finish(r),
+                    _ => Action::Capture,
+                }
+            }
+            WM_MOUSEMOVE => {
+                let p = point(lp);
+                self.cursor = p;
+                self.edit_event(|e| e.mouse_move(p))
+            }
+            WM_LBUTTONUP => {
+                let p = point(lp);
+                match self.edit_event(|e| e.mouse_up(p)) {
+                    Action::Finish(r) => Action::Finish(r),
+                    _ => Action::Release,
+                }
+            }
+            WM_KEYDOWN => {
+                let held = |vk: u16| unsafe { GetKeyState(vk as i32) } < 0;
+                let (ctrl, shift) = (held(VK_CONTROL.0), held(VK_SHIFT.0));
+                self.edit_event(|e| e.key(wp.0 as u32, ctrl, shift))
+            }
+            WM_MOUSEWHEEL => {
+                let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
+                self.edit_event(|e| e.wheel(delta))
+            }
+            WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
+                let mut p = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut p) };
+                let at = (p.x - self.origin.0, p.y - self.origin.1);
+                self.edit.as_ref().map_or(Action::Default, |e| Action::Cursor(e.cursor(at)))
+            }
+            WM_RBUTTONUP => Action::Handled,
+            WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => Action::Finish(None),
+            WM_CLOSE => Action::Finish(None),
+            _ => Action::Default,
         }
     }
 
@@ -624,6 +792,9 @@ impl State {
                 _ => Action::Default,
             };
         }
+        if self.edit.is_some() {
+            return self.handle_edit(msg, wp, lp);
+        }
         match msg {
             WM_LBUTTONDOWN => {
                 self.drag_start = Some(point(lp));
@@ -643,7 +814,7 @@ impl State {
                 if self.last_paint.get().elapsed() >= self.frame { Action::Paint } else { Action::Handled }
             }
             WM_LBUTTONUP => match self.finish_drag(point(lp)) {
-                Some(sel) => Action::Finish(Some(sel)),
+                Some(picked) => self.picked(picked),
                 None => {
                     self.update_selection(point(lp));
                     Action::Release
@@ -663,7 +834,7 @@ impl State {
             WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize => {
                 self.drag_start.get_or_insert(self.cursor);
                 match self.finish_drag(self.cursor) {
-                    Some(sel) => Action::Finish(Some(sel)),
+                    Some(picked) => self.picked(picked),
                     None => Action::Handled,
                 }
             }
@@ -674,7 +845,7 @@ impl State {
     }
 }
 
-fn finish(result: Option<Selection>) {
+fn finish(result: Option<Picked>) {
     let target = STATE.with(|s| {
         s.borrow_mut().as_mut().map(|st| {
             st.done = true;
@@ -721,6 +892,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             Action::Finish(sel) => {
                 finish(sel);
                 LRESULT(0)
+            }
+            Action::Cursor(id) => {
+                SetCursor(LoadCursorW(None, id).ok());
+                LRESULT(1)
             }
         }
     }

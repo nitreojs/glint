@@ -3,10 +3,12 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 
+use glint::config::{Config, ShotFormat, parse_hotkey};
+use glint::editor::Output;
 use glint::indicator::Indicator;
-use glint::config::{Config, parse_hotkey};
-use glint::overlay::{self, Selection};
+use glint::overlay::{self, Picked, Purpose, Shot};
 use glint::recorder::{Outcome, Params, Recorder};
+use glint::shot_out::{self, ImageFormat};
 use glint::tray::Tray;
 use glint::util::{date_time, human_duration, human_size, log, log_path, wide};
 use glint::{autostart, ipc, monitors};
@@ -29,8 +31,10 @@ const WM_APP_QUIT: u32 = WM_APP + 4;
 /// Posted by the indicator pill's buttons (see the handler for WPARAM values).
 const WM_APP_STOP: u32 = WM_APP + 5;
 const HOTKEY_ID: i32 = 1;
+const SHOT_HOTKEY_ID: i32 = 2;
 
 const ID_RECORD: usize = 100;
+const ID_SHOT: usize = 105;
 const ID_FOLDER: usize = 101;
 const ID_SETTINGS: usize = 102;
 const ID_LOG: usize = 103;
@@ -53,7 +57,9 @@ enum ClickTarget {
 struct App {
     hwnd: HWND,
     cfg: Config,
+    /// The record and screenshot hotkeys, while registered.
     hotkey: Option<String>,
+    shot_hotkey: Option<String>,
     state: State,
     tray: Tray,
     taskbar_created: u32,
@@ -76,30 +82,36 @@ impl App {
         self.tray.notify(title, text, error);
     }
 
-    fn register_hotkey(&mut self) {
+    /// (Re-)registers one global hotkey; returns the combo it now holds.
+    fn grab_hotkey(&mut self, id: i32, held: bool, combo: &str, what: &str) -> Option<String> {
         unsafe {
-            if self.hotkey.take().is_some() {
-                let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+            if held {
+                let _ = UnregisterHotKey(Some(self.hwnd), id);
             }
-            let (mods, vk) = parse_hotkey(&self.cfg.hotkey).expect("validated in Config::load");
-            let mods = HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT;
-            if RegisterHotKey(Some(self.hwnd), HOTKEY_ID, mods, vk).is_ok() {
-                self.hotkey = Some(self.cfg.hotkey.clone());
-            } else {
-                let text = format!(
-                    "{} is already used by another app (ShareX?). Pick another in Settings, or use the tray menu.",
-                    self.cfg.hotkey
-                );
-                self.notify("glint: hotkey unavailable", &text, true, ClickTarget::None);
+            let (mods, vk) = parse_hotkey(combo).expect("validated in Config::load");
+            if RegisterHotKey(Some(self.hwnd), id, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk).is_ok() {
+                return Some(combo.to_string());
             }
         }
+        let text = format!("{combo} is already used by another app. Pick another {what} hotkey in Settings, or use the tray menu.");
+        log(&format!("{what} hotkey {combo} is taken by another app"));
+        self.notify("glint: hotkey unavailable", &text, true, ClickTarget::None);
+        None
     }
 
-    /// Releases the hotkey while the settings window records a new one.
-    fn pause_hotkey(&mut self) {
-        if self.hotkey.take().is_some() {
-            unsafe {
-                let _ = UnregisterHotKey(Some(self.hwnd), HOTKEY_ID);
+    fn register_hotkeys(&mut self) {
+        let (record, shot) = (self.cfg.hotkey.clone(), self.cfg.screenshot_hotkey.clone());
+        self.hotkey = self.grab_hotkey(HOTKEY_ID, self.hotkey.is_some(), &record, "recording");
+        self.shot_hotkey = self.grab_hotkey(SHOT_HOTKEY_ID, self.shot_hotkey.is_some(), &shot, "screenshot");
+    }
+
+    /// Releases the hotkeys while the settings window records a new one.
+    fn pause_hotkeys(&mut self) {
+        for (id, held) in [(HOTKEY_ID, self.hotkey.take()), (SHOT_HOTKEY_ID, self.shot_hotkey.take())] {
+            if held.is_some() {
+                unsafe {
+                    let _ = UnregisterHotKey(Some(self.hwnd), id);
+                }
             }
         }
     }
@@ -108,11 +120,12 @@ impl App {
     fn reload(&mut self) {
         match Config::load() {
             Ok(cfg) => {
-                let hotkey_changed = self.hotkey.as_deref() != Some(cfg.hotkey.as_str());
+                let hotkeys_changed = self.hotkey.as_deref() != Some(cfg.hotkey.as_str())
+                    || self.shot_hotkey.as_deref() != Some(cfg.screenshot_hotkey.as_str());
                 let startup_changed = self.cfg.launch_at_startup != cfg.launch_at_startup;
                 self.cfg = cfg;
-                if hotkey_changed {
-                    self.register_hotkey();
+                if hotkeys_changed {
+                    self.register_hotkeys();
                 }
                 if startup_changed {
                     self.sync_autostart();
@@ -128,32 +141,53 @@ impl App {
         }
     }
 
-    fn toggle(&mut self) {
+    /// A hotkey (or the tray menu) was used: start picking, or stop what's running.
+    fn toggle(&mut self, shot: bool) {
         match &self.state {
-            State::Idle => self.start_selection(),
+            State::Idle => self.start_selection(shot),
             State::Selecting(h) => overlay::cancel(*h),
-            State::Recording { .. } => self.stop_recording(false),
-            State::Stopping { .. } => {}
+            State::Recording { .. } if !shot => self.stop_recording(false),
+            State::Recording { .. } | State::Stopping { .. } => {}
         }
     }
 
-    fn start_selection(&mut self) {
+    fn start_selection(&mut self, shot: bool) {
         self.reload();
         let outputs = match monitors::enumerate() {
             Ok(o) if !o.is_empty() => o,
             Ok(_) => return self.notify("glint", "No monitors found.", true, ClickTarget::None),
             Err(e) => return self.notify("glint: can't list monitors", &e.message(), true, ClickTarget::None),
         };
-        match overlay::open(self.hwnd, WM_APP_SELECTION, outputs, self.cfg.codec.codec().min_size()) {
+        let purpose = if shot { Purpose::Shot } else { Purpose::Record { min: self.cfg.codec.codec().min_size() } };
+        match overlay::open(self.hwnd, WM_APP_SELECTION, outputs, purpose) {
             Ok(h) => self.state = State::Selecting(h),
             Err(e) => self.notify("glint: can't open the selection overlay", &e, true, ClickTarget::Log),
         }
     }
 
-    fn on_selection(&mut self, sel: Option<Selection>) {
+    /// A new file in the output folder named by the settings' pattern, never overwriting.
+    fn unique_path(&self, ext: &str) -> PathBuf {
+        let dir = self.cfg.output_dir();
+        let (date, time) = date_time();
+        let stem = self.cfg.file_stem(&date, &time);
+        let mut path = dir.join(format!("{stem}.{ext}"));
+        for n in 2.. {
+            if !path.exists() {
+                break;
+            }
+            path = dir.join(format!("{stem}_{n}.{ext}"));
+        }
+        path
+    }
+
+    fn on_selection(&mut self, picked: Option<Picked>) {
         let State::Selecting(picker) = std::mem::replace(&mut self.state, State::Idle) else { return };
-        let sel = match sel {
-            Some(sel) if !self.exiting => sel,
+        let sel = match picked {
+            Some(Picked::Region(sel)) if !self.exiting => sel,
+            Some(Picked::Shot(shot)) if !self.exiting => {
+                overlay::dismiss(picker);
+                return self.finish_shot(shot);
+            }
             _ => return overlay::dismiss(picker),
         };
         let out = &sel.output;
@@ -161,16 +195,7 @@ impl App {
             0 => out.refresh_hz,
             cap => (cap as f64).min(out.refresh_hz),
         };
-        let dir = self.cfg.output_dir();
-        let (date, time) = date_time();
-        let stem = self.cfg.file_stem(&date, &time);
-        let mut path = dir.join(format!("{stem}.mp4"));
-        for n in 2.. {
-            if !path.exists() {
-                break;
-            }
-            path = dir.join(format!("{stem}_{n}.mp4"));
-        }
+        let path = self.unique_path("mp4");
         let params = Params {
             adapter_idx: out.adapter_idx,
             output_idx: out.output_idx,
@@ -205,6 +230,53 @@ impl App {
                 log(&format!("start failed: {e}"));
                 self.notify("glint: couldn't start recording", &e, true, ClickTarget::Log);
             }
+        }
+    }
+
+    /// Copies and / or saves a finished screenshot, as the editor's button or the settings say.
+    fn finish_shot(&mut self, shot: Shot) {
+        let (copy, save) = match shot.output {
+            // With both switched off in the settings, Enter still has to do something.
+            Output::Default if !self.cfg.screenshot_copy && !self.cfg.screenshot_save => (true, false),
+            Output::Default => (self.cfg.screenshot_copy, self.cfg.screenshot_save),
+            Output::Copy => (true, false),
+            Output::Save => (false, true),
+        };
+        let size = format!("{}×{}", shot.w, shot.h);
+        let mut errors = Vec::new();
+        if copy && let Err(e) = shot_out::copy_to_clipboard(Some(self.hwnd), &shot.pixels, shot.w, shot.h) {
+            errors.push(format!("couldn't copy: {e}"));
+        }
+        let mut saved = None;
+        if save {
+            let format = match self.cfg.screenshot_format {
+                ShotFormat::Png => ImageFormat::Png,
+                ShotFormat::Jpg => ImageFormat::Jpg,
+            };
+            let path = self.unique_path(format.extension());
+            let written = shot_out::encode(&shot.pixels, shot.w, shot.h, format, self.cfg.screenshot_quality as u8)
+                .and_then(|bytes| {
+                    let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
+                    std::fs::write(&path, &bytes).map(|_| bytes.len()).map_err(|e| format!("{}: {e}", path.display()))
+                });
+            match written {
+                Ok(bytes) => saved = Some((path, bytes)),
+                Err(e) => errors.push(format!("couldn't save: {e}")),
+            }
+        }
+        if !errors.is_empty() {
+            let text = errors.join("\n");
+            log(&format!("screenshot: {text}"));
+            return self.notify("glint: screenshot failed", &text, true, ClickTarget::Log);
+        }
+        match saved {
+            Some((path, bytes)) => {
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let title = if copy { "Screenshot copied and saved" } else { "Screenshot saved" };
+                let text = format!("{name}\n{} · {size}", human_size(bytes as u64));
+                self.notify(title, &text, false, ClickTarget::File(path));
+            }
+            None => self.notify("Screenshot copied", &format!("{size}, ready to paste"), false, ClickTarget::None),
         }
     }
 
@@ -317,26 +389,28 @@ fn open_settings() {
 }
 
 fn show_menu(hwnd: HWND) {
-    let Some((recording, busy, hotkey)) = with_app(|a| {
+    let Some((recording, busy, hotkey, shot_hotkey)) = with_app(|a| {
         let recording = matches!(a.state, State::Recording { .. });
         let busy = matches!(a.state, State::Stopping { .. } | State::Selecting(_));
-        (recording, busy, a.hotkey.clone())
+        (recording, busy, a.hotkey.clone(), a.shot_hotkey.clone())
     }) else {
         return;
     };
-    let label = match (recording, hotkey) {
-        (true, Some(h)) => format!("Stop recording\t{h}"),
-        (true, None) => "Stop recording".to_string(),
-        (false, Some(h)) => format!("Record region\t{h}"),
-        (false, None) => "Record region".to_string(),
+    let with_key = |text: &str, key: Option<String>| match key {
+        Some(k) => format!("{text}\t{k}"),
+        None => text.to_string(),
     };
+    let label = with_key(if recording { "Stop recording" } else { "Record region" }, hotkey);
+    let shot_label = with_key("Take screenshot", shot_hotkey);
     let cmd = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        let label = wide(&label);
+        let (label, shot_label) = (wide(&label), wide(&shot_label));
         let flags = if busy { MF_STRING | MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(menu, flags, ID_RECORD, PCWSTR(label.as_ptr()));
+        let shot_flags = if busy || recording { MF_STRING | MF_GRAYED } else { MF_STRING };
+        let _ = AppendMenuW(menu, shot_flags, ID_SHOT, PCWSTR(shot_label.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open recordings folder"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open output folder"));
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings…"));
         let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -351,7 +425,10 @@ fn show_menu(hwnd: HWND) {
     };
     match cmd {
         ID_RECORD => {
-            with_app(|a| a.toggle());
+            with_app(|a| a.toggle(false));
+        }
+        ID_SHOT => {
+            with_app(|a| a.toggle(true));
         }
         ID_FOLDER => {
             if let Some(dir) = with_app(|a| a.cfg.output_dir()) {
@@ -370,8 +447,8 @@ fn show_menu(hwnd: HWND) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_HOTKEY if wp.0 as i32 == HOTKEY_ID => {
-            with_app(|a| a.toggle());
+        WM_HOTKEY if wp.0 as i32 == HOTKEY_ID || wp.0 as i32 == SHOT_HOTKEY_ID => {
+            with_app(|a| a.toggle(wp.0 as i32 == SHOT_HOTKEY_ID));
             return LRESULT(0);
         }
         // From the indicator pill: WPARAM 0 = stop and save, 1 = discard.
@@ -384,7 +461,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         ipc::WM_HOTKEY_PAUSE => {
-            with_app(|a| if wp.0 == 1 { a.pause_hotkey() } else { a.register_hotkey() });
+            with_app(|a| if wp.0 == 1 { a.pause_hotkeys() } else { a.register_hotkeys() });
             return LRESULT(0);
         }
         WM_APP_TRAY => {
@@ -402,7 +479,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_APP_SELECTION | WM_APP_DONE => {
             let handled = with_app(|a| unsafe {
                 if msg == WM_APP_SELECTION {
-                    a.on_selection(*Box::from_raw(lp.0 as *mut Option<Selection>));
+                    a.on_selection(*Box::from_raw(lp.0 as *mut Option<Picked>));
                 } else {
                     a.on_done(*Box::from_raw(lp.0 as *mut Result<Outcome, String>));
                 }
@@ -495,25 +572,29 @@ fn main() {
             hwnd,
             cfg,
             hotkey: None,
+            shot_hotkey: None,
             state: State::Idle,
             tray: Tray::new(hwnd, WM_APP_TRAY),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             click: ClickTarget::None,
             exiting: false,
         };
-        app.register_hotkey();
+        app.register_hotkeys();
         let autostarted = std::env::args().any(|a| a == autostart::ARG);
         match cfg_err {
             Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
             None => {
                 app.sync_autostart(); // keeps the entry pointing at this exe
                 if app.hotkey.is_some() && !autostarted {
-                    let text = format!("Press {} to record a region. Tray icon → settings.", app.cfg.hotkey);
+                    let text = format!(
+                        "{} records a region, {} takes a screenshot. Tray icon → settings.",
+                        app.cfg.hotkey, app.cfg.screenshot_hotkey
+                    );
                     app.notify("glint is running", &text, false, ClickTarget::None);
                 }
             }
         }
-        log(&format!("started, hotkey {:?}", app.hotkey));
+        log(&format!("started, hotkeys record {:?}, screenshot {:?}", app.hotkey, app.shot_hotkey));
         APP.with(|a| *a.borrow_mut() = Some(app));
 
         let mut msg = MSG::default();

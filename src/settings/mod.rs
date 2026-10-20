@@ -32,7 +32,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 
 use crate::config::{
-    CodecName, Config, DEFAULT_FILE_NAME, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, file_name_problem, hotkey_string,
+    CodecName, Config, DEFAULT_FILE_NAME, MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, ShotFormat, file_name_problem,
+    hotkey_string, parse_hotkey,
 };
 use crate::ipc::{self, SETTINGS_TITLE, WM_HOTKEY_PAUSE, WM_RELOAD};
 use crate::tray::icon_pixels;
@@ -85,6 +86,7 @@ pub fn run() {
         cfg,
         error: load_error,
         listening: None,
+        listen_for: HotkeyField::Record,
         hotkey_error: None,
         section: Section::General,
         dialog: None,
@@ -108,17 +110,50 @@ pub fn run() {
 enum Section {
     General,
     Recording,
+    Screenshots,
     Output,
     About,
 }
 
-const SECTIONS: [Section; 4] = [Section::General, Section::Recording, Section::Output, Section::About];
+const SECTIONS: [Section; 5] =
+    [Section::General, Section::Recording, Section::Screenshots, Section::Output, Section::About];
+
+/// The two hotkeys the general section edits.
+#[derive(Clone, Copy, PartialEq)]
+enum HotkeyField {
+    Record,
+    Screenshot,
+}
+
+impl HotkeyField {
+    fn name(self) -> &'static str {
+        match self {
+            HotkeyField::Record => "record",
+            HotkeyField::Screenshot => "screenshot",
+        }
+    }
+
+    fn other(self) -> HotkeyField {
+        match self {
+            HotkeyField::Record => HotkeyField::Screenshot,
+            HotkeyField::Screenshot => HotkeyField::Record,
+        }
+    }
+
+    fn of(self, cfg: &mut Config) -> &mut String {
+        match self {
+            HotkeyField::Record => &mut cfg.hotkey,
+            HotkeyField::Screenshot => &mut cfg.screenshot_hotkey,
+        }
+    }
+}
 
 impl Section {
     fn name(self) -> &'static str {
         match self {
             Section::General => "general",
             Section::Recording => "recording",
+            Section::Screenshots => "screenshots",
             Section::Output => "output",
             Section::About => "about",
         }
@@ -128,13 +163,23 @@ impl Section {
     fn changes(self, a: &Config, b: &Config) -> usize {
         let n = |same: bool| usize::from(!same);
         match self {
-            Section::General => n(a.hotkey == b.hotkey) + n(a.launch_at_startup == b.launch_at_startup),
+            Section::General => {
+                n(a.hotkey == b.hotkey)
+                    + n(a.screenshot_hotkey == b.screenshot_hotkey)
+                    + n(a.launch_at_startup == b.launch_at_startup)
+            }
             Section::Recording => {
                 n(a.fps == b.fps)
                     + n(a.codec == b.codec)
                     + n(a.quality == b.quality)
                     + n(a.effort == b.effort)
                     + n(a.draw_cursor == b.draw_cursor)
+            }
+            Section::Screenshots => {
+                n(a.screenshot_format == b.screenshot_format)
+                    + n(a.screenshot_quality == b.screenshot_quality)
+                    + n(a.screenshot_copy == b.screenshot_copy)
+                    + n(a.screenshot_save == b.screenshot_save)
             }
             Section::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
             Section::About => 0,
@@ -147,6 +192,7 @@ impl Section {
         match self {
             Section::General => {
                 cfg.hotkey = d.hotkey;
+                cfg.screenshot_hotkey = d.screenshot_hotkey;
                 cfg.launch_at_startup = d.launch_at_startup;
             }
             Section::Recording => {
@@ -155,6 +201,12 @@ impl Section {
                 cfg.quality = d.quality;
                 cfg.effort = d.effort;
                 cfg.draw_cursor = d.draw_cursor;
+            }
+            Section::Screenshots => {
+                cfg.screenshot_format = d.screenshot_format;
+                cfg.screenshot_quality = d.screenshot_quality;
+                cfg.screenshot_copy = d.screenshot_copy;
+                cfg.screenshot_save = d.screenshot_save;
             }
             Section::Output => {
                 cfg.output_dir = d.output_dir;
@@ -178,8 +230,9 @@ struct SettingsApp {
     /// What is being edited.
     cfg: Config,
     error: Option<String>,
-    /// The keyboard hook's thread while a new hotkey is being recorded.
+    /// The keyboard hook's thread while a new hotkey is being recorded, and for which field.
     listening: Option<Listener>,
+    listen_for: HotkeyField,
     /// Keys and reason of the last combo that can't be used; listening goes on.
     hotkey_error: Option<(Vec<String>, String)>,
     section: Section,
@@ -346,10 +399,11 @@ impl Listener {
 }
 
 impl SettingsApp {
-    fn start_listening(&mut self) {
+    fn start_listening(&mut self, field: HotkeyField) {
         if self.listening.is_some() {
             return;
         }
+        self.listen_for = field;
         HELD.store(0, Ordering::SeqCst);
         *CAPTURED.lock().unwrap() = None;
         self.hotkey_error = None;
@@ -400,8 +454,14 @@ impl SettingsApp {
             self.hotkey_error = Some((keys, msg));
             return;
         }
+        let other = self.listen_for.other();
+        if parse_hotkey(other.of(&mut self.cfg)).is_ok_and(|combo| combo == (mods, vk)) {
+            let msg = format!("{} is already the {} hotkey.", keys.join(" + "), other.name());
+            self.hotkey_error = Some((keys, msg));
+            return;
+        }
         self.stop_listening();
-        self.cfg.hotkey = text;
+        *self.listen_for.of(&mut self.cfg) = text;
     }
 
     fn changes(&self) -> usize {
@@ -543,6 +603,15 @@ fn quality_word(q: u32) -> &'static str {
     }
 }
 
+fn shot_quality_word(q: u32) -> &'static str {
+    match q {
+        95.. => "near lossless",
+        85..=94 => "high",
+        70..=84 => "good",
+        _ => "small files",
+    }
+}
+
 fn effort_word(e: u32) -> &'static str {
     match e {
         0..=24 => "fastest, least gpu load",
@@ -622,6 +691,7 @@ impl eframe::App for SettingsApp {
         match self.section {
             Section::General => self.general(&mut content, &look),
             Section::Recording => self.recording(&mut content, &look),
+            Section::Screenshots => self.screenshots(&mut content, &look),
             Section::Output => self.output(&mut content, &look),
             Section::About => self.about(&mut content, &look),
         }
@@ -640,24 +710,34 @@ impl eframe::App for SettingsApp {
 }
 
 impl SettingsApp {
-    fn general(&mut self, ui: &mut Ui, look: &Look) {
-        let keys = key_names(&self.cfg.hotkey);
+    /// One hotkey row: the field, and the reason the last combo can't be used.
+    fn hotkey_row(&mut self, ui: &mut Ui, look: &Look, label: &str, field: HotkeyField) {
+        let keys = key_names(field.of(&mut self.cfg));
         let held = held_names();
-        let state = match (&self.listening, &self.hotkey_error) {
-            (Some(_), Some((keys, _))) => HotkeyState::Error { keys },
-            (Some(_), None) => HotkeyState::Listening { held: &held },
+        let mine = self.listening.is_some() && self.listen_for == field;
+        let state = match (mine, &self.hotkey_error) {
+            (true, Some((keys, _))) => HotkeyState::Error { keys },
+            (true, None) => HotkeyState::Listening { held: &held },
             _ => HotkeyState::Idle,
         };
         let mut clicked = false;
-        row(ui, look, "record hotkey", 7.0, |ui| {
+        row(ui, look, label, 7.0, |ui| {
             clicked = widgets::hotkey_field(ui, look, &keys, state).clicked();
-            if let Some((_, msg)) = &self.hotkey_error {
+            if let Some((_, msg)) = self.hotkey_error.as_ref().filter(|_| mine) {
                 hint(ui, msg.clone(), look.p.warn);
             }
         });
         if clicked {
-            if self.listening.is_some() { self.stop_listening() } else { self.start_listening() }
+            self.stop_listening();
+            if !mine {
+                self.start_listening(field);
+            }
         }
+    }
+
+    fn general(&mut self, ui: &mut Ui, look: &Look) {
+        self.hotkey_row(ui, look, "record hotkey", HotkeyField::Record);
+        self.hotkey_row(ui, look, "screenshot hotkey", HotkeyField::Screenshot);
         row(ui, look, "launch at startup", 1.0, |ui| {
             let text = if self.cfg.launch_at_startup { "on" } else { "off" };
             widgets::toggle(ui, look, &mut self.cfg.launch_at_startup, text);
@@ -701,6 +781,40 @@ impl SettingsApp {
         });
     }
 
+    fn screenshots(&mut self, ui: &mut Ui, look: &Look) {
+        let p = look.p;
+        row(ui, look, "format", 7.0, |ui| {
+            let formats = [(ShotFormat::Png, "png"), (ShotFormat::Jpg, "jpg")];
+            widgets::segmented(ui, look, &mut self.cfg.screenshot_format, &formats, Some(168.0));
+            hint(ui, "png — lossless · jpg — smaller files", p.t3);
+        });
+        // The quality row only matters for jpg; it fades in and out with the choice.
+        let jpg = self.cfg.screenshot_format == ShotFormat::Jpg;
+        let shown = widgets::glide(ui, Id::unique("jpg-quality"), if jpg { 1.0 } else { 0.0 }, 0.12);
+        if shown > 0.0 {
+            ui.scope(|ui| {
+                ui.multiply_opacity(shown);
+                row(ui, look, "quality", 0.0, |ui| {
+                    let word = shot_quality_word(self.cfg.screenshot_quality);
+                    let q = &mut self.cfg.screenshot_quality;
+                    widgets::slider(ui, look, q, 50..=100, word, "50 ← smaller", "sharper → 100");
+                });
+            });
+        }
+        row(ui, look, "after capture", 1.0, |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            widgets::checkbox(ui, look, &mut self.cfg.screenshot_copy, "copy to clipboard");
+            widgets::checkbox(ui, look, &mut self.cfg.screenshot_save, "save to the output folder");
+            if !self.cfg.screenshot_copy && !self.cfg.screenshot_save {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                hint(ui, "with both off, enter still copies", p.warn);
+            }
+        });
+        row(ui, look, "in the editor", 0.0, |ui| {
+            hint(ui, "enter does the above · ctrl+c copies · ctrl+s saves · esc cancels", p.t3);
+        });
+    }
+
     fn output(&mut self, ui: &mut Ui, look: &Look) {
         let p = look.p;
         let default_dir = Config { output_dir: String::new(), ..Config::default() }.output_dir();
@@ -721,7 +835,7 @@ impl SettingsApp {
                 }
             });
             ui.add_space(2.0);
-            hint(ui, "recordings are saved here. leave empty for the default.", p.t3);
+            hint(ui, "recordings and screenshots are saved here. leave empty for the default.", p.t3);
         });
         let problem = file_name_problem(&self.cfg.file_name);
         row(ui, look, "file names", 7.0, |ui| {

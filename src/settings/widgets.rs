@@ -528,6 +528,34 @@ pub fn segmented<T: Copy + PartialEq>(
     resp
 }
 
+/// 16 px box with a white check when on, `text` beside it; the whole line is clickable.
+pub fn checkbox(ui: &mut Ui, look: &Look, on: &mut bool, text: &str) -> Response {
+    let p = &look.p;
+    let g = galley(ui, text, sans(13.0));
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(26.0 + g.size().x, 18.0), Sense::click());
+    if resp.clicked() {
+        *on = !*on;
+        resp.mark_changed();
+    }
+    let t = anim(ui, resp.id, *on, 0.08);
+    let h = anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
+    let bx = Rect::from_min_size(pos2(rect.left(), rect.center().y - 8.0), vec2(16.0, 16.0));
+    let painter = ui.painter();
+    painter.rect(bx, 3, mix(p.field, p.acc, t), Stroke::new(1.0, p.line3.gamma_multiply(1.0 - t)), StrokeKind::Inside);
+    painter.rect_filled(bx, 3, p.hov.gamma_multiply(h));
+    if t > 0.0 {
+        let check = vec![
+            pos2(bx.left() + 4.0, bx.center().y + 0.5),
+            pos2(bx.left() + 7.0, bx.bottom() - 4.5),
+            pos2(bx.right() - 3.5, bx.top() + 4.5),
+        ];
+        painter.add(Shape::line(check, Stroke::new(2.0, Color32::WHITE.gamma_multiply(t))));
+    }
+    painter.galley(pos2(bx.right() + 10.0, rect.center().y - g.size().y / 2.0), g, p.t1);
+    focus_ring(ui, look, &resp, bx, 3.0);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// 36 x 20 switch with `text` beside it.
 pub fn toggle(ui: &mut Ui, look: &Look, on: &mut bool, text: &str) -> Response {
     let p = &look.p;
