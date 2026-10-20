@@ -13,14 +13,14 @@ pub(super) enum Tool {
     Pixelate,
 }
 
-/// Tools with their tooltip and shortcut key.
+/// Tools with their tooltip and letter key; digits 1-6 follow this order.
 pub(super) const TOOLS: [(Tool, &str, u8); 6] = [
-    (Tool::Pen, "pen  ·  P", b'P'),
-    (Tool::Highlighter, "highlighter  ·  H", b'H'),
-    (Tool::Arrow, "arrow  ·  A", b'A'),
-    (Tool::Rectangle, "rectangle  ·  R", b'R'),
-    (Tool::Blur, "blur  ·  B", b'B'),
-    (Tool::Pixelate, "pixelate  ·  X", b'X'),
+    (Tool::Pen, "pen  ·  1 / P", b'P'),
+    (Tool::Highlighter, "highlighter  ·  2 / H", b'H'),
+    (Tool::Arrow, "arrow  ·  3 / A", b'A'),
+    (Tool::Rectangle, "rectangle  ·  4 / R", b'R'),
+    (Tool::Blur, "blur  ·  5 / B", b'B'),
+    (Tool::Pixelate, "pixelate  ·  6 / X", b'X'),
 ];
 
 pub(super) struct Strength {

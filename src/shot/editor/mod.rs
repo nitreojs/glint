@@ -645,8 +645,8 @@ impl Editor {
             (VK_DELETE | VK_BACK, false) => self.delete(),
             (VK_OEM_4, false) => self.nudge(-1),
             (VK_OEM_6, false) => self.nudge(1),
-            (_, false) => match TOOLS.iter().find(|(.., key)| *key as u32 == vk) {
-                Some((tool, ..)) => self.activate(Item::Tool(*tool)),
+            (_, false) => match TOOLS.iter().enumerate().find(|(i, (.., key))| tool_key(vk, *i, *key)) {
+                Some((_, (tool, ..))) => self.activate(Item::Tool(*tool)),
                 None => Event::None,
             },
             _ => Event::None,
@@ -674,6 +674,13 @@ impl Editor {
         self.notice = None;
         Event::Repaint
     }
+}
+
+fn tool_key(vk: u32, index: usize, letter: u8) -> bool {
+    const VK_0: u32 = 0x30;
+    const VK_NUMPAD0: u32 = 0x60;
+    let digit = index as u32 + 1;
+    vk == letter as u32 || vk == VK_0 + digit || vk == VK_NUMPAD0 + digit
 }
 
 #[cfg(test)]
