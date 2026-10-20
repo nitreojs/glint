@@ -113,31 +113,80 @@ fn gdi_refresh(device: &str) -> f64 {
 pub const MIN_W: i32 = 160;
 pub const MIN_H: i32 = 64;
 
-/// Maps a desktop-space selection onto one output: picks the output with the largest
-/// overlap, clips to it, grows tiny selections to the encoder minimum and rounds the size
-/// down to even numbers (required by 4:2:0 video).
-pub fn fit_selection(sel: Rect, outputs: &[Output]) -> Option<(Rect, usize)> {
-    let (idx, clipped) = outputs
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| o.rect.intersect(&sel).map(|r| (i, r)))
-        .max_by_key(|(_, r)| r.area())?;
+/// Maps a drag from `anchor` to `cursor` (desktop coordinates) onto one output: the output
+/// under the anchor (or, failing that, the one overlapping the drag most), clipped to it.
+/// Tiny selections grow to the encoder minimum *away from the anchor* and odd sizes lose
+/// their last pixel on the cursor side, so the corner where the drag started never moves.
+pub fn fit_drag(anchor: (i32, i32), cursor: (i32, i32), outputs: &[Output]) -> Option<(Rect, usize)> {
+    let raw = Rect::from_points(anchor.0, anchor.1, cursor.0, cursor.1);
+    let idx = output_at(outputs, anchor.0, anchor.1).or_else(|| {
+        let overlap = |o: &Output| o.rect.intersect(&raw).map_or(0, |r| r.area());
+        outputs.iter().enumerate().filter(|(_, o)| overlap(o) > 0).max_by_key(|(_, o)| overlap(o)).map(|(i, _)| i)
+    })?;
     let mon = outputs[idx].rect;
-    let mut r = clipped;
-    for (pos, len, min, lo, hi) in [
-        (&mut r.x, &mut r.w, MIN_W, mon.x, mon.right()),
-        (&mut r.y, &mut r.h, MIN_H, mon.y, mon.bottom()),
-    ] {
-        if *len < min {
-            let c = *pos + *len / 2;
-            *len = min.min(hi - lo);
-            *pos = (c - *len / 2).clamp(lo, hi - *len);
+    let axis = |a: i32, c: i32, lo: i32, hi: i32, min: i32| -> (i32, i32) {
+        let (a, c) = (a.clamp(lo, hi), c.clamp(lo, hi));
+        let len = ((c - a).abs().max(min.min(hi - lo))) & !1;
+        if c >= a {
+            let start = a.min(hi - len); // pushed back only when the monitor edge forces it
+            (start, len)
+        } else {
+            let end = a.max(lo + len);
+            (end - len, len)
         }
-        *len &= !1;
-    }
-    Some((r, idx))
+    };
+    let (x, w) = axis(anchor.0, cursor.0, mon.x, mon.right(), MIN_W);
+    let (y, h) = axis(anchor.1, cursor.1, mon.y, mon.bottom(), MIN_H);
+    Some((Rect { x, y, w, h }, idx))
 }
 
 pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
     outputs.iter().position(|o| o.rect.contains(x, y))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn output(x: i32, y: i32, w: i32, h: i32) -> Output {
+        Output {
+            adapter_idx: 0,
+            output_idx: 0,
+            device_name: String::new(),
+            rect: Rect { x, y, w, h },
+            refresh_hz: 144.0,
+            rotated: false,
+        }
+    }
+
+    #[test]
+    fn tiny_drags_grow_away_from_the_anchor() {
+        let outs = [output(0, 0, 3440, 1440)];
+        // A few pixels above the start point: the bottom edge stays at the anchor.
+        let (r, _) = fit_drag((500, 400), (530, 390), &outs).unwrap();
+        assert_eq!((r.x, r.bottom(), r.w, r.h), (500, 400, MIN_W, MIN_H));
+        // Moving further up (still under the minimum) must not move the box at all.
+        let (r2, _) = fit_drag((500, 400), (530, 350), &outs).unwrap();
+        assert_eq!(r2, r);
+        // Down-right: the top-left corner stays at the anchor.
+        let (r, _) = fit_drag((500, 400), (510, 410), &outs).unwrap();
+        assert_eq!((r.x, r.y, r.w, r.h), (500, 400, MIN_W, MIN_H));
+    }
+
+    #[test]
+    fn odd_sizes_trim_the_cursor_side() {
+        let outs = [output(0, 0, 3440, 1440)];
+        let (r, _) = fit_drag((1000, 800), (499, 299), &outs).unwrap(); // up-left, 501 x 501
+        assert_eq!((r.right(), r.bottom(), r.w, r.h), (1000, 800, 500, 500));
+    }
+
+    #[test]
+    fn growth_is_pushed_inside_the_monitor_and_stays_on_the_anchor_monitor() {
+        let outs = [output(-1920, 540, 1920, 1080), output(0, 0, 3440, 1440)];
+        let (r, i) = fit_drag((3430, 1435), (3436, 1438), &outs).unwrap();
+        assert_eq!((i, r.right(), r.bottom(), r.w, r.h), (1, 3440, 1440, MIN_W, MIN_H));
+        // A drag that starts on the right monitor and crosses into the left one is clipped to the right one.
+        let (r, i) = fit_drag((300, 600), (-500, 900), &outs).unwrap();
+        assert_eq!((i, r.x, r.right()), (1, 0, 300));
+    }
 }

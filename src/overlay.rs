@@ -19,7 +19,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, w};
 
 use crate::gfx::{Dib, Painter, animate, rgba};
-use crate::monitors::{Output, fit_selection, output_at};
+use crate::monitors::{Output, fit_drag, output_at};
 use crate::util::Rect;
 
 #[derive(Clone, Debug)]
@@ -253,17 +253,14 @@ fn ring(outer: Rect, inner: Rect) -> [RECT; 4] {
 }
 
 impl State {
-    fn to_desktop(&self, r: Rect) -> Rect {
-        r.offset(self.origin.0, self.origin.1)
-    }
     fn to_client(&self, r: Rect) -> Rect {
         r.offset(-self.origin.0, -self.origin.1)
     }
 
     /// The selection that would be recorded for a drag from `a` to `b` (client coords).
     fn fitted(&self, a: (i32, i32), b: (i32, i32)) -> Option<(Rect, usize)> {
-        let raw = self.to_desktop(Rect::from_points(a.0, a.1, b.0, b.1));
-        fit_selection(raw, &self.outputs)
+        let (ox, oy) = self.origin;
+        fit_drag((a.0 + ox, a.1 + oy), (b.0 + ox, b.1 + oy), &self.outputs)
     }
 
     /// Replaces the selection and, if `label` is Some, the label; invalidates exactly the
@@ -342,7 +339,10 @@ impl State {
         let click = (end.0 - start.0).abs() < CLICK_SLOP && (end.1 - start.1).abs() < CLICK_SLOP;
         let fitted = if click {
             let (dx, dy) = (end.0 + self.origin.0, end.1 + self.origin.1);
-            output_at(&self.outputs, dx, dy).and_then(|i| fit_selection(self.outputs[i].rect, &self.outputs))
+            output_at(&self.outputs, dx, dy).and_then(|i| {
+                let m = self.outputs[i].rect;
+                fit_drag((m.x, m.y), (m.right(), m.bottom()), &self.outputs)
+            })
         } else {
             self.fitted(start, end)
         };
