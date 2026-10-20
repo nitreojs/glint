@@ -1,3 +1,4 @@
+pub mod autostart;
 pub mod gfx;
 pub mod config;
 pub mod cursor;

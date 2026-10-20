@@ -8,8 +8,8 @@ use glint::config::{Config, parse_hotkey};
 use glint::overlay::{self, Selection};
 use glint::recorder::{Outcome, Params, Recorder};
 use glint::tray::Tray;
-use glint::util::{human_duration, human_size, log, log_path, timestamp, wide};
-use glint::{ipc, monitors};
+use glint::util::{date_time, human_duration, human_size, log, log_path, wide};
+use glint::{autostart, ipc, monitors};
 
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -109,12 +109,22 @@ impl App {
         match Config::load() {
             Ok(cfg) => {
                 let hotkey_changed = self.hotkey.as_deref() != Some(cfg.hotkey.as_str());
+                let startup_changed = self.cfg.launch_at_startup != cfg.launch_at_startup;
                 self.cfg = cfg;
                 if hotkey_changed {
                     self.register_hotkey();
                 }
+                if startup_changed {
+                    self.sync_autostart();
+                }
             }
             Err(e) => self.notify("glint: settings error", &e, true, ClickTarget::None),
+        }
+    }
+
+    fn sync_autostart(&mut self) {
+        if let Err(e) = autostart::sync(self.cfg.launch_at_startup) {
+            self.notify("glint: launch at startup", &e, true, ClickTarget::None);
         }
     }
 
@@ -152,13 +162,14 @@ impl App {
             cap => (cap as f64).min(out.refresh_hz),
         };
         let dir = self.cfg.output_dir();
-        let stamp = timestamp();
-        let mut path = dir.join(format!("glint_{stamp}.mp4"));
+        let (date, time) = date_time();
+        let stem = self.cfg.file_stem(&date, &time);
+        let mut path = dir.join(format!("{stem}.mp4"));
         for n in 2.. {
             if !path.exists() {
                 break;
             }
-            path = dir.join(format!("glint_{stamp}_{n}.mp4"));
+            path = dir.join(format!("{stem}_{n}.mp4"));
         }
         let params = Params {
             adapter_idx: out.adapter_idx,
@@ -487,13 +498,16 @@ fn main() {
             exiting: false,
         };
         app.register_hotkey();
+        let autostarted = std::env::args().any(|a| a == autostart::ARG);
         match cfg_err {
             Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
-            None if app.hotkey.is_some() => {
-                let text = format!("Press {} to record a region. Tray icon → settings.", app.cfg.hotkey);
-                app.notify("glint is running", &text, false, ClickTarget::None);
+            None => {
+                app.sync_autostart(); // keeps the entry pointing at this exe
+                if app.hotkey.is_some() && !autostarted {
+                    let text = format!("Press {} to record a region. Tray icon → settings.", app.cfg.hotkey);
+                    app.notify("glint is running", &text, false, ClickTarget::None);
+                }
             }
-            None => {}
         }
         log(&format!("started, hotkey {:?}", app.hotkey));
         APP.with(|a| *a.borrow_mut() = Some(app));

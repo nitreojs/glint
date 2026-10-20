@@ -9,13 +9,20 @@ use crate::util::{app_dir, videos_dir};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub hotkey: String,
+    pub launch_at_startup: bool,
     pub output_dir: String,
+    /// File name pattern without the extension; see [`Config::file_stem`].
+    pub file_name: String,
     pub fps: u32,
     pub codec: CodecName,
     pub quality: u32,
     pub effort: u32,
     pub draw_cursor: bool,
 }
+
+pub const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
+/// Characters Windows doesn't allow in file names.
+pub const BAD_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -37,7 +44,9 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             hotkey: "Ctrl+Alt+PrintScreen".into(),
+            launch_at_startup: false,
             output_dir: String::new(),
+            file_name: DEFAULT_FILE_NAME.into(),
             fps: 0,
             codec: CodecName::H264,
             quality: 22,
@@ -63,6 +72,9 @@ impl Config {
         parse_hotkey(&cfg.hotkey)?;
         if cfg.quality > 51 {
             return Err(format!("quality must be 0-51, got {}", cfg.quality));
+        }
+        if let Some(problem) = file_name_problem(&cfg.file_name) {
+            return Err(format!("file_name {}: {problem}", toml::Value::String(cfg.file_name.clone())));
         }
         Ok(cfg)
     }
@@ -92,8 +104,15 @@ impl Config {
 # Right, Num0-Num9.
 hotkey = {hotkey}
 
+# Start glint (in the tray) when you sign in to Windows.
+launch_at_startup = {launch_at_startup}
+
 # Folder for recordings. Empty = <Videos>\glint
 output_dir = {output_dir}
+
+# File names, without the extension. {{date}} becomes 2026-10-20 and {{time}} 14-32-07
+# (local time); a number is appended if the file already exists.
+file_name = {file_name}
 
 # Frame rate cap. 0 = the native refresh rate of the monitor being recorded.
 fps = {fps}
@@ -113,7 +132,9 @@ effort = {effort}
 draw_cursor = {draw_cursor}
 "#,
             hotkey = q(&self.hotkey),
+            launch_at_startup = self.launch_at_startup,
             output_dir = q(&self.output_dir),
+            file_name = q(&self.file_name),
             fps = self.fps,
             quality = self.quality,
             effort = self.effort,
@@ -128,6 +149,20 @@ draw_cursor = {draw_cursor}
             PathBuf::from(self.output_dir.trim())
         }
     }
+
+    /// File name (without extension) for a capture made at `date` / `time`.
+    pub fn file_stem(&self, date: &str, time: &str) -> String {
+        let pattern = match self.file_name.trim() {
+            "" => DEFAULT_FILE_NAME,
+            p => p,
+        };
+        pattern.replace("{date}", date).replace("{time}", time).trim_end_matches(['.', ' ']).to_string()
+    }
+}
+
+/// Why `pattern` can't name files, if it can't.
+pub fn file_name_problem(pattern: &str) -> Option<&'static str> {
+    pattern.contains(BAD_NAME_CHARS).then_some("file names can't contain \\ / : * ? \" < > |")
 }
 
 pub const MOD_ALT: u32 = 0x1;
@@ -249,7 +284,9 @@ mod tests {
     fn saved_file_parses_back_to_the_same_settings() {
         let cfg = Config {
             hotkey: "Shift+Pause".into(),
+            launch_at_startup: true,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),
+            file_name: "clip {date} at {time}".into(),
             fps: 60,
             codec: CodecName::Hevc,
             quality: 18,
@@ -259,5 +296,16 @@ mod tests {
         let back: Config = toml::from_str(&cfg.render()).unwrap();
         assert_eq!(back, cfg);
         assert_eq!(toml::from_str::<Config>(&Config::default().render()).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn file_names_fill_in_the_pattern() {
+        let named = |pattern: &str| Config { file_name: pattern.into(), ..Config::default() };
+        assert_eq!(named(DEFAULT_FILE_NAME).file_stem("2026-10-20", "14-32-07"), "glint_2026-10-20_14-32-07");
+        assert_eq!(named("{time} {time}").file_stem("d", "t"), "t t");
+        // Empty means the default; trailing dots and spaces aren't valid at the end of a name.
+        assert_eq!(named("  ").file_stem("d", "t"), "glint_d_t");
+        assert_eq!(named("clip {date}. ").file_stem("d", "t"), "clip d");
+        assert!(file_name_problem("a/b").is_some() && file_name_problem("glint {date}").is_none());
     }
 }

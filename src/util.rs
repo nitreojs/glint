@@ -93,10 +93,16 @@ pub fn videos_dir() -> PathBuf {
     std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join("Videos")).unwrap_or_else(std::env::temp_dir)
 }
 
+/// Local date and time as (`YYYY-MM-DD`, `HH-MM-SS`).
+pub fn date_time() -> (String, String) {
+    let t = unsafe { GetLocalTime() };
+    (format!("{:04}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay), format!("{:02}-{:02}-{:02}", t.wHour, t.wMinute, t.wSecond))
+}
+
 /// Local time as `YYYY-MM-DD_HH-MM-SS`.
 pub fn timestamp() -> String {
-    let t = unsafe { GetLocalTime() };
-    format!("{:04}-{:02}-{:02}_{:02}-{:02}-{:02}", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond)
+    let (date, time) = date_time();
+    format!("{date}_{time}")
 }
 
 pub fn human_size(bytes: u64) -> String {
