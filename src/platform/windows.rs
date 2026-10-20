@@ -1,8 +1,9 @@
-use windows::Win32::Foundation::{HWND, LPARAM, RECT, TRUE};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GetClassNameW, GetLayeredWindowAttributes, GetWindowLongW, GetWindowRect, IsIconic,
-    IsWindowVisible, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
+    EnumWindows, GWL_EXSTYLE, GetClassNameW, GetClientRect, GetLayeredWindowAttributes, GetWindowLongW, GetWindowRect,
+    IsIconic, IsWindowVisible, LAYERED_WINDOW_ATTRIBUTES_FLAGS, LWA_ALPHA, WS_EX_LAYERED, WS_EX_TRANSPARENT,
 };
 use windows::core::{BOOL, w};
 
@@ -10,17 +11,29 @@ use super::rect::Rect;
 
 /// Visible top-level windows, topmost first, by their visible DWM frame (without the
 /// invisible resize borders). Taken together with the screenshot, so hovering matches it.
-pub(crate) fn visible_windows() -> Vec<Rect> {
+pub(crate) fn visible_windows() -> Vec<(HWND, Rect)> {
     unsafe extern "system" fn add(hwnd: HWND, lp: LPARAM) -> BOOL {
-        let list = unsafe { &mut *(lp.0 as *mut Vec<Rect>) };
-        list.extend(unsafe { window_rect(hwnd) });
+        let list = unsafe { &mut *(lp.0 as *mut Vec<(HWND, Rect)>) };
+        list.extend(unsafe { window_rect(hwnd) }.map(|r| (hwnd, r)));
         TRUE
     }
     let mut list = Vec::new();
     unsafe {
-        let _ = EnumWindows(Some(add), LPARAM(&mut list as *mut Vec<Rect> as isize));
+        let _ = EnumWindows(Some(add), LPARAM(&mut list as *mut Vec<(HWND, Rect)> as isize));
     }
     list
+}
+
+/// The client area of `hwnd` in screen coordinates, or None if it's empty.
+pub(crate) fn client_rect(hwnd: HWND) -> Option<Rect> {
+    let mut rc = RECT::default();
+    let mut origin = POINT::default();
+    unsafe {
+        GetClientRect(hwnd, &mut rc).ok()?;
+        ClientToScreen(hwnd, &mut origin).ok().ok()?;
+    }
+    let r = Rect::from_win(&rc).offset(origin.x, origin.y);
+    (r.w > 0 && r.h > 0).then_some(r)
 }
 
 /// Windows thinner than this (physical px) in either direction are never picked.

@@ -16,8 +16,10 @@ pub(crate) struct Config {
     pub hotkey: String,
     pub screenshot_hotkey: String,
     pub fullscreen_hotkey: String,
+    pub pause_hotkey: String,
     pub launch_at_startup: bool,
     pub freeze_screen: bool,
+    pub ui_elements: UiElements,
     pub notify_success: bool,
     pub output_dir: String,
     /// File name pattern without the extension; see [`Config::file_stem`].
@@ -27,11 +29,21 @@ pub(crate) struct Config {
     pub quality: u32,
     pub effort: u32,
     pub draw_cursor: bool,
+    pub audio_desktop: bool,
+    pub audio_mic: bool,
+    pub countdown: u32,
+    pub open_trimmer: bool,
+    pub screenshot_style: ShotStyle,
     pub screenshot_format: ShotFormat,
     /// JPG quality, 50-100.
     pub screenshot_quality: u32,
     pub screenshot_copy: bool,
     pub screenshot_save: bool,
+    pub screenshot_upload: bool,
+    pub upload_destination: String,
+    pub litterbox_expiry: Expiry,
+    pub upload_copy_link: bool,
+    pub recording_upload: bool,
 }
 
 pub(crate) const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
@@ -52,6 +64,55 @@ pub(crate) enum ShotFormat {
     Jpg,
 }
 
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ShotStyle {
+    Select,
+    Sharex,
+}
+
+/// When hovering picks UI elements inside windows instead of whole windows.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum UiElements {
+    Shift,
+    Always,
+    Off,
+}
+
+impl UiElements {
+    pub(crate) fn used(self, shift: bool) -> bool {
+        match self {
+            UiElements::Shift => shift,
+            UiElements::Always => true,
+            UiElements::Off => false,
+        }
+    }
+}
+
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Expiry {
+    #[serde(rename = "1h")]
+    Hour,
+    #[serde(rename = "12h")]
+    HalfDay,
+    #[serde(rename = "24h")]
+    Day,
+    #[serde(rename = "72h")]
+    ThreeDays,
+}
+
+impl Expiry {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Expiry::Hour => "1h",
+            Expiry::HalfDay => "12h",
+            Expiry::Day => "24h",
+            Expiry::ThreeDays => "72h",
+        }
+    }
+}
+
 impl CodecName {
     pub(crate) fn codec(self) -> Codec {
         match self {
@@ -67,8 +128,10 @@ impl Default for Config {
             hotkey: "Ctrl+Alt+PrintScreen".into(),
             screenshot_hotkey: "Ctrl+PrintScreen".into(),
             fullscreen_hotkey: "PrintScreen".into(),
+            pause_hotkey: "Pause".into(),
             launch_at_startup: false,
             freeze_screen: true,
+            ui_elements: UiElements::Shift,
             notify_success: true,
             output_dir: String::new(),
             file_name: DEFAULT_FILE_NAME.into(),
@@ -77,10 +140,20 @@ impl Default for Config {
             quality: 22,
             effort: 50,
             draw_cursor: true,
+            audio_desktop: false,
+            audio_mic: false,
+            countdown: 0,
+            open_trimmer: false,
+            screenshot_style: ShotStyle::Select,
             screenshot_format: ShotFormat::Png,
             screenshot_quality: 90,
             screenshot_copy: true,
             screenshot_save: true,
+            screenshot_upload: false,
+            upload_destination: "catbox".into(),
+            litterbox_expiry: Expiry::Day,
+            upload_copy_link: true,
+            recording_upload: false,
         }
     }
 }
@@ -102,6 +175,7 @@ impl Config {
             ("hotkey", &cfg.hotkey),
             ("screenshot_hotkey", &cfg.screenshot_hotkey),
             ("fullscreen_hotkey", &cfg.fullscreen_hotkey),
+            ("pause_hotkey", &cfg.pause_hotkey),
         ];
         let mut combos = Vec::with_capacity(hotkeys.len());
         for (name, combo) in hotkeys {
@@ -113,6 +187,9 @@ impl Config {
         }
         if cfg.quality > 51 {
             return Err(format!("quality must be 0-51, got {}", cfg.quality));
+        }
+        if cfg.countdown > 10 {
+            return Err(format!("countdown must be 0-10 seconds, got {}", cfg.countdown));
         }
         if !(50..=100).contains(&cfg.screenshot_quality) {
             return Err(format!("screenshot_quality must be 50-100, got {}", cfg.screenshot_quality));
@@ -142,6 +219,15 @@ impl Config {
             ShotFormat::Png => "png",
             ShotFormat::Jpg => "jpg",
         };
+        let style = match self.screenshot_style {
+            ShotStyle::Select => "select",
+            ShotStyle::Sharex => "sharex",
+        };
+        let ui_elements = match self.ui_elements {
+            UiElements::Shift => "shift",
+            UiElements::Always => "always",
+            UiElements::Off => "off",
+        };
         format!(
             r#"# glint settings. "Settings…" in the tray menu edits this file; hand edits apply the
 # next time a recording starts.
@@ -158,12 +244,20 @@ screenshot_hotkey = {screenshot_hotkey}
 # Screenshots every monitor at once, straight to the clipboard / folder, without selecting.
 fullscreen_hotkey = {fullscreen_hotkey}
 
+# Pauses and resumes a running recording (only held while recording).
+pause_hotkey = {pause_hotkey}
+
 # Start glint (in the tray) when you sign in to Windows.
 launch_at_startup = {launch_at_startup}
 
 # While selecting a region, show a still image of the screen (true) or the live screen,
 # dimmed (false).
 freeze_screen = {freeze_screen}
+
+# While selecting, highlight buttons, panels and other UI elements inside windows instead of
+# whole windows (the mouse wheel steps out to bigger parts): "shift" while Shift is held,
+# "always", or "off".
+ui_elements = "{ui_elements}"
 
 # Tray notifications after a screenshot or recording is saved (true), or only when
 # something goes wrong (false).
@@ -193,16 +287,45 @@ effort = {effort}
 
 draw_cursor = {draw_cursor}
 
+# Record the sound playing on the default output device, and/or the default microphone.
+# Both on = mixed into one track.
+audio_desktop = {audio_desktop}
+audio_mic = {audio_mic}
+
+# Seconds to count down after selecting a region before recording starts (0 = none).
+countdown = {countdown}
+
+# Open the trimmer (trim, export a gif) after every recording is saved.
+open_trimmer = {open_trimmer}
+
+# Screenshots: "select" picks a region first, then opens the editor; "sharex" opens the
+# editor on the whole frozen screen first (pick a region with Q). Recordings always select first.
+screenshot_style = "{style}"
+
 # Screenshots: "png" (lossless) or "jpg" (smaller; screenshot_quality 50-100 applies).
 screenshot_format = "{format}"
 screenshot_quality = {screenshot_quality}
-# What happens when a screenshot is finished: copy it, save it to the folder, or both.
+# What happens when a screenshot is finished: copy it, save it to the folder, upload it
+# (any combination).
 screenshot_copy = {screenshot_copy}
 screenshot_save = {screenshot_save}
+screenshot_upload = {screenshot_upload}
+
+# Where uploads go: "catbox" (permanent, 200 MB), "litterbox" (temporary, 1 GB), "uguu"
+# (temporary, 128 MB), "pomf" (pomf.lain.la, 1 GB), or the name of a custom uploader
+# imported in settings (a ShareX .sxcu file in %APPDATA%\glint\uploaders).
+upload_destination = {upload_destination}
+# How long litterbox keeps files: "1h", "12h", "24h" or "72h".
+litterbox_expiry = "{expiry}"
+# Copy the link to the clipboard when an upload finishes.
+upload_copy_link = {upload_copy_link}
+# Upload every recording after it's saved.
+recording_upload = {recording_upload}
 "#,
             hotkey = q(&self.hotkey),
             screenshot_hotkey = q(&self.screenshot_hotkey),
             fullscreen_hotkey = q(&self.fullscreen_hotkey),
+            pause_hotkey = q(&self.pause_hotkey),
             launch_at_startup = self.launch_at_startup,
             freeze_screen = self.freeze_screen,
             notify_success = self.notify_success,
@@ -212,9 +335,18 @@ screenshot_save = {screenshot_save}
             quality = self.quality,
             effort = self.effort,
             draw_cursor = self.draw_cursor,
+            audio_desktop = self.audio_desktop,
+            audio_mic = self.audio_mic,
+            countdown = self.countdown,
+            open_trimmer = self.open_trimmer,
             screenshot_quality = self.screenshot_quality,
             screenshot_copy = self.screenshot_copy,
             screenshot_save = self.screenshot_save,
+            screenshot_upload = self.screenshot_upload,
+            upload_destination = q(&self.upload_destination),
+            expiry = self.litterbox_expiry.name(),
+            upload_copy_link = self.upload_copy_link,
+            recording_upload = self.recording_upload,
         )
     }
 
@@ -266,8 +398,10 @@ mod tests {
             hotkey: "Shift+Pause".into(),
             screenshot_hotkey: "Win+Shift+S".into(),
             fullscreen_hotkey: "Alt+F12".into(),
+            pause_hotkey: "Ctrl+Pause".into(),
             launch_at_startup: true,
             freeze_screen: false,
+            ui_elements: UiElements::Always,
             notify_success: false,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),
             file_name: "clip {date} at {time}".into(),
@@ -276,10 +410,20 @@ mod tests {
             quality: 18,
             effort: 75,
             draw_cursor: false,
+            audio_desktop: true,
+            audio_mic: true,
+            countdown: 5,
+            open_trimmer: true,
+            screenshot_style: ShotStyle::Sharex,
             screenshot_format: ShotFormat::Jpg,
             screenshot_quality: 75,
             screenshot_copy: false,
             screenshot_save: true,
+            screenshot_upload: true,
+            upload_destination: "my \"host\".sxcu".into(),
+            litterbox_expiry: Expiry::Hour,
+            upload_copy_link: false,
+            recording_upload: true,
         };
         let back: Config = toml::from_str(&cfg.render()).unwrap();
         assert_eq!(back, cfg);
@@ -295,5 +439,18 @@ mod tests {
         assert_eq!(named("  ").file_stem("d", "t"), "glint_d_t");
         assert_eq!(named("clip {date}. ").file_stem("d", "t"), "clip d");
         assert!(file_name_problem("a/b").is_some() && file_name_problem("glint {date}").is_none());
+    }
+
+    #[test]
+    fn ui_elements_follow_the_mode_and_shift() {
+        let used = |mode: UiElements| [mode.used(false), mode.used(true)];
+        assert_eq!(used(UiElements::Shift), [false, true]);
+        assert_eq!(used(UiElements::Always), [true, true]);
+        assert_eq!(used(UiElements::Off), [false, false]);
+        let parsed = |v: &str| toml::from_str::<Config>(&format!("ui_elements = \"{v}\"")).map(|c| c.ui_elements);
+        assert_eq!(parsed("always").unwrap(), UiElements::Always);
+        assert_eq!(parsed("off").unwrap(), UiElements::Off);
+        assert!(parsed("ctrl").is_err());
+        assert_eq!(Config::default().ui_elements, UiElements::Shift);
     }
 }

@@ -1,5 +1,6 @@
 use eframe::egui::Ui;
 
+use crate::config::UiElements;
 use crate::settings::SettingsApp;
 use crate::settings::hotkey_capture::{HotkeyField, held_names, key_names};
 use crate::settings::widgets::{self, HotkeyState, Look, hint, row};
@@ -34,6 +35,7 @@ impl SettingsApp {
         self.hotkey_row(ui, look, "record hotkey", HotkeyField::Record);
         self.hotkey_row(ui, look, "screenshot hotkey", HotkeyField::Screenshot);
         self.hotkey_row(ui, look, "all screens hotkey", HotkeyField::Fullscreen);
+        self.hotkey_row(ui, look, "pause hotkey", HotkeyField::Pause);
         row(ui, look, "launch at startup", 1.0, |ui| {
             let text = if self.cfg.launch_at_startup { "on" } else { "off" };
             widgets::toggle(ui, look, &mut self.cfg.launch_at_startup, text);
@@ -43,6 +45,11 @@ impl SettingsApp {
             let text = if self.cfg.freeze_screen { "on" } else { "off" };
             widgets::toggle(ui, look, &mut self.cfg.freeze_screen, text);
             hint(ui, "while selecting a region, show a still image instead of the live screen", look.p.t3);
+        });
+        row(ui, look, "ui elements", 7.0, |ui| {
+            let modes = [(UiElements::Shift, "hold shift"), (UiElements::Always, "always"), (UiElements::Off, "off")];
+            widgets::segmented(ui, look, &mut self.cfg.ui_elements, &modes, Some(260.0));
+            hint(ui, "hold shift while selecting to pick buttons and panels inside apps", look.p.t3);
         });
         row(ui, look, "notifications", 7.0, |ui| {
             let choices = [(true, "all"), (false, "errors only")];

@@ -3,6 +3,7 @@ use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::Graphics::Gdi::{BitBlt, SRCCOPY};
 
 use super::Purpose;
+use crate::config::UiElements;
 use crate::platform::gfx::{Canvas, Dib, Painter, rgba};
 use crate::platform::monitors::Output as Monitor;
 use crate::platform::rect::Rect;
@@ -39,14 +40,22 @@ pub(super) fn pill_size(painter: &Painter, font: &IDWriteTextFormat, text: &str)
     ((tw.ceil() + painter.px(11.0) * 2.0) as i32, painter.px(26.0) as i32)
 }
 
-/// The hint for `purpose`; Ctrl+A is mentioned only with more than one monitor.
-pub(super) fn hint_text(purpose: Purpose, monitors: usize) -> String {
+/// The hint for `purpose`; Ctrl+A is mentioned only with more than one monitor, UI elements only
+/// when they're detected.
+pub(super) fn hint_text(purpose: Purpose, monitors: usize, elements: UiElements) -> String {
     let verb = match purpose {
         Purpose::Record { .. } => "record",
-        Purpose::Shot => "capture",
+        Purpose::Shot { .. } => "capture",
+    };
+    let wheel = match elements {
+        UiElements::Shift => "   ·   Shift for parts of apps",
+        UiElements::Always => "   ·   Scroll for bigger or smaller parts",
+        UiElements::Off => "",
     };
     let all = if monitors > 1 { "   ·   Ctrl+A for all screens" } else { "" };
-    format!("Drag to select a region   ·   Click to {verb} the highlighted window or monitor{all}   ·   Esc to cancel")
+    format!(
+        "Drag to select a region   ·   Click to {verb} what's highlighted{wheel}   ·   Ctrl+click to add more{all}   ·   Esc to cancel"
+    )
 }
 
 pub(super) fn hint_rects(painter: &Painter, font: &IDWriteTextFormat, hint: &str, outputs: &[Monitor], origin: (i32, i32)) -> Vec<Rect> {

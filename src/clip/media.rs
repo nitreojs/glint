@@ -1,0 +1,296 @@
+use std::path::Path;
+
+use windows::Win32::Foundation::HMODULE;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D11::*;
+use windows::Win32::Graphics::Dxgi::IDXGIAdapter;
+use windows::Win32::Media::MediaFoundation::*;
+use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
+use windows::Win32::System::Variant::VT_I8;
+use windows::core::{GUID, HSTRING, Interface};
+
+use crate::platform::log::log;
+use crate::record::{Codec, Ctx};
+
+pub(super) const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+pub(super) const ANY: u32 = MF_SOURCE_READER_ANY_STREAM.0 as u32;
+const ALL: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
+
+pub(super) struct Com;
+
+impl Com {
+    pub(super) fn init() -> Self {
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+        }
+        Com
+    }
+}
+
+impl Drop for Com {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = MFShutdown();
+            CoUninitialize();
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct Info {
+    pub duration: i64,
+    pub size: (u32, u32),
+    pub fps: f64,
+    pub codec: Option<Codec>,
+    pub audio: bool,
+}
+
+pub(super) fn pack(hi: u32, lo: u32) -> u64 {
+    ((hi as u64) << 32) | lo as u64
+}
+
+fn unpack(v: u64) -> (u32, u32) {
+    ((v >> 32) as u32, v as u32)
+}
+
+pub(super) unsafe fn attributes(n: u32) -> Result<IMFAttributes, String> {
+    let mut a = None;
+    unsafe { MFCreateAttributes(&mut a, n).ctx("MFCreateAttributes")? };
+    Ok(a.unwrap())
+}
+
+pub(super) struct Gpu {
+    pub mgr: IMFDXGIDeviceManager,
+}
+
+impl Gpu {
+    pub(super) fn new() -> Result<Self, String> {
+        unsafe {
+            let mut device = None;
+            D3D11CreateDevice(
+                None::<&IDXGIAdapter>,
+                D3D_DRIVER_TYPE_HARDWARE,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .ctx("D3D11CreateDevice")?;
+            let device = device.unwrap();
+            let mt: ID3D11Multithread = device.cast().ctx("ID3D11Multithread")?;
+            let _ = mt.SetMultithreadProtected(true);
+            let mut token = 0;
+            let mut mgr = None;
+            MFCreateDXGIDeviceManager(&mut token, &mut mgr).ctx("MFCreateDXGIDeviceManager")?;
+            let mgr = mgr.unwrap();
+            mgr.ResetDevice(&device, token).ctx("IMFDXGIDeviceManager::ResetDevice")?;
+            Ok(Gpu { mgr })
+        }
+    }
+}
+
+pub(super) fn open(path: &Path, gpu: Option<&Gpu>) -> Result<IMFSourceReader, String> {
+    unsafe {
+        let attrs = attributes(3)?;
+        attrs.SetUINT32(&MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, 1).ctx("attr")?;
+        if let Some(g) = gpu {
+            attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ctx("attr")?;
+            attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &g.mgr).ctx("attr")?;
+        }
+        MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &attrs).ctx("can't open the video")
+    }
+}
+
+pub(super) fn rgb_reader(src: &Path, size: (u32, u32)) -> Result<IMFSourceReader, String> {
+    let gpu = Gpu::new().and_then(|g| {
+        let r = open(src, Some(&g))?;
+        video_only(&r, MFVideoFormat_RGB32, size)?;
+        Ok(r)
+    });
+    gpu.or_else(|e| {
+        log(&format!("decoding in software: {e}"));
+        let r = open(src, None)?;
+        video_only(&r, MFVideoFormat_RGB32, size)?;
+        Ok(r)
+    })
+}
+
+pub(super) fn probe(path: &Path) -> Result<Info, String> {
+    unsafe {
+        let reader = open(path, None)?;
+        let native = reader.GetNativeMediaType(VIDEO, 0).map_err(|_| "the file has no video".to_string())?;
+        let mut size = unpack(native.GetUINT64(&MF_MT_FRAME_SIZE).ctx("frame size")?);
+        let mut area = MFVideoArea::default();
+        let blob = std::slice::from_raw_parts_mut(&mut area as *mut _ as *mut u8, size_of::<MFVideoArea>());
+        for key in [MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_GEOMETRIC_APERTURE] {
+            if native.GetBlob(&key, blob, None).is_ok() && area.Area.cx > 0 && area.Area.cy > 0 {
+                size = (area.Area.cx as u32, area.Area.cy as u32);
+                break;
+            }
+        }
+        let fps = match native.GetUINT64(&MF_MT_FRAME_RATE).map(unpack) {
+            Ok((n, d)) if n > 0 && d > 0 => n as f64 / d as f64,
+            _ => 30.0,
+        };
+        let codec = match native.GetGUID(&MF_MT_SUBTYPE) {
+            Ok(g) if g == MFVideoFormat_H264 => Some(Codec::H264),
+            Ok(g) if g == MFVideoFormat_HEVC => Some(Codec::Hevc),
+            _ => None,
+        };
+        let mut pv =
+            reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION).ctx("duration")?;
+        let duration = pv.Anonymous.Anonymous.Anonymous.uhVal as i64;
+        let _ = PropVariantClear(&mut pv);
+        let audio = streams(&reader).iter().any(|s| s.1 == MFMediaType_Audio);
+        Ok(Info { duration, size, fps, codec, audio })
+    }
+}
+
+pub(super) fn streams(reader: &IMFSourceReader) -> Vec<(u32, GUID, IMFMediaType)> {
+    (0..)
+        .map_while(|i| unsafe {
+            let t = reader.GetNativeMediaType(i, 0).ok()?;
+            Some((i, t.GetMajorType().unwrap_or_default(), t))
+        })
+        .collect()
+}
+
+pub(super) fn video_only(reader: &IMFSourceReader, subtype: GUID, size: (u32, u32)) -> Result<(), String> {
+    unsafe {
+        reader.SetStreamSelection(ALL, false).ctx("SetStreamSelection")?;
+        reader.SetStreamSelection(VIDEO, true).ctx("SetStreamSelection")?;
+        set_video_output(reader, subtype, size)
+    }
+}
+
+pub(super) fn set_video_output(reader: &IMFSourceReader, subtype: GUID, size: (u32, u32)) -> Result<(), String> {
+    unsafe {
+        let t = MFCreateMediaType().ctx("MFCreateMediaType")?;
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
+        t.SetGUID(&MF_MT_SUBTYPE, &subtype).ctx("mt")?;
+        t.SetUINT64(&MF_MT_FRAME_SIZE, pack(size.0, size.1)).ctx("mt")?;
+        t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).ctx("mt")?;
+        if subtype == MFVideoFormat_RGB32 {
+            t.SetUINT32(&MF_MT_DEFAULT_STRIDE, size.0 * 4).ctx("mt")?;
+        }
+        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).ctx("mt")?;
+        let set = reader.SetCurrentMediaType(VIDEO, None, &t);
+        if let Err(e) = &set
+            && e.code() == MF_E_TOPO_CODEC_NOT_FOUND
+            && reader
+                .GetNativeMediaType(VIDEO, 0)
+                .and_then(|n| n.GetGUID(&MF_MT_SUBTYPE))
+                .is_ok_and(|g| g == MFVideoFormat_HEVC)
+        {
+            return Err("windows has no hevc decoder: install “hevc video extensions” from the microsoft store".into());
+        }
+        set.ctx("the video can't be decoded")
+    }
+}
+
+pub(super) fn seek(reader: &IMFSourceReader, t: i64) -> Result<(), String> {
+    unsafe {
+        let mut pv = PROPVARIANT::default();
+        (*pv.Anonymous.Anonymous).vt = VT_I8;
+        (*pv.Anonymous.Anonymous).Anonymous.hVal = t.max(0);
+        reader.SetCurrentPosition(&GUID::zeroed(), &pv).ctx("seek")
+    }
+}
+
+pub(super) enum Got {
+    Sample { stream: u32, ts: i64, sample: IMFSample },
+    End(u32),
+}
+
+pub(super) fn read(reader: &IMFSourceReader, stream: u32) -> Result<Got, String> {
+    loop {
+        let (mut idx, mut flags, mut ts, mut sample) = (0u32, 0u32, 0i64, None);
+        unsafe {
+            reader
+                .ReadSample(stream, 0, Some(&mut idx), Some(&mut flags), Some(&mut ts), Some(&mut sample))
+                .ctx("ReadSample")?;
+        }
+        if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
+            return Err("the video couldn't be decoded".into());
+        }
+        if let Some(sample) = sample {
+            return Ok(Got::Sample { stream: idx, ts, sample });
+        }
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            return Ok(Got::End(idx));
+        }
+    }
+}
+
+pub(super) fn duration(sample: &IMFSample) -> i64 {
+    unsafe { sample.GetSampleDuration().unwrap_or(0) }
+}
+
+#[derive(Clone)]
+pub(super) struct Decoded {
+    pub ts: i64,
+    pub dur: i64,
+    pub sample: IMFSample,
+}
+
+pub(super) fn next_video(reader: &IMFSourceReader) -> Result<Option<Decoded>, String> {
+    Ok(match read(reader, VIDEO)? {
+        Got::Sample { ts, sample, .. } => Some(Decoded { ts, dur: duration(&sample), sample }),
+        Got::End(_) => None,
+    })
+}
+
+pub(super) fn decode_until(
+    reader: &IMFSourceReader,
+    t: i64,
+    mut best: Option<Decoded>,
+) -> Result<(Option<Decoded>, Option<Decoded>), String> {
+    loop {
+        if best.as_ref().is_some_and(|b| b.dur > 0 && b.ts + b.dur > t) {
+            return Ok((best, None));
+        }
+        match next_video(reader)? {
+            None => return Ok((best, None)),
+            Some(f) if f.ts <= t => best = Some(f),
+            Some(f) if best.is_none() => return Ok((Some(f), None)),
+            Some(f) => return Ok((best, Some(f))),
+        }
+    }
+}
+
+pub(super) struct Rows {
+    scan0: *const u8,
+    pitch: isize,
+    width: usize,
+}
+
+impl Rows {
+    pub(super) fn row(&self, y: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.scan0.offset(y as isize * self.pitch), self.width) }
+    }
+}
+
+pub(super) fn with_pixels<R>(sample: &IMFSample, width: u32, f: impl FnOnce(&Rows) -> R) -> Result<R, String> {
+    unsafe {
+        let buf = sample.GetBufferByIndex(0).ctx("GetBufferByIndex")?;
+        let width = width as usize * 4;
+        if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
+            let mut scan0 = std::ptr::null_mut();
+            let mut pitch = 0;
+            b2.Lock2D(&mut scan0, &mut pitch).ctx("Lock2D")?;
+            let r = f(&Rows { scan0, pitch: pitch as isize, width });
+            let _ = b2.Unlock2D();
+            return Ok(r);
+        }
+        let mut scan0 = std::ptr::null_mut();
+        buf.Lock(&mut scan0, None, None).ctx("Lock")?;
+        let r = f(&Rows { scan0, pitch: width as isize, width });
+        let _ = buf.Unlock();
+        Ok(r)
+    }
+}

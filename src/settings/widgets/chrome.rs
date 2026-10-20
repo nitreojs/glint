@@ -13,7 +13,7 @@ pub(crate) enum TitleAction {
 }
 
 /// The 40 px bar: mark, name, drag area, minimize and close. `active` is 1 while focused.
-pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, active: f32, radius: u8) -> TitleAction {
+pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, what: &str, active: f32, radius: u8) -> TitleAction {
     let p = &look.p;
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 }, p.side);
@@ -29,7 +29,7 @@ pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, active: f32, radiu
         semibold(13.0),
         mix(p.t4, p.t1, active),
     );
-    painter.text(pos2(name.right() + 9.0, rect.center().y), Align2::LEFT_CENTER, "settings", sans(13.0), mix(p.t4, p.t3, active));
+    painter.text(pos2(name.right() + 9.0, rect.center().y), Align2::LEFT_CENTER, what, sans(13.0), mix(p.t4, p.t3, active));
 
     // Everything but the buttons moves the window; a double-click does nothing (fixed size).
     let buttons = 2.0 * 46.0;

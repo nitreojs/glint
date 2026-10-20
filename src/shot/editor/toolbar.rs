@@ -3,14 +3,18 @@ use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 
 use super::Editor;
 use super::marks::{COLORS, TOOLS, Tool, arrow};
+use super::text::Typesetter;
 use crate::platform::gfx::{Canvas, Painter, rgba};
 use crate::platform::rect::Rect;
 
 pub(super) const BAR_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.92);
 pub(super) const WHITE: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
+const COLOR_TIPS: [&str; 5] =
+    ["red  ·  Shift+1", "yellow  ·  Shift+2", "green  ·  Shift+3", "blue  ·  Shift+4", "white  ·  Shift+5"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Item {
+    Region,
     Tool(Tool),
     Color(usize),
     Size(usize),
@@ -18,6 +22,8 @@ pub(super) enum Item {
     Redo,
     Copy,
     Save,
+    Upload,
+    Pin,
     Done,
     Close,
 }
@@ -25,39 +31,50 @@ pub(super) enum Item {
 impl Item {
     pub(super) fn tip(self) -> Option<&'static str> {
         Some(match self {
+            Item::Region => "region  ·  Q",
             Item::Tool(t) => TOOLS.iter().find(|(tool, ..)| *tool == t).map(|(_, tip, _)| *tip)?,
-            Item::Color(_) => return None,
+            Item::Color(i) => COLOR_TIPS[i],
             Item::Size(_) => "size  ·  [ ]",
             Item::Undo => "undo  ·  Ctrl+Z",
             Item::Redo => "redo  ·  Ctrl+Y",
             Item::Copy => "copy  ·  Ctrl+C",
             Item::Save => "save  ·  Ctrl+S",
+            Item::Upload => "upload  ·  Ctrl+U",
+            Item::Pin => "pin to screen",
             Item::Done => "done  ·  Enter",
             Item::Close => "cancel  ·  Esc",
         })
     }
 }
 
-/// Toolbar groups, left to right; a separator goes between groups.
-fn groups() -> [Vec<Item>; 5] {
-    [
+/// Toolbar groups, left to right; a separator goes between groups. `region`: canvas mode's region tool.
+fn groups(region: bool) -> Vec<Vec<Item>> {
+    let mut groups = if region { vec![vec![Item::Region]] } else { Vec::new() };
+    groups.extend([
         TOOLS.iter().map(|(t, ..)| Item::Tool(*t)).collect(),
         (0..COLORS.len()).map(Item::Color).collect(),
         (0..3).map(Item::Size).collect(),
         vec![Item::Undo, Item::Redo],
-        vec![Item::Copy, Item::Save, Item::Done, Item::Close],
-    ]
+        vec![Item::Copy, Item::Save, Item::Upload, Item::Pin, Item::Done, Item::Close],
+    ]);
+    groups
 }
 
 impl Editor {
-    /// Lays the toolbar out under the selection, or above it, or inside it when neither fits.
+    /// Lays the toolbar out under the selection, or above it, or inside it when neither fits; with
+    /// no selection, at the top of the monitor under the mouse.
     pub(super) fn place_bar(&mut self) {
         let (cell, pad, gap) = (self.px(32.0) as i32, self.px(4.0) as i32, self.px(9.0) as i32);
-        let groups = groups();
+        let groups = groups(self.region);
         let n: i32 = groups.iter().map(|g| g.len() as i32).sum();
         let w = pad * 2 + n * cell + gap * (groups.len() as i32 - 1);
         let h = cell + pad * 2;
-        let (bar, monitor) = place(self.sel, (w, h), self.px(10.0) as i32, &self.monitors);
+        let margin = self.px(10.0) as i32;
+        let (bar, monitor) = if self.selected {
+            place(self.sel, (w, h), margin, &self.monitors)
+        } else {
+            top(self.mouse, (w, h), margin, &self.monitors)
+        };
         self.bar_monitor = monitor;
         let (x, y) = (bar.x, bar.y);
         if bar == self.bar && !self.cells.is_empty() {
@@ -85,7 +102,7 @@ impl Editor {
         let (tw, _) = painter.measure(text, font);
         let (w, h) = ((tw.ceil() + self.px(20.0)) as i32, self.px(26.0) as i32);
         let gap = self.px(6.0) as i32;
-        let below_sel = b.y >= self.sel.bottom();
+        let below_sel = !self.selected || b.y >= self.sel.bottom();
         let mut y = if below_sel { b.bottom() + gap } else { b.y - gap - h };
         let m = self.bar_monitor;
         if y < m.y || y + h > m.bottom() {
@@ -99,7 +116,7 @@ impl Editor {
         let (b, s) = (self.bar, self.scale);
         let (pressed, size, color) = (self.pressed(), self.current(), self.shown_color());
         let (can_undo, can_redo) = (!self.history.is_empty(), !self.future.is_empty());
-        let groups = groups();
+        let groups = groups(self.region);
         let (w, h) = (b.w as f32, b.h as f32);
         c.round_rect(0.0, 0.0, w, h, 10.0 * s, BAR_BG);
         // Separators between groups.
@@ -137,7 +154,7 @@ impl Editor {
                 _ => true,
             };
             let ink = if enabled { WHITE } else { rgba(255, 255, 255, 0.3) };
-            draw_icon(c, item, (x + cw / 2.0, y + ch / 2.0), s, ink, color);
+            draw_icon(c, item, (x + cw / 2.0, y + ch / 2.0), s, ink, color, &self.fonts);
         }
     }
 }
@@ -145,7 +162,9 @@ impl Editor {
 /// The bar and the monitor it lies on; it never straddles monitors or sits in a gap.
 fn place(sel: Rect, (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect, Rect) {
     let cx = sel.x + sel.w / 2;
-    let on = |m: Rect, y: i32| Rect { x: (cx - w / 2).clamp(m.x + margin, (m.right() - w - margin).max(m.x)), y, w, h };
+    let on = |m: Rect, y: i32| {
+        Rect { x: (cx - w / 2).max(m.x + margin).min((m.right() - w - margin).max(m.x)), y, w, h }
+    };
     let low = nearest(monitors, (cx, sel.bottom() - 1));
     let below = (sel.bottom() + margin).max(low.y + margin);
     if below + h <= low.bottom() - margin {
@@ -160,7 +179,14 @@ fn place(sel: Rect, (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect
     (on(low, inside), low)
 }
 
-fn nearest(monitors: &[Rect], (x, y): (i32, i32)) -> Rect {
+/// At the top centre of the monitor under `mouse`.
+fn top(mouse: (i32, i32), (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect, Rect) {
+    let m = nearest(monitors, mouse);
+    let x = (m.x + (m.w - w) / 2).max(m.x);
+    (Rect { x, y: m.y + margin, w, h }, m)
+}
+
+pub(super) fn nearest(monitors: &[Rect], (x, y): (i32, i32)) -> Rect {
     let gap = |m: &&Rect| {
         let dx = (m.x - x).max(x - (m.right() - 1)).max(0) as i64;
         let dy = (m.y - y).max(y - (m.bottom() - 1)).max(0) as i64;
@@ -169,16 +195,13 @@ fn nearest(monitors: &[Rect], (x, y): (i32, i32)) -> Rect {
     *monitors.iter().min_by_key(gap).expect("at least one monitor")
 }
 
-fn draw_icon(
-    c: &Canvas,
-    item: Item,
-    (x, y): (f32, f32),
-    s: f32,
-    ink: D2D1_COLOR_F,
-    color: usize,
-) {
+fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR_F, color: usize, fonts: &Typesetter) {
     let p = |dx: f32, dy: f32| (x + dx * s, y + dy * s);
     match item {
+        Item::Region => {
+            c.polyline(&[p(-3.5, -7.0), p(-3.5, 3.5), p(7.0, 3.5)], 1.6 * s, ink);
+            c.polyline(&[p(-7.0, -3.5), p(3.5, -3.5), p(3.5, 7.0)], 1.6 * s, ink);
+        }
         Item::Tool(Tool::Pen) => {
             c.polyline(&[p(-5.0, 5.0), p(5.0, -5.0)], 2.0 * s, ink);
             c.polygon(&[p(-6.5, 6.5), p(-5.5, 3.5), p(-3.5, 5.5)], ink);
@@ -203,6 +226,14 @@ fn draw_icon(
                     c.round_rect(qx, qy, q - 0.6 * s, q - 0.6 * s, 0.6 * s, D2D1_COLOR_F { a: a * ink.a, ..ink });
                 }
             }
+        }
+        Item::Tool(Tool::Text) => {
+            c.polyline(&[p(-5.5, -5.5), p(5.5, -5.5)], 2.0 * s, ink);
+            c.polyline(&[p(0.0, -5.5), p(0.0, 6.0)], 2.0 * s, ink);
+        }
+        Item::Tool(Tool::Step) => {
+            c.circle((x, y), 7.5 * s, ink);
+            fonts.draw_centred(c, "1", 10.0 * s, (x, y), BAR_BG);
         }
         Item::Color(i) => {
             c.circle((x, y), 6.0 * s, COLORS[i]);
@@ -229,6 +260,17 @@ fn draw_icon(
             c.polyline(&[p(0.0, -6.0), p(0.0, 2.5)], 1.6 * s, ink);
             c.polyline(&[p(-3.5, -1.0), p(0.0, 2.5), p(3.5, -1.0)], 1.6 * s, ink);
             c.polyline(&[p(-6.0, 3.0), p(-6.0, 6.0), p(6.0, 6.0), p(6.0, 3.0)], 1.6 * s, ink);
+        }
+        Item::Upload => {
+            c.polyline(&[p(0.0, 2.5), p(0.0, -6.0)], 1.6 * s, ink);
+            c.polyline(&[p(-3.5, -2.5), p(0.0, -6.0), p(3.5, -2.5)], 1.6 * s, ink);
+            c.polyline(&[p(-6.0, 3.0), p(-6.0, 6.0), p(6.0, 6.0), p(6.0, 3.0)], 1.6 * s, ink);
+        }
+        Item::Pin => {
+            c.polyline(&[p(-4.0, -6.5), p(4.0, -6.5)], 1.6 * s, ink);
+            c.polygon(&[p(-2.5, -6.5), p(2.5, -6.5), p(3.5, -1.0), p(-3.5, -1.0)], ink);
+            c.polyline(&[p(-5.5, -1.0), p(5.5, -1.0)], 1.6 * s, ink);
+            c.polyline(&[p(0.0, -1.0), p(0.0, 7.0)], 1.4 * s, ink);
         }
         Item::Done => c.polyline(&[p(-5.5, 0.5), p(-1.5, 4.5), p(6.0, -4.0)], 2.0 * s, ink),
         Item::Close => {

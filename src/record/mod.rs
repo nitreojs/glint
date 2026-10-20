@@ -7,11 +7,13 @@
 //! * Encoder thread: a second device shared with Media Foundation. It pulls frames from
 //!   the ring, draws the cursor, snaps timestamps to the frame grid and feeds the hardware
 //!   encoder MFT, which writes the MP4.
+//! * Audio thread (when enabled): WASAPI loopback and/or microphone, mixed into one 48 kHz
+//!   stereo track on the capture clock and handed to the encoder, which adds an AAC stream.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::thread;
 
 use windows::Win32::Foundation::HMODULE;
@@ -21,7 +23,7 @@ use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SA
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-use windows::Win32::System::Performance::QueryPerformanceCounter;
+use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
     GetCurrentThread, SetThreadPriority, THREAD_PRIORITY, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_HIGHEST,
 };
@@ -29,14 +31,19 @@ use windows::Win32::System::Threading::{
 use crate::platform::log::log;
 use crate::platform::rect::Rect;
 
+mod audio;
 mod capture;
 mod cursor;
 mod encoder;
 pub(crate) mod indicator;
+mod mix;
 mod rotate;
+mod timeline;
 
+pub(crate) use audio::AudioSource;
 use capture::Capture;
 use encoder::Encoder;
+use timeline::Pauses;
 
 /// Shared textures between capture and encoder; capture drops frames only if all are busy.
 const RING: usize = 6;
@@ -75,6 +82,7 @@ pub(crate) struct Params {
     /// Encoder quality-vs-speed knob, 0 (fastest) ..= 100 (best).
     pub effort: u32,
     pub draw_cursor: bool,
+    pub audio: Vec<AudioSource>,
     pub path: PathBuf,
 }
 
@@ -94,6 +102,8 @@ pub(crate) struct Summary {
     pub duration_s: f64,
     /// Capture ended on its own (e.g. resolution change); the file is still valid.
     pub stopped_early: Option<String>,
+    pub audio: Vec<AudioSource>,
+    pub audio_issues: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -106,12 +116,15 @@ pub(crate) enum Outcome {
 pub(crate) struct Recorder {
     stop: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
+    pauses: Arc<Mutex<Pauses>>,
 }
 
-/// Moves COM objects created during setup onto the capture thread. D3D11/DXGI objects are
-/// free-threaded; after the move only the capture thread touches them.
+/// Moves COM objects created during setup onto the capture and audio threads. D3D11/DXGI and
+/// WASAPI objects are free-threaded; after the move only that thread touches them.
 struct SendCapture(Capture);
 unsafe impl Send for SendCapture {}
+struct SendAudio(Vec<audio::Device>);
+unsafe impl Send for SendAudio {}
 
 /// A recorder whose pipeline is initializing; see [`Starting::wait`].
 pub(crate) struct Starting {
@@ -119,6 +132,7 @@ pub(crate) struct Starting {
     go: mpsc::SyncSender<()>,
     stop: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
+    pauses: Arc<Mutex<Pauses>>,
 }
 
 impl Starting {
@@ -128,7 +142,7 @@ impl Starting {
         match self.ready.recv() {
             Ok(Ok(())) => {
                 let _ = self.go.send(());
-                Ok(Recorder { stop: self.stop, abort: self.abort })
+                Ok(Recorder { stop: self.stop, abort: self.abort, pauses: self.pauses })
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err("encoder thread exited during startup".into()),
@@ -142,9 +156,10 @@ impl Recorder {
     pub(crate) fn start(p: Params, on_done: impl FnOnce(Result<Outcome, String>) + Send + 'static) -> Result<Starting, String> {
         let stop = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
+        let pauses = Arc::new(Mutex::new(Pauses::default()));
         let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
         let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
-        let (st, ab) = (stop.clone(), abort.clone());
+        let (st, ab, ps) = (stop.clone(), abort.clone(), pauses.clone());
         thread::Builder::new()
             .name("glint-encode".into())
             .spawn(move || unsafe {
@@ -152,18 +167,31 @@ impl Recorder {
                 let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
                 let mf = MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok();
                 let path = p.path.clone();
-                let setup = Capture::new(&p).and_then(|cap| Encoder::new(p, &cap).map(|enc| (cap, enc)));
+                let setup = Capture::new(&p).and_then(|cap| {
+                    let (mut devices, mut issues) = (Vec::new(), Vec::new());
+                    for &s in &p.audio {
+                        match audio::open(s) {
+                            Ok(d) => devices.push(d),
+                            Err(e) => {
+                                log(&format!("audio: {e}"));
+                                issues.push(e);
+                            }
+                        }
+                    }
+                    let sources: Vec<AudioSource> = devices.iter().map(|d| d.source).collect();
+                    Encoder::new(p, &cap, !sources.is_empty()).map(|enc| (cap, enc, SendAudio(devices), (sources, issues)))
+                });
                 match setup {
                     Err(e) => {
                         let _ = std::fs::remove_file(&path);
                         let _ = ready_tx.send(Err(e));
                     }
-                    Ok((cap, enc)) => {
+                    Ok((cap, enc, devices, audio)) => {
                         let _ = ready_tx.send(Ok(()));
                         let res = if go_rx.recv().is_ok() {
-                            run_session(cap, enc, &st, &ab)
+                            run_session(cap, enc, devices, audio, &st, &ab, &ps)
                         } else {
-                            drop((cap, enc));
+                            drop((cap, enc, devices));
                             Err("recording was cancelled before it started".into())
                         };
                         let discarded = ab.load(Ordering::SeqCst);
@@ -181,7 +209,7 @@ impl Recorder {
                 }
             })
             .map_err(|e| format!("failed to spawn encoder thread: {e}"))?;
-        Ok(Starting { ready: ready_rx, go: go_tx, stop, abort })
+        Ok(Starting { ready: ready_rx, go: go_tx, stop, abort, pauses })
     }
 
     /// Requests a graceful stop; `on_done` fires once the MP4 is finalized.
@@ -194,11 +222,53 @@ impl Recorder {
         self.abort.store(true, Ordering::SeqCst);
         self.stop.store(true, Ordering::SeqCst);
     }
+
+    pub(crate) fn pause(&self) {
+        lock(&self.pauses).pause(hns(qpc()));
+    }
+
+    pub(crate) fn resume(&self) {
+        lock(&self.pauses).resume(hns(qpc()));
+    }
+
+    pub(crate) fn paused(&self) -> bool {
+        lock(&self.pauses).paused()
+    }
 }
 
-unsafe fn run_session(cap: Capture, mut enc: Encoder, stop: &Arc<AtomicBool>, abort: &AtomicBool) -> Result<Summary, String> {
+fn lock(m: &Mutex<Pauses>) -> MutexGuard<'_, Pauses> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+unsafe fn run_session(
+    cap: Capture,
+    mut enc: Encoder,
+    devices: SendAudio,
+    (audio, mut audio_issues): (Vec<AudioSource>, Vec<String>),
+    stop: &Arc<AtomicBool>,
+    abort: &AtomicBool,
+    pauses: &Mutex<Pauses>,
+) -> Result<Summary, String> {
     let (tx, rx) = mpsc::channel::<Msg>();
     let (free_tx, free_rx) = mpsc::channel::<usize>();
+    let mixer = if devices.0.is_empty() {
+        None
+    } else {
+        let (st, tx) = (stop.clone(), tx.clone());
+        let spawned = thread::Builder::new().name("glint-audio".into()).spawn(move || {
+            let devices = devices;
+            unsafe {
+                set_priority(THREAD_PRIORITY_HIGHEST);
+                let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+                let issues = audio::run(devices.0, &st, &tx);
+                if com {
+                    CoUninitialize();
+                }
+                issues
+            }
+        });
+        Some(spawned.map_err(|e| format!("failed to spawn audio thread: {e}"))?)
+    };
     let cap = SendCapture(cap);
     let st = stop.clone();
     let capture = thread::Builder::new()
@@ -208,17 +278,24 @@ unsafe fn run_session(cap: Capture, mut enc: Encoder, stop: &Arc<AtomicBool>, ab
             unsafe {
                 set_priority(THREAD_PRIORITY_HIGHEST);
                 let r = cap.0.run(&st, &tx, &free_rx);
+                st.store(true, Ordering::SeqCst);
                 let _ = tx.send(Msg::End { qpc: qpc() });
                 r
             }
         })
-        .map_err(|e| format!("failed to spawn capture thread: {e}"))?;
-    let enc_res = unsafe { enc.run(&rx, &free_tx, abort) };
+        .map_err(|e| {
+            stop.store(true, Ordering::SeqCst);
+            format!("failed to spawn capture thread: {e}")
+        })?;
+    let enc_res = unsafe { enc.run(&rx, &free_tx, abort, pauses) };
     if enc_res.is_err() {
         stop.store(true, Ordering::SeqCst);
     }
     drop(rx);
     let cap_res = capture.join().unwrap_or_else(|_| Err("capture thread panicked".into()));
+    if let Some(m) = mixer {
+        audio_issues.extend(m.join().unwrap_or_else(|_| vec!["audio thread panicked".into()]));
+    }
     let (frames, enc_dropped, duration_s) = enc_res?;
     let (cap_dropped, coalesced, stopped_early) = match cap_res {
         Ok(s) => (s.dropped, s.coalesced, None),
@@ -229,7 +306,7 @@ unsafe fn run_session(cap: Capture, mut enc: Encoder, stop: &Arc<AtomicBool>, ab
         "finished: {frames} frames, {dropped} dropped, {coalesced} coalesced by DDA, {duration_s:.2}s{}",
         stopped_early.as_deref().map(|e| format!(", stopped early: {e}")).unwrap_or_default()
     ));
-    Ok(Summary { path: enc.p.path.clone(), dropped, duration_s, stopped_early })
+    Ok(Summary { path: enc.p.path.clone(), dropped, duration_s, stopped_early, audio, audio_issues })
 }
 
 fn set_priority(p: THREAD_PRIORITY) {
@@ -238,7 +315,7 @@ fn set_priority(p: THREAD_PRIORITY) {
     }
 }
 
-trait Ctx<T> {
+pub(crate) trait Ctx<T> {
     fn ctx(self, what: &str) -> Result<T, String>;
 }
 impl<T> Ctx<T> for windows::core::Result<T> {
@@ -253,6 +330,17 @@ fn qpc() -> i64 {
         let _ = QueryPerformanceCounter(&mut v);
     }
     v
+}
+
+fn hns(qpc: i64) -> i64 {
+    static FREQ: LazyLock<i64> = LazyLock::new(|| {
+        let mut f = 0;
+        unsafe {
+            let _ = QueryPerformanceFrequency(&mut f);
+        }
+        f.max(1)
+    });
+    (qpc as i128 * 10_000_000 / *FREQ as i128) as i64
 }
 
 unsafe fn create_device(adapter: &IDXGIAdapter1, flags: D3D11_CREATE_DEVICE_FLAG) -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
@@ -303,4 +391,7 @@ enum Msg {
     Frame { slot: Option<usize>, qpc: i64, cursor: Option<(i32, i32)> },
     Shape(DXGI_OUTDUPL_POINTER_SHAPE_INFO, Vec<u8>),
     End { qpc: i64 },
+    /// `start`: capture time of the first frame in 100 ns units.
+    Audio { start: i64, data: Vec<i16> },
+    AudioEnd,
 }

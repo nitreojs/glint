@@ -9,17 +9,20 @@ use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, NIN_SELECT, ShellExecuteW}
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::config::Config;
+use crate::config::{Config, ShotStyle};
+use crate::history::{self, Kind};
 use crate::picker::{self, Picked, Purpose};
 use crate::platform::capture;
 use crate::platform::format::{human_duration, human_size};
 use crate::platform::log::{log, log_path};
 use crate::platform::monitors;
+use crate::platform::rect::Rect;
 use crate::platform::wide::wide;
-use crate::record::indicator::Indicator;
-use crate::record::{Outcome, Params, Recorder, Source};
+use crate::record::indicator::{self, Indicator};
+use crate::record::{AudioSource, Outcome, Params, Recorder, Source};
 use crate::shot::editor::Output;
 use crate::shot::{self, Delivered, Shot};
+use crate::upload::{self, Done};
 
 mod autostart;
 mod hotkeys;
@@ -27,7 +30,7 @@ pub(crate) mod ipc;
 mod menu;
 pub(crate) mod tray;
 
-use hotkeys::{FULL_HOTKEY_ID, HOTKEY_ID, SHOT_HOTKEY_ID};
+use hotkeys::{ESC_HOTKEY_ID, FULL_HOTKEY_ID, HOTKEY_ID, PAUSE_HOTKEY_ID, SHOT_HOTKEY_ID};
 use menu::show_menu;
 use tray::Tray;
 
@@ -39,11 +42,15 @@ const WM_APP_DONE: u32 = WM_APP + 3;
 const WM_APP_QUIT: u32 = WM_APP + 4;
 /// Posted by the indicator pill's buttons (see the handler for WPARAM values).
 const WM_APP_STOP: u32 = WM_APP + 5;
+const COUNTDOWN_TIMER_ID: usize = 7;
+/// A pinned screenshot's copy / save: a `Box<Shot>` in LPARAM.
+const WM_APP_PIN: u32 = WM_APP + 30;
 
 enum State {
     Idle,
     Selecting(HWND),
-    Recording { rec: Recorder, _indicator: Option<Indicator>, size: (i32, i32), fps: f64 },
+    Countdown { params: Params, monitors: Vec<Rect>, indicator: Indicator, left: u32, fps: f64 },
+    Recording { rec: Recorder, indicator: Option<Indicator>, size: (i32, i32), fps: f64 },
     Stopping { size: (i32, i32), fps: f64 },
 }
 
@@ -51,6 +58,7 @@ enum State {
 enum ClickTarget {
     None,
     File(PathBuf),
+    Link(String),
     Log,
 }
 
@@ -61,6 +69,7 @@ struct App {
     hotkey: Option<String>,
     shot_hotkey: Option<String>,
     full_hotkey: Option<String>,
+    pause_hotkey: Option<String>,
     state: State,
     tray: Tray,
     taskbar_created: u32,
@@ -93,9 +102,11 @@ impl App {
     fn reload(&mut self) {
         match Config::load() {
             Ok(cfg) => {
+                let recording = matches!(self.state, State::Recording { .. });
                 let hotkeys_changed = self.hotkey.as_deref() != Some(cfg.hotkey.as_str())
                     || self.shot_hotkey.as_deref() != Some(cfg.screenshot_hotkey.as_str())
-                    || self.full_hotkey.as_deref() != Some(cfg.fullscreen_hotkey.as_str());
+                    || self.full_hotkey.as_deref() != Some(cfg.fullscreen_hotkey.as_str())
+                    || recording && self.pause_hotkey.as_deref() != Some(cfg.pause_hotkey.as_str());
                 let startup_changed = self.cfg.launch_at_startup != cfg.launch_at_startup;
                 let before = std::mem::replace(&mut self.cfg, cfg);
                 if hotkeys_changed {
@@ -120,9 +131,55 @@ impl App {
         match &self.state {
             State::Idle => self.start_selection(shot),
             State::Selecting(h) => picker::cancel(*h),
+            State::Countdown { .. } if !shot => self.cancel_countdown(),
             State::Recording { .. } if !shot => self.stop_recording(false),
-            State::Recording { .. } | State::Stopping { .. } => {}
+            State::Countdown { .. } | State::Recording { .. } | State::Stopping { .. } => {}
         }
+    }
+
+    fn toggle_pause(&mut self) {
+        let State::Recording { rec, indicator, .. } = &self.state else { return };
+        let pause = !rec.paused();
+        if pause {
+            rec.pause();
+        } else {
+            rec.resume();
+        }
+        if let Some(i) = indicator {
+            i.set_paused(pause);
+        }
+        log(if pause { "paused" } else { "resumed" });
+        self.update_tip();
+    }
+
+    fn on_indicator(&mut self, button: usize) {
+        match (&self.state, button) {
+            (State::Countdown { .. }, indicator::DISCARD) => self.cancel_countdown(),
+            (State::Recording { .. }, indicator::PAUSE) => self.toggle_pause(),
+            (State::Recording { .. }, indicator::STOP | indicator::DISCARD) => {
+                self.stop_recording(button == indicator::DISCARD)
+            }
+            _ => {}
+        }
+    }
+
+    fn update_tip(&mut self) {
+        if let State::Recording { rec, size, fps, .. } = &self.state {
+            let what = if rec.paused() { "paused" } else { "recording" };
+            let tip = format!("glint: {what} {}×{} @ {:.0} fps", size.0, size.1, fps);
+            self.tray.set_recording(true, &tip);
+        }
+    }
+
+    fn audio_sources(&self) -> Vec<AudioSource> {
+        let mut sources = Vec::new();
+        if self.cfg.audio_desktop {
+            sources.push(AudioSource::Desktop);
+        }
+        if self.cfg.audio_mic {
+            sources.push(AudioSource::Mic);
+        }
+        sources
     }
 
     fn start_selection(&mut self, shot: bool) {
@@ -132,8 +189,12 @@ impl App {
             Ok(_) => return self.notify("glint", "No monitors found.", true, ClickTarget::None),
             Err(e) => return self.notify("glint: can't list monitors", &e.message(), true, ClickTarget::None),
         };
-        let purpose = if shot { Purpose::Shot } else { Purpose::Record { min: self.cfg.codec.codec().min_size() } };
-        match picker::open(self.hwnd, WM_APP_SELECTION, outputs, purpose, self.cfg.freeze_screen) {
+        let purpose = match shot {
+            true => Purpose::Shot { draw_first: self.cfg.screenshot_style == ShotStyle::Sharex },
+            false => Purpose::Record { min: self.cfg.codec.codec().min_size() },
+        };
+        let (freeze, elements) = (self.cfg.freeze_screen, self.cfg.ui_elements);
+        match picker::open(self.hwnd, WM_APP_SELECTION, outputs, purpose, freeze, elements) {
             Ok(h) => self.state = State::Selecting(h),
             Err(e) => self.notify("glint: can't open the selection overlay", &e, true, ClickTarget::Log),
         }
@@ -147,8 +208,9 @@ impl App {
         let captured = capture::virtual_screen();
         self.reload();
         match captured {
-            Ok((pixels, area)) => {
-                self.finish_shot(Shot { pixels, w: area.w as u32, h: area.h as u32, output: Output::Default })
+            Ok((pixels, at)) => {
+                let (w, h) = (at.w as u32, at.h as u32);
+                self.finish_shot(Shot { pixels, w, h, alpha: false, at, output: Output::Default })
             }
             Err(e) => {
                 log(&format!("screenshot: {e}"));
@@ -185,8 +247,73 @@ impl App {
             qp: self.cfg.quality,
             effort: self.cfg.effort,
             draw_cursor: self.cfg.draw_cursor,
+            audio: self.audio_sources(),
             path,
         };
+        let monitors: Vec<Rect> = sel.outputs.iter().map(|o| o.rect).collect();
+        if self.cfg.countdown > 0 {
+            picker::dismiss(picker);
+            return self.start_countdown(params, monitors, fps);
+        }
+        self.begin_recording(params, &monitors, fps, None, Some(picker));
+    }
+
+    fn start_countdown(&mut self, params: Params, monitors: Vec<Rect>, fps: f64) {
+        let left = self.cfg.countdown;
+        match Indicator::show(params.region, &monitors, self.hwnd, WM_APP_STOP, left) {
+            Ok(indicator) => {
+                unsafe {
+                    SetTimer(Some(self.hwnd), COUNTDOWN_TIMER_ID, 1000, None);
+                }
+                self.grab_escape();
+                self.tray.set_recording(true, "glint: starting…");
+                self.state = State::Countdown { params, monitors, indicator, left, fps };
+            }
+            Err(e) => {
+                log(&format!("countdown unavailable: {e}"));
+                self.begin_recording(params, &monitors, fps, None, None);
+            }
+        }
+    }
+
+    fn tick_countdown(&mut self) {
+        if let State::Countdown { left, indicator, .. } = &mut self.state {
+            *left = left.saturating_sub(1);
+            if *left > 0 {
+                return indicator.count(*left);
+            }
+        }
+        self.end_countdown();
+        if let State::Countdown { params, monitors, indicator, fps, .. } = std::mem::replace(&mut self.state, State::Idle) {
+            self.begin_recording(params, &monitors, fps, Some(indicator), None);
+        }
+    }
+
+    fn end_countdown(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), COUNTDOWN_TIMER_ID);
+        }
+        self.release_escape();
+    }
+
+    fn cancel_countdown(&mut self) {
+        if matches!(self.state, State::Countdown { .. }) {
+            self.end_countdown();
+            self.state = State::Idle;
+            self.tray.set_recording(false, "glint");
+            log("countdown cancelled");
+        }
+    }
+
+    fn begin_recording(
+        &mut self,
+        params: Params,
+        monitors: &[Rect],
+        fps: f64,
+        indicator: Option<Indicator>,
+        picker: Option<HWND>,
+    ) {
+        let region = params.region;
         let hwnd = self.hwnd.0 as isize;
         let done = move |res: Result<Outcome, String>| unsafe {
             let b = Box::into_raw(Box::new(res));
@@ -196,27 +323,38 @@ impl App {
         };
         // The pipeline initializes while the picker fades out; capture starts once it's gone.
         let started = Recorder::start(params, done);
-        picker::dismiss(picker);
+        if let Some(p) = picker {
+            picker::dismiss(p);
+        }
         match started.and_then(|s| s.wait()) {
             Ok(rec) => {
-                let monitors: Vec<_> = sel.outputs.iter().map(|o| o.rect).collect();
-                let indicator = Indicator::show(sel.rect, &monitors, self.hwnd, WM_APP_STOP)
-                    .map_err(|e| log(&format!("indicator unavailable: {e}")))
-                    .ok();
-                let tip = format!("glint: recording {}×{} @ {:.0} fps", sel.rect.w, sel.rect.h, fps);
-                self.tray.set_recording(true, &tip);
-                self.state = State::Recording { rec, _indicator: indicator, size: (sel.rect.w, sel.rect.h), fps };
+                let indicator = match indicator {
+                    Some(mut i) => i.start().map(|_| i),
+                    None => Indicator::show(region, monitors, self.hwnd, WM_APP_STOP, 0),
+                };
+                let indicator = indicator.map_err(|e| log(&format!("indicator unavailable: {e}"))).ok();
+                self.state = State::Recording { rec, indicator, size: (region.w, region.h), fps };
+                self.grab_pause_hotkey();
+                self.update_tip();
             }
             Err(e) => {
                 log(&format!("start failed: {e}"));
+                self.tray.set_recording(false, "glint");
                 self.notify("glint: couldn't start recording", &e, true, ClickTarget::Log);
             }
         }
     }
 
     fn finish_shot(&mut self, shot: Shot) {
+        if shot.output == Output::Pin {
+            if let Err(e) = shot::pin::open(shot, self.hwnd, WM_APP_PIN) {
+                log(&format!("pin: {e}"));
+                self.notify("glint: couldn't pin the screenshot", &e, true, ClickTarget::Log);
+            }
+            return;
+        }
         let size = format!("{}×{}", shot.w, shot.h);
-        let Delivered { copied, saved } = match shot::deliver(&shot, &self.cfg, self.hwnd) {
+        let Delivered { copied, saved, uploading } = match shot::deliver(&shot, &self.cfg, self.hwnd) {
             Ok(delivered) => delivered,
             Err(text) => {
                 log(&format!("screenshot: {text}"));
@@ -230,13 +368,19 @@ impl App {
                 let text = format!("{name}\n{} · {size}", human_size(bytes as u64));
                 self.notify_done(title, &text, ClickTarget::File(path));
             }
-            None => self.notify_done("Screenshot copied", &format!("{size}, ready to paste"), ClickTarget::None),
+            None if copied => self.notify_done("Screenshot copied", &format!("{size}, ready to paste"), ClickTarget::None),
+            None if uploading => {
+                let text = format!("{size}, to {}", self.cfg.upload_destination);
+                self.notify_done("Uploading screenshot…", &text, ClickTarget::None);
+            }
+            None => {}
         }
     }
 
     /// Ends the recording; with `discard` the file is thrown away instead of saved.
     fn stop_recording(&mut self, discard: bool) {
         if let State::Recording { rec, size, fps, .. } = std::mem::replace(&mut self.state, State::Idle) {
+            self.release_pause_hotkey();
             // The indicator fades out as the old state drops.
             if discard {
                 rec.abort();
@@ -255,6 +399,7 @@ impl App {
             _ => ((0, 0), 0.0),
         };
         self.state = State::Idle; // drops the indicator if capture ended on its own
+        self.release_pause_hotkey();
         self.tray.set_recording(false, "glint");
         match res {
             Ok(Outcome::Discarded) => {
@@ -271,13 +416,33 @@ impl App {
                     size.1,
                     fps
                 );
+                let audio: Vec<&str> = s.audio.iter().map(|a| a.short_name()).collect();
+                if !audio.is_empty() {
+                    text += &format!(" · {}", audio.join(" + "));
+                }
+                for issue in &s.audio_issues {
+                    text += &format!("\n{issue}");
+                }
                 if s.dropped > 0 {
                     text += &format!("\n{} frames dropped (lower \"effort\" in settings)", s.dropped);
                 }
                 if let Some(why) = &s.stopped_early {
                     text += &format!("\nStopped early: {why}");
                 }
-                if s.dropped > 0 || s.stopped_early.is_some() {
+                history::add(Kind::Recording, Some(&s.path), bytes, None);
+                let mut upload_failed = false;
+                if self.cfg.recording_upload
+                    && let Err(e) = upload::start_file(&self.cfg, Kind::Recording, &s.path, self.hwnd)
+                {
+                    text += &format!("\nCouldn't upload: {e}");
+                    upload_failed = true;
+                }
+                if self.cfg.open_trimmer
+                    && let Err(e) = crate::clip::spawn(&s.path)
+                {
+                    log(&format!("can't open the trimmer: {e}"));
+                }
+                if s.dropped > 0 || s.stopped_early.is_some() || !s.audio_issues.is_empty() || upload_failed {
                     self.notify("Recording saved", &text, false, ClickTarget::File(s.path));
                 } else {
                     self.notify_done("Recording saved", &text, ClickTarget::File(s.path));
@@ -293,12 +458,38 @@ impl App {
         }
     }
 
+    fn on_uploaded(&mut self, done: Done) {
+        match done.result {
+            Ok(url) => {
+                history::add(done.kind, done.path.as_deref(), done.size, Some(&url));
+                let copied = self.cfg.upload_copy_link && {
+                    let copied = shot::copy_text(Some(self.hwnd), &url);
+                    if let Err(e) = &copied {
+                        log(&format!("can't copy the link: {e}"));
+                    }
+                    copied.is_ok()
+                };
+                let title = if copied { "Uploaded, link copied" } else { "Uploaded" };
+                let text = format!("{url}\n{} · {}", human_size(done.size), done.host);
+                self.notify_done(title, &text, ClickTarget::Link(url));
+            }
+            Err(e) => {
+                log(&format!("upload to {} failed: {e}", done.host));
+                self.notify("glint: upload failed", &format!("{}: {e}", done.host), true, ClickTarget::Log);
+            }
+        }
+    }
+
     /// Exit: finish a running recording first so the file is finalized.
     fn exit(&mut self) {
         self.exiting = true;
         match &self.state {
             State::Recording { .. } => self.stop_recording(false),
             State::Stopping { .. } => {}
+            State::Countdown { .. } => {
+                self.cancel_countdown();
+                self.close_window();
+            }
             State::Selecting(h) => {
                 picker::dismiss(*h);
                 self.state = State::Idle;
@@ -318,6 +509,7 @@ impl App {
     fn open_click_target(&self) {
         match &self.click {
             ClickTarget::File(p) => shell("explorer.exe", &format!("/select,\"{}\"", p.display())),
+            ClickTarget::Link(url) => shell(url, ""),
             ClickTarget::Log => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
             ClickTarget::None => {}
         }
@@ -356,9 +548,20 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.shot_all_screens());
             return LRESULT(0);
         }
-        // From the indicator pill: WPARAM 0 = stop and save, 1 = discard.
+        WM_HOTKEY if wp.0 as i32 == PAUSE_HOTKEY_ID => {
+            with_app(|a| a.toggle_pause());
+            return LRESULT(0);
+        }
+        WM_HOTKEY if wp.0 as i32 == ESC_HOTKEY_ID => {
+            with_app(|a| a.cancel_countdown());
+            return LRESULT(0);
+        }
+        WM_TIMER if wp.0 == COUNTDOWN_TIMER_ID => {
+            with_app(|a| a.tick_countdown());
+            return LRESULT(0);
+        }
         WM_APP_STOP => {
-            with_app(|a| a.stop_recording(wp.0 == 1));
+            with_app(|a| a.on_indicator(wp.0));
             return LRESULT(0);
         }
         ipc::WM_RELOAD => {
@@ -381,12 +584,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         // Results posted from the overlay / encoder thread own a Box in LPARAM. If the state
         // is busy (re-entrant dispatch), re-post instead of dropping the result.
-        WM_APP_SELECTION | WM_APP_DONE => {
+        WM_APP_SELECTION | WM_APP_DONE | WM_APP_PIN | upload::WM_UPLOADED => {
             let handled = with_app(|a| unsafe {
-                if msg == WM_APP_SELECTION {
-                    a.on_selection(*Box::from_raw(lp.0 as *mut Option<Picked>));
-                } else {
-                    a.on_done(*Box::from_raw(lp.0 as *mut Result<Outcome, String>));
+                match msg {
+                    WM_APP_SELECTION => a.on_selection(*Box::from_raw(lp.0 as *mut Option<Picked>)),
+                    WM_APP_PIN => a.finish_shot(*Box::from_raw(lp.0 as *mut Shot)),
+                    upload::WM_UPLOADED => a.on_uploaded(*Box::from_raw(lp.0 as *mut Done)),
+                    _ => a.on_done(*Box::from_raw(lp.0 as *mut Result<Outcome, String>)),
                 }
             });
             if handled.is_none() {
@@ -471,6 +675,7 @@ pub fn run() {
             hotkey: None,
             shot_hotkey: None,
             full_hotkey: None,
+            pause_hotkey: None,
             state: State::Idle,
             tray: Tray::new(hwnd, WM_APP_TRAY),
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),

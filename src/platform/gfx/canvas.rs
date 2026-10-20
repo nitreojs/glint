@@ -3,7 +3,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::{DWRITE_MEASURING_MODE_NATURAL, IDWriteTextFormat};
+use windows::Win32::Graphics::DirectWrite::{DWRITE_MEASURING_MODE_NATURAL, IDWriteTextFormat, IDWriteTextLayout};
 use windows_numerics::Vector2;
 
 use crate::platform::wide::wide;
@@ -109,5 +109,10 @@ impl Canvas<'_> {
                 DWRITE_MEASURING_MODE_NATURAL,
             );
         }
+    }
+
+    pub(crate) fn text_layout(&self, layout: &IDWriteTextLayout, (x, y): (f32, f32), color: D2D1_COLOR_F) {
+        self.color(color);
+        unsafe { self.rt.DrawTextLayout(Vector2 { X: x, Y: y }, layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE) };
     }
 }

@@ -1,5 +1,6 @@
-//! On-screen recording indicator: viewfinder corner brackets around the recorded region and a
-//! small floating pill with a pulsing red dot, the elapsed time and a stop button.
+//! On-screen recording indicator: viewfinder corner brackets around the recorded region, an
+//! optional countdown bubble in its centre before the recording starts, and a small floating
+//! pill with a pulsing red dot, the elapsed time and pause / stop / discard buttons.
 //!
 //! Every window here is excluded from screen capture, so none of it appears in the video
 //! even where it overlaps the region (e.g. when recording a whole monitor). On Windows 10
@@ -9,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::f32::consts::TAU;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget;
@@ -23,7 +24,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, Tr
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
-use crate::platform::gfx::{Dib, Painter, animate, make_glass, rgba};
+use crate::platform::gfx::{Dib, Painter, animate, ease_out, make_glass, rgba};
 use crate::platform::log::log;
 use crate::platform::rect::Rect;
 
@@ -34,6 +35,8 @@ const TIMER_ID: usize = 1;
 /// Fast timer that runs only while a hover transition is in flight.
 const ANIM_TIMER_ID: usize = 2;
 const HOVER_MS: f32 = 140.0;
+const COUNT_TIMER_ID: usize = 3;
+const COUNT_POP_MS: f32 = 220.0;
 /// Bracket colors (BGR): light brackets over dark content, dark over bright content.
 const LIGHT: (COLORREF, COLORREF) = (COLORREF(0x00F4F4F4), COLORREF(0x00303030));
 const DARK: (COLORREF, COLORREF) = (COLORREF(0x00181614), COLORREF(0x00B0B0B0));
@@ -41,10 +44,30 @@ const DARK: (COLORREF, COLORREF) = (COLORREF(0x00181614), COLORREF(0x00B0B0B0));
 const CORNER_ALPHA: u8 = 255;
 const DASH_ALPHA: u8 = 150;
 
+pub(crate) const STOP: usize = 0;
+pub(crate) const DISCARD: usize = 1;
+pub(crate) const PAUSE: usize = 2;
+
 pub(crate) struct Indicator {
     /// Brackets and dashed sides with their full opacity.
     marks: Vec<(HWND, u8)>,
-    pill: HWND,
+    pill: Option<HWND>,
+    pill_pos: Rect,
+    count: Option<HWND>,
+    owner: HWND,
+    msg: u32,
+}
+
+struct CountState {
+    owner: HWND,
+    msg: u32,
+    painter: Painter,
+    font: IDWriteTextFormat,
+    rt: ID2D1HwndRenderTarget,
+    size: f32,
+    n: u32,
+    changed: Instant,
+    fade: f32,
 }
 
 struct PillState {
@@ -55,24 +78,47 @@ struct PillState {
     rt: ID2D1HwndRenderTarget,
     layout: Layout,
     started: Instant,
+    paused_for: Duration,
+    paused_at: Option<Instant>,
     hover: Option<Button>,
-    /// Hover progress of [stop, discard], 0 (idle) ..= 1 (hovered).
-    hover_t: [f32; 2],
+    /// Hover progress of [pause, stop, discard], 0 (idle) ..= 1 (hovered).
+    hover_t: [f32; 3],
     last_frame: Instant,
     /// The fast timer and 1 ms timer resolution are active.
     animating: bool,
     fade: f32,
 }
 
+impl PillState {
+    fn elapsed(&self) -> Duration {
+        let paused = self.paused_for + self.paused_at.map_or(Duration::ZERO, |p| p.elapsed());
+        self.started.elapsed().saturating_sub(paused)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Button {
+    /// Pause or resume.
+    Pause,
     /// Stop and save.
     Stop,
     /// Stop and delete the file.
     Discard,
 }
 
-/// Pill geometry, in pixels: [pad | dot | gap | m:ss | gap | ■ | ✕ | pad]. The buttons are
+const BUTTONS: [Button; 3] = [Button::Pause, Button::Stop, Button::Discard];
+
+impl Button {
+    fn wparam(self) -> usize {
+        match self {
+            Button::Pause => PAUSE,
+            Button::Stop => STOP,
+            Button::Discard => DISCARD,
+        }
+    }
+}
+
+/// Pill geometry, in pixels: [pad | dot | gap | m:ss | gap | ❚❚ | ■ | ✕ | pad]. The buttons are
 /// square hit areas whose hover circles are concentric with the pill's rounded end.
 struct Layout {
     w: f32,
@@ -82,8 +128,7 @@ struct Layout {
     time_w: f32,
     button: f32,
     top: f32,
-    stop_x: f32,
-    discard_x: f32,
+    xs: [f32; 3],
 }
 
 impl Layout {
@@ -91,24 +136,23 @@ impl Layout {
         let (h, button, dot) = (p.px(28.0), p.px(22.0), p.px(8.0));
         let top = ((h - button) / 2.0).floor();
         let text_x = p.px(12.0) + dot + p.px(8.0);
-        let stop_x = text_x + time_w + p.px(6.0);
+        let pause_x = text_x + time_w + p.px(6.0);
+        let stop_x = pause_x + button + p.px(1.0);
         let discard_x = stop_x + button + p.px(1.0);
-        Layout { w: discard_x + button + top, h, dot, text_x, time_w, button, top, stop_x, discard_x }
+        Layout { w: discard_x + button + top, h, dot, text_x, time_w, button, top, xs: [pause_x, stop_x, discard_x] }
     }
 
     fn hit(&self, x: f32, y: f32) -> Option<Button> {
         if y < self.top || y >= self.top + self.button {
             return None;
         }
-        [(Button::Stop, self.stop_x), (Button::Discard, self.discard_x)]
-            .into_iter()
-            .find(|&(_, bx)| x >= bx && x < bx + self.button)
-            .map(|(b, _)| b)
+        BUTTONS.into_iter().zip(self.xs).find(|&(_, bx)| x >= bx && x < bx + self.button).map(|(b, _)| b)
     }
 }
 
 thread_local! {
     static PILL: RefCell<Option<PillState>> = const { RefCell::new(None) };
+    static COUNT: RefCell<Option<CountState>> = const { RefCell::new(None) };
     /// Pre-rendered bracket/dash images, painted on WM_PAINT.
     static MARKS: RefCell<Vec<(HWND, Dib)>> = const { RefCell::new(Vec::new()) };
 }
@@ -221,13 +265,21 @@ fn mark(pos: Rect, parts: &[Rect], alpha: u8) -> Option<(HWND, u8)> {
 
 impl Indicator {
     /// `capture` and `monitors` (the recorded outputs) are in desktop coordinates. The pill's
-    /// buttons post `msg` to `owner` with WPARAM 0 (stop and save) or 1 (discard). Fades in
-    /// before returning.
-    pub(crate) fn show(capture: Rect, monitors: &[Rect], owner: HWND, msg: u32) -> Result<Indicator, String> {
+    /// buttons post `msg` to `owner` with WPARAM [`STOP`], [`DISCARD`] or [`PAUSE`]. With a
+    /// `countdown`, a bubble showing it replaces the pill until [`Indicator::start`]; clicking
+    /// it posts [`DISCARD`]. Fades in before returning.
+    pub(crate) fn show(
+        capture: Rect,
+        monitors: &[Rect],
+        owner: HWND,
+        msg: u32,
+        countdown: u32,
+    ) -> Result<Indicator, String> {
         let painter = Painter::new()?;
         let px = |v: f32| painter.px(v) as i32;
         register(w!("glint_mark"), Some(mark_proc), IDC_ARROW);
         register(w!("glint_pill"), Some(pill_proc), IDC_ARROW);
+        register(w!("glint_count"), Some(count_proc), IDC_HAND);
 
         // The frame sits just outside the region; where that is off the monitors it is pushed
         // inside (it is excluded from capture, so it never shows up in the video).
@@ -279,43 +331,160 @@ impl Indicator {
         if y + ph > monitor.bottom() {
             (x, y) = (capture.x + px(12.0), capture.y + px(12.0));
         }
-        let pos = clamp_into(x, y, pw, ph, monitor);
-        let pill = popup(w!("glint_pill"), WINDOW_EX_STYLE(0), pos).ok_or("can't create the indicator window")?;
-        make_glass(pill);
-        exclude_from_capture(pill);
-        let rt = painter.window_target(pill, pw, ph)?;
-        PILL.with(|p| {
-            *p.borrow_mut() = Some(PillState {
-                owner,
-                msg,
-                painter,
-                font,
-                rt,
-                layout,
-                started: Instant::now(),
-                hover: None,
-                hover_t: [0.0; 2],
-                last_frame: Instant::now(),
-                animating: false,
-                fade: 0.0,
-            })
-        });
-        unsafe {
-            let _ = ShowWindow(pill, SW_SHOWNOACTIVATE);
-            render_pill(); // fully transparent until the fade starts
-            SetTimer(Some(pill), TIMER_ID, 33, None);
+        let pill_pos = clamp_into(x, y, pw, ph, monitor);
+        let mut ind = Indicator { marks, pill: None, pill_pos, count: None, owner, msg };
+        if countdown > 0 {
+            let (cx, cy) = (capture.x + capture.w / 2, capture.y + capture.h / 2);
+            let on = monitors.iter().copied().find(|m| m.contains(cx, cy)).unwrap_or(monitor);
+            let d = px(104.0);
+            ind.count = Some(open_count(clamp_into(cx - d / 2, cy - d / 2, d, d, on), countdown, owner, msg)?);
+        } else {
+            ind.pill = Some(open_pill(painter, font, layout, pill_pos, owner, msg)?);
         }
-        animate(FADE_IN_MS, |t| set_fade(&marks, t));
-        Ok(Indicator { marks, pill })
+        animate(FADE_IN_MS, |t| {
+            set_fade(&ind.marks, t);
+            set_pill_fade(t);
+            set_count_fade(t);
+        });
+        Ok(ind)
+    }
+
+    pub(crate) fn count(&self, n: u32) {
+        COUNT.with(|c| {
+            if let Ok(mut g) = c.try_borrow_mut()
+                && let Some(st) = g.as_mut()
+            {
+                st.n = n;
+                st.changed = Instant::now();
+            }
+        });
+        render_count();
+    }
+
+    pub(crate) fn start(&mut self) -> Result<(), String> {
+        if let Some(count) = self.count.take() {
+            animate(FADE_OUT_MS, |t| set_count_fade(1.0 - t));
+            close_count(count);
+        }
+        if self.pill.is_none() {
+            let painter = Painter::new()?;
+            let font = painter.font(13.0)?;
+            let layout = Layout::new(&painter, painter.measure("88:88", &font).0.ceil());
+            self.pill = Some(open_pill(painter, font, layout, self.pill_pos, self.owner, self.msg)?);
+            animate(FADE_IN_MS, set_pill_fade);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_paused(&self, on: bool) {
+        PILL.with(|p| {
+            if let Ok(mut g) = p.try_borrow_mut()
+                && let Some(st) = g.as_mut()
+            {
+                match (on, st.paused_at) {
+                    (true, None) => st.paused_at = Some(Instant::now()),
+                    (false, Some(at)) => {
+                        st.paused_for += at.elapsed();
+                        st.paused_at = None;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        render_pill();
+    }
+}
+
+fn open_pill(
+    painter: Painter,
+    font: IDWriteTextFormat,
+    layout: Layout,
+    pos: Rect,
+    owner: HWND,
+    msg: u32,
+) -> Result<HWND, String> {
+    let pill = popup(w!("glint_pill"), WINDOW_EX_STYLE(0), pos).ok_or("can't create the indicator window")?;
+    make_glass(pill);
+    exclude_from_capture(pill);
+    let rt = painter.window_target(pill, pos.w, pos.h)?;
+    PILL.with(|p| {
+        *p.borrow_mut() = Some(PillState {
+            owner,
+            msg,
+            painter,
+            font,
+            rt,
+            layout,
+            started: Instant::now(),
+            paused_for: Duration::ZERO,
+            paused_at: None,
+            hover: None,
+            hover_t: [0.0; 3],
+            last_frame: Instant::now(),
+            animating: false,
+            fade: 0.0,
+        })
+    });
+    unsafe {
+        let _ = ShowWindow(pill, SW_SHOWNOACTIVATE);
+        render_pill(); // fully transparent until the fade starts
+        SetTimer(Some(pill), TIMER_ID, 33, None);
+    }
+    Ok(pill)
+}
+
+fn open_count(pos: Rect, n: u32, owner: HWND, msg: u32) -> Result<HWND, String> {
+    let painter = Painter::new()?;
+    let font = painter.font(46.0)?;
+    let hwnd = popup(w!("glint_count"), WINDOW_EX_STYLE(0), pos).ok_or("can't create the countdown window")?;
+    make_glass(hwnd);
+    exclude_from_capture(hwnd);
+    let rt = match painter.window_target(hwnd, pos.w, pos.h) {
+        Ok(rt) => rt,
+        Err(e) => {
+            unsafe {
+                let _ = DestroyWindow(hwnd);
+            }
+            return Err(e);
+        }
+    };
+    COUNT.with(|c| {
+        *c.borrow_mut() =
+            Some(CountState { owner, msg, painter, font, rt, size: pos.w as f32, n, changed: Instant::now(), fade: 0.0 })
+    });
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        render_count();
+        SetTimer(Some(hwnd), COUNT_TIMER_ID, 16, None);
+    }
+    Ok(hwnd)
+}
+
+fn close_count(hwnd: HWND) {
+    unsafe {
+        let _ = KillTimer(Some(hwnd), COUNT_TIMER_ID);
+    }
+    COUNT.with(|c| c.borrow_mut().take());
+    unsafe {
+        let _ = DestroyWindow(hwnd);
     }
 }
 
 impl Drop for Indicator {
     fn drop(&mut self) {
-        unsafe {
-            let _ = KillTimer(Some(self.pill), TIMER_ID);
+        if let Some(pill) = self.pill {
+            unsafe {
+                let _ = KillTimer(Some(pill), TIMER_ID);
+            }
         }
-        animate(FADE_OUT_MS, |t| set_fade(&self.marks, 1.0 - t));
+        animate(FADE_OUT_MS, |t| {
+            set_fade(&self.marks, 1.0 - t);
+            set_pill_fade(1.0 - t);
+            set_count_fade(1.0 - t);
+        });
+        if let Some(count) = self.count.take() {
+            close_count(count);
+        }
         if let Some(st) = PILL.with(|p| p.borrow_mut().take())
             && st.animating
         {
@@ -324,7 +493,7 @@ impl Drop for Indicator {
             }
         }
         unsafe {
-            for h in self.marks.iter().map(|m| m.0).chain([self.pill]) {
+            for h in self.marks.iter().map(|m| m.0).chain(self.pill) {
                 let _ = DestroyWindow(h);
             }
         }
@@ -450,6 +619,9 @@ fn set_fade(marks: &[(HWND, u8)], fade: f32) {
             let _ = SetLayeredWindowAttributes(h, COLORREF(0), (fade * alpha as f32) as u8, LWA_ALPHA);
         }
     }
+}
+
+fn set_pill_fade(fade: f32) {
     PILL.with(|p| {
         if let Ok(mut g) = p.try_borrow_mut()
             && let Some(st) = g.as_mut()
@@ -460,13 +632,24 @@ fn set_fade(marks: &[(HWND, u8)], fade: f32) {
     render_pill();
 }
 
+fn set_count_fade(fade: f32) {
+    COUNT.with(|c| {
+        if let Ok(mut g) = c.try_borrow_mut()
+            && let Some(st) = g.as_mut()
+        {
+            st.fade = fade;
+        }
+    });
+    render_count();
+}
+
 /// Moves hover progress toward the hovered button; returns whether anything is still moving.
 fn advance_hover(st: &mut PillState) -> bool {
     let now = Instant::now();
     let step = (now - st.last_frame).as_secs_f32() * 1000.0 / HOVER_MS;
     st.last_frame = now;
     let mut moving = false;
-    for (t, button) in st.hover_t.iter_mut().zip([Button::Stop, Button::Discard]) {
+    for (t, button) in st.hover_t.iter_mut().zip(BUTTONS) {
         let target = if st.hover == Some(button) { 1.0 } else { 0.0 };
         *t = if *t < target { (*t + step).min(target) } else { (*t - step).max(target) };
         moving |= *t != target;
@@ -483,16 +666,18 @@ fn render_pill() -> bool {
         let moving = advance_hover(st);
         let px = |v: f32| st.painter.px(v);
         let l = &st.layout;
-        let t = st.started.elapsed().as_secs_f32();
-        let secs = t as u64;
+        let paused = st.paused_at.is_some();
+        let secs = st.elapsed().as_secs();
         let clock = format!("{}:{:02}", secs / 60, secs % 60);
-        let pulse = 0.6 + 0.4 * (t * TAU / PULSE_S).cos();
+        let wave = (st.started.elapsed().as_secs_f32() * TAU / PULSE_S).cos();
         let white = |a: f32| rgba(255, 255, 255, a);
         let _ = st.painter.render(&st.rt, st.fade, |c| {
             c.round_rect(0.0, 0.0, l.w, l.h, l.h / 2.0, rgba(16, 16, 20, 0.88));
-            c.round_rect(px(12.0), (l.h - l.dot) / 2.0, l.dot, l.dot, l.dot / 2.0, rgba(255, 69, 58, pulse));
-            c.text(&clock, &st.font, [l.text_x, 0.0, l.time_w + 2.0, l.h], white(0.96));
-            for ((button, x), &h) in [(Button::Stop, l.stop_x), (Button::Discard, l.discard_x)].into_iter().zip(&st.hover_t) {
+            let (dot, clock_alpha) =
+                if paused { (rgba(255, 159, 10, 0.95), 0.6 + 0.36 * wave) } else { (rgba(255, 69, 58, 0.6 + 0.4 * wave), 0.96) };
+            c.round_rect(px(12.0), (l.h - l.dot) / 2.0, l.dot, l.dot, l.dot / 2.0, dot);
+            c.text(&clock, &st.font, [l.text_x, 0.0, l.time_w + 2.0, l.h], white(clock_alpha));
+            for ((button, x), &h) in BUTTONS.into_iter().zip(l.xs).zip(&st.hover_t) {
                 let e = h * h * (3.0 - 2.0 * h); // smoothstep
                 let (cx, cy) = (x + l.button / 2.0, l.top + l.button / 2.0);
                 if e > 0.0 {
@@ -503,6 +688,15 @@ fn render_pill() -> bool {
                 }
                 let a = 0.8 + 0.2 * e;
                 match button {
+                    Button::Pause if paused => {
+                        let (w, h) = (px(4.5), px(5.5));
+                        c.polygon(&[(cx - w * 0.7, cy - h), (cx - w * 0.7, cy + h), (cx + w * 1.3, cy)], white(a));
+                    }
+                    Button::Pause => {
+                        let (w, h, gap) = (px(3.0), px(10.0), px(2.0));
+                        c.round_rect(cx - gap / 2.0 - w, cy - h / 2.0, w, h, px(1.0), white(a));
+                        c.round_rect(cx + gap / 2.0, cy - h / 2.0, w, h, px(1.0), white(a));
+                    }
                     Button::Stop => {
                         let s = px(10.0);
                         c.round_rect(cx - s / 2.0, cy - s / 2.0, s, s, px(2.0), white(a));
@@ -517,6 +711,23 @@ fn render_pill() -> bool {
         });
         moving
     })
+}
+
+fn render_count() {
+    COUNT.with(|c| {
+        let Ok(g) = c.try_borrow() else { return };
+        let Some(st) = g.as_ref() else { return };
+        let pop = ease_out((st.changed.elapsed().as_secs_f32() * 1000.0 / COUNT_POP_MS).min(1.0));
+        let text = st.n.to_string();
+        let (tw, _) = st.painter.measure(&text, &st.font);
+        let (s, r) = (st.size, st.size / 2.0);
+        let _ = st.painter.render(&st.rt, st.fade, |c| {
+            c.circle((r, r), r - 1.0, rgba(16, 16, 20, 0.88));
+            c.ring((r, r), r - st.painter.px(5.0), st.painter.px(2.0), rgba(255, 69, 58, 0.35 + 0.5 * pop));
+            let dy = st.painter.px(6.0) * (1.0 - pop);
+            c.text(&text, &st.font, [(s - tw) / 2.0, dy, tw + 2.0, s], rgba(255, 255, 255, 0.96 * pop));
+        });
+    });
 }
 
 /// Runs the fast animation timer (with 1 ms timer resolution, so it actually ticks every
@@ -627,7 +838,31 @@ unsafe extern "system" fn pill_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             });
             if let Some((owner, msg, button)) = target {
                 unsafe {
-                    let _ = PostMessageW(Some(owner), msg, WPARAM((button == Button::Discard) as usize), LPARAM(0));
+                    let _ = PostMessageW(Some(owner), msg, WPARAM(button.wparam()), LPARAM(0));
+                }
+            }
+        }
+        WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
+        _ => return unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
+    LRESULT(0)
+}
+
+unsafe extern "system" fn count_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    match msg {
+        WM_TIMER if wp.0 == COUNT_TIMER_ID => render_count(),
+        WM_PAINT => unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
+            render_count();
+        },
+        WM_ERASEBKGND => return LRESULT(1),
+        WM_LBUTTONUP => {
+            let target = COUNT.with(|c| c.try_borrow().ok().and_then(|g| g.as_ref().map(|s| (s.owner, s.msg))));
+            if let Some((owner, msg)) = target {
+                unsafe {
+                    let _ = PostMessageW(Some(owner), msg, WPARAM(DISCARD), LPARAM(0));
                 }
             }
         }

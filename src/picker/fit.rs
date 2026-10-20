@@ -50,7 +50,29 @@ pub(super) fn window_pick(win: Rect, outputs: &[Output]) -> Option<Rect> {
         .iter()
         .filter_map(|o| win.intersect(&o.rect))
         .filter(|r| r.w >= MIN_PICK && r.h >= MIN_PICK)
-        .reduce(|a, b| Rect::from_points(a.x.min(b.x), a.y.min(b.y), a.right().max(b.right()), a.bottom().max(b.bottom())))
+        .reduce(hull)
+}
+
+pub(super) fn hull(a: Rect, b: Rect) -> Rect {
+    Rect::from_points(a.x.min(b.x), a.y.min(b.y), a.right().max(b.right()), a.bottom().max(b.bottom()))
+}
+
+/// Ctrl+click: adds `r` to the chosen windows, or takes it out again.
+pub(super) fn toggle(chosen: &mut Vec<Rect>, r: Rect) {
+    match chosen.iter().position(|&c| c == r) {
+        Some(i) => {
+            chosen.remove(i);
+        }
+        None => chosen.push(r),
+    }
+}
+
+/// What the chosen windows pick: their bounding box, fitted into `area`, and with `cutout` the windows
+/// themselves inside it (None when one of them already covers the whole box).
+pub(super) fn multi_pick(chosen: &[Rect], area: Rect, fit: Fit, cutout: bool) -> Option<(Rect, Option<Vec<Rect>>)> {
+    let rect = fit_rect(chosen.iter().copied().reduce(hull)?, area, fit);
+    let cut: Option<Vec<Rect>> = cutout.then(|| chosen.iter().filter_map(|c| c.intersect(&rect)).collect());
+    Some((rect, cut.filter(|c| !c.contains(&rect))))
 }
 
 /// The outputs `rect` overlaps, in enumeration order.
@@ -168,5 +190,47 @@ mod tests {
         assert_eq!(fit_rect(window_pick(max, &outs).unwrap(), AREA, MIN), outs[0].rect);
         let max = Rect { x: 357, y: -1448, w: 2576, h: 1456 };
         assert_eq!(window_pick(max, &outs), Some(outs[2].rect));
+    }
+
+    #[test]
+    fn ctrl_click_toggles_windows_in_and_out() {
+        let (a, b) = (Rect { x: 10, y: 10, w: 100, h: 50 }, Rect { x: 300, y: 40, w: 80, h: 80 });
+        let mut chosen = Vec::new();
+        toggle(&mut chosen, a);
+        toggle(&mut chosen, b);
+        assert_eq!(chosen, [a, b]);
+        toggle(&mut chosen, a);
+        assert_eq!(chosen, [b]);
+        toggle(&mut chosen, a);
+        assert_eq!(chosen, [b, a]);
+    }
+
+    #[test]
+    fn chosen_windows_pick_their_bounding_box() {
+        let outs = layout();
+        // One on the main monitor, one on the left monitor, odd sizes.
+        let a = Rect { x: 101, y: 700, w: 301, h: 201 };
+        let b = Rect { x: -900, y: 600, w: 400, h: 151 };
+        let bounds = Rect { x: -900, y: 600, w: 1302, h: 301 };
+        let (rect, cut) = multi_pick(&[a, b], AREA, Fit::ANY, true).unwrap();
+        assert_eq!((rect, cut), (bounds, Some(vec![a, b])));
+        assert_eq!(on(rect, &outs), [outs[0].rect, outs[1].rect]);
+        // Recordings get the even-sized box and no cutout.
+        let (rect, cut) = multi_pick(&[a, b], AREA, MIN, false).unwrap();
+        assert_eq!((rect, cut), (Rect { w: 1302, h: 300, ..bounds }, None));
+        // A window covering the others needs no cutout; nothing chosen picks nothing.
+        let big = Rect { x: -1000, y: 500, w: 1500, h: 500 };
+        assert_eq!(multi_pick(&[a, big], AREA, Fit::ANY, true), Some((big, None)));
+        assert_eq!(multi_pick(&[], AREA, Fit::ANY, true), None);
+    }
+
+    #[test]
+    fn cutouts_stay_inside_the_virtual_screen() {
+        // Hanging off the bottom right of the main monitor; the cutout is clipped with the box.
+        let a = Rect { x: 3300, y: 1300, w: 400, h: 400 };
+        let b = Rect { x: 3000, y: 1000, w: 100, h: 100 };
+        let (rect, cut) = multi_pick(&[a, b], AREA, Fit::ANY, true).unwrap();
+        assert_eq!(rect, Rect { x: 3000, y: 1000, w: 440, h: 620 });
+        assert_eq!(cut, Some(vec![Rect { x: 3300, y: 1300, w: 140, h: 320 }, b]));
     }
 }

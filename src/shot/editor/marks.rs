@@ -1,5 +1,6 @@
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
+use super::text::Typesetter;
 use crate::platform::gfx::{Canvas, rgba};
 use crate::platform::rect::Rect;
 
@@ -11,16 +12,20 @@ pub(super) enum Tool {
     Rectangle,
     Blur,
     Pixelate,
+    Text,
+    Step,
 }
 
-/// Tools with their tooltip and letter key; digits 1-6 follow this order.
-pub(super) const TOOLS: [(Tool, &str, u8); 6] = [
+/// Tools with their tooltip and letter key; digits 1-8 follow this order.
+pub(super) const TOOLS: [(Tool, &str, u8); 8] = [
     (Tool::Pen, "pen  ·  1 / P", b'P'),
     (Tool::Highlighter, "highlighter  ·  2 / H", b'H'),
     (Tool::Arrow, "arrow  ·  3 / A", b'A'),
     (Tool::Rectangle, "rectangle  ·  4 / R", b'R'),
     (Tool::Blur, "blur  ·  5 / B", b'B'),
     (Tool::Pixelate, "pixelate  ·  6 / X", b'X'),
+    (Tool::Text, "text  ·  7 / T", b'T'),
+    (Tool::Step, "step  ·  8 / N", b'N'),
 ];
 
 pub(super) struct Strength {
@@ -38,6 +43,8 @@ impl Tool {
             Tool::Highlighter => ([10.0, 16.0, 28.0], 2.0, 4.0, 80.0, "width"),
             Tool::Blur => ([4.0, 8.0, 16.0], 1.0, 1.0, 40.0, "blur"),
             Tool::Pixelate => ([6.0, 12.0, 20.0], 2.0, 2.0, 80.0, "block size"),
+            Tool::Text => ([16.0, 24.0, 36.0], 2.0, 8.0, 160.0, "size"),
+            Tool::Step => ([20.0, 28.0, 40.0], 2.0, 12.0, 120.0, "size"),
         };
         Strength { presets, step, min, max, name }
     }
@@ -50,6 +57,9 @@ pub(super) const COLORS: [D2D1_COLOR_F; 5] = [
     rgba(0x0A, 0x84, 0xFF, 1.0),
     rgba(0xFF, 0xFF, 0xFF, 1.0),
 ];
+/// Palette entries a white number can't sit on.
+const LIGHT: [bool; 5] = [false, true, false, false, true];
+const STEP_INK: D2D1_COLOR_F = rgba(20, 20, 24, 1.0);
 const HIGHLIGHTER_ALPHA: f32 = 0.4;
 const MIN_SIDE: i32 = 3;
 
@@ -60,6 +70,10 @@ pub(super) enum Mark {
     Rectangle { rect: Rect, color: usize, width: f32 },
     Blur { rect: Rect, radius: f32 },
     Pixelate { rect: Rect, block: f32 },
+    /// `at` is the top-left corner; `extent` is the laid-out size in physical pixels.
+    Text { at: (f32, f32), text: String, color: usize, size: f32, extent: (f32, f32) },
+    /// A numbered disc of diameter `size` (radius `r` in physical pixels), with an arrow to `tail`.
+    Step { at: (f32, f32), tail: Option<(f32, f32)>, color: usize, size: f32, r: f32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,6 +94,8 @@ impl Mark {
             Tool::Rectangle => Mark::Rectangle { rect, color, width: strength },
             Tool::Blur => Mark::Blur { rect, radius: strength },
             Tool::Pixelate => Mark::Pixelate { rect, block: strength },
+            Tool::Text => Mark::Text { at, text: String::new(), color, size: strength, extent: (0.0, 0.0) },
+            Tool::Step => Mark::Step { at, tail: None, color, size: strength, r: 0.0 },
         }
     }
 
@@ -91,6 +107,8 @@ impl Mark {
             Mark::Rectangle { .. } => Tool::Rectangle,
             Mark::Blur { .. } => Tool::Blur,
             Mark::Pixelate { .. } => Tool::Pixelate,
+            Mark::Text { .. } => Tool::Text,
+            Mark::Step { .. } => Tool::Step,
         }
     }
 
@@ -103,6 +121,7 @@ impl Mark {
             Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => *width,
             Mark::Blur { radius, .. } => *radius,
             Mark::Pixelate { block, .. } => *block,
+            Mark::Text { size, .. } | Mark::Step { size, .. } => *size,
         }
     }
 
@@ -111,19 +130,28 @@ impl Mark {
             Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => width,
             Mark::Blur { radius, .. } => radius,
             Mark::Pixelate { block, .. } => block,
+            Mark::Text { size, .. } | Mark::Step { size, .. } => size,
         }
     }
 
     pub(super) fn color(&self) -> Option<usize> {
         match self {
-            Mark::Stroke { color, .. } | Mark::Arrow { color, .. } | Mark::Rectangle { color, .. } => Some(*color),
+            Mark::Stroke { color, .. }
+            | Mark::Arrow { color, .. }
+            | Mark::Rectangle { color, .. }
+            | Mark::Text { color, .. }
+            | Mark::Step { color, .. } => Some(*color),
             Mark::Blur { .. } | Mark::Pixelate { .. } => None,
         }
     }
 
     pub(super) fn color_mut(&mut self) -> Option<&mut usize> {
         match self {
-            Mark::Stroke { color, .. } | Mark::Arrow { color, .. } | Mark::Rectangle { color, .. } => Some(color),
+            Mark::Stroke { color, .. }
+            | Mark::Arrow { color, .. }
+            | Mark::Rectangle { color, .. }
+            | Mark::Text { color, .. }
+            | Mark::Step { color, .. } => Some(color),
             Mark::Blur { .. } | Mark::Pixelate { .. } => None,
         }
     }
@@ -131,14 +159,15 @@ impl Mark {
     pub(super) fn area_mut(&mut self) -> Option<&mut Rect> {
         match self {
             Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => Some(rect),
-            Mark::Stroke { .. } | Mark::Arrow { .. } => None,
+            Mark::Stroke { .. } | Mark::Arrow { .. } | Mark::Text { .. } | Mark::Step { .. } => None,
         }
     }
 
     /// Whether the mark is big enough to keep (a click without a drag isn't an arrow).
     pub(super) fn worth_keeping(&self) -> bool {
         match self {
-            Mark::Stroke { .. } => true,
+            Mark::Stroke { .. } | Mark::Step { .. } => true,
+            Mark::Text { text, .. } => !text.trim().is_empty(),
             Mark::Arrow { from, to, .. } => (from.0 - to.0).abs() >= 3.0 || (from.1 - to.1).abs() >= 3.0,
             Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
                 rect.w >= MIN_SIDE && rect.h >= MIN_SIDE
@@ -151,6 +180,11 @@ impl Mark {
             Mark::Stroke { points, .. } => span(points),
             Mark::Arrow { from, to, .. } => span(&[*from, *to]),
             Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => *rect,
+            Mark::Text { at, extent, .. } => span(&[*at, (at.0 + extent.0.max(1.0), at.1 + extent.1)]),
+            Mark::Step { at, tail, r, .. } => {
+                let corners = [(at.0 - r, at.1 - r), (at.0 + r, at.1 + r)];
+                span(&[&corners[..], tail.as_slice()].concat())
+            }
         }
     }
 
@@ -162,7 +196,9 @@ impl Mark {
                 let w = ink_width(*width, scale);
                 (w / 2.0).max(arrow_head(w, f32::MAX) * 0.55)
             }
-            Mark::Blur { .. } | Mark::Pixelate { .. } => 0.0,
+            Mark::Text { size, .. } => outline(size * scale),
+            Mark::Step { tail: Some(_), r, .. } => arrow_head(tail_width(*r), f32::MAX) * 0.55,
+            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Step { .. } => 0.0,
         };
         self.bbox().inflate(reach.ceil() as i32 + 1)
     }
@@ -179,6 +215,11 @@ impl Mark {
             Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
                 *rect = rect.offset(dx, dy)
             }
+            Mark::Text { at, .. } => shift(at),
+            Mark::Step { at, tail, .. } => {
+                shift(at);
+                tail.iter_mut().for_each(shift);
+            }
         }
         m
     }
@@ -194,6 +235,7 @@ impl Mark {
         match (&mut m, grip) {
             (Mark::Arrow { from, .. }, Grip::From) => shift(from),
             (Mark::Arrow { to, .. }, Grip::To) => shift(to),
+            (Mark::Step { tail: Some(t), .. }, Grip::To) => shift(t),
             (m, Grip::Edge(edges)) => {
                 if let Some(r) = m.area_mut() {
                     *r = resize(*r, edges, (dx, dy), b, MIN_SIDE);
@@ -220,12 +262,17 @@ impl Mark {
                 within(*rect, p, reach) && !within(*rect, p, -reach)
             }
             Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => within(*rect, p, 0.0),
+            Mark::Text { .. } => within(self.bbox(), p, slop),
+            Mark::Step { at, tail, r, .. } => {
+                dist(p, *at) <= r + slop || tail.is_some_and(|t| seg_dist(p, *at, t) <= tail_width(*r) / 2.0 + slop)
+            }
         }
     }
 
     pub(super) fn grips(&self) -> Vec<(Grip, (f32, f32))> {
         match self {
-            Mark::Stroke { .. } => Vec::new(),
+            Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { tail: None, .. } => Vec::new(),
+            Mark::Step { tail: Some(t), .. } => vec![(Grip::To, *t)],
             Mark::Arrow { from, to, .. } => vec![(Grip::From, *from), (Grip::To, *to)],
             Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
                 GRIPS.iter().map(|&e| (Grip::Edge(e), edge_point(*rect, e))).collect()
@@ -327,7 +374,27 @@ fn ink_width(width: f32, scale: f32) -> f32 {
     (width * scale).round().max(1.0)
 }
 
-pub(super) fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32), scale: f32) {
+/// Pairs each mark with the number the step markers so far reach: steps count 1, 2, 3 … in order.
+pub(super) fn numbered<'a>(marks: impl Iterator<Item = &'a Mark>) -> impl Iterator<Item = (&'a Mark, usize)> {
+    marks.scan(0, |n, m| {
+        if let Mark::Step { .. } = m {
+            *n += 1;
+        }
+        Some((m, *n))
+    })
+}
+
+fn tail_width(r: f32) -> f32 {
+    (r / 4.0).round().max(2.0)
+}
+
+/// How far the dark outline around text reaches, for a font of `px` physical pixels.
+pub(super) fn outline(px: f32) -> f32 {
+    (px / 14.0).round().max(1.0)
+}
+
+/// Draws `m`; `step` is the number a step marker shows.
+pub(super) fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32), scale: f32, fonts: &Typesetter, step: usize) {
     let at = |(x, y): (f32, f32)| (x + dx, y + dy);
     match m {
         Mark::Stroke { highlight, points, color, width } => {
@@ -341,6 +408,24 @@ pub(super) fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32), scale: f32) 
         Mark::Rectangle { rect, color, width } => {
             let (x, y) = at((rect.x as f32, rect.y as f32));
             c.rect_outline(x, y, rect.w as f32, rect.h as f32, ink_width(*width, scale), COLORS[*color]);
+        }
+        Mark::Text { at: corner, text, color, size, .. } => {
+            let px = size * scale;
+            fonts.draw_outlined(c, text, px, at(*corner), COLORS[*color], outline(px));
+        }
+        Mark::Step { at: centre, tail, color, r, .. } => {
+            let o = at(*centre);
+            if let Some(t) = tail {
+                let t = at(*t);
+                let len = dist(o, t);
+                if len > *r {
+                    let from = (o.0 + (t.0 - o.0) * r / len, o.1 + (t.1 - o.1) * r / len);
+                    arrow(c, from, t, tail_width(*r), COLORS[*color]);
+                }
+            }
+            c.circle(o, *r, COLORS[*color]);
+            let ink = if LIGHT[*color] { STEP_INK } else { COLORS[4] };
+            fonts.draw_centred(c, &step.to_string(), r * 1.15, o, ink);
         }
         Mark::Blur { .. } | Mark::Pixelate { .. } => {}
     }

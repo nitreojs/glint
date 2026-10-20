@@ -1,6 +1,8 @@
-use windows::Win32::UI::Input::KeyboardAndMouse::{HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE,
+};
 
-use super::{App, ClickTarget};
+use super::{App, ClickTarget, State};
 use crate::config::Config;
 use crate::config::hotkeys::parse_hotkey;
 use crate::platform::log::log;
@@ -8,6 +10,8 @@ use crate::platform::log::log;
 pub(super) const HOTKEY_ID: i32 = 1;
 pub(super) const SHOT_HOTKEY_ID: i32 = 2;
 pub(super) const FULL_HOTKEY_ID: i32 = 3;
+pub(super) const PAUSE_HOTKEY_ID: i32 = 4;
+pub(super) const ESC_HOTKEY_ID: i32 = 5;
 
 impl App {
     /// (Re-)registers one global hotkey; returns the combo it now holds.
@@ -41,6 +45,39 @@ impl App {
         self.shot_hotkey = self.grab_hotkey(SHOT_HOTKEY_ID, held, combo, "screenshot", announce[1]);
         let (held, combo) = (self.full_hotkey.is_some(), &cfg.fullscreen_hotkey);
         self.full_hotkey = self.grab_hotkey(FULL_HOTKEY_ID, held, combo, "all screens", announce[2]);
+        if matches!(self.state, State::Recording { .. }) {
+            self.grab_pause_hotkey();
+        }
+    }
+
+    pub(super) fn grab_pause_hotkey(&mut self) {
+        let combo = self.cfg.pause_hotkey.clone();
+        self.pause_hotkey = self.grab_hotkey(PAUSE_HOTKEY_ID, self.pause_hotkey.is_some(), &combo, "pause", false);
+        if self.pause_hotkey.is_none() {
+            log(&format!("pause hotkey {combo} is taken by another app"));
+        }
+    }
+
+    pub(super) fn release_pause_hotkey(&mut self) {
+        if self.pause_hotkey.take().is_some() {
+            unsafe {
+                let _ = UnregisterHotKey(Some(self.hwnd), PAUSE_HOTKEY_ID);
+            }
+        }
+    }
+
+    pub(super) fn grab_escape(&self) {
+        unsafe {
+            if RegisterHotKey(Some(self.hwnd), ESC_HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE.0 as u32).is_err() {
+                log("esc is taken by another app; the record hotkey cancels the countdown");
+            }
+        }
+    }
+
+    pub(super) fn release_escape(&self) {
+        unsafe {
+            let _ = UnregisterHotKey(Some(self.hwnd), ESC_HOTKEY_ID);
+        }
     }
 
     /// Releases the hotkeys while the settings window records a new one.
@@ -49,6 +86,7 @@ impl App {
             (HOTKEY_ID, self.hotkey.take()),
             (SHOT_HOTKEY_ID, self.shot_hotkey.take()),
             (FULL_HOTKEY_ID, self.full_hotkey.take()),
+            (PAUSE_HOTKEY_ID, self.pause_hotkey.take()),
         ];
         for (id, held) in held {
             if held.is_some() {

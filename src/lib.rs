@@ -1,7 +1,10 @@
 pub mod app;
+pub mod clip;
 mod config;
+mod history;
 mod picker;
 mod platform;
 mod record;
 pub mod settings;
 mod shot;
+mod upload;

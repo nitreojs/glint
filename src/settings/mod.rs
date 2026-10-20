@@ -12,6 +12,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Id, Key, Layout, Rect, RichText,
     Stroke, TextStyle, Ui, UiBuilder, pos2, vec2,
 };
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
@@ -24,10 +25,11 @@ use crate::platform::wide::from_wstr;
 
 mod hotkey_capture;
 mod sections;
-mod widgets;
+pub(crate) mod widgets;
 
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, Listener};
+use sections::uploads::Uploaders;
 use sections::{SECTIONS, Section};
 use widgets::{
     BAR_H, CONTENT_X, FOOTER_H, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, medium, mono, sans, semibold,
@@ -82,6 +84,9 @@ pub fn run() {
         rounded: None,
         light: None,
         closing: false,
+        uploaders: Uploaders::load(),
+        shown: None,
+        pinned: false,
     };
     let _ = eframe::run_native(
         SETTINGS_TITLE,
@@ -122,6 +127,9 @@ struct SettingsApp {
     light: Option<bool>,
     /// Closing was confirmed (or there was nothing to lose): let the close through.
     closing: bool,
+    uploaders: Uploaders,
+    shown: Option<Section>,
+    pinned: bool,
 }
 
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -209,15 +217,18 @@ fn windows_build() -> u32 {
 /// Asks Windows 11 to round the window; returns whether it's rounded (never on Windows 10),
 /// or None while the window doesn't exist yet.
 fn round_corners() -> Option<bool> {
-    let hwnd = ipc::find_settings()?;
+    Some(round(ipc::find_settings()?))
+}
+
+pub(crate) fn round(hwnd: HWND) -> bool {
     if windows_build() < 22000 {
-        return Some(false);
+        return false;
     }
     let pref = DWMWCP_ROUND;
     let set = unsafe {
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const _ as _, size_of_val(&pref) as u32)
     };
-    Some(set.is_ok())
+    set.is_ok()
 }
 
 impl eframe::App for SettingsApp {
@@ -253,7 +264,7 @@ impl eframe::App for SettingsApp {
         let full = ui.max_rect();
         ui.painter().rect_filled(full, radius, p.surf);
         let bar = Rect::from_min_size(full.min, vec2(full.width(), BAR_H));
-        match widgets::title_bar(ui, &look, bar, active, radius) {
+        match widgets::title_bar(ui, &look, bar, "settings", active, radius) {
             TitleAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             TitleAction::Close => self.request_close(&ctx),
             TitleAction::None => {}
@@ -282,18 +293,36 @@ impl eframe::App for SettingsApp {
         ui.painter().text(pos2(body.left(), body.top() + 18.0), Align2::LEFT_TOP, self.section.name(), semibold(20.0), p.t1);
         let rows = Rect::from_min_max(pos2(body.left(), body.top() + 56.0), body.right_bottom());
         let mut content = ui.new_child(UiBuilder::new().max_rect(rows).layout(Layout::top_down(Align::Min)));
-        content.spacing_mut().item_spacing = vec2(8.0, 0.0);
-        if let Some(e) = &self.error {
-            hint(&mut content, e.clone(), p.warn);
-            content.add_space(12.0);
+        if self.shown != Some(self.section) {
+            self.shown = Some(self.section);
+            self.pinned = true;
         }
-        match self.section {
-            Section::General => self.general(&mut content, &look),
-            Section::Recording => self.recording(&mut content, &look),
-            Section::Screenshots => self.screenshots(&mut content, &look),
-            Section::Output => self.output(&mut content, &look),
-            Section::About => self.about(&mut content, &look),
+        // observed on the user's machine: a fresh window opened scrolled to the bottom with no input
+        let touched = ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.pointer.delta() != egui::Vec2::ZERO
+                || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        });
+        self.pinned &= !touched;
+        let mut scroll = egui::ScrollArea::vertical().id_salt(self.section.name()).auto_shrink(false);
+        if self.pinned {
+            scroll = scroll.vertical_scroll_offset(0.0);
         }
+        scroll.show(&mut content, |content| {
+            content.spacing_mut().item_spacing = vec2(8.0, 0.0);
+            if let Some(e) = &self.error {
+                hint(content, e.clone(), p.warn);
+                content.add_space(12.0);
+            }
+            match self.section {
+                Section::General => self.general(content, &look),
+                Section::Recording => self.recording(content, &look),
+                Section::Screenshots => self.screenshots(content, &look),
+                Section::Uploads => self.uploads(content, &look),
+                Section::Output => self.output(content, &look),
+                Section::About => self.about(content, &look),
+            }
+        });
         self.footer(ui, &look, Rect::from_min_max(pos2(main.left(), body.bottom()), main.right_bottom()));
         self.dialogs(&ctx, &look);
 
@@ -392,7 +421,7 @@ impl SettingsApp {
                     });
                     body(
                         ui,
-                        "rust crates (egui, eframe, winit, windows-rs, serde, toml and their dependencies), \
+                        "rust crates (egui, eframe, winit, windows-rs, serde, toml, gif, color_quant and their dependencies), \
                          by their authors, under permissive licences, mostly mit or apache-2.0.",
                     );
                     ui.add_space(4.0);
@@ -410,7 +439,7 @@ impl SettingsApp {
     }
 }
 
-fn fonts(ctx: &egui::Context) {
+pub(crate) fn fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
     let defaults = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
     for (name, bytes) in FONTS {
@@ -448,7 +477,7 @@ fn fonts(ctx: &egui::Context) {
 }
 
 /// egui's own widgets (text fields, the licence scroll area) in the palette's colours.
-fn visuals(ctx: &egui::Context, p: &widgets::Palette, light: bool) {
+pub(crate) fn visuals(ctx: &egui::Context, p: &widgets::Palette, light: bool) {
     let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = p.surf;
     v.window_fill = p.surf;
@@ -462,3 +491,92 @@ fn visuals(ctx: &egui::Context, p: &widgets::Palette, light: bool) {
     ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
     ctx.set_visuals(v);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::App;
+
+    const TOP: f32 = 118.0;
+
+    struct Harness {
+        ctx: egui::Context,
+        app: SettingsApp,
+        frame: eframe::Frame,
+        time: f64,
+    }
+
+    impl Harness {
+        fn new() -> Harness {
+            let ctx = egui::Context::default();
+            fonts(&ctx);
+            let cfg = Config::default();
+            let app = SettingsApp {
+                saved: cfg.clone(),
+                cfg,
+                error: None,
+                listening: None,
+                listen_for: HotkeyField::Record,
+                hotkey_error: None,
+                section: Section::General,
+                dialog: None,
+                keyboard: false,
+                rounded: Some(false),
+                light: None,
+                closing: false,
+                uploaders: Uploaders::load(),
+                shown: None,
+                pinned: false,
+            };
+            Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0 }
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>, label: &str) -> Option<f32> {
+            self.time += 0.016;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WINDOW[0], WINDOW[1]))),
+                time: Some(self.time),
+                events,
+                ..Default::default()
+            };
+            let (app, frame) = (&mut self.app, &mut self.frame);
+            let out = self.ctx.run_ui(input, |ui| app.ui(ui, frame));
+            out.shapes.iter().find_map(|c| match &c.shape {
+                egui::epaint::Shape::Text(t) if t.galley.text() == label => Some(t.pos.y),
+                _ => None,
+            })
+        }
+    }
+
+    fn wheel() -> egui::Event {
+        egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            delta: vec2(0.0, -2000.0),
+            modifiers: Default::default(),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+        }
+    }
+
+    #[test]
+    fn sections_open_at_the_top() {
+        let mut h = Harness::new();
+        assert_eq!(h.frame(Vec::new(), "record hotkey"), Some(TOP));
+        h.frame(vec![egui::Event::PointerMoved(pos2(400.0, 300.0))], "record hotkey");
+        for _ in 0..20 {
+            assert_eq!(h.frame(vec![wheel()], "record hotkey"), Some(TOP));
+        }
+
+        h.frame(vec![egui::Event::PointerMoved(pos2(420.0, 320.0))], "record hotkey");
+        for _ in 0..20 {
+            h.frame(vec![wheel()], "record hotkey");
+        }
+        assert!(h.frame(Vec::new(), "record hotkey").is_none_or(|y| y < TOP));
+
+        h.app.go(Section::Recording);
+        assert_eq!(h.frame(Vec::new(), "frame rate"), Some(TOP));
+        h.app.go(Section::General);
+        assert_eq!(h.frame(Vec::new(), "record hotkey"), Some(TOP));
+    }
+}
+

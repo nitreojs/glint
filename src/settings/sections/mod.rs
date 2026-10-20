@@ -5,18 +5,20 @@ mod general;
 mod output;
 mod recording;
 mod screenshots;
+pub(super) mod uploads;
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Section {
     General,
     Recording,
     Screenshots,
+    Uploads,
     Output,
     About,
 }
 
-pub(super) const SECTIONS: [Section; 5] =
-    [Section::General, Section::Recording, Section::Screenshots, Section::Output, Section::About];
+pub(super) const SECTIONS: [Section; 6] =
+    [Section::General, Section::Recording, Section::Screenshots, Section::Uploads, Section::Output, Section::About];
 
 impl Section {
     pub(super) fn name(self) -> &'static str {
@@ -24,6 +26,7 @@ impl Section {
             Section::General => "general",
             Section::Recording => "recording",
             Section::Screenshots => "screenshots",
+            Section::Uploads => "uploads",
             Section::Output => "output",
             Section::About => "about",
         }
@@ -37,8 +40,10 @@ impl Section {
                 n(a.hotkey == b.hotkey)
                     + n(a.screenshot_hotkey == b.screenshot_hotkey)
                     + n(a.fullscreen_hotkey == b.fullscreen_hotkey)
+                    + n(a.pause_hotkey == b.pause_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
                     + n(a.freeze_screen == b.freeze_screen)
+                    + n(a.ui_elements == b.ui_elements)
                     + n(a.notify_success == b.notify_success)
             }
             Section::Recording => {
@@ -46,13 +51,25 @@ impl Section {
                     + n(a.codec == b.codec)
                     + n(a.quality == b.quality)
                     + n(a.effort == b.effort)
+                    + n(a.audio_desktop == b.audio_desktop)
+                    + n(a.audio_mic == b.audio_mic)
+                    + n(a.countdown == b.countdown)
                     + n(a.draw_cursor == b.draw_cursor)
+                    + n(a.open_trimmer == b.open_trimmer)
             }
             Section::Screenshots => {
                 n(a.screenshot_format == b.screenshot_format)
+                    + n(a.screenshot_style == b.screenshot_style)
                     + n(a.screenshot_quality == b.screenshot_quality)
                     + n(a.screenshot_copy == b.screenshot_copy)
                     + n(a.screenshot_save == b.screenshot_save)
+                    + n(a.screenshot_upload == b.screenshot_upload)
+            }
+            Section::Uploads => {
+                n(a.upload_destination == b.upload_destination)
+                    + n(a.litterbox_expiry == b.litterbox_expiry)
+                    + n(a.upload_copy_link == b.upload_copy_link)
+                    + n(a.recording_upload == b.recording_upload)
             }
             Section::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
             Section::About => 0,
@@ -67,8 +84,10 @@ impl Section {
                 cfg.hotkey = d.hotkey;
                 cfg.screenshot_hotkey = d.screenshot_hotkey;
                 cfg.fullscreen_hotkey = d.fullscreen_hotkey;
+                cfg.pause_hotkey = d.pause_hotkey;
                 cfg.launch_at_startup = d.launch_at_startup;
                 cfg.freeze_screen = d.freeze_screen;
+                cfg.ui_elements = d.ui_elements;
                 cfg.notify_success = d.notify_success;
             }
             Section::Recording => {
@@ -76,13 +95,25 @@ impl Section {
                 cfg.codec = d.codec;
                 cfg.quality = d.quality;
                 cfg.effort = d.effort;
+                cfg.audio_desktop = d.audio_desktop;
+                cfg.audio_mic = d.audio_mic;
+                cfg.countdown = d.countdown;
                 cfg.draw_cursor = d.draw_cursor;
+                cfg.open_trimmer = d.open_trimmer;
             }
             Section::Screenshots => {
                 cfg.screenshot_format = d.screenshot_format;
+                cfg.screenshot_style = d.screenshot_style;
                 cfg.screenshot_quality = d.screenshot_quality;
                 cfg.screenshot_copy = d.screenshot_copy;
                 cfg.screenshot_save = d.screenshot_save;
+                cfg.screenshot_upload = d.screenshot_upload;
+            }
+            Section::Uploads => {
+                cfg.upload_destination = d.upload_destination;
+                cfg.litterbox_expiry = d.litterbox_expiry;
+                cfg.upload_copy_link = d.upload_copy_link;
+                cfg.recording_upload = d.recording_upload;
             }
             Section::Output => {
                 cfg.output_dir = d.output_dir;

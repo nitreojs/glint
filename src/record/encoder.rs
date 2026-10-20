@@ -1,19 +1,25 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::time::Duration;
 
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::System::Performance::QueryPerformanceFrequency;
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, HSTRING, Interface, PWSTR};
 
 use super::capture::Capture;
 use super::cursor::CursorRenderer;
-use super::{Codec, Ctx, INFINITE, Msg, Params, RING, create_device, qpc, texture_desc};
+use super::mix::{RATE, frames_to_hns};
+use super::timeline::{AudioPlacer, Pauses};
+use super::{Codec, Ctx, INFINITE, Msg, Params, RING, create_device, hns, lock, qpc, texture_desc};
 use crate::platform::log::log;
+
+/// 192 kbps, one of the four rates the media foundation aac encoder accepts.
+const AAC_BYTES_PER_SECOND: u32 = 24_000;
 
 fn pack(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
@@ -29,13 +35,35 @@ pub(super) struct Encoder {
     cursor: Option<CursorRenderer>,
     writer: IMFSinkWriter,
     stream: u32,
+    audio: Option<u32>,
     alloc: IMFVideoSampleAllocatorEx,
     _mgr: IMFDXGIDeviceManager,
-    qpc_freq: i64,
+}
+
+struct Video {
+    grid: f64,
+    start: Option<i64>,
+    /// The newest frame and its slot; it is handed to the encoder once a later slot begins.
+    pending: Option<(IMFSample, i64)>,
+    have_image: bool,
+    frames: u64,
+    dropped: u64,
+    cursor: Option<(i32, i32)>,
+    stale: bool,
+}
+
+impl Video {
+    fn slot_time(&self, slot: i64) -> i64 {
+        (slot as f64 * self.grid).round() as i64
+    }
+
+    fn slot(&self, t: i64) -> i64 {
+        self.start.map_or(0, |s| (((t - s) as f64 / self.grid).round() as i64).max(0))
+    }
 }
 
 impl Encoder {
-    pub(super) unsafe fn new(p: Params, cap: &Capture) -> Result<Self, String> {
+    pub(super) unsafe fn new(p: Params, cap: &Capture, audio: bool) -> Result<Self, String> {
         unsafe {
             let (device, ctx) = create_device(&cap.adapter, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)?;
             // Media Foundation uses this device from its own worker threads.
@@ -124,6 +152,7 @@ impl Encoder {
             enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, p.effort.min(100)).ctx("enc")?;
             enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (p.fps * 2.0).round() as u32).ctx("enc")?;
             writer.SetInputMediaType(stream, &in_t, &enc).ctx("IMFSinkWriter::SetInputMediaType")?;
+            let audio = if audio { Some(add_audio_stream(&writer)?) } else { None };
 
             let name = describe_encoder(&writer, stream);
             writer.BeginWriting().ctx("IMFSinkWriter::BeginWriting")?;
@@ -140,14 +169,13 @@ impl Encoder {
             aattrs.SetUINT32(&MF_SA_D3D11_USAGE, D3D11_USAGE_DEFAULT.0 as u32).ctx("attr")?;
             alloc.InitializeSampleAllocatorEx(4, 16, &aattrs, &in_t).ctx("InitializeSampleAllocatorEx")?;
 
-            let mut qpc_freq = 0;
-            let _ = QueryPerformanceFrequency(&mut qpc_freq);
             log(&format!(
-                "recording {w}x{h}@{:.3} {:?} qp={} effort={} -> {} [{name}]",
+                "recording {w}x{h}@{:.3} {:?} qp={} effort={}{} -> {} [{name}]",
                 p.fps,
                 p.codec,
                 p.qp,
                 p.effort,
+                if audio.is_some() { " + aac audio" } else { "" },
                 p.path.display()
             ));
             Ok(Encoder {
@@ -160,49 +188,79 @@ impl Encoder {
                 cursor,
                 writer,
                 stream,
+                audio,
                 alloc,
                 _mgr: mgr,
-                qpc_freq,
             })
         }
     }
 
-    fn to_hns(&self, qpc_delta: i64) -> i64 {
-        (qpc_delta as i128 * 10_000_000 / self.qpc_freq as i128) as i64
-    }
-
-    /// Consumes capture messages until `End`, then finalizes the file (skipped when
-    /// `abort` is set: the file is going to be deleted).
+    /// Consumes capture and audio messages until both have ended, then finalizes the file
+    /// (skipped when `abort` is set: the file is going to be deleted).
     /// Returns (frames written, frames dropped, duration in seconds).
-    pub(super) unsafe fn run(&mut self, rx: &Receiver<Msg>, free_tx: &Sender<usize>, abort: &AtomicBool) -> Result<(u64, u64, f64), String> {
+    pub(super) unsafe fn run(
+        &mut self,
+        rx: &Receiver<Msg>,
+        free_tx: &Sender<usize>,
+        abort: &AtomicBool,
+        pauses: &Mutex<Pauses>,
+    ) -> Result<(u64, u64, f64), String> {
         unsafe {
-            // Frames sit on the stream's frame grid. Capture times jitter by a millisecond or two
-            // around vsync (which would show up as judder), cursor-only updates arrive between
-            // vsyncs, and a capped fps means several captures per slot: everything that lands in
-            // the same slot is merged into one frame, the latest state wins.
-            let grid = 1e7 / self.p.fps;
-            let slot_time = |slot: i64| (slot as f64 * grid).round() as i64;
-            let mut start_qpc: Option<i64> = None;
-            // The newest frame and its slot; it is handed to the encoder once a later slot begins.
-            let mut pending: Option<(IMFSample, i64)> = None;
-            let mut have_image = false;
-            let (mut frames, mut dropped) = (0u64, 0u64);
+            // Capture times jitter by a millisecond or two around vsync (which would show up as
+            // judder), cursor-only updates arrive between vsyncs, and a capped fps means several
+            // captures per slot: everything that lands in the same slot is merged into one
+            // frame, the latest state wins.
+            let mut v = Video {
+                grid: 1e7 / self.p.fps,
+                start: None,
+                pending: None,
+                have_image: false,
+                frames: 0,
+                dropped: 0,
+                cursor: None,
+                stale: false,
+            };
+            let mut placer = AudioPlacer::default();
+            let mut early_audio: Vec<(i64, Vec<i16>)> = Vec::new();
+            let mut audio_open = self.audio.is_some();
             let mut end_qpc = None;
 
-            for msg in rx.iter() {
+            loop {
+                let msg = match rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(m) => Some(m),
+                    Err(RecvTimeoutError::Timeout) => None,
+                    Err(RecvTimeoutError::Disconnected) => break,
+                };
                 match msg {
-                    Msg::Shape(si, buf) => {
+                    None => {}
+                    Some(Msg::Shape(si, buf)) => {
                         if let Some(c) = self.cursor.as_mut()
                             && let Err(e) = c.set_shape(&self.device, &si, &buf)
                         {
                             log(&format!("pointer shape update failed: {e}"));
                         }
                     }
-                    Msg::End { qpc } => {
+                    Some(Msg::End { qpc }) => {
                         end_qpc = Some(qpc);
-                        break;
+                        if !audio_open {
+                            break;
+                        }
                     }
-                    Msg::Frame { slot: ring_slot, qpc, cursor } => {
+                    Some(Msg::AudioEnd) => {
+                        audio_open = false;
+                        if end_qpc.is_some() {
+                            break;
+                        }
+                    }
+                    Some(Msg::Audio { start, data }) => match v.start {
+                        Some(origin) => {
+                            let at = placer.next;
+                            let out = placer.place(start, &data, &lock(pauses), origin);
+                            self.write_audio(at, &out)?;
+                        }
+                        None => early_audio.push((start, data)),
+                    },
+                    Some(Msg::Frame { slot: ring_slot, qpc, cursor }) => {
                         if let Some(i) = ring_slot {
                             let (tex, km) = &self.ring[i];
                             self.mt.Enter();
@@ -214,55 +272,108 @@ impl Encoder {
                             self.mt.Leave();
                             r.ctx("AcquireSync")?;
                             let _ = free_tx.send(i);
-                            have_image = true;
+                            v.have_image = true;
                         }
-                        if !have_image {
+                        v.cursor = cursor;
+                        if !v.have_image {
                             continue;
                         }
-                        let start = *start_qpc.get_or_insert(qpc);
-                        let slot = ((self.to_hns(qpc - start) as f64 / grid).round() as i64).max(0);
-                        match &pending {
-                            Some((s, ps)) if slot <= *ps => self.compose(s, cursor)?,
-                            _ => {
-                                let sample = match self.alloc.AllocateSample() {
-                                    Ok(s) => s,
-                                    Err(e) if e.code() == MF_E_SAMPLEALLOCATOR_EMPTY => {
-                                        dropped += 1;
-                                        continue;
-                                    }
-                                    Err(e) => return Err(format!("AllocateSample: {}", e.message())),
-                                };
-                                self.compose(&sample, cursor)?;
-                                sample.SetSampleTime(slot_time(slot)).ctx("SetSampleTime")?;
-                                if let Some((prev, ps)) = pending.take() {
-                                    prev.SetSampleDuration(slot_time(slot) - slot_time(ps)).ctx("SetSampleDuration")?;
-                                    self.writer.WriteSample(self.stream, &prev).ctx("WriteSample")?;
-                                    frames += 1;
-                                }
-                                pending = Some((sample, slot));
-                            }
+                        let t = lock(pauses).active(hns(qpc));
+                        match t {
+                            Some(t) => self.frame(&mut v, t)?,
+                            None => v.stale = true,
                         }
+                    }
+                }
+                if v.stale && end_qpc.is_none() {
+                    let t = lock(pauses).active(hns(qpc()));
+                    if let Some(t) = t {
+                        v.stale = false;
+                        self.frame(&mut v, t)?;
+                    }
+                }
+                if let Some(origin) = v.start
+                    && !early_audio.is_empty()
+                {
+                    for (start, data) in std::mem::take(&mut early_audio) {
+                        let at = placer.next;
+                        let out = placer.place(start, &data, &lock(pauses), origin);
+                        self.write_audio(at, &out)?;
                     }
                 }
             }
 
             if abort.load(Ordering::SeqCst) {
-                return Ok((frames, dropped, 0.0));
+                return Ok((v.frames, v.dropped, 0.0));
             }
             let mut duration_s = 0.0;
-            if let (Some((prev, ps)), Some(start)) = (pending.take(), start_qpc) {
-                let end = end_qpc.unwrap_or_else(qpc);
-                let end_slot = ((self.to_hns(end - start) as f64 / grid).round() as i64).max(ps + 1);
-                prev.SetSampleDuration(slot_time(end_slot) - slot_time(ps)).ctx("SetSampleDuration")?;
+            if let Some((prev, ps)) = v.pending.take() {
+                let end = lock(pauses).active_clamped(hns(end_qpc.unwrap_or_else(qpc)));
+                let end_slot = v.slot(end).max(ps + 1);
+                prev.SetSampleDuration(v.slot_time(end_slot) - v.slot_time(ps)).ctx("SetSampleDuration")?;
                 self.writer.WriteSample(self.stream, &prev).ctx("WriteSample")?;
-                frames += 1;
-                duration_s = slot_time(end_slot) as f64 / 1e7;
+                v.frames += 1;
+                duration_s = v.slot_time(end_slot) as f64 / 1e7;
+                let at = placer.next;
+                let pad = placer.pad(v.slot_time(end_slot));
+                self.write_audio(at, &pad)?;
             }
-            if frames == 0 {
+            if v.frames == 0 {
                 return Err("no frames were captured".into());
             }
             self.writer.Finalize().ctx("IMFSinkWriter::Finalize")?;
-            Ok((frames, dropped, duration_s))
+            Ok((v.frames, v.dropped, duration_s))
+        }
+    }
+
+    unsafe fn frame(&self, v: &mut Video, t: i64) -> Result<(), String> {
+        unsafe {
+            v.start.get_or_insert(t);
+            let slot = v.slot(t);
+            match &v.pending {
+                Some((s, ps)) if slot <= *ps => self.compose(s, v.cursor)?,
+                _ => {
+                    let sample = match self.alloc.AllocateSample() {
+                        Ok(s) => s,
+                        Err(e) if e.code() == MF_E_SAMPLEALLOCATOR_EMPTY => {
+                            v.dropped += 1;
+                            return Ok(());
+                        }
+                        Err(e) => return Err(format!("AllocateSample: {}", e.message())),
+                    };
+                    self.compose(&sample, v.cursor)?;
+                    sample.SetSampleTime(v.slot_time(slot)).ctx("SetSampleTime")?;
+                    if let Some((prev, ps)) = v.pending.take() {
+                        prev.SetSampleDuration(v.slot_time(slot) - v.slot_time(ps)).ctx("SetSampleDuration")?;
+                        self.writer.WriteSample(self.stream, &prev).ctx("WriteSample")?;
+                        v.frames += 1;
+                    }
+                    v.pending = Some((sample, slot));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    unsafe fn write_audio(&self, at: i64, data: &[i16]) -> Result<(), String> {
+        let Some(stream) = self.audio else { return Ok(()) };
+        if data.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            let bytes = std::mem::size_of_val(data);
+            let buf = MFCreateMemoryBuffer(bytes as u32).ctx("MFCreateMemoryBuffer")?;
+            let mut p = std::ptr::null_mut();
+            buf.Lock(&mut p, None, None).ctx("IMFMediaBuffer::Lock")?;
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, p, bytes);
+            let _ = buf.Unlock();
+            buf.SetCurrentLength(bytes as u32).ctx("SetCurrentLength")?;
+            let sample = MFCreateSample().ctx("MFCreateSample")?;
+            sample.AddBuffer(&buf).ctx("AddBuffer")?;
+            let end = at + (data.len() / 2) as i64;
+            sample.SetSampleTime(frames_to_hns(at)).ctx("SetSampleTime")?;
+            sample.SetSampleDuration(frames_to_hns(end) - frames_to_hns(at)).ctx("SetSampleDuration")?;
+            self.writer.WriteSample(stream, &sample).ctx("WriteSample (audio)")
         }
     }
 
@@ -306,6 +417,31 @@ impl Encoder {
             self.mt.Leave();
             Ok(())
         }
+    }
+}
+
+unsafe fn add_audio_stream(writer: &IMFSinkWriter) -> Result<u32, String> {
+    unsafe {
+        let out_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
+        out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
+        out_t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AAC_BYTES_PER_SECOND).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29).ctx("mt")?;
+        let stream = writer.AddStream(&out_t).ctx("IMFSinkWriter::AddStream (audio)")?;
+
+        let in_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
+        in_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
+        in_t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, RATE).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE * 4).ctx("mt")?;
+        writer.SetInputMediaType(stream, &in_t, None).ctx("IMFSinkWriter::SetInputMediaType (audio)")?;
+        Ok(stream)
     }
 }
 

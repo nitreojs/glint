@@ -3,10 +3,10 @@
 use std::time::Duration;
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, RPC_E_CHANGED_MODE};
-use windows::Win32::Graphics::Gdi::{BI_RGB, BITMAPV5HEADER, LCS_GM_IMAGES};
+use windows::Win32::Graphics::Gdi::{BI_BITFIELDS, BI_RGB, BITMAPINFOHEADER, BITMAPV5HEADER, LCS_GM_IMAGES};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatJpeg, GUID_ContainerFormatPng, GUID_WICPixelFormat24bppBGR,
-    IWICImagingFactory, WICBitmapEncoderNoCache,
+    GUID_WICPixelFormat32bppBGRA, IWICImagingFactory, WICBitmapEncoderNoCache,
 };
 use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream, PROPBAG2};
 use windows::Win32::System::Com::{
@@ -17,7 +17,7 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::CF_DIBV5;
+use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT};
 use windows::Win32::System::Variant::{VARIANT, VT_R4};
 use windows::core::{Error, PWSTR, w};
 
@@ -36,19 +36,45 @@ impl ImageFormat {
     }
 }
 
-/// `pixels`: top-down rows of 0x00RRGGBB (the high byte is garbage/ignored; the image is opaque), `w * h` long.
-/// `quality` 1..=100 applies to JPG only.
-pub(crate) fn encode(pixels: &[u32], w: u32, h: u32, format: ImageFormat, quality: u8) -> Result<Vec<u8>, String> {
+/// `pixels`: top-down rows of 0xAARRGGBB, `w * h` long; without `alpha` the high byte is garbage and the image
+/// is opaque. With `alpha`, PNG keeps it and JPG is composited onto black. `quality` 1..=100 applies to JPG only.
+pub(crate) fn encode(
+    pixels: &[u32],
+    w: u32,
+    h: u32,
+    alpha: bool,
+    format: ImageFormat,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
     check_size(pixels, w, h)?;
     let _com = Com::init()?;
-    encode_wic(pixels, w, h, format, quality)
+    encode_wic(pixels, w, h, alpha, format, quality)
+}
+
+/// Straight alpha as PNG and CF_DIBV5 store it; fully transparent pixels lose their colour, which would
+/// otherwise still show whatever was on the screen there.
+fn straight(p: u32) -> u32 {
+    if p >> 24 == 0 { 0 } else { p }
+}
+
+fn on_black(p: u32) -> u32 {
+    let a = p >> 24;
+    let scale = |shift: u32| ((((p >> shift) & 0xFF) * a + 127) / 255) << shift;
+    0xFF00_0000 | scale(16) | scale(8) | scale(0)
 }
 
 /// Puts the image on the clipboard as CF_DIBV5 (so every app can paste it) and as the registered
 /// "PNG" format (what Telegram, browsers, Office prefer). `owner` may be the caller's window.
-pub(crate) fn copy_to_clipboard(owner: Option<HWND>, pixels: &[u32], w: u32, h: u32) -> Result<(), String> {
+/// With `alpha` a CF_DIB composited onto black goes along for apps that can't read alpha.
+pub(crate) fn copy_to_clipboard(
+    owner: Option<HWND>,
+    pixels: &[u32],
+    w: u32,
+    h: u32,
+    alpha: bool,
+) -> Result<(), String> {
     // Everything slow happens before OpenClipboard so other apps are locked out only briefly.
-    let png = encode(pixels, w, h, ImageFormat::Png, 100)?;
+    let png = encode(pixels, w, h, alpha, ImageFormat::Png, 100)?;
     let png_format = unsafe { RegisterClipboardFormatW(w!("PNG")) };
     if png_format == 0 {
         return Err(format!("RegisterClipboardFormatW: {}", Error::from_thread()));
@@ -61,29 +87,65 @@ pub(crate) fn copy_to_clipboard(owner: Option<HWND>, pixels: &[u32], w: u32, h: 
         bV5Height: h as i32,
         bV5Planes: 1,
         bV5BitCount: 32,
-        bV5Compression: BI_RGB,
+        bV5Compression: if alpha { BI_BITFIELDS } else { BI_RGB },
         bV5SizeImage: w * h * 4,
+        bV5RedMask: 0x00FF_0000,
+        bV5GreenMask: 0x0000_FF00,
+        bV5BlueMask: 0x0000_00FF,
+        bV5AlphaMask: if alpha { 0xFF00_0000 } else { 0 },
         bV5CSType: LCS_SRGB,
         bV5Intent: LCS_GM_IMAGES as u32,
         ..Default::default()
     };
-    let header_len = size_of::<BITMAPV5HEADER>();
-    let dib_mem = Global::new(header_len + pixels.len() * 4, |buf| {
-        let (head, body) = buf.split_at_mut(header_len);
-        // SAFETY: BITMAPV5HEADER is a plain repr(C) struct of integers, `head` is exactly its size.
-        head.copy_from_slice(unsafe { std::slice::from_raw_parts((&raw const header).cast::<u8>(), header_len) });
-        for (dst, src) in body.chunks_exact_mut(w as usize * 4).zip(pixels.chunks_exact(w as usize).rev()) {
-            for (d, p) in dst.chunks_exact_mut(4).zip(src) {
-                // BI_RGB ignores the 4th byte officially, but apps that read it as alpha must see opaque.
-                d.copy_from_slice(&(p | 0xFF00_0000).to_le_bytes());
-            }
-        }
-    })?;
+    // BI_RGB ignores the 4th byte officially, but apps that read it as alpha must see opaque.
+    let dib_mem = dib(&header, pixels, w, |p| if alpha { straight(p) } else { p | 0xFF00_0000 })?;
+    let fallback = if alpha {
+        let header = BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: w as i32,
+            biHeight: h as i32,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            biSizeImage: w * h * 4,
+            ..Default::default()
+        };
+        Some(dib(&header, pixels, w, on_black)?)
+    } else {
+        None
+    };
 
     let _clipboard = Clipboard::open(owner)?;
     unsafe { EmptyClipboard() }.map_err(|e| format!("EmptyClipboard: {e}"))?;
     png_mem.give_to_clipboard(png_format)?;
-    dib_mem.give_to_clipboard(u32::from(CF_DIBV5.0))
+    dib_mem.give_to_clipboard(u32::from(CF_DIBV5.0))?;
+    match fallback {
+        Some(mem) => mem.give_to_clipboard(u32::from(CF_DIB.0)),
+        None => Ok(()),
+    }
+}
+
+pub(crate) fn copy_text(owner: Option<HWND>, text: &str) -> Result<(), String> {
+    let utf16: Vec<u8> = text.encode_utf16().chain([0]).flat_map(u16::to_le_bytes).collect();
+    let mem = Global::new(utf16.len(), |buf| buf.copy_from_slice(&utf16))?;
+    let _clipboard = Clipboard::open(owner)?;
+    unsafe { EmptyClipboard() }.map_err(|e| format!("EmptyClipboard: {e}"))?;
+    mem.give_to_clipboard(u32::from(CF_UNICODETEXT.0))
+}
+
+/// A packed bottom-up DIB: `header`, then the rows, each pixel through `px`.
+fn dib<H>(header: &H, pixels: &[u32], w: u32, px: impl Fn(u32) -> u32) -> Result<Global, String> {
+    let header_len = size_of::<H>();
+    Global::new(header_len + pixels.len() * 4, |buf| {
+        let (head, body) = buf.split_at_mut(header_len);
+        // SAFETY: the bitmap headers are plain repr(C) structs of integers, `head` is exactly their size.
+        head.copy_from_slice(unsafe { std::slice::from_raw_parts((header as *const H).cast::<u8>(), header_len) });
+        for (dst, src) in body.chunks_exact_mut(w as usize * 4).zip(pixels.chunks_exact(w as usize).rev()) {
+            for (d, p) in dst.chunks_exact_mut(4).zip(src) {
+                d.copy_from_slice(&px(*p).to_le_bytes());
+            }
+        }
+    })
 }
 
 /// 'sRGB' (LCS_sRGB lives in UI_ColorSystem, not worth a crate feature for one constant).
@@ -98,7 +160,14 @@ fn check_size(pixels: &[u32], w: u32, h: u32) -> Result<(), String> {
     Ok(())
 }
 
-fn encode_wic(pixels: &[u32], w: u32, h: u32, format: ImageFormat, quality: u8) -> Result<Vec<u8>, String> {
+fn encode_wic(
+    pixels: &[u32],
+    w: u32,
+    h: u32,
+    alpha: bool,
+    format: ImageFormat,
+    quality: u8,
+) -> Result<Vec<u8>, String> {
     unsafe {
         let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
             .map_err(|e| format!("WIC CoCreateInstance: {e}"))?;
@@ -125,22 +194,29 @@ fn encode_wic(pixels: &[u32], w: u32, h: u32, format: ImageFormat, quality: u8) 
         frame.Initialize(props.as_ref()).map_err(|e| format!("WIC frame Initialize: {e}"))?;
         frame.SetSize(w, h).map_err(|e| format!("WIC SetSize: {e}"))?;
         // 24bpp is native to both encoders and leaves no alpha channel in the file, so the result is opaque.
-        let mut pixel_format = GUID_WICPixelFormat24bppBGR;
+        // 32bppBGRA (straight, unlike PBGRA) is native to the PNG encoder and gives colour type 6.
+        let keep_alpha = alpha && format == ImageFormat::Png;
+        let wanted = if keep_alpha { GUID_WICPixelFormat32bppBGRA } else { GUID_WICPixelFormat24bppBGR };
+        let mut pixel_format = wanted;
         frame.SetPixelFormat(&mut pixel_format).map_err(|e| format!("WIC SetPixelFormat: {e}"))?;
-        if pixel_format != GUID_WICPixelFormat24bppBGR {
-            return Err(format!("WIC SetPixelFormat: encoder wants {pixel_format:?} instead of 24bpp BGR"));
+        if pixel_format != wanted {
+            return Err(format!("WIC SetPixelFormat: encoder wants {pixel_format:?} instead of {wanted:?}"));
         }
 
         // Converted in ~1 MiB bands so a 4K shot doesn't need a second full-size buffer.
-        let stride = w as usize * 3;
+        let stride = w as usize * if keep_alpha { 4 } else { 3 };
         let band_rows = ((1 << 20) / stride).max(1);
         let mut band = Vec::with_capacity(band_rows.min(h as usize) * stride);
         for rows in pixels.chunks(w as usize * band_rows) {
             band.clear();
-            band.extend(rows.iter().flat_map(|p| {
-                let [b, g, r, _] = p.to_le_bytes();
-                [b, g, r]
-            }));
+            if keep_alpha {
+                band.extend(rows.iter().flat_map(|&p| straight(p).to_le_bytes()));
+            } else {
+                band.extend(rows.iter().flat_map(|&p| {
+                    let [b, g, r, _] = if alpha { on_black(p) } else { p }.to_le_bytes();
+                    [b, g, r]
+                }));
+            }
             frame
                 .WritePixels((rows.len() / w as usize) as u32, stride as u32, &band)
                 .map_err(|e| format!("WIC WritePixels: {e}"))?;
@@ -249,8 +325,14 @@ mod tests {
         GUID_WICPixelFormat32bppBGR, IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
         WICDecodeMetadataCacheOnDemand,
     };
+    use windows::core::GUID;
 
     fn decode(bytes: &[u8]) -> (u32, u32, Vec<u32>) {
+        let (w, h, px) = decode_as(bytes, &GUID_WICPixelFormat32bppBGR);
+        (w, h, px.into_iter().map(|p| p & 0x00FF_FFFF).collect())
+    }
+
+    fn decode_as(bytes: &[u8], format: &GUID) -> (u32, u32, Vec<u32>) {
         unsafe {
             let factory: IWICImagingFactory =
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
@@ -262,7 +344,7 @@ mod tests {
             converter
                 .Initialize(
                     &decoder.GetFrame(0).unwrap(),
-                    &GUID_WICPixelFormat32bppBGR,
+                    format,
                     WICBitmapDitherTypeNone,
                     None::<&IWICPalette>,
                     0.0,
@@ -273,7 +355,7 @@ mod tests {
             converter.GetSize(&mut w, &mut h).unwrap();
             let mut buf = vec![0u8; (w * h * 4) as usize];
             converter.CopyPixels(std::ptr::null(), w * 4, &mut buf).unwrap();
-            (w, h, buf.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], 0])).collect())
+            (w, h, buf.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
         }
     }
 
@@ -287,11 +369,11 @@ mod tests {
         let pixels: Vec<u32> = expected.iter().map(|p| p | 0x5A00_0000).collect();
         let _com = Com::init().unwrap();
 
-        let png = encode(&pixels, w, h, ImageFormat::Png, 1).unwrap();
+        let png = encode(&pixels, w, h, false, ImageFormat::Png, 1).unwrap();
         assert_eq!(&png[1..4], b"PNG");
         assert_eq!(decode(&png), (w, h, expected.clone()));
 
-        let jpg = encode(&pixels, w, h, ImageFormat::Jpg, 90).unwrap();
+        let jpg = encode(&pixels, w, h, false, ImageFormat::Jpg, 90).unwrap();
         assert_eq!(&jpg[..2], &[0xFF, 0xD8]);
         let (jw, jh, decoded) = decode(&jpg);
         assert_eq!((jw, jh), (w, h));
@@ -306,6 +388,30 @@ mod tests {
         // 4:2:0 chroma subsampling alone smears neighbouring colours by up to about half their difference.
         assert!(worst <= 24, "JPEG drifted by {worst}");
         // Proves ImageQuality reaches the encoder.
-        assert!(encode(&pixels, w, h, ImageFormat::Jpg, 10).unwrap().len() < jpg.len());
+        assert!(encode(&pixels, w, h, false, ImageFormat::Jpg, 10).unwrap().len() < jpg.len());
+    }
+
+    #[test]
+    fn alpha_survives_png_and_turns_black_in_jpg() {
+        let (w, h) = (4, 3);
+        // Opaque, half, and fully transparent pixels over a colour that must not leak into the file.
+        let pixels: Vec<u32> =
+            (0..w * h).map(|i| [0xFF00_0000, 0x8000_0000, 0][i as usize % 3] | 0x00C0_6020 | i).collect();
+        let _com = Com::init().unwrap();
+
+        let png = encode(&pixels, w, h, true, ImageFormat::Png, 100).unwrap();
+        assert_eq!(&png[12..16], b"IHDR");
+        assert_eq!(png[25], 6, "colour type: truecolour with alpha");
+        let expected: Vec<u32> = pixels.iter().map(|&p| if p >> 24 == 0 { 0 } else { p }).collect();
+        assert_eq!(decode_as(&png, &GUID_WICPixelFormat32bppBGRA), (w, h, expected));
+
+        let opaque = encode(&pixels, w, h, false, ImageFormat::Png, 100).unwrap();
+        assert_eq!(opaque[25], 2, "colour type: truecolour");
+
+        let jpg = encode(&pixels, w, h, true, ImageFormat::Jpg, 100).unwrap();
+        let (_, _, decoded) = decode(&jpg);
+        let green = |p: u32| (p >> 8) & 0xFF;
+        assert!(green(decoded[2]) < 8 && green(decoded[0]) > 0x50, "{decoded:08X?}");
+        assert_eq!(on_black(0x8040_80FF), 0xFF20_4080);
     }
 }

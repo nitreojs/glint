@@ -1,6 +1,6 @@
 use eframe::egui::{Id, Ui};
 
-use crate::config::ShotFormat;
+use crate::config::{ShotFormat, ShotStyle};
 use crate::settings::SettingsApp;
 use crate::settings::widgets::{self, Look, hint, row};
 
@@ -16,6 +16,12 @@ fn shot_quality_word(q: u32) -> &'static str {
 impl SettingsApp {
     pub(in crate::settings) fn screenshots(&mut self, ui: &mut Ui, look: &Look) {
         let p = look.p;
+        row(ui, look, "style", 7.0, |ui| {
+            let styles = [(ShotStyle::Select, "select first"), (ShotStyle::Sharex, "draw first")];
+            widgets::segmented(ui, look, &mut self.cfg.screenshot_style, &styles, Some(220.0));
+            let frozen = if self.cfg.freeze_screen { "" } else { " · the screen freezes anyway" };
+            hint(ui, format!("draw first — like sharex: draw on the screen, then pick a region with Q{frozen}"), p.t3);
+        });
         row(ui, look, "format", 7.0, |ui| {
             let formats = [(ShotFormat::Png, "png"), (ShotFormat::Jpg, "jpg")];
             widgets::segmented(ui, look, &mut self.cfg.screenshot_format, &formats, Some(168.0));
@@ -38,13 +44,14 @@ impl SettingsApp {
             ui.spacing_mut().item_spacing.y = 10.0;
             widgets::checkbox(ui, look, &mut self.cfg.screenshot_copy, "copy to clipboard");
             widgets::checkbox(ui, look, &mut self.cfg.screenshot_save, "save to the output folder");
-            if !self.cfg.screenshot_copy && !self.cfg.screenshot_save {
+            widgets::checkbox(ui, look, &mut self.cfg.screenshot_upload, "upload");
+            if !self.cfg.screenshot_copy && !self.cfg.screenshot_save && !self.cfg.screenshot_upload {
                 ui.spacing_mut().item_spacing.y = 6.0;
-                hint(ui, "with both off, enter still copies", p.warn);
+                hint(ui, "with all off, enter still copies", p.warn);
             }
         });
         row(ui, look, "in the editor", 0.0, |ui| {
-            hint(ui, "enter does the above · ctrl+c copies · ctrl+s saves · esc cancels", p.t3);
+            hint(ui, "enter does the above · ctrl+c copies · ctrl+s saves · ctrl+u uploads · esc cancels", p.t3);
         });
     }
 }

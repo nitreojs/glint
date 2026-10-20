@@ -5,6 +5,7 @@ use crate::settings::SettingsApp;
 use crate::settings::widgets::{self, Look, hint, row};
 
 const FPS_PRESETS: [u32; 6] = [0, 30, 60, 120, 144, 240];
+const COUNTDOWN_PRESETS: [u32; 3] = [0, 3, 5];
 
 fn fps_label(fps: u32) -> String {
     match fps {
@@ -63,9 +64,33 @@ impl SettingsApp {
             let word = effort_word(self.cfg.effort);
             widgets::slider(ui, look, &mut self.cfg.effort, 0..=100, word, "0 ← faster", "smaller files → 100");
         });
+        row(ui, look, "desktop audio", 1.0, |ui| {
+            let text = if self.cfg.audio_desktop { "on" } else { "off" };
+            widgets::toggle(ui, look, &mut self.cfg.audio_desktop, text);
+            hint(ui, "what your default output device plays", t3);
+        });
+        row(ui, look, "microphone", 1.0, |ui| {
+            let text = if self.cfg.audio_mic { "on" } else { "off" };
+            widgets::toggle(ui, look, &mut self.cfg.audio_mic, text);
+            hint(ui, "your default recording device; with desktop audio, both go into one track", t3);
+        });
+        let mut counts = COUNTDOWN_PRESETS.to_vec();
+        if !counts.contains(&self.cfg.countdown) {
+            counts.push(self.cfg.countdown);
+            counts.sort_unstable();
+        }
+        let labels: Vec<String> = counts.iter().map(|&s| if s == 0 { "off".into() } else { format!("{s} s") }).collect();
+        let choices: Vec<(u32, &str)> = counts.iter().copied().zip(labels.iter().map(String::as_str)).collect();
+        row(ui, look, "countdown", 7.0, |ui| {
+            widgets::segmented(ui, look, &mut self.cfg.countdown, &choices, Some(200.0));
+            hint(ui, "esc or the record hotkey cancels it", t3);
+        });
         row(ui, look, "mouse cursor", 1.0, |ui| {
             let text = if self.cfg.draw_cursor { "shown in captures" } else { "hidden" };
             widgets::toggle(ui, look, &mut self.cfg.draw_cursor, text);
+        });
+        row(ui, look, "trimmer", 1.0, |ui| {
+            widgets::toggle(ui, look, &mut self.cfg.open_trimmer, "open trimmer after recording");
         });
     }
 }
