@@ -22,15 +22,18 @@ use windows::Win32::Graphics::Dwm::{
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
 use crate::editor::{self, Editor, Output};
-use crate::gfx::{Dib, Painter, animate, rgba};
+use crate::gfx::{Canvas, Dib, Painter, animate, rgba};
 use crate::monitors::{Fit, Output as Monitor, fit_drag, fit_rect, output_at};
 use crate::util::{Rect, log};
+
+mod live;
+use live::Live;
 
 #[derive(Clone, Debug)]
 pub struct Selection {
@@ -77,6 +80,7 @@ const GLIDE_MS: f32 = 120.0;
 const FLIP_MS: f32 = 120.0;
 /// Posted to the picker once per composed frame while a glide runs.
 const WM_GLIDE: u32 = WM_APP + 40;
+const NOTICE_TIMER: usize = 0x6E01;
 
 /// Vsync pacing for the glide: a thread waits on DwmFlush (one return per composed frame)
 /// and posts [`WM_GLIDE`], so the highlight moves once per refresh. WM_TIMER can't do
@@ -93,8 +97,20 @@ const HINT_SHOT: &str = "Drag to select a region   ·   Click to capture the hig
 /// A pre-rendered pill (label or hint) and where it sits, in client coordinates.
 struct Pill {
     rect: Rect,
-    dib: Dib,
+    dib: Option<Dib>,
     text: String,
+}
+
+struct Frozen {
+    bright: Dib,
+    dim: Dib,
+    /// The hint pills drawn over the bright image, shown where a highlight covers a hint.
+    hints: Vec<Pill>,
+}
+
+enum Screen {
+    Frozen(Frozen),
+    Live(Live),
 }
 
 /// The highlight moving from `from` to the current target.
@@ -112,8 +128,8 @@ struct State {
     owner: HWND,
     msg: u32,
     origin: (i32, i32),
-    bright: Dib,
-    dim: Dib,
+    size: (i32, i32),
+    screen: Screen,
     painter: Painter,
     font: IDWriteTextFormat,
     white: HBRUSH,
@@ -134,8 +150,6 @@ struct State {
     /// Current (fitted) selection or hover highlight in client coordinates, as displayed.
     sel: Option<Rect>,
     label: Option<Pill>,
-    /// The hint pills drawn over the bright image, shown where a highlight covers a hint.
-    hints: Vec<Pill>,
     /// Markup editor, once a screenshot region is picked.
     edit: Option<Editor>,
     /// What the highlight shows or glides to (client coordinates) and the output it's on.
@@ -175,6 +189,7 @@ enum Action {
     /// Handled; repaint right away (outside the state borrow).
     Paint,
     Release,
+    ShowFrozen,
     Finish(Option<Picked>),
     /// WM_SETCURSOR: show this system cursor.
     Cursor(PCWSTR),
@@ -182,19 +197,19 @@ enum Action {
 
 /// Renders a pill with `text` over a copy of `bg` at (x, y).
 fn render_pill(painter: &Painter, font: &IDWriteTextFormat, text: &str, bg: &Dib, x: i32, y: i32) -> Result<Pill, String> {
-    let (tw, _) = painter.measure(text, font);
-    let h = painter.px(26.0);
-    let pad = painter.px(11.0);
-    let w = tw.ceil() + pad * 2.0;
-    let dib = Dib::new(w as i32, h as i32)?;
+    let (w, h) = pill_size(painter, font, text);
+    let dib = Dib::new(w, h)?;
     unsafe {
         let _ = BitBlt(dib.dc, 0, 0, dib.w, dib.h, Some(bg.dc), x, y, SRCCOPY);
     }
-    painter.draw(&dib, |c| {
-        c.round_rect(0.0, 0.0, w, h, h / 2.0, PILL_BG);
-        c.text(text, font, [pad, 0.0, tw + 2.0, h], PILL_TEXT);
-    })?;
-    Ok(Pill { rect: Rect { x, y, w: dib.w, h: dib.h }, dib, text: text.to_string() })
+    painter.draw(&dib, |c| draw_pill(c, painter, font, text, w as f32, h as f32))?;
+    Ok(Pill { rect: Rect { x, y, w, h }, dib: Some(dib), text: text.to_string() })
+}
+
+fn draw_pill(c: &Canvas, painter: &Painter, font: &IDWriteTextFormat, text: &str, w: f32, h: f32) {
+    let pad = painter.px(11.0);
+    c.round_rect(0.0, 0.0, w, h, h / 2.0, PILL_BG);
+    c.text(text, font, [pad, 0.0, w - pad * 2.0 + 2.0, h], PILL_TEXT);
 }
 
 fn pill_size(painter: &Painter, font: &IDWriteTextFormat, text: &str) -> (i32, i32) {
@@ -202,46 +217,80 @@ fn pill_size(painter: &Painter, font: &IDWriteTextFormat, text: &str) -> (i32, i
     ((tw.ceil() + painter.px(11.0) * 2.0) as i32, painter.px(26.0) as i32)
 }
 
-/// Takes a screenshot and fades the picker in. `msg` is posted to `owner` with the result.
-pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> Result<HWND, String> {
-    unsafe {
-        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+fn hint_text(purpose: Purpose) -> &'static str {
+    match purpose {
+        Purpose::Record { .. } => HINT_RECORD,
+        Purpose::Shot => HINT_SHOT,
+    }
+}
 
-        let bright = Dib::new(vw, vh)?;
-        let mut dim = Dib::new(vw, vh)?;
-        let screen = GetDC(None);
-        let _ = BitBlt(bright.dc, 0, 0, vw, vh, Some(screen), vx, vy, ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0));
-        ReleaseDC(None, screen);
-        let windows = visible_windows();
-        let _ = GdiFlush();
-        for (d, &s) in dim.pixels_mut().iter_mut().zip(bright.pixels()) {
-            let rb = (((s & 0x00FF_00FF) * DIM) >> 8) & 0x00FF_00FF;
-            let g = (((s & 0x0000_FF00) * DIM) >> 8) & 0x0000_FF00;
-            *d = rb | g;
+fn hint_rects(painter: &Painter, font: &IDWriteTextFormat, hint: &str, outputs: &[Monitor], origin: (i32, i32)) -> Vec<Rect> {
+    let (w, h) = pill_size(painter, font, hint);
+    let top = painter.px(28.0) as i32;
+    outputs
+        .iter()
+        .map(|o| {
+            let r = o.rect.offset(-origin.0, -origin.1);
+            Rect { x: r.x + (r.w - w) / 2, y: r.y + top, w, h }
+        })
+        .collect()
+}
+
+impl Frozen {
+    fn capture(area: Rect, hints: &[Rect], hint: &str, painter: &Painter, font: &IDWriteTextFormat) -> Result<Frozen, String> {
+        unsafe {
+            let bright = Dib::new(area.w, area.h)?;
+            let mut dim = Dib::new(area.w, area.h)?;
+            let screen = GetDC(None);
+            let _ = BitBlt(bright.dc, 0, 0, area.w, area.h, Some(screen), area.x, area.y, ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0));
+            ReleaseDC(None, screen);
+            let _ = GdiFlush();
+            for (d, &s) in dim.pixels_mut().iter_mut().zip(bright.pixels()) {
+                let rb = (((s & 0x00FF_00FF) * DIM) >> 8) & 0x00FF_00FF;
+                let g = (((s & 0x0000_FF00) * DIM) >> 8) & 0x0000_FF00;
+                *d = rb | g;
+            }
+            // The hint is baked into the dimmed image only: the bright one is what a screenshot
+            // captures. A copy drawn over the bright image shows where a highlight covers it.
+            let mut pills = Vec::with_capacity(hints.len());
+            for r in hints {
+                let on_dim = render_pill(painter, font, hint, &dim, r.x, r.y)?;
+                if let Some(src) = &on_dim.dib {
+                    let _ = BitBlt(dim.dc, r.x, r.y, r.w, r.h, Some(src.dc), 0, 0, SRCCOPY);
+                }
+                pills.push(render_pill(painter, font, hint, &bright, r.x, r.y)?);
+            }
+            let _ = GdiFlush();
+            Ok(Frozen { bright, dim, hints: pills })
         }
+    }
+}
 
+fn fade_window(hwnd: HWND, t: f32) {
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), (t * 255.0) as u8, LWA_ALPHA);
+    }
+}
+
+/// Fades the picker in. `msg` is posted to `owner` with the result.
+pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose, freeze: bool) -> Result<HWND, String> {
+    unsafe {
+        let area = Rect {
+            x: GetSystemMetrics(SM_XVIRTUALSCREEN),
+            y: GetSystemMetrics(SM_YVIRTUALSCREEN),
+            w: GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        };
+        let windows = visible_windows();
         let painter = Painter::new()?;
         let font = painter.font(13.0)?;
-        let hint = match purpose {
-            Purpose::Record { .. } => HINT_RECORD,
-            Purpose::Shot => HINT_SHOT,
+        let hint = hint_text(purpose);
+        let hints = hint_rects(&painter, &font, hint, &outputs, (area.x, area.y));
+        let screen = if freeze {
+            Screen::Frozen(Frozen::capture(area, &hints, hint, &painter, &font)?)
+        } else {
+            Screen::Live(Live::new(area, &hints, hint, &painter, &font)?)
         };
-        let (hw, _) = pill_size(&painter, &font, hint);
-        // The hint is baked into the dimmed image only: the bright one is what a screenshot
-        // captures. A copy drawn over the bright image shows where a highlight covers it.
-        let mut hints = Vec::with_capacity(outputs.len());
-        for o in &outputs {
-            let r = o.rect.offset(-vx, -vy);
-            let (x, y) = (r.x + (r.w - hw) / 2, r.y + painter.px(28.0) as i32);
-            let on_dim = render_pill(&painter, &font, hint, &dim, x, y)?;
-            let p = on_dim.rect;
-            let _ = BitBlt(dim.dc, p.x, p.y, p.w, p.h, Some(on_dim.dib.dc), 0, 0, SRCCOPY);
-            hints.push(render_pill(&painter, &font, hint, &bright, x, y)?);
-        }
-        let _ = GdiFlush();
 
         let hinst = GetModuleHandleW(None).map_err(|e| e.to_string())?;
         let class = w!("glint_overlay");
@@ -259,10 +308,10 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> R
             class,
             w!("glint"),
             WS_POPUP,
-            vx,
-            vy,
-            vw,
-            vh,
+            area.x,
+            area.y,
+            area.w,
+            area.h,
             None,
             None,
             Some(hinst.into()),
@@ -271,7 +320,9 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> R
         .map_err(|e| format!("CreateWindowEx: {e}"))?;
         let on = TRUE;
         let _ = DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &on as *const BOOL as _, 4);
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
+        // layered windows at alpha 0 let the mouse through
+        let alpha = if freeze { 0 } else { 1 };
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
 
         let max_hz = outputs.iter().map(|o| o.refresh_hz).fold(60.0, f64::max);
         let frame = Duration::from_secs_f64(0.9 / max_hz);
@@ -280,9 +331,9 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> R
                 hwnd,
                 owner,
                 msg,
-                origin: (vx, vy),
-                bright,
-                dim,
+                origin: (area.x, area.y),
+                size: (area.w, area.h),
+                screen,
                 painter,
                 font,
                 white: CreateSolidBrush(COLORREF(0x00FFFFFF)),
@@ -300,7 +351,6 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> R
                 },
                 sel: None,
                 label: None,
-                hints,
                 edit: None,
                 target: None,
                 glide: None,
@@ -312,7 +362,7 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> R
             // Highlight what's under the cursor right away, before the first paint.
             let mut p = POINT::default();
             if GetCursorPos(&mut p).is_ok() {
-                st.cursor = (p.x - vx, p.y - vy);
+                st.cursor = (p.x - area.x, p.y - area.y);
                 st.update_selection(st.cursor);
             }
             *s.borrow_mut() = Some(st);
@@ -321,7 +371,11 @@ pub fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose) -> R
         let _ = UpdateWindow(hwnd);
         let _ = SetForegroundWindow(hwnd);
         animate(FADE_IN_MS, |t| {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), (t * 255.0) as u8, LWA_ALPHA);
+            STATE.with(|s| {
+                if let Some(st) = s.borrow_mut().as_mut() {
+                    st.set_fade(t);
+                }
+            })
         });
         Ok(hwnd)
     }
@@ -336,14 +390,15 @@ pub fn cancel(hwnd: HWND) {
 
 /// Fades the picker out and destroys it. Returns once the desktop is visible again.
 pub fn dismiss(hwnd: HWND) {
-    let st = STATE.with(|s| {
+    let mut st = STATE.with(|s| {
         let mut g = s.borrow_mut();
         if g.as_ref().is_some_and(|st| st.hwnd == hwnd) { g.take() } else { None }
     });
     unsafe {
         let _ = ReleaseCapture();
-        animate(FADE_OUT_MS, |t| {
-            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), ((1.0 - t) * 255.0) as u8, LWA_ALPHA);
+        animate(FADE_OUT_MS, |t| match st.as_mut() {
+            Some(st) => st.set_fade(1.0 - t),
+            None => fade_window(hwnd, 1.0 - t),
         });
         let _ = DestroyWindow(hwnd);
         drop(st);
@@ -465,6 +520,9 @@ impl State {
             self.label = label;
             labels.extend(self.label.as_ref().map(|l| l.rect));
         }
+        if matches!(self.screen, Screen::Live(_)) {
+            return self.schedule_live_sync();
+        }
         unsafe {
             let damage = CreateRectRgn(0, 0, 0, 0);
             let add = |r: HRGN| {
@@ -492,6 +550,38 @@ impl State {
             let _ = InvalidateRgn(self.hwnd, Some(damage), false);
             let _ = DeleteObject(damage.into());
         }
+    }
+
+    fn schedule_live_sync(&self) {
+        let corner = RECT { left: 0, top: 0, right: 1, bottom: 1 };
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), Some(&corner), false);
+        }
+    }
+
+    fn set_fade(&mut self, t: f32) {
+        match &mut self.screen {
+            Screen::Frozen(_) => fade_window(self.hwnd, t),
+            Screen::Live(live) => live.set_fade(t, &self.painter, &self.font),
+        }
+    }
+
+    fn freeze(&mut self) -> Result<(), String> {
+        let Screen::Live(live) = &self.screen else { return Ok(()) };
+        live.hide();
+        fade_window(self.hwnd, 0.0);
+        unsafe {
+            let _ = DwmFlush();
+        }
+        let area = Rect { x: self.origin.0, y: self.origin.1, w: self.size.0, h: self.size.1 };
+        let hint = hint_text(self.purpose);
+        let hints = hint_rects(&self.painter, &self.font, hint, &self.outputs, self.origin);
+        self.screen = Screen::Frozen(Frozen::capture(area, &hints, hint, &self.painter, &self.font)?);
+        self.label = None;
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
+        Ok(())
     }
 
     /// Shows what the mouse at `cur` would pick: the drag selection while dragging, otherwise
@@ -591,16 +681,19 @@ impl State {
         let above = sel.y - RING - gap - lh;
         // In the editor the toolbar may sit above the shot; the label then goes inside.
         let bar_above = self.edit.as_ref().is_some_and(|e| e.bar.bottom() <= sel.y);
-        let (x, y, bg) = if above >= mon.y && !bar_above {
-            (sel.x - RING, above, &self.dim)
+        let (x, y, on_dim) = if above >= mon.y && !bar_above {
+            (sel.x - RING, above, true)
         } else {
-            (sel.x + gap + 2, sel.y + gap + 2, &self.bright)
+            (sel.x + gap + 2, sel.y + gap + 2, false)
         };
         let x = x.clamp(mon.x, (mon.right() - lw).max(mon.x));
         if same_text.is_some_and(|l| (l.rect.x, l.rect.y) == (x, y)) {
             return self.set_selection(Some(sel), None); // label unchanged
         }
-        let label = render_pill(&self.painter, &self.font, &text, bg, x, y).ok();
+        let label = match &self.screen {
+            Screen::Frozen(f) => render_pill(&self.painter, &self.font, &text, if on_dim { &f.dim } else { &f.bright }, x, y).ok(),
+            Screen::Live(_) => Some(Pill { rect: Rect { x, y, w: lw, h: lh }, dib: None, text }),
+        };
         self.set_selection(Some(sel), Some(label));
     }
 
@@ -617,13 +710,18 @@ impl State {
             Purpose::Shot => {
                 self.set_gliding(false);
                 self.glide = None;
+                let was_live = matches!(self.screen, Screen::Live(_));
+                if let Err(e) = self.freeze() {
+                    log(&format!("screenshot failed: {e}"));
+                    return Action::Finish(None);
+                }
                 let sel = self.to_client(rect);
                 let ed = Editor::new(sel, self.to_client(self.outputs[oi].rect), self.painter.scale);
                 self.invalidate(&ed.extent());
                 self.edit = Some(ed);
                 self.target = Some((sel, oi));
                 self.show(Some(sel));
-                Action::Release
+                if was_live { Action::ShowFrozen } else { Action::Release }
             }
         }
     }
@@ -639,13 +737,16 @@ impl State {
     /// Runs an editor call and turns its outcome into repaints or the picker's result.
     fn edit_event(&mut self, call: impl FnOnce(&mut Editor) -> editor::Event) -> Action {
         let Some(ed) = self.edit.as_mut() else { return Action::Handled };
-        let before = ed.extent();
-        match call(ed) {
+        let before = ed.frame();
+        let event = call(ed);
+        if let Some(left) = ed.notice_left() {
+            unsafe { SetTimer(Some(self.hwnd), NOTICE_TIMER, left.as_millis() as u32 + 1, None) };
+        }
+        match event {
             editor::Event::None => Action::Handled,
             editor::Event::Repaint => {
-                let (after, sel) = (ed.extent(), ed.sel);
-                self.invalidate(&before);
-                self.invalidate(&after);
+                let (damage, sel) = (ed.damage(&before), ed.sel);
+                self.invalidate(&damage);
                 if let Some((_, oi)) = self.target {
                     self.target = Some((sel, oi));
                     self.show(Some(sel));
@@ -653,22 +754,35 @@ impl State {
                 if self.last_paint.get().elapsed() >= self.frame { Action::Paint } else { Action::Handled }
             }
             editor::Event::Cancel => Action::Finish(None),
-            editor::Event::Finish(output) => match ed.pixels(&self.bright, &self.painter) {
-                Ok((pixels, w, h)) => Action::Finish(Some(Picked::Shot(Shot { pixels, w, h, output }))),
-                Err(e) => {
-                    log(&format!("screenshot failed: {e}"));
-                    Action::Finish(None)
+            editor::Event::Finish(output) => {
+                let Screen::Frozen(f) = &self.screen else { return Action::Finish(None) };
+                match ed.pixels(&f.bright, &self.painter) {
+                    Ok((pixels, w, h)) => Action::Finish(Some(Picked::Shot(Shot { pixels, w, h, output }))),
+                    Err(e) => {
+                        log(&format!("screenshot failed: {e}"));
+                        Action::Finish(None)
+                    }
                 }
-            },
+            }
         }
     }
 
     /// Every pixel is written exactly once per paint, so nothing flickers.
     unsafe fn paint(&mut self) {
+        if let Screen::Live(live) = &mut self.screen {
+            unsafe {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(self.hwnd, &mut ps);
+                self.last_paint.set(Instant::now());
+                FillRect(hdc, &ps.rcPaint, self.black);
+                let _ = EndPaint(self.hwnd, &ps);
+            }
+            return live.sync(self.sel, self.label.as_ref(), &self.painter, &self.font);
+        }
         // Rendering can change what the editor covers (a tooltip appears): paint that too.
-        if let Some(ed) = self.edit.as_mut() {
+        if let (Some(ed), Screen::Frozen(f)) = (self.edit.as_mut(), &self.screen) {
             let before = ed.extent();
-            if let Err(e) = ed.render(&self.bright, &self.dim, &self.painter, &self.font) {
+            if let Err(e) = ed.render(&f.bright, &self.painter, &self.font) {
                 log(&format!("editor render failed: {e}"));
             }
             let after = ed.extent();
@@ -676,6 +790,7 @@ impl State {
                 self.invalidate(&after);
             }
         }
+        let Screen::Frozen(f) = &self.screen else { return };
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
@@ -687,25 +802,23 @@ impl State {
             let saved = SaveDC(hdc);
             let mut holes: Vec<Rect> = self.sel.iter().map(|s| s.inflate(RING)).collect();
             holes.extend(label.map(|l| l.rect));
-            if let Some(ed) = &self.edit {
-                holes.push(ed.bar);
-                holes.extend(ed.tip());
-            }
             for h in &holes {
                 ExcludeClipRect(hdc, h.x, h.y, h.right(), h.bottom());
             }
-            let _ = BitBlt(hdc, rp.x, rp.y, rp.w, rp.h, Some(self.dim.dc), rp.x, rp.y, SRCCOPY);
+            let _ = BitBlt(hdc, rp.x, rp.y, rp.w, rp.h, Some(f.dim.dc), rp.x, rp.y, SRCCOPY);
             let _ = RestoreDC(hdc, saved);
 
             if let Some(ed) = &self.edit {
-                ed.paint(hdc, self.white, self.black);
+                if let Err(e) = ed.paint(hdc, &self.painter, &self.font, self.white, self.black) {
+                    log(&format!("editor paint failed: {e}"));
+                }
             } else if let Some(s) = self.sel {
                 let saved = SaveDC(hdc);
                 if let Some(l) = label {
                     ExcludeClipRect(hdc, l.rect.x, l.rect.y, l.rect.right(), l.rect.bottom());
                 }
                 if let Some(i) = s.intersect(&rp) {
-                    let _ = BitBlt(hdc, i.x, i.y, i.w, i.h, Some(self.bright.dc), i.x, i.y, SRCCOPY);
+                    let _ = BitBlt(hdc, i.x, i.y, i.w, i.h, Some(f.bright.dc), i.x, i.y, SRCCOPY);
                 }
                 for r in ring(s.inflate(1), s) {
                     FillRect(hdc, &r, self.white);
@@ -714,15 +827,19 @@ impl State {
                     FillRect(hdc, &r, self.black);
                 }
                 IntersectClipRect(hdc, s.x, s.y, s.right(), s.bottom());
-                for h in self.hints.iter().filter(|h| h.rect.intersect(&s).is_some()) {
-                    let r = h.rect;
-                    let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(h.dib.dc), 0, 0, SRCCOPY);
+                for h in f.hints.iter().filter(|h| h.rect.intersect(&s).is_some()) {
+                    if let Some(dib) = &h.dib {
+                        let r = h.rect;
+                        let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(dib.dc), 0, 0, SRCCOPY);
+                    }
                 }
                 let _ = RestoreDC(hdc, saved);
             }
-            if let Some(l) = label {
+            if let Some(l) = label
+                && let Some(dib) = &l.dib
+            {
                 let r = l.rect;
-                let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(l.dib.dc), 0, 0, SRCCOPY);
+                let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(dib.dc), 0, 0, SRCCOPY);
             }
             let _ = EndPaint(self.hwnd, &ps);
         }
@@ -750,6 +867,10 @@ impl State {
                     _ => Action::Release,
                 }
             }
+            // bit 30 of lparam: the key was already down (auto-repeat)
+            WM_KEYDOWN if lp.0 & (1 << 30) != 0 && (wp.0 == VK_RETURN.0 as usize || wp.0 == VK_SPACE.0 as usize) => {
+                Action::Handled
+            }
             WM_KEYDOWN => {
                 let held = |vk: u16| unsafe { GetKeyState(vk as i32) } < 0;
                 let (ctrl, shift) = (held(VK_CONTROL.0), held(VK_SHIFT.0));
@@ -758,6 +879,10 @@ impl State {
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
                 self.edit_event(|e| e.wheel(delta))
+            }
+            WM_TIMER if wp.0 == NOTICE_TIMER => {
+                let _ = unsafe { KillTimer(Some(self.hwnd), NOTICE_TIMER) };
+                self.edit_event(|e| e.tick())
             }
             WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
                 let mut p = POINT::default();
@@ -831,7 +956,7 @@ impl State {
             }
             WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => Action::Finish(None),
             // Enter confirms the drag in progress, or picks what's highlighted.
-            WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize => {
+            WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize || wp.0 == VK_SPACE.0 as usize => {
                 self.drag_start.get_or_insert(self.cursor);
                 match self.finish_drag(self.cursor) {
                     Some(picked) => self.picked(picked),
@@ -887,6 +1012,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             Action::Release => {
                 let _ = ReleaseCapture();
+                LRESULT(0)
+            }
+            Action::ShowFrozen => {
+                let _ = ReleaseCapture();
+                let _ = UpdateWindow(hwnd);
+                fade_window(hwnd, 1.0);
                 LRESULT(0)
             }
             Action::Finish(sel) => {

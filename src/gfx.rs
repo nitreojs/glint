@@ -154,9 +154,13 @@ impl Painter {
 
     /// Draws onto an opaque DIB (e.g. a copy of the screenshot behind a pill).
     pub fn draw(&self, dib: &Dib, f: impl FnOnce(&Canvas)) -> Result<(), String> {
+        self.draw_on(dib.dc, RECT { left: 0, top: 0, right: dib.w, bottom: dib.h }, f)
+    }
+
+    pub fn draw_on(&self, hdc: HDC, r: RECT, f: impl FnOnce(&Canvas)) -> Result<(), String> {
         let rt = &self.dc_target;
         unsafe {
-            rt.BindDC(dib.dc, &RECT { left: 0, top: 0, right: dib.w, bottom: dib.h }).map_err(|e| format!("BindDC: {e}"))?;
+            rt.BindDC(hdc, &r).map_err(|e| format!("BindDC: {e}"))?;
         }
         self.paint(rt, false, 1.0, f)
     }

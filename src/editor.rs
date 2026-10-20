@@ -7,9 +7,11 @@
 //! the shot instead of dragging the marks along. Blur and pixelate hide what's on screen, so
 //! they always sit under the drawn shapes.
 
+use std::time::{Duration, Instant};
+
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-use windows::Win32::Graphics::Gdi::{BitBlt, FillRect, GdiFlush, HBRUSH, HDC, SRCCOPY};
+use windows::Win32::Graphics::Gdi::{BitBlt, FillRect, GdiFlush, HBRUSH, HDC, RectVisible, SRCCOPY};
 use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
 };
@@ -38,6 +40,26 @@ const TOOLS: [(Tool, &str, u8); 6] = [
     (Tool::Pixelate, "pixelate  ·  X", b'X'),
 ];
 
+struct Strength {
+    presets: [f32; 3],
+    step: f32,
+    min: f32,
+    max: f32,
+    name: &'static str,
+}
+
+impl Tool {
+    fn strength(self) -> Strength {
+        let (presets, step, min, max, name) = match self {
+            Tool::Pen | Tool::Arrow | Tool::Rectangle => ([2.0, 4.0, 8.0], 1.0, 1.0, 40.0, "width"),
+            Tool::Highlighter => ([10.0, 16.0, 28.0], 2.0, 4.0, 80.0, "width"),
+            Tool::Blur => ([4.0, 8.0, 16.0], 1.0, 1.0, 40.0, "blur"),
+            Tool::Pixelate => ([6.0, 12.0, 20.0], 2.0, 2.0, 80.0, "block size"),
+        };
+        Strength { presets, step, min, max, name }
+    }
+}
+
 const COLORS: [D2D1_COLOR_F; 5] = [
     rgba(0xE5, 0x40, 0x2F, 1.0),
     rgba(0xFF, 0xD6, 0x0A, 1.0),
@@ -45,10 +67,14 @@ const COLORS: [D2D1_COLOR_F; 5] = [
     rgba(0x0A, 0x84, 0xFF, 1.0),
     rgba(0xFF, 0xFF, 0xFF, 1.0),
 ];
-/// Stroke widths at 96 DPI; the highlighter is four times as wide.
-const SIZES: [f32; 3] = [2.0, 4.0, 8.0];
+const HIGHLIGHTER_ALPHA: f32 = 0.4;
 const BAR_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.92);
 const WHITE: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
+const GRIP_EDGE: D2D1_COLOR_F = rgba(20, 20, 24, 0.9);
+const NOTICE: Duration = Duration::from_millis(1200);
+const WHEEL_GROUP: Duration = Duration::from_secs(1);
+const WHEEL_DELTA: i32 = 120;
+const MIN_SIDE: i32 = 3;
 
 /// What the shot does when it's finished.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,33 +92,240 @@ pub enum Event {
     Cancel,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 enum Mark {
-    Stroke { points: Vec<(f32, f32)>, color: D2D1_COLOR_F, width: f32 },
-    Arrow { from: (f32, f32), to: (f32, f32), color: D2D1_COLOR_F, width: f32 },
-    Rectangle { a: (f32, f32), b: (f32, f32), color: D2D1_COLOR_F, width: f32 },
-    Blur(Rect),
-    Pixelate(Rect),
+    Stroke { highlight: bool, points: Vec<(f32, f32)>, color: usize, width: f32 },
+    Arrow { from: (f32, f32), to: (f32, f32), color: usize, width: f32 },
+    Rectangle { rect: Rect, color: usize, width: f32 },
+    Blur { rect: Rect, radius: f32 },
+    Pixelate { rect: Rect, block: f32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Grip {
+    From,
+    To,
+    Edge(Edges),
 }
 
 impl Mark {
+    fn new(tool: Tool, (x, y): (i32, i32), color: usize, strength: f32) -> Mark {
+        let (at, rect) = ((x as f32, y as f32), Rect { x, y, w: 0, h: 0 });
+        match tool {
+            Tool::Pen | Tool::Highlighter => {
+                Mark::Stroke { highlight: tool == Tool::Highlighter, points: vec![at], color, width: strength }
+            }
+            Tool::Arrow => Mark::Arrow { from: at, to: at, color, width: strength },
+            Tool::Rectangle => Mark::Rectangle { rect, color, width: strength },
+            Tool::Blur => Mark::Blur { rect, radius: strength },
+            Tool::Pixelate => Mark::Pixelate { rect, block: strength },
+        }
+    }
+
+    fn tool(&self) -> Tool {
+        match self {
+            Mark::Stroke { highlight: true, .. } => Tool::Highlighter,
+            Mark::Stroke { .. } => Tool::Pen,
+            Mark::Arrow { .. } => Tool::Arrow,
+            Mark::Rectangle { .. } => Tool::Rectangle,
+            Mark::Blur { .. } => Tool::Blur,
+            Mark::Pixelate { .. } => Tool::Pixelate,
+        }
+    }
+
     fn is_effect(&self) -> bool {
-        matches!(self, Mark::Blur(_) | Mark::Pixelate(_))
+        matches!(self, Mark::Blur { .. } | Mark::Pixelate { .. })
+    }
+
+    fn strength(&self) -> f32 {
+        match self {
+            Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => *width,
+            Mark::Blur { radius, .. } => *radius,
+            Mark::Pixelate { block, .. } => *block,
+        }
+    }
+
+    fn strength_mut(&mut self) -> &mut f32 {
+        match self {
+            Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => width,
+            Mark::Blur { radius, .. } => radius,
+            Mark::Pixelate { block, .. } => block,
+        }
+    }
+
+    fn color(&self) -> Option<usize> {
+        match self {
+            Mark::Stroke { color, .. } | Mark::Arrow { color, .. } | Mark::Rectangle { color, .. } => Some(*color),
+            Mark::Blur { .. } | Mark::Pixelate { .. } => None,
+        }
+    }
+
+    fn color_mut(&mut self) -> Option<&mut usize> {
+        match self {
+            Mark::Stroke { color, .. } | Mark::Arrow { color, .. } | Mark::Rectangle { color, .. } => Some(color),
+            Mark::Blur { .. } | Mark::Pixelate { .. } => None,
+        }
+    }
+
+    fn area_mut(&mut self) -> Option<&mut Rect> {
+        match self {
+            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => Some(rect),
+            Mark::Stroke { .. } | Mark::Arrow { .. } => None,
+        }
     }
 
     /// Whether the mark is big enough to keep (a click without a drag isn't an arrow).
     fn worth_keeping(&self) -> bool {
-        let far = |a: (f32, f32), b: (f32, f32)| (a.0 - b.0).abs() >= 3.0 || (a.1 - b.1).abs() >= 3.0;
         match self {
             Mark::Stroke { .. } => true,
-            Mark::Arrow { from, to, .. } => far(*from, *to),
-            Mark::Rectangle { a, b, .. } => (a.0 - b.0).abs() >= 3.0 && (a.1 - b.1).abs() >= 3.0,
-            Mark::Blur(r) | Mark::Pixelate(r) => r.w >= 3 && r.h >= 3,
+            Mark::Arrow { from, to, .. } => (from.0 - to.0).abs() >= 3.0 || (from.1 - to.1).abs() >= 3.0,
+            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
+                rect.w >= MIN_SIDE && rect.h >= MIN_SIDE
+            }
+        }
+    }
+
+    fn bbox(&self) -> Rect {
+        match self {
+            Mark::Stroke { points, .. } => span(points),
+            Mark::Arrow { from, to, .. } => span(&[*from, *to]),
+            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => *rect,
+        }
+    }
+
+    fn shifted(&self, dx: i32, dy: i32) -> Mark {
+        let shift = |p: &mut (f32, f32)| *p = (p.0 + dx as f32, p.1 + dy as f32);
+        let mut m = self.clone();
+        match &mut m {
+            Mark::Stroke { points, .. } => points.iter_mut().for_each(shift),
+            Mark::Arrow { from, to, .. } => {
+                shift(from);
+                shift(to);
+            }
+            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
+                *rect = rect.offset(dx, dy)
+            }
+        }
+        m
+    }
+
+    fn resized(&self, grip: Grip, (dx, dy): (i32, i32), b: Rect) -> Mark {
+        let shift = |p: &mut (f32, f32)| {
+            *p = (
+                (p.0 + dx as f32).max(b.x as f32).min(b.right() as f32),
+                (p.1 + dy as f32).max(b.y as f32).min(b.bottom() as f32),
+            )
+        };
+        let mut m = self.clone();
+        match (&mut m, grip) {
+            (Mark::Arrow { from, .. }, Grip::From) => shift(from),
+            (Mark::Arrow { to, .. }, Grip::To) => shift(to),
+            (m, Grip::Edge(edges)) => {
+                if let Some(r) = m.area_mut() {
+                    *r = resize(*r, edges, (dx, dy), b, MIN_SIDE);
+                }
+            }
+            _ => {}
+        }
+        m
+    }
+
+    fn hit(&self, p: (f32, f32), scale: f32) -> bool {
+        let slop = 4.0 * scale;
+        match self {
+            Mark::Stroke { points, width, .. } => path_dist(points, p) <= width * scale / 2.0 + slop,
+            Mark::Arrow { from, to, width, .. } => {
+                let (w, len) = (width * scale, dist(*from, *to));
+                let head = arrow_head(w, len);
+                let t = if len > 0.0 { head / len } else { 0.0 };
+                let base = (to.0 + (from.0 - to.0) * t, to.1 + (from.1 - to.1) * t);
+                seg_dist(p, *from, *to) <= w / 2.0 + slop || seg_dist(p, base, *to) <= head * 0.55 + slop
+            }
+            Mark::Rectangle { rect, width, .. } => {
+                let reach = width * scale / 2.0 + slop;
+                within(*rect, p, reach) && !within(*rect, p, -reach)
+            }
+            Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => within(*rect, p, 0.0),
+        }
+    }
+
+    fn grips(&self) -> Vec<(Grip, (f32, f32))> {
+        match self {
+            Mark::Stroke { .. } => Vec::new(),
+            Mark::Arrow { from, to, .. } => vec![(Grip::From, *from), (Grip::To, *to)],
+            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
+                GRIPS.iter().map(|&e| (Grip::Edge(e), edge_point(*rect, e))).collect()
+            }
         }
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+fn span(points: &[(f32, f32)]) -> Rect {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in points {
+        (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x), y1.max(y));
+    }
+    Rect::from_points(x0.floor() as i32, y0.floor() as i32, x1.ceil() as i32, y1.ceil() as i32)
+}
+
+fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
+    (a.0 - b.0).hypot(a.1 - b.1)
+}
+
+fn seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len2 = dx * dx + dy * dy;
+    let t = if len2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
+    dist(p, (a.0 + t * dx, a.1 + t * dy))
+}
+
+fn path_dist(points: &[(f32, f32)], p: (f32, f32)) -> f32 {
+    match points {
+        [a] => dist(p, *a),
+        _ => points.windows(2).map(|s| seg_dist(p, s[0], s[1])).fold(f32::INFINITY, f32::min),
+    }
+}
+
+fn within(r: Rect, (x, y): (f32, f32), pad: f32) -> bool {
+    x >= r.x as f32 - pad && x <= r.right() as f32 + pad && y >= r.y as f32 - pad && y <= r.bottom() as f32 + pad
+}
+
+fn edge_point(r: Rect, e: Edges) -> (f32, f32) {
+    let at = |lo: bool, hi: bool, start: i32, len: i32| {
+        (if lo {
+            start
+        } else if hi {
+            start + len
+        } else {
+            start + len / 2
+        }) as f32
+    };
+    (at(e.l, e.r, r.x, r.w), at(e.t, e.b, r.y, r.h))
+}
+
+fn resize(r: Rect, e: Edges, (dx, dy): (i32, i32), b: Rect, min: i32) -> Rect {
+    let (mut x0, mut y0, mut x1, mut y1) = (r.x, r.y, r.right(), r.bottom());
+    if e.l {
+        x0 = (x0 + dx).max(b.x).min(x1 - min);
+    }
+    if e.r {
+        x1 = (x1 + dx).min(b.right()).max(x0 + min);
+    }
+    if e.t {
+        y0 = (y0 + dy).max(b.y).min(y1 - min);
+    }
+    if e.b {
+        y1 = (y1 + dy).min(b.bottom()).max(y0 + min);
+    }
+    Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
+}
+
+fn shift_within(r: Rect, (dx, dy): (i32, i32), b: Rect) -> (i32, i32) {
+    let fit = |d: i32, lo: i32, hi: i32| d.clamp(lo.min(hi), lo.max(hi));
+    (fit(dx, b.x - r.x, b.right() - r.right()), fit(dy, b.y - r.y, b.bottom() - r.bottom()))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Item {
     Tool(Tool),
     Color(usize),
@@ -126,13 +359,13 @@ fn groups() -> [Vec<Item>; 5] {
     [
         TOOLS.iter().map(|(t, ..)| Item::Tool(*t)).collect(),
         (0..COLORS.len()).map(Item::Color).collect(),
-        (0..SIZES.len()).map(Item::Size).collect(),
+        (0..3).map(Item::Size).collect(),
         vec![Item::Undo, Item::Redo],
         vec![Item::Copy, Item::Save, Item::Done, Item::Close],
     ]
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Edges {
     l: bool,
     t: bool,
@@ -140,9 +373,44 @@ struct Edges {
     b: bool,
 }
 
+const GRIPS: [Edges; 8] = {
+    const fn e(l: bool, t: bool, r: bool, b: bool) -> Edges {
+        Edges { l, t, r, b }
+    }
+    [
+        e(true, true, false, false),
+        e(false, true, false, false),
+        e(false, true, true, false),
+        e(true, false, false, false),
+        e(false, false, true, false),
+        e(true, false, false, true),
+        e(false, false, false, true),
+        e(false, false, true, true),
+    ]
+};
+
+fn edge_cursor(e: Edges) -> PCWSTR {
+    match (e.l || e.r, e.t || e.b) {
+        (true, true) if (e.l && e.t) || (e.r && e.b) => IDC_SIZENWSE,
+        (true, true) => IDC_SIZENESW,
+        (true, false) => IDC_SIZEWE,
+        _ => IDC_SIZENS,
+    }
+}
+
+fn grip_cursor(grip: Option<Grip>) -> PCWSTR {
+    match grip {
+        Some(Grip::Edge(e)) => edge_cursor(e),
+        Some(Grip::From | Grip::To) => IDC_CROSS,
+        None => IDC_SIZEALL,
+    }
+}
+
 enum Hit {
     Bar(Item),
+    Grip(Grip),
     Handle(Edges),
+    Mark(usize),
     Inside,
     Outside,
 }
@@ -150,11 +418,34 @@ enum Hit {
 enum Drag {
     /// A mark being drawn; `anchor` is where the press was (boxes grow from it either way).
     Mark { mark: Mark, anchor: (i32, i32) },
+    Edit { index: usize, grip: Option<Grip>, grab: (i32, i32), from: Mark },
     Move { grab: (i32, i32), from: Rect },
     Resize { edges: Edges, grab: (i32, i32), from: Rect },
     /// A toolbar button is held; it fires on release over the same button.
     Bar(Item),
 }
+
+#[derive(PartialEq)]
+struct Look {
+    hover: Option<Item>,
+    pressed: Option<Item>,
+    tool: Option<Tool>,
+    color: usize,
+    size: Option<(Tool, f32)>,
+    undo: bool,
+    redo: bool,
+    pill: Option<(Item, String)>,
+}
+
+#[derive(PartialEq)]
+pub struct Frame {
+    canvas: Vec<Rect>,
+    chrome: Vec<Rect>,
+    picked: Option<usize>,
+    look: Look,
+}
+
+type Snapshot = (Vec<Mark>, Option<usize>);
 
 pub struct Editor {
     /// The shot's region (client coordinates).
@@ -162,26 +453,27 @@ pub struct Editor {
     /// The monitor the selection stays on.
     bounds: Rect,
     marks: Vec<Mark>,
-    undone: Vec<Mark>,
-    /// Bumped whenever the set of blur / pixelate marks changes (invalidates `base`).
-    effects_gen: u64,
+    picked: Option<usize>,
+    history: Vec<Snapshot>,
+    future: Vec<Snapshot>,
+    wheel_group: Option<(usize, Instant)>,
+    wheel_acc: i32,
     tool: Option<Tool>,
     color: usize,
-    size: usize,
+    strength: [f32; 6],
     drag: Option<Drag>,
     hover: Option<Item>,
+    notice: Option<(String, Instant)>,
     scale: f32,
     /// The selection with its committed effects, and what it was built from.
-    base: Option<(Rect, u64, Dib)>,
+    base: Option<(Rect, Vec<Mark>, Dib)>,
     /// What shows inside the selection: `base` plus shapes. Rebuilt when `view_dirty`.
     view: Option<Dib>,
     view_dirty: bool,
-    /// Toolbar cells (client coordinates) and the rendered bar.
+    /// Toolbar cells (client coordinates).
     cells: Vec<(Item, Rect)>,
     pub bar: Rect,
-    bar_dib: Option<Dib>,
-    bar_dirty: bool,
-    tip: Option<(Rect, Dib, Item)>,
+    pill: Option<(Rect, Item, String)>,
 }
 
 impl Editor {
@@ -190,22 +482,24 @@ impl Editor {
             sel,
             bounds,
             marks: Vec::new(),
-            undone: Vec::new(),
-            effects_gen: 0,
+            picked: None,
+            history: Vec::new(),
+            future: Vec::new(),
+            wheel_group: None,
+            wheel_acc: 0,
             tool: None,
             color: 0,
-            size: 1,
+            strength: TOOLS.map(|(t, ..)| t.strength().presets[1]),
             drag: None,
             hover: None,
+            notice: None,
             scale,
             base: None,
             view: None,
             view_dirty: true,
             cells: Vec::new(),
             bar: Rect::default(),
-            bar_dib: None,
-            bar_dirty: true,
-            tip: None,
+            pill: None,
         };
         ed.place_bar();
         ed
@@ -215,16 +509,111 @@ impl Editor {
         (v * self.scale).round()
     }
 
-    /// Everything the editor draws; the overlay repaints the union before and after a change.
+    /// Everything the editor draws.
     pub fn extent(&self) -> Vec<Rect> {
-        let mut v = vec![self.sel.inflate(self.px(8.0) as i32), self.bar];
-        v.extend(self.tip.as_ref().map(|t| t.0));
+        let mut v = self.canvas();
+        v.extend(self.chrome());
         v
     }
 
-    /// The tooltip's rectangle, while one shows.
-    pub fn tip(&self) -> Option<Rect> {
-        self.tip.as_ref().map(|t| t.0)
+    fn canvas(&self) -> Vec<Rect> {
+        let mut v = vec![self.sel.inflate(self.px(8.0) as i32)];
+        v.extend(self.picked_extent());
+        v
+    }
+
+    fn chrome(&self) -> Vec<Rect> {
+        let mut v = vec![self.bar];
+        v.extend(self.pill.as_ref().map(|p| p.0));
+        v
+    }
+
+    pub fn frame(&self) -> Frame {
+        Frame { canvas: self.canvas(), chrome: self.chrome(), picked: self.picked, look: self.look() }
+    }
+
+    pub fn damage(&self, before: &Frame) -> Vec<Rect> {
+        let now = self.frame();
+        let mut v = Vec::new();
+        if self.view_dirty || now.canvas != before.canvas || now.picked != before.picked {
+            v.extend(&before.canvas);
+            v.extend(&now.canvas);
+        }
+        if now.chrome != before.chrome || now.look != before.look {
+            v.extend(&before.chrome);
+            v.extend(&now.chrome);
+        }
+        v
+    }
+
+    fn look(&self) -> Look {
+        Look {
+            hover: self.hover,
+            pressed: self.pressed(),
+            tool: self.tool,
+            color: self.shown_color(),
+            size: self.current(),
+            undo: !self.history.is_empty(),
+            redo: !self.future.is_empty(),
+            pill: self.pill_text(),
+        }
+    }
+
+    fn pressed(&self) -> Option<Item> {
+        match self.drag {
+            Some(Drag::Bar(item)) => Some(item),
+            _ => None,
+        }
+    }
+
+    fn picked_mark(&self) -> Option<&Mark> {
+        self.picked.map(|i| &self.marks[i])
+    }
+
+    fn shown_color(&self) -> usize {
+        self.picked_mark().and_then(Mark::color).unwrap_or(self.color)
+    }
+
+    fn current(&self) -> Option<(Tool, f32)> {
+        match self.picked_mark() {
+            Some(m) => Some((m.tool(), m.strength())),
+            None => self.tool.map(|t| (t, self.strength[t as usize])),
+        }
+    }
+
+    fn tip(&self, item: Item) -> Option<String> {
+        match (item, self.current()) {
+            (Item::Size(n), Some((tool, _))) => {
+                let s = tool.strength();
+                Some(format!("{}  ·  {}", s.name, s.presets[n]))
+            }
+            _ => item.tip().map(str::to_owned),
+        }
+    }
+
+    fn pill_text(&self) -> Option<(Item, String)> {
+        if let Some((text, _)) = &self.notice {
+            return Some((Item::Size(1), text.clone()));
+        }
+        let item = self.hover.filter(|_| self.pressed().is_none())?;
+        self.tip(item).map(|t| (item, t))
+    }
+
+    fn grip_box(&self, (x, y): (f32, f32)) -> Rect {
+        let k = self.px(8.0) as i32;
+        Rect { x: x.round() as i32 - k, y: y.round() as i32 - k, w: 2 * k, h: 2 * k }
+    }
+
+    fn outline(&self, m: &Mark) -> Rect {
+        m.bbox().inflate((m.strength() * self.scale / 2.0 + self.px(4.0)).ceil() as i32)
+    }
+
+    fn picked_extent(&self) -> Option<Rect> {
+        let m = self.picked_mark()?;
+        Some(match m {
+            Mark::Stroke { .. } => self.outline(m).inflate(2),
+            _ => m.bbox().inflate(self.px(8.0) as i32 + 1),
+        })
     }
 
     /// Lays the toolbar out under the selection, or above it, or inside it when neither fits.
@@ -262,8 +651,7 @@ impl Editor {
                 cx += cell;
             }
         }
-        self.bar_dirty = true;
-        self.tip = None;
+        self.pill = None;
     }
 
     fn hit(&self, p: (i32, i32)) -> Hit {
@@ -272,6 +660,12 @@ impl Editor {
         }
         if self.bar.contains(p.0, p.1) {
             return Hit::Outside; // the bar's padding
+        }
+        let at = (p.0 as f32, p.1 as f32);
+        let reach = self.px(8.0);
+        let mut grips = self.picked_mark().into_iter().flat_map(Mark::grips);
+        if let Some((grip, _)) = grips.find(|(_, q)| dist(at, *q) <= reach) {
+            return Hit::Grip(grip);
         }
         let s = self.sel;
         let grip = self.px(6.0) as i32;
@@ -283,75 +677,80 @@ impl Editor {
                 return Hit::Handle(edges);
             }
         }
-        if s.contains(p.0, p.1) { Hit::Inside } else { Hit::Outside }
+        if !s.contains(p.0, p.1) {
+            return Hit::Outside;
+        }
+        match self.mark_at(at) {
+            Some(i) => Hit::Mark(i),
+            None => Hit::Inside,
+        }
+    }
+
+    fn mark_at(&self, at: (f32, f32)) -> Option<usize> {
+        let n = self.marks.len();
+        let shapes = (0..n).rev().filter(|&i| !self.marks[i].is_effect());
+        let effects = (0..n).rev().filter(|&i| self.marks[i].is_effect());
+        self.picked
+            .into_iter()
+            .chain(shapes)
+            .chain(effects)
+            .filter(|&i| self.tool.is_none_or(|t| t == self.marks[i].tool()))
+            .find(|&i| self.marks[i].hit(at, self.scale))
     }
 
     pub fn cursor(&self, p: (i32, i32)) -> PCWSTR {
-        if let Some(Drag::Mark { .. }) = self.drag {
-            return IDC_CROSS;
+        match &self.drag {
+            Some(Drag::Mark { .. }) => return IDC_CROSS,
+            Some(Drag::Edit { grip, .. }) => return grip_cursor(*grip),
+            _ => {}
         }
         match self.hit(p) {
             Hit::Bar(_) => IDC_HAND,
-            Hit::Handle(e) => match (e.l || e.r, e.t || e.b) {
-                (true, true) if (e.l && e.t) || (e.r && e.b) => IDC_SIZENWSE,
-                (true, true) => IDC_SIZENESW,
-                (true, false) => IDC_SIZEWE,
-                _ => IDC_SIZENS,
-            },
+            Hit::Grip(grip) => grip_cursor(Some(grip)),
+            Hit::Handle(e) => edge_cursor(e),
+            Hit::Mark(i) if self.picked == Some(i) => IDC_SIZEALL,
+            Hit::Mark(_) => IDC_HAND,
             Hit::Inside if self.tool.is_some() => IDC_CROSS,
             Hit::Inside => IDC_SIZEALL,
             Hit::Outside => IDC_ARROW,
         }
     }
 
-    fn color(&self) -> D2D1_COLOR_F {
-        COLORS[self.color]
-    }
-
-    fn width(&self) -> f32 {
-        self.px(SIZES[self.size])
+    fn grab(&self, index: usize, grip: Option<Grip>, p: (i32, i32)) -> Drag {
+        Drag::Edit { index, grip, grab: p, from: self.marks[index].clone() }
     }
 
     pub fn mouse_down(&mut self, p: (i32, i32)) -> Event {
-        let f = (p.0 as f32, p.1 as f32);
-        self.drag = match self.hit(p) {
-            Hit::Bar(item) => {
-                self.bar_dirty = true;
-                Some(Drag::Bar(item))
-            }
+        let hit = self.hit(p);
+        let picked = self.picked;
+        match hit {
+            Hit::Bar(_) | Hit::Grip(_) => {}
+            Hit::Mark(i) => self.picked = Some(i),
+            _ => self.picked = None,
+        }
+        self.drag = match hit {
+            Hit::Bar(item) => Some(Drag::Bar(item)),
+            Hit::Grip(grip) => self.picked.map(|index| self.grab(index, Some(grip), p)),
+            Hit::Mark(index) => Some(self.grab(index, None, p)),
             Hit::Handle(edges) => Some(Drag::Resize { edges, grab: p, from: self.sel }),
             Hit::Inside => match self.tool {
                 None => Some(Drag::Move { grab: p, from: self.sel }),
                 Some(tool) => {
-                    let (color, width) = (self.color(), self.width());
-                    let r = Rect { x: p.0, y: p.1, w: 0, h: 0 };
-                    let mark = match tool {
-                        Tool::Pen => Mark::Stroke { points: vec![f], color, width },
-                        // A wide translucent stroke, drawn as one path so overlaps don't darken.
-                        Tool::Highlighter => {
-                            Mark::Stroke { points: vec![f], color: D2D1_COLOR_F { a: 0.4, ..color }, width: width * 4.0 }
-                        }
-                        Tool::Arrow => Mark::Arrow { from: f, to: f, color, width },
-                        Tool::Rectangle => Mark::Rectangle { a: f, b: f, color, width },
-                        Tool::Blur => Mark::Blur(r),
-                        Tool::Pixelate => Mark::Pixelate(r),
-                    };
-                    Some(Drag::Mark { mark, anchor: p })
+                    self.view_dirty = true;
+                    Some(Drag::Mark { mark: Mark::new(tool, p, self.color, self.strength[tool as usize]), anchor: p })
                 }
             },
             Hit::Outside => None,
         };
-        if matches!(self.drag, Some(Drag::Mark { .. })) {
-            self.view_dirty = true;
-        }
-        if self.drag.is_some() { Event::Repaint } else { Event::None }
+        if self.drag.is_some() || self.picked != picked { Event::Repaint } else { Event::None }
     }
 
     pub fn mouse_move(&mut self, p: (i32, i32)) -> Event {
-        let f = (p.0 as f32, p.1 as f32);
         let b = self.bounds;
         match &mut self.drag {
             Some(Drag::Mark { mark, anchor }) => {
+                let q = (p.0.clamp(b.x, b.right()), p.1.clamp(b.y, b.bottom()));
+                let f = (q.0 as f32, q.1 as f32);
                 match mark {
                     Mark::Stroke { points, .. } => {
                         if points.last().is_some_and(|l| (l.0 - f.0).abs() + (l.1 - f.1).abs() >= 1.0) {
@@ -359,9 +758,27 @@ impl Editor {
                         }
                     }
                     Mark::Arrow { to, .. } => *to = f,
-                    Mark::Rectangle { b: corner, .. } => *corner = f,
-                    Mark::Blur(r) | Mark::Pixelate(r) => *r = Rect::from_points(anchor.0, anchor.1, p.0, p.1),
+                    Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
+                        *rect = Rect::from_points(anchor.0, anchor.1, q.0, q.1)
+                    }
                 }
+                self.view_dirty = true;
+                Event::Repaint
+            }
+            Some(Drag::Edit { index, grip, grab, from }) => {
+                let d = (p.0 - grab.0, p.1 - grab.1);
+                let mark = match grip {
+                    Some(grip) => from.resized(*grip, d, b),
+                    None => {
+                        let (dx, dy) = shift_within(from.bbox(), d, b);
+                        from.shifted(dx, dy)
+                    }
+                };
+                let i = *index;
+                if self.marks[i] == mark {
+                    return Event::None;
+                }
+                self.marks[i] = mark;
                 self.view_dirty = true;
                 Event::Repaint
             }
@@ -372,21 +789,7 @@ impl Editor {
                 self.set_sel(Rect { x, y, ..from })
             }
             &mut Some(Drag::Resize { edges, grab, from }) => {
-                let (dx, dy) = (p.0 - grab.0, p.1 - grab.1);
-                let (mut x0, mut y0, mut x1, mut y1) = (from.x, from.y, from.right(), from.bottom());
-                if edges.l {
-                    x0 = (x0 + dx).clamp(b.x, x1 - 1);
-                }
-                if edges.r {
-                    x1 = (x1 + dx).clamp(x0 + 1, b.right());
-                }
-                if edges.t {
-                    y0 = (y0 + dy).clamp(b.y, y1 - 1);
-                }
-                if edges.b {
-                    y1 = (y1 + dy).clamp(y0 + 1, b.bottom());
-                }
-                self.set_sel(Rect { x: x0, y: y0, w: x1 - x0, h: y1 - y0 })
+                self.set_sel(resize(from, edges, (p.0 - grab.0, p.1 - grab.1), b, 1))
             }
             Some(Drag::Bar(_)) => Event::None,
             None => {
@@ -398,7 +801,6 @@ impl Editor {
                     return Event::None;
                 }
                 self.hover = hover;
-                self.bar_dirty = true;
                 Event::Repaint
             }
         }
@@ -416,16 +818,24 @@ impl Editor {
 
     pub fn mouse_up(&mut self, p: (i32, i32)) -> Event {
         match self.drag.take() {
-            Some(Drag::Bar(item)) => {
-                self.bar_dirty = true;
-                match self.hit(p) {
-                    Hit::Bar(at) if at == item => self.activate(item),
-                    _ => Event::Repaint,
+            Some(Drag::Bar(item)) => match self.hit(p) {
+                Hit::Bar(at) if at == item => self.activate(item),
+                _ => Event::Repaint,
+            },
+            Some(Drag::Mark { mark, .. }) => {
+                if mark.worth_keeping() {
+                    self.remember();
+                    self.marks.push(mark);
+                    self.picked = Some(self.marks.len() - 1);
                 }
+                self.view_dirty = true;
+                Event::Repaint
             }
-            Some(Drag::Mark { mark: m, .. }) => {
-                if m.worth_keeping() {
-                    self.push(m);
+            Some(Drag::Edit { index, from, .. }) => {
+                if self.marks[index] != from {
+                    let mut before = self.marks.clone();
+                    before[index] = from;
+                    self.record((before, Some(index)));
                 }
                 self.view_dirty = true;
                 Event::Repaint
@@ -435,45 +845,79 @@ impl Editor {
         }
     }
 
-    fn push(&mut self, m: Mark) {
-        if m.is_effect() {
-            self.effects_gen += 1;
-        }
-        self.marks.push(m);
-        if self.undone.drain(..).any(|m| m.is_effect()) {
-            self.effects_gen += 1;
-        }
-        self.bar_dirty = true;
+    fn remember(&mut self) {
+        self.record((self.marks.clone(), self.picked));
+    }
+
+    fn record(&mut self, before: Snapshot) {
+        self.history.push(before);
+        self.future.clear();
+        self.wheel_group = None;
     }
 
     fn undo(&mut self) -> Event {
-        let Some(m) = self.marks.pop() else { return Event::None };
-        if m.is_effect() {
-            self.effects_gen += 1;
-        }
-        self.undone.push(m);
-        self.view_dirty = true;
-        self.bar_dirty = true;
-        Event::Repaint
+        self.travel(true)
     }
 
     fn redo(&mut self) -> Event {
-        let Some(m) = self.undone.pop() else { return Event::None };
-        if m.is_effect() {
-            self.effects_gen += 1;
-        }
-        self.marks.push(m);
+        self.travel(false)
+    }
+
+    fn travel(&mut self, back: bool) -> Event {
+        let (from, to) =
+            if back { (&mut self.history, &mut self.future) } else { (&mut self.future, &mut self.history) };
+        let Some((marks, picked)) = from.pop() else { return Event::None };
+        to.push((std::mem::replace(&mut self.marks, marks), self.picked));
+        self.picked = picked.filter(|&i| self.tool.is_none_or(|t| self.marks.get(i).is_some_and(|m| m.tool() == t)));
+        self.wheel_group = None;
         self.view_dirty = true;
-        self.bar_dirty = true;
+        Event::Repaint
+    }
+
+    fn delete(&mut self) -> Event {
+        let Some(i) = self.picked else { return Event::None };
+        self.remember();
+        self.marks.remove(i);
+        self.picked = None;
+        self.view_dirty = true;
+        Event::Repaint
+    }
+
+    fn escape(&mut self) -> Event {
+        if self.picked.take().is_none() {
+            return Event::Cancel;
+        }
+        if let Some(Drag::Edit { index, from, .. }) = self.drag.take() {
+            self.marks[index] = from;
+        }
+        self.view_dirty = true;
         Event::Repaint
     }
 
     fn activate(&mut self, item: Item) -> Event {
-        self.bar_dirty = true;
         match item {
-            Item::Tool(t) => self.tool = if self.tool == Some(t) { None } else { Some(t) },
-            Item::Color(i) => self.color = i,
-            Item::Size(i) => self.size = i,
+            Item::Tool(t) => {
+                self.tool = if self.tool == Some(t) { None } else { Some(t) };
+                if self.tool.is_some_and(|t| self.picked_mark().is_some_and(|m| m.tool() != t)) {
+                    self.picked = None;
+                }
+            }
+            Item::Color(c) => {
+                self.color = c;
+                if let Some(i) = self.picked
+                    && self.marks[i].color().is_some_and(|old| old != c)
+                {
+                    self.remember();
+                    if let Some(slot) = self.marks[i].color_mut() {
+                        *slot = c;
+                    }
+                    self.view_dirty = true;
+                }
+            }
+            Item::Size(n) => match self.current() {
+                Some((tool, _)) => return self.set_strength(tool.strength().presets[n], false),
+                None => return Event::None,
+            },
             Item::Undo => return self.undo(),
             Item::Redo => return self.redo(),
             Item::Copy => return Event::Finish(Output::Copy),
@@ -484,25 +928,60 @@ impl Editor {
         Event::Repaint
     }
 
+    fn set_strength(&mut self, v: f32, wheel: bool) -> Event {
+        let Some((tool, _)) = self.current() else { return Event::None };
+        let spec = tool.strength();
+        let v = v.clamp(spec.min, spec.max);
+        self.strength[tool as usize] = v;
+        if let Some(i) = self.picked
+            && self.marks[i].strength() != v
+        {
+            let grouped = wheel && self.wheel_group.is_some_and(|(g, at)| g == i && at.elapsed() < WHEEL_GROUP);
+            if !grouped {
+                self.remember();
+            }
+            *self.marks[i].strength_mut() = v;
+            if wheel {
+                self.wheel_group = Some((i, Instant::now()));
+            }
+            self.view_dirty = true;
+        }
+        if wheel {
+            self.notice = Some((format!("{}  ·  {v}", spec.name), Instant::now()));
+        }
+        Event::Repaint
+    }
+
+    fn nudge(&mut self, steps: i32) -> Event {
+        let Some((tool, v)) = self.current() else { return Event::None };
+        self.set_strength(v + steps as f32 * tool.strength().step, true)
+    }
+
     /// Keyboard shortcuts; `vk` is a virtual-key code.
     pub fn key(&mut self, vk: u32, ctrl: bool, shift: bool) -> Event {
+        const VK_BACK: u32 = 0x08;
         const VK_RETURN: u32 = 0x0D;
         const VK_ESCAPE: u32 = 0x1B;
+        const VK_SPACE: u32 = 0x20;
+        const VK_DELETE: u32 = 0x2E;
         const VK_OEM_4: u32 = 0xDB; // [
         const VK_OEM_6: u32 = 0xDD; // ]
-        if self.drag.is_some() && vk != VK_ESCAPE {
+        if vk == VK_ESCAPE {
+            return self.escape();
+        }
+        if self.drag.is_some() {
             return Event::None;
         }
         match (vk, ctrl) {
-            (VK_ESCAPE, _) => Event::Cancel,
-            (VK_RETURN, _) => Event::Finish(Output::Default),
+            (VK_RETURN | VK_SPACE, _) => Event::Finish(Output::Default),
             (0x43, true) => Event::Finish(Output::Copy), // C
             (0x53, true) => Event::Finish(Output::Save), // S
             (0x5A, true) if shift => self.redo(),        // Z
             (0x5A, true) => self.undo(),
             (0x59, true) => self.redo(), // Y
-            (VK_OEM_4, false) => self.activate(Item::Size(self.size.saturating_sub(1))),
-            (VK_OEM_6, false) => self.activate(Item::Size((self.size + 1).min(SIZES.len() - 1))),
+            (VK_DELETE | VK_BACK, false) => self.delete(),
+            (VK_OEM_4, false) => self.nudge(-1),
+            (VK_OEM_6, false) => self.nudge(1),
             (_, false) => match TOOLS.iter().find(|(.., key)| *key as u32 == vk) {
                 Some((tool, ..)) => self.activate(Item::Tool(*tool)),
                 None => Event::None,
@@ -511,43 +990,60 @@ impl Editor {
         }
     }
 
-    /// The mouse wheel steps through the sizes.
     pub fn wheel(&mut self, delta: i32) -> Event {
-        let size = if delta > 0 { (self.size + 1).min(SIZES.len() - 1) } else { self.size.saturating_sub(1) };
-        if size == self.size {
+        if self.drag.is_some() {
             return Event::None;
         }
-        self.activate(Item::Size(size))
+        self.wheel_acc += delta;
+        let notches = self.wheel_acc / WHEEL_DELTA;
+        self.wheel_acc -= notches * WHEEL_DELTA;
+        if notches == 0 { Event::None } else { self.nudge(notches) }
     }
 
-    /// Brings `view`, the toolbar and its tooltip up to date. `bright` is the frozen screen,
-    /// `dim` its darkened copy (the toolbar sits on it).
-    pub fn render(&mut self, bright: &Dib, dim: &Dib, painter: &Painter, font: &IDWriteTextFormat) -> Result<(), String> {
+    pub fn notice_left(&self) -> Option<Duration> {
+        self.notice.as_ref().map(|(_, at)| NOTICE.saturating_sub(at.elapsed()))
+    }
+
+    pub fn tick(&mut self) -> Event {
+        if self.notice.as_ref().is_none_or(|(_, at)| at.elapsed() < NOTICE) {
+            return Event::None;
+        }
+        self.notice = None;
+        Event::Repaint
+    }
+
+    /// Brings `view` and the pill's placement up to date. `bright` is the frozen screen.
+    pub fn render(&mut self, bright: &Dib, painter: &Painter, font: &IDWriteTextFormat) -> Result<(), String> {
         if self.view_dirty {
             self.render_view(bright, painter)?;
             self.view_dirty = false;
         }
-        if self.bar_dirty {
-            self.render_bar(dim, painter, font)?;
-            self.bar_dirty = false;
+        let want = self.pill_text();
+        if self.pill.as_ref().map(|(_, item, text)| (*item, text)) != want.as_ref().map(|(item, text)| (*item, text)) {
+            self.pill = want.map(|(item, text)| (self.place_pill(item, &text, painter, font), item, text));
         }
         Ok(())
     }
 
     fn render_view(&mut self, bright: &Dib, painter: &Painter) -> Result<(), String> {
         let s = self.sel;
-        let fresh = self.base.as_ref().is_some_and(|(r, g, _)| *r == s && *g == self.effects_gen);
+        let editing = match &self.drag {
+            Some(Drag::Edit { index, .. }) if self.marks[*index].is_effect() => Some(*index),
+            _ => None,
+        };
+        let committed =
+            || self.marks.iter().enumerate().filter(move |&(i, m)| m.is_effect() && Some(i) != editing).map(|(_, m)| m);
+        let fresh = self.base.as_ref().is_some_and(|(r, fx, _)| *r == s && fx.iter().eq(committed()));
         if !fresh {
-            let base = Dib::new(s.w, s.h)?;
+            let mut base = Dib::new(s.w, s.h)?;
             unsafe {
                 let _ = BitBlt(base.dc, 0, 0, s.w, s.h, Some(bright.dc), s.x, s.y, SRCCOPY);
                 let _ = GdiFlush();
             }
-            let mut base = base;
-            for m in self.marks.iter().filter(|m| m.is_effect()) {
+            for m in committed() {
                 apply_effect(&mut base, m, s, self.scale);
             }
-            self.base = Some((s, self.effects_gen, base));
+            self.base = Some((s, committed().cloned().collect(), base));
         }
         let (_, _, base) = self.base.as_ref().expect("built above");
         if self.view.as_ref().is_none_or(|v| (v.w, v.h) != (s.w, s.h)) {
@@ -558,108 +1054,93 @@ impl Editor {
             let _ = BitBlt(view.dc, 0, 0, s.w, s.h, Some(base.dc), 0, 0, SRCCOPY);
             let _ = GdiFlush();
         }
-        let live = match &self.drag {
+        let drawing = match &self.drag {
             Some(Drag::Mark { mark, .. }) => Some(mark),
             _ => None,
         };
-        if let Some(m) = live.filter(|m| m.is_effect()) {
+        for m in drawing.into_iter().chain(editing.map(|i| &self.marks[i])).filter(|m| m.is_effect()) {
             apply_effect(view, m, s, self.scale);
         }
-        let shift = (-s.x as f32, -s.y as f32);
-        let shapes = self.marks.iter().chain(live).filter(|m| !m.is_effect());
+        let (shift, scale) = ((-s.x as f32, -s.y as f32), self.scale);
+        let shapes = self.marks.iter().chain(drawing).filter(|m| !m.is_effect());
         painter.draw(view, |c| {
             for m in shapes {
-                draw_mark(c, m, shift);
+                draw_mark(c, m, shift, scale);
             }
         })
     }
 
-    fn render_bar(&mut self, dim: &Dib, painter: &Painter, font: &IDWriteTextFormat) -> Result<(), String> {
+    /// Tooltip for the hovered button, on the side of the bar away from the selection.
+    fn place_pill(&self, item: Item, text: &str, painter: &Painter, font: &IDWriteTextFormat) -> Rect {
         let b = self.bar;
-        let dib = Dib::new(b.w, b.h)?;
-        unsafe {
-            let _ = BitBlt(dib.dc, 0, 0, b.w, b.h, Some(dim.dc), b.x, b.y, SRCCOPY);
+        let cell = self.cells.iter().find(|(i, _)| *i == item).map(|(_, r)| *r).unwrap_or(b);
+        let (tw, _) = painter.measure(text, font);
+        let (w, h) = ((tw.ceil() + self.px(20.0)) as i32, self.px(26.0) as i32);
+        let gap = self.px(6.0) as i32;
+        let below_sel = b.y >= self.sel.bottom();
+        let mut y = if below_sel { b.bottom() + gap } else { b.y - gap - h };
+        if y < self.bounds.y || y + h > self.bounds.bottom() {
+            y = if below_sel { b.y - gap - h } else { b.bottom() + gap };
         }
-        let pressed = match self.drag {
-            Some(Drag::Bar(item)) => Some(item),
-            _ => None,
-        };
-        let s = self.scale;
-        let (can_undo, can_redo) = (!self.marks.is_empty(), !self.undone.is_empty());
-        let groups = groups();
-        painter.draw(&dib, |c| {
-            let (w, h) = (b.w as f32, b.h as f32);
-            c.round_rect(0.0, 0.0, w, h, 10.0 * s, BAR_BG);
-            // Separators between groups.
-            let mut i = 0;
-            for g in &groups[..groups.len() - 1] {
-                i += g.len();
-                let (_, before) = self.cells[i - 1];
-                let x = (before.right() - b.x) as f32 + (4.0 * s).round() + 0.5;
-                c.line((x, h * 0.28), (x, h * 0.72), 1.0, rgba(255, 255, 255, 0.16));
-            }
-            for &(item, r) in &self.cells {
-                let (x, y) = ((r.x - b.x) as f32, (r.y - b.y) as f32);
-                let (cw, ch) = (r.w as f32, r.h as f32);
-                let active = match item {
-                    Item::Tool(t) => self.tool == Some(t),
-                    Item::Size(i) => self.size == i,
-                    _ => false,
-                };
-                let bg = if pressed == Some(item) {
-                    0.26
-                } else if active {
-                    0.18
-                } else if self.hover == Some(item) {
-                    0.10
-                } else {
-                    0.0
-                };
-                if bg > 0.0 {
-                    c.round_rect(x + 2.0 * s, y + 2.0 * s, cw - 4.0 * s, ch - 4.0 * s, 7.0 * s, rgba(255, 255, 255, bg));
-                }
-                let enabled = match item {
-                    Item::Undo => can_undo,
-                    Item::Redo => can_redo,
-                    _ => true,
-                };
-                let ink = if enabled { WHITE } else { rgba(255, 255, 255, 0.3) };
-                draw_icon(c, item, (x + cw / 2.0, y + ch / 2.0), s, ink, self.color);
-            }
-        })?;
-        self.bar_dib = Some(dib);
-
-        // Tooltip for the hovered button, on the side of the bar away from the selection.
-        let tip_item = self.hover.filter(|_| pressed.is_none());
-        self.tip = match tip_item.and_then(|i| i.tip().map(|t| (i, t))) {
-            Some((item, text)) => {
-                let cell = self.cells.iter().find(|(i, _)| *i == item).map(|(_, r)| *r).unwrap_or(b);
-                let (tw, _) = painter.measure(text, font);
-                let (w, h) = ((tw.ceil() + self.px(20.0)) as i32, self.px(26.0) as i32);
-                let gap = self.px(6.0) as i32;
-                let below_sel = b.y >= self.sel.bottom();
-                let mut y = if below_sel { b.bottom() + gap } else { b.y - gap - h };
-                if y < self.bounds.y || y + h > self.bounds.bottom() {
-                    y = if below_sel { b.y - gap - h } else { b.bottom() + gap };
-                }
-                let x = (cell.x + cell.w / 2 - w / 2).clamp(self.bounds.x, (self.bounds.right() - w).max(self.bounds.x));
-                let tip = Dib::new(w, h)?;
-                unsafe {
-                    let _ = BitBlt(tip.dc, 0, 0, w, h, Some(dim.dc), x, y, SRCCOPY);
-                }
-                painter.draw(&tip, |c| {
-                    c.round_rect(0.0, 0.0, w as f32, h as f32, h as f32 / 2.0, BAR_BG);
-                    c.text(text, font, [self.px(10.0), 0.0, tw + 2.0, h as f32], WHITE);
-                })?;
-                Some((Rect { x, y, w, h }, tip, item))
-            }
-            None => None,
-        };
-        Ok(())
+        let x = (cell.x + cell.w / 2 - w / 2).clamp(self.bounds.x, (self.bounds.right() - w).max(self.bounds.x));
+        Rect { x, y, w, h }
     }
 
-    /// Paints the selection (with marks), its handles, the toolbar and the tooltip.
-    pub fn paint(&self, hdc: HDC, white: HBRUSH, black: HBRUSH) {
+    fn draw_bar(&self, c: &Canvas) {
+        let (b, s) = (self.bar, self.scale);
+        let (pressed, size, color) = (self.pressed(), self.current(), self.shown_color());
+        let (can_undo, can_redo) = (!self.history.is_empty(), !self.future.is_empty());
+        let groups = groups();
+        let (w, h) = (b.w as f32, b.h as f32);
+        c.round_rect(0.0, 0.0, w, h, 10.0 * s, BAR_BG);
+        // Separators between groups.
+        let mut i = 0;
+        for g in &groups[..groups.len() - 1] {
+            i += g.len();
+            let (_, before) = self.cells[i - 1];
+            let x = (before.right() - b.x) as f32 + (4.0 * s).round() + 0.5;
+            c.line((x, h * 0.28), (x, h * 0.72), 1.0, rgba(255, 255, 255, 0.16));
+        }
+        for &(item, r) in &self.cells {
+            let (x, y) = ((r.x - b.x) as f32, (r.y - b.y) as f32);
+            let (cw, ch) = (r.w as f32, r.h as f32);
+            let active = match item {
+                Item::Tool(t) => self.tool == Some(t),
+                Item::Size(n) => size.is_some_and(|(tool, v)| tool.strength().presets[n] == v),
+                _ => false,
+            };
+            let bg = if pressed == Some(item) {
+                0.26
+            } else if active {
+                0.18
+            } else if self.hover == Some(item) {
+                0.10
+            } else {
+                0.0
+            };
+            if bg > 0.0 {
+                c.round_rect(x + 2.0 * s, y + 2.0 * s, cw - 4.0 * s, ch - 4.0 * s, 7.0 * s, rgba(255, 255, 255, bg));
+            }
+            let enabled = match item {
+                Item::Undo => can_undo,
+                Item::Redo => can_redo,
+                Item::Size(_) => size.is_some(),
+                _ => true,
+            };
+            let ink = if enabled { WHITE } else { rgba(255, 255, 255, 0.3) };
+            draw_icon(c, item, (x + cw / 2.0, y + ch / 2.0), s, ink, color);
+        }
+    }
+
+    /// Paints the selection (with marks), its handles, the picked mark's handles, the toolbar and the pill.
+    pub fn paint(
+        &self,
+        hdc: HDC,
+        painter: &Painter,
+        font: &IDWriteTextFormat,
+        white: HBRUSH,
+        black: HBRUSH,
+    ) -> Result<(), String> {
         unsafe {
             let s = self.sel;
             if let Some(v) = &self.view {
@@ -673,29 +1154,44 @@ impl Editor {
             }
             // Handles at the corners and edge midpoints.
             let hs = self.px(7.0) as i32;
-            let (cx, cy) = (s.x + s.w / 2, s.y + s.h / 2);
-            for (x, y) in [
-                (s.x, s.y),
-                (cx, s.y),
-                (s.right(), s.y),
-                (s.x, cy),
-                (s.right(), cy),
-                (s.x, s.bottom()),
-                (cx, s.bottom()),
-                (s.right(), s.bottom()),
-            ] {
+            for e in GRIPS {
+                let (x, y) = edge_point(s, e);
+                let (x, y) = (x as i32, y as i32);
                 let outer = Rect { x: x - hs / 2 - 1, y: y - hs / 2 - 1, w: hs + 2, h: hs + 2 };
                 FillRect(hdc, &outer.to_win(), black);
                 FillRect(hdc, &outer.inflate(-1).to_win(), white);
             }
-            if let Some(bar) = &self.bar_dib {
-                let b = self.bar;
-                let _ = BitBlt(hdc, b.x, b.y, b.w, b.h, Some(bar.dc), 0, 0, SRCCOPY);
+            let visible = |r: Rect| RectVisible(hdc, &r.to_win()).as_bool();
+            if let Some(m) = self.picked_mark() {
+                if let Mark::Stroke { .. } = m {
+                    dashed_box(hdc, self.outline(m), white, black, self.px(4.0) as i32);
+                }
+                let (r, edge) = (4.5 * self.scale, 1.5 * self.scale);
+                for (_, q) in m.grips() {
+                    let gb = self.grip_box(q);
+                    if visible(gb) {
+                        let at = (q.0 - gb.x as f32, q.1 - gb.y as f32);
+                        painter.draw_on(hdc, gb.to_win(), |c| {
+                            c.circle(at, r + edge, GRIP_EDGE);
+                            c.circle(at, r, WHITE);
+                        })?;
+                    }
+                }
             }
-            if let Some((r, dib, _)) = &self.tip {
-                let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(dib.dc), 0, 0, SRCCOPY);
+            if visible(self.bar) {
+                painter.draw_on(hdc, self.bar.to_win(), |c| self.draw_bar(c))?;
+            }
+            if let Some((r, _, text)) = &self.pill
+                && visible(*r)
+            {
+                let (w, h, pad) = (r.w as f32, r.h as f32, self.px(10.0));
+                painter.draw_on(hdc, r.to_win(), |c| {
+                    c.round_rect(0.0, 0.0, w, h, h / 2.0, BAR_BG);
+                    c.text(text, font, [pad, 0.0, w - pad, h], WHITE);
+                })?;
             }
         }
+        Ok(())
     }
 
     /// The finished shot: the selection with every mark, as 0x00RRGGBB rows.
@@ -707,20 +1203,53 @@ impl Editor {
     }
 }
 
-fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32)) {
+unsafe fn dashed_box(hdc: HDC, r: Rect, white: HBRUSH, black: HBRUSH, dash: i32) {
+    let outer = r.inflate(1);
+    let step = (2 * dash) as usize;
+    unsafe {
+        for e in crate::overlay::ring(outer, r) {
+            FillRect(hdc, &e, black);
+        }
+        for x in (outer.x..outer.right()).step_by(step) {
+            let w = dash.min(outer.right() - x);
+            for y in [outer.y, r.bottom()] {
+                FillRect(hdc, &Rect { x, y, w, h: 1 }.to_win(), white);
+            }
+        }
+        for y in (outer.y..outer.bottom()).step_by(step) {
+            let h = dash.min(outer.bottom() - y);
+            for x in [outer.x, r.right()] {
+                FillRect(hdc, &Rect { x, y, w: 1, h }.to_win(), white);
+            }
+        }
+    }
+}
+
+fn ink_width(width: f32, scale: f32) -> f32 {
+    (width * scale).round().max(1.0)
+}
+
+fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32), scale: f32) {
     let at = |(x, y): (f32, f32)| (x + dx, y + dy);
     match m {
-        Mark::Stroke { points, color, width, .. } => {
+        Mark::Stroke { highlight, points, color, width } => {
             let pts: Vec<(f32, f32)> = points.iter().map(|&p| at(p)).collect();
-            c.polyline(&pts, *width, *color);
+            let a = if *highlight { HIGHLIGHTER_ALPHA } else { 1.0 };
+            c.polyline(&pts, ink_width(*width, scale), D2D1_COLOR_F { a, ..COLORS[*color] });
         }
-        Mark::Arrow { from, to, color, width } => arrow(c, at(*from), at(*to), *width, *color),
-        Mark::Rectangle { a, b, color, width } => {
-            let ((x0, y0), (x1, y1)) = (at(*a), at(*b));
-            c.rect_outline(x0.min(x1), y0.min(y1), (x1 - x0).abs(), (y1 - y0).abs(), *width, *color);
+        Mark::Arrow { from, to, color, width } => {
+            arrow(c, at(*from), at(*to), ink_width(*width, scale), COLORS[*color])
         }
-        Mark::Blur(_) | Mark::Pixelate(_) => {}
+        Mark::Rectangle { rect, color, width } => {
+            let (x, y) = at((rect.x as f32, rect.y as f32));
+            c.rect_outline(x, y, rect.w as f32, rect.h as f32, ink_width(*width, scale), COLORS[*color]);
+        }
+        Mark::Blur { .. } | Mark::Pixelate { .. } => {}
     }
+}
+
+fn arrow_head(width: f32, len: f32) -> f32 {
+    (width * 3.2 + 7.0).min(len)
 }
 
 /// A shaft with a filled head whose size follows the stroke width.
@@ -731,7 +1260,7 @@ fn arrow(c: &Canvas, from: (f32, f32), to: (f32, f32), width: f32, color: D2D1_C
         return;
     }
     let (ux, uy) = (dx / len, dy / len);
-    let head = (width * 3.2 + 7.0).min(len);
+    let head = arrow_head(width, len);
     let half = head * 0.55;
     let base = (to.0 - ux * head, to.1 - uy * head);
     // The shaft ends inside the head so the joint doesn't show.
@@ -810,18 +1339,18 @@ fn draw_icon(
 
 /// Applies a blur / pixelate mark to `dib`, which shows the screen area `sel`.
 fn apply_effect(dib: &mut Dib, m: &Mark, sel: Rect, scale: f32) {
-    let (r, blur) = match m {
-        Mark::Blur(r) => (*r, true),
-        Mark::Pixelate(r) => (*r, false),
+    let (r, blur, strength) = match m {
+        Mark::Blur { rect, radius } => (*rect, true, *radius),
+        Mark::Pixelate { rect, block } => (*rect, false, *block),
         _ => return,
     };
     let Some(r) = r.intersect(&sel).map(|r| r.offset(-sel.x, -sel.y)) else { return };
     let stride = dib.w as usize;
     let px = dib.pixels_mut();
     if blur {
-        box_blur(px, stride, r, (8.0 * scale).round().max(4.0) as usize);
+        box_blur(px, stride, r, (strength * scale).round().max(1.0) as usize);
     } else {
-        pixelate(px, stride, r, (12.0 * scale).round().max(6.0) as i32);
+        pixelate(px, stride, r, (strength * scale).round().max(2.0) as i32);
     }
 }
 
@@ -905,6 +1434,79 @@ fn pixelate(px: &mut [u32], stride: usize, r: Rect, block: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn editor() -> Editor {
+        Editor::new(Rect { x: 0, y: 0, w: 400, h: 300 }, Rect { x: 0, y: 0, w: 1920, h: 1080 }, 1.0)
+    }
+
+    #[test]
+    fn marks_are_hit_on_their_ink() {
+        let arrow = Mark::Arrow { from: (0.0, 0.0), to: (100.0, 0.0), color: 0, width: 4.0 };
+        assert!(arrow.hit((50.0, 5.0), 1.0));
+        assert!(!arrow.hit((50.0, 20.0), 1.0));
+        assert!(arrow.hit((82.0, 9.0), 1.0), "the head is wider than the shaft");
+        assert!(!arrow.hit((20.0, 9.0), 1.0));
+
+        let area = Rect { x: 100, y: 100, w: 200, h: 100 };
+        let rect = Mark::Rectangle { rect: area, color: 0, width: 4.0 };
+        assert!(rect.hit((100.0, 150.0), 1.0));
+        assert!(rect.hit((95.0, 150.0), 1.0));
+        assert!(!rect.hit((200.0, 150.0), 1.0));
+        assert!(!rect.hit((80.0, 150.0), 1.0));
+
+        let blur = Mark::Blur { rect: area, radius: 8.0 };
+        assert!(blur.hit((200.0, 150.0), 1.0));
+        assert!(!blur.hit((80.0, 150.0), 1.0));
+    }
+
+    #[test]
+    fn tools_pick_only_their_own_kind() {
+        let mut ed = editor();
+        ed.marks.push(Mark::Blur { rect: Rect { x: 50, y: 50, w: 200, h: 150 }, radius: 8.0 });
+        ed.marks.push(Mark::Arrow { from: (60.0, 100.0), to: (240.0, 100.0), color: 0, width: 4.0 });
+        let (on_arrow, on_blur) = ((150, 100), (150, 170));
+        assert!(matches!(ed.hit(on_arrow), Hit::Mark(1)));
+        assert!(matches!(ed.hit(on_blur), Hit::Mark(0)));
+        ed.tool = Some(Tool::Arrow);
+        assert!(matches!(ed.hit(on_arrow), Hit::Mark(1)));
+        assert!(matches!(ed.hit(on_blur), Hit::Inside));
+        ed.tool = Some(Tool::Blur);
+        assert!(matches!(ed.hit(on_arrow), Hit::Mark(0)));
+    }
+
+    #[test]
+    fn undo_restores_moved_and_resized_marks() {
+        let mut ed = editor();
+        let start = Rect { x: 100, y: 100, w: 100, h: 80 };
+        ed.marks.push(Mark::Rectangle { rect: start, color: 0, width: 4.0 });
+        let area = |ed: &Editor| match &ed.marks[0] {
+            Mark::Rectangle { rect, .. } => *rect,
+            _ => unreachable!(),
+        };
+        ed.mouse_down((100, 140));
+        ed.mouse_move((130, 150));
+        ed.mouse_up((130, 150));
+        let moved = Rect { x: 130, y: 110, ..start };
+        assert_eq!(area(&ed), moved);
+        ed.mouse_down((230, 190));
+        ed.mouse_move((250, 200));
+        ed.mouse_up((250, 200));
+        let resized = Rect { w: 120, h: 90, ..moved };
+        assert_eq!(area(&ed), resized);
+        ed.wheel(WHEEL_DELTA);
+        ed.wheel(WHEEL_DELTA);
+        assert_eq!(ed.marks[0].strength(), 6.0);
+
+        ed.undo();
+        assert_eq!(ed.marks[0].strength(), 4.0, "one wheel gesture is one step");
+        ed.undo();
+        assert_eq!(area(&ed), moved);
+        ed.undo();
+        assert_eq!(area(&ed), start);
+        ed.redo();
+        ed.redo();
+        assert_eq!(area(&ed), resized);
+    }
 
     #[test]
     fn blur_and_pixelate_stay_inside_their_box() {

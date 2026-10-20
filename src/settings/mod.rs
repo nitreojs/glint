@@ -167,6 +167,7 @@ impl Section {
                 n(a.hotkey == b.hotkey)
                     + n(a.screenshot_hotkey == b.screenshot_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
+                    + n(a.freeze_screen == b.freeze_screen)
             }
             Section::Recording => {
                 n(a.fps == b.fps)
@@ -194,6 +195,7 @@ impl Section {
                 cfg.hotkey = d.hotkey;
                 cfg.screenshot_hotkey = d.screenshot_hotkey;
                 cfg.launch_at_startup = d.launch_at_startup;
+                cfg.freeze_screen = d.freeze_screen;
             }
             Section::Recording => {
                 cfg.fps = d.fps;
@@ -742,6 +744,11 @@ impl SettingsApp {
             let text = if self.cfg.launch_at_startup { "on" } else { "off" };
             widgets::toggle(ui, look, &mut self.cfg.launch_at_startup, text);
             hint(ui, "glint starts in the tray when you sign in to windows", look.p.t3);
+        });
+        row(ui, look, "freeze screen", 1.0, |ui| {
+            let text = if self.cfg.freeze_screen { "on" } else { "off" };
+            widgets::toggle(ui, look, &mut self.cfg.freeze_screen, text);
+            hint(ui, "while selecting a region, show a still image instead of the live screen", look.p.t3);
         });
     }
 

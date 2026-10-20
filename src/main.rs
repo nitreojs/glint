@@ -159,7 +159,7 @@ impl App {
             Err(e) => return self.notify("glint: can't list monitors", &e.message(), true, ClickTarget::None),
         };
         let purpose = if shot { Purpose::Shot } else { Purpose::Record { min: self.cfg.codec.codec().min_size() } };
-        match overlay::open(self.hwnd, WM_APP_SELECTION, outputs, purpose) {
+        match overlay::open(self.hwnd, WM_APP_SELECTION, outputs, purpose, self.cfg.freeze_screen) {
             Ok(h) => self.state = State::Selecting(h),
             Err(e) => self.notify("glint: can't open the selection overlay", &e, true, ClickTarget::Log),
         }

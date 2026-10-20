@@ -11,6 +11,7 @@ pub struct Config {
     pub hotkey: String,
     pub screenshot_hotkey: String,
     pub launch_at_startup: bool,
+    pub freeze_screen: bool,
     pub output_dir: String,
     /// File name pattern without the extension; see [`Config::file_stem`].
     pub file_name: String,
@@ -59,6 +60,7 @@ impl Default for Config {
             hotkey: "Ctrl+Alt+PrintScreen".into(),
             screenshot_hotkey: "Ctrl+PrintScreen".into(),
             launch_at_startup: false,
+            freeze_screen: true,
             output_dir: String::new(),
             file_name: DEFAULT_FILE_NAME.into(),
             fps: 0,
@@ -138,6 +140,10 @@ screenshot_hotkey = {screenshot_hotkey}
 # Start glint (in the tray) when you sign in to Windows.
 launch_at_startup = {launch_at_startup}
 
+# While selecting a region, show a still image of the screen (true) or the live screen,
+# dimmed (false).
+freeze_screen = {freeze_screen}
+
 # Folder for recordings and screenshots. Empty = <Videos>\glint
 output_dir = {output_dir}
 
@@ -172,6 +178,7 @@ screenshot_save = {screenshot_save}
             hotkey = q(&self.hotkey),
             screenshot_hotkey = q(&self.screenshot_hotkey),
             launch_at_startup = self.launch_at_startup,
+            freeze_screen = self.freeze_screen,
             output_dir = q(&self.output_dir),
             file_name = q(&self.file_name),
             fps = self.fps,
@@ -328,6 +335,7 @@ mod tests {
             hotkey: "Shift+Pause".into(),
             screenshot_hotkey: "Win+Shift+S".into(),
             launch_at_startup: true,
+            freeze_screen: false,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),
             file_name: "clip {date} at {time}".into(),
             fps: 60,
