@@ -39,6 +39,7 @@ impl Section {
                     + n(a.fullscreen_hotkey == b.fullscreen_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
                     + n(a.freeze_screen == b.freeze_screen)
+                    + n(a.notify_success == b.notify_success)
             }
             Section::Recording => {
                 n(a.fps == b.fps)
@@ -68,6 +69,7 @@ impl Section {
                 cfg.fullscreen_hotkey = d.fullscreen_hotkey;
                 cfg.launch_at_startup = d.launch_at_startup;
                 cfg.freeze_screen = d.freeze_screen;
+                cfg.notify_success = d.notify_success;
             }
             Section::Recording => {
                 cfg.fps = d.fps;

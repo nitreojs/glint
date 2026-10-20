@@ -44,5 +44,10 @@ impl SettingsApp {
             widgets::toggle(ui, look, &mut self.cfg.freeze_screen, text);
             hint(ui, "while selecting a region, show a still image instead of the live screen", look.p.t3);
         });
+        row(ui, look, "notifications", 7.0, |ui| {
+            let choices = [(true, "all"), (false, "errors only")];
+            widgets::segmented(ui, look, &mut self.cfg.notify_success, &choices, Some(200.0));
+            hint(ui, "errors only — no popup after every screenshot or recording", look.p.t3);
+        });
     }
 }

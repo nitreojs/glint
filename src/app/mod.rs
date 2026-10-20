@@ -83,6 +83,12 @@ impl App {
         self.tray.notify(title, text, error);
     }
 
+    fn notify_done(&mut self, title: &str, text: &str, click: ClickTarget) {
+        if self.cfg.notify_success {
+            self.notify(title, text, false, click);
+        }
+    }
+
     /// Re-reads settings; (re-)registers the hotkey when it changed or isn't held.
     fn reload(&mut self) {
         match Config::load() {
@@ -222,9 +228,9 @@ impl App {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let title = if copied { "Screenshot copied and saved" } else { "Screenshot saved" };
                 let text = format!("{name}\n{} · {size}", human_size(bytes as u64));
-                self.notify(title, &text, false, ClickTarget::File(path));
+                self.notify_done(title, &text, ClickTarget::File(path));
             }
-            None => self.notify("Screenshot copied", &format!("{size}, ready to paste"), false, ClickTarget::None),
+            None => self.notify_done("Screenshot copied", &format!("{size}, ready to paste"), ClickTarget::None),
         }
     }
 
@@ -252,7 +258,7 @@ impl App {
         self.tray.set_recording(false, "glint");
         match res {
             Ok(Outcome::Discarded) => {
-                self.notify("Recording discarded", "Nothing was saved.", false, ClickTarget::None);
+                self.notify_done("Recording discarded", "Nothing was saved.", ClickTarget::None);
             }
             Ok(Outcome::Saved(s)) => {
                 let bytes = std::fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0);
@@ -271,7 +277,11 @@ impl App {
                 if let Some(why) = &s.stopped_early {
                     text += &format!("\nStopped early: {why}");
                 }
-                self.notify("Recording saved", &text, false, ClickTarget::File(s.path));
+                if s.dropped > 0 || s.stopped_early.is_some() {
+                    self.notify("Recording saved", &text, false, ClickTarget::File(s.path));
+                } else {
+                    self.notify_done("Recording saved", &text, ClickTarget::File(s.path));
+                }
             }
             Err(e) => {
                 log(&format!("recording failed: {e}"));
@@ -479,7 +489,7 @@ pub fn run() {
                         "{} records a region, {} takes a screenshot, {} captures all screens. Tray icon → settings.",
                         app.cfg.hotkey, app.cfg.screenshot_hotkey, app.cfg.fullscreen_hotkey
                     );
-                    app.notify("glint is running", &text, false, ClickTarget::None);
+                    app.notify_done("glint is running", &text, ClickTarget::None);
                 }
             }
         }

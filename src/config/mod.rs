@@ -18,6 +18,7 @@ pub(crate) struct Config {
     pub fullscreen_hotkey: String,
     pub launch_at_startup: bool,
     pub freeze_screen: bool,
+    pub notify_success: bool,
     pub output_dir: String,
     /// File name pattern without the extension; see [`Config::file_stem`].
     pub file_name: String,
@@ -68,6 +69,7 @@ impl Default for Config {
             fullscreen_hotkey: "PrintScreen".into(),
             launch_at_startup: false,
             freeze_screen: true,
+            notify_success: true,
             output_dir: String::new(),
             file_name: DEFAULT_FILE_NAME.into(),
             fps: 0,
@@ -163,6 +165,10 @@ launch_at_startup = {launch_at_startup}
 # dimmed (false).
 freeze_screen = {freeze_screen}
 
+# Tray notifications after a screenshot or recording is saved (true), or only when
+# something goes wrong (false).
+notify_success = {notify_success}
+
 # Folder for recordings and screenshots. Empty = <Videos>\glint
 output_dir = {output_dir}
 
@@ -199,6 +205,7 @@ screenshot_save = {screenshot_save}
             fullscreen_hotkey = q(&self.fullscreen_hotkey),
             launch_at_startup = self.launch_at_startup,
             freeze_screen = self.freeze_screen,
+            notify_success = self.notify_success,
             output_dir = q(&self.output_dir),
             file_name = q(&self.file_name),
             fps = self.fps,
@@ -261,6 +268,7 @@ mod tests {
             fullscreen_hotkey: "Alt+F12".into(),
             launch_at_startup: true,
             freeze_screen: false,
+            notify_success: false,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),
             file_name: "clip {date} at {time}".into(),
             fps: 60,
