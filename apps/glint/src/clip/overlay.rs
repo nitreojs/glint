@@ -51,6 +51,10 @@ fn caps(keys: &[&str]) -> Vec<String> {
     keys.iter().map(|k| (*k).to_string()).collect()
 }
 
+pub(super) fn danger(light: bool) -> Color32 {
+    if light { Color32::from_rgb(0xB4, 0x3A, 0x2C) } else { Color32::from_rgb(0xE7, 0x77, 0x6C) }
+}
+
 impl ClipApp {
     pub(super) fn file_row(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
         let p = look.p;
@@ -131,8 +135,7 @@ impl ClipApp {
                 let danger = matches!(item, Item::Delete);
                 let painter = ui.painter();
                 painter.rect_filled(r, 5, p.ctlh.gamma_multiply(hov));
-                let red = if self.light == Some(true) { Color32::from_rgb(0xB4, 0x3A, 0x2C) } else { Color32::from_rgb(0xE7, 0x77, 0x6C) };
-                let color = if danger { red } else { mix(p.t2, p.t1, hov) };
+                let color = if danger { self::danger(self.light == Some(true)) } else { mix(p.t2, p.t1, hov) };
                 painter.text(pos2(r.left() + 10.0, r.center().y), Align2::LEFT_CENTER, *name, sans(13.0), color);
                 if !keys.is_empty() {
                     let g = painter.layout_no_wrap((*keys).to_string(), widgets::mono_medium(12.0), p.t1);

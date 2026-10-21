@@ -74,7 +74,10 @@ impl Scan {
                 }
                 Ok(())
             })();
-            if let Err(e) = res {
+            if let Err(e) = res
+                && !stop.load(Ordering::Relaxed)
+                && path.exists()
+            {
                 log(&format!("clip: scanning for scene cuts stopped: {e}"));
             }
         });

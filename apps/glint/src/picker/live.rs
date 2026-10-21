@@ -1,3 +1,4 @@
+use glint_core::geom::outline::{inward, outer};
 use glint_core::geom::rect::Rect;
 use glint_core::log::log;
 use glint_media::rect::WinRect;
@@ -93,17 +94,21 @@ impl Live {
         }
     }
 
+    /// Shows `chosen` and `sel` lit, with their outlines on `monitors` (client coordinates).
     pub(super) fn sync(
         &mut self,
         chosen: &[Rect],
         sel: Option<Rect>,
         label: Option<&Pill>,
+        monitors: &[Rect],
         painter: &Painter,
         font: &IDWriteTextFormat,
     ) {
         if (chosen, sel) != (self.lit.0.as_slice(), self.lit.1) {
             self.lit = (chosen.to_vec(), sel);
             let lit: Vec<Rect> = chosen.iter().copied().chain(sel).collect();
+            // outline windows: around each rect, or inside it on sides at the edge of its monitors
+            let rings: Vec<Rect> = lit.iter().map(|&l| outer(l, inward(l, monitors, RING), RING)).collect();
             while self.outlines.len() < lit.len() {
                 let at = Rect { x: self.origin.0, y: self.origin.1, w: 1, h: 1 };
                 match popup(at, WS_EX_LAYERED | WS_EX_TRANSPARENT, OUTLINE) {
@@ -121,23 +126,24 @@ impl Live {
             }
             unsafe {
                 let shape = CreateRectRgn(0, 0, self.size.0, self.size.1);
-                for l in &lit {
-                    cut(shape, l.inflate(RING));
+                for &r in &rings {
+                    cut(shape, r);
                 }
                 SetWindowRgn(self.dim.0, Some(shape), true);
                 let _ = UpdateWindow(self.dim.0);
                 for (i, o) in self.outlines.iter().enumerate() {
-                    let Some(h) = lit.get(i).map(|l| l.inflate(RING)) else {
+                    let Some(&h) = rings.get(i) else {
                         let _ = ShowWindow(o.0, SW_HIDE);
                         continue;
                     };
                     let shape = CreateRectRgn(0, 0, h.w, h.h);
                     let is_sel = i == chosen.len();
-                    for other in if is_sel { &lit[i..] } else { chosen } {
-                        cut(shape, other.offset(-h.x, -h.y));
+                    let lit_inside = if is_sel { &rings[i..] } else { &rings[..chosen.len()] };
+                    for other in lit_inside {
+                        cut(shape, other.inflate(-RING).offset(-h.x, -h.y));
                     }
-                    if let Some(s) = sel.filter(|_| !is_sel) {
-                        cut(shape, s.inflate(RING).offset(-h.x, -h.y));
+                    if let Some(&s) = rings.get(chosen.len()).filter(|_| !is_sel) {
+                        cut(shape, s.offset(-h.x, -h.y));
                     }
                     SetWindowRgn(o.0, Some(shape), false);
                     // Below the shade (they never overlap), above the screen and under the pills.

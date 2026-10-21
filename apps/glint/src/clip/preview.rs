@@ -33,6 +33,14 @@ pub(super) fn speaker(painter: &egui::Painter, c: Pos2, color: Color32, on: bool
     }
 }
 
+fn one_to_one(px_per_pixel: f32) -> bool {
+    (px_per_pixel - 1.0).abs() < 0.001
+}
+
+pub(super) fn crisp(px_per_pixel: f32, fitted: bool) -> bool {
+    one_to_one(px_per_pixel) || (!fitted && px_per_pixel >= 1.999)
+}
+
 fn grip_point(g: Grip, r: Rect) -> Pos2 {
     let x = if g.left { r.left() } else if g.right { r.right() } else { r.center().x };
     let y = if g.top { r.top() } else if g.bottom { r.bottom() } else { r.center().y };
@@ -91,7 +99,9 @@ impl ClipApp {
         if self.viewer.animating(now, motion()) {
             ctx.request_repaint();
         }
-        let frame = Rect::from_min_size(rect.min + place.offset, img * place.scale);
+        let at = rect.min + place.offset;
+        let at = if one_to_one(place.scale * ppp) { pos2((at.x * ppp).round() / ppp, (at.y * ppp).round() / ppp) } else { at };
+        let frame = Rect::from_min_size(at, img * place.scale);
         let playing = self.play != Play::Paused;
         resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, if playing { "pause" } else { "play" }));
 
@@ -140,7 +150,7 @@ impl ClipApp {
         if let Some(tex) = &self.tex {
             painter.image(tex.id(), frame, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
         }
-        self.set_nearest(place.scale * ppp > 1.001);
+        self.set_nearest(crisp(place.scale * ppp, self.viewer.fitted));
 
         let cropping = self.cropping.is_some();
         let crop_t = ease(anim(ui, Id::unique("clip-cropping"), cropping, 0.2));

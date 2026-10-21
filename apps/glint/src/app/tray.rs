@@ -1,7 +1,7 @@
 //! Notification-area icon (idle / recording) and balloon notifications.
 
+use glint_core::icon::{RECORDING_RED, add_badge, icon_pixels};
 use glint_core::wide::copy_wstr;
-use glint_ui::icon::{RECORDING_RED, icon_pixels};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, GetDC, ReleaseDC,
@@ -11,6 +11,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO, SM_CXSMICON};
 
 pub(crate) const IDLE_TIP: &str = "glint\nclick: screenshot · double-click: settings";
+const READY_MARK: &str = " (update ready)";
 
 pub(crate) struct Tray {
     hwnd: HWND,
@@ -19,6 +20,9 @@ pub(crate) struct Tray {
     idle: HICON,
     rec: HICON,
     recording: bool,
+    accent: [u8; 3],
+    /// A downloaded update waits: the idle icon has a dot and the tooltip says so.
+    update_ready: bool,
 }
 
 impl Tray {
@@ -29,9 +33,11 @@ impl Tray {
             hwnd,
             callback,
             size,
-            idle: make_icon(size, true, accent),
-            rec: make_icon(size, false, RECORDING_RED),
+            idle: make_icon(size, true, accent, false),
+            rec: make_icon(size, false, RECORDING_RED, false),
             recording: false,
+            accent,
+            update_ready: false,
         };
         tray.add();
         tray
@@ -39,7 +45,24 @@ impl Tray {
 
     /// Redraws the idle icon in a new accent colour.
     pub(crate) fn set_accent(&mut self, accent: [u8; 3]) {
-        let old = std::mem::replace(&mut self.idle, make_icon(self.size, true, accent));
+        self.accent = accent;
+        self.redraw_idle();
+    }
+
+    /// Marks the icon and tooltip while a downloaded update waits for a restart.
+    pub(crate) fn set_update_ready(&mut self, ready: bool) {
+        if self.update_ready == ready {
+            return;
+        }
+        self.update_ready = ready;
+        self.redraw_idle();
+        if !self.recording {
+            self.set_idle_tip(IDLE_TIP);
+        }
+    }
+
+    fn redraw_idle(&mut self) {
+        let old = std::mem::replace(&mut self.idle, make_icon(self.size, true, self.accent, self.update_ready));
         if !self.recording {
             let mut d = self.data();
             d.uFlags = NIF_ICON;
@@ -51,6 +74,11 @@ impl Tray {
         unsafe {
             let _ = DestroyIcon(old);
         }
+    }
+
+    /// `tip` with the update mark after its first line.
+    fn idle_tip(&self, tip: &str) -> String {
+        tip_with_mark(tip, self.update_ready)
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -68,7 +96,8 @@ impl Tray {
         d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         d.uCallbackMessage = self.callback;
         d.hIcon = if self.recording { self.rec } else { self.idle };
-        copy_wstr(&mut d.szTip, if self.recording { "glint: recording" } else { IDLE_TIP });
+        let tip = if self.recording { "glint: recording".to_string() } else { self.idle_tip(IDLE_TIP) };
+        copy_wstr(&mut d.szTip, &tip);
         d.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &d);
@@ -81,7 +110,7 @@ impl Tray {
         let mut d = self.data();
         d.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         d.hIcon = if on { self.rec } else { self.idle };
-        copy_wstr(&mut d.szTip, tip);
+        copy_wstr(&mut d.szTip, &if on { tip.to_string() } else { self.idle_tip(tip) });
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
         }
@@ -93,7 +122,7 @@ impl Tray {
         }
         let mut d = self.data();
         d.uFlags = NIF_TIP | NIF_SHOWTIP;
-        copy_wstr(&mut d.szTip, tip);
+        copy_wstr(&mut d.szTip, &self.idle_tip(tip));
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
         }
@@ -129,8 +158,21 @@ impl Drop for Tray {
 }
 
 
-fn make_icon(size: i32, highlight: bool, color: [u8; 3]) -> HICON {
-    let px = icon_pixels(size, highlight, color);
+fn tip_with_mark(tip: &str, ready: bool) -> String {
+    if !ready {
+        return tip.to_string();
+    }
+    match tip.split_once('\n') {
+        Some((first, rest)) => format!("{first}{READY_MARK}\n{rest}"),
+        None => format!("{tip}{READY_MARK}"),
+    }
+}
+
+fn make_icon(size: i32, highlight: bool, color: [u8; 3], badge: bool) -> HICON {
+    let mut px = icon_pixels(size, highlight, color);
+    if badge {
+        add_badge(&mut px, size, color);
+    }
     unsafe {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -156,5 +198,17 @@ fn make_icon(size: i32, highlight: bool, color: [u8; 3]) -> HICON {
         let _ = DeleteObject(color.into());
         let _ = DeleteObject(mask.into());
         icon
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_waiting_update_shows_in_the_tooltip() {
+        assert_eq!(tip_with_mark(IDLE_TIP, false), IDLE_TIP);
+        assert_eq!(tip_with_mark(IDLE_TIP, true), "glint (update ready)\nclick: screenshot · double-click: settings");
+        assert_eq!(tip_with_mark("glint: uploading 40 %", true), "glint: uploading 40 % (update ready)");
     }
 }

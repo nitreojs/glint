@@ -4,7 +4,7 @@ use glint_core::config::audio::{MAX_TRACKS, track_name};
 mod about;
 pub(super) mod audio;
 pub(super) mod general;
-mod output;
+pub(super) mod output;
 mod recording;
 mod screenshots;
 pub(super) mod updates;
@@ -55,6 +55,7 @@ impl Section {
                 n(a.hotkey == b.hotkey)
                     + n(a.screenshot_hotkey == b.screenshot_hotkey)
                     + n(a.fullscreen_hotkey == b.fullscreen_hotkey)
+                    + n(a.monitor_hotkey == b.monitor_hotkey)
                     + n(a.pause_hotkey == b.pause_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
                     + n(a.freeze_screen == b.freeze_screen)
@@ -106,6 +107,7 @@ impl Section {
                 cfg.hotkey = d.hotkey;
                 cfg.screenshot_hotkey = d.screenshot_hotkey;
                 cfg.fullscreen_hotkey = d.fullscreen_hotkey;
+                cfg.monitor_hotkey = d.monitor_hotkey;
                 cfg.pause_hotkey = d.pause_hotkey;
                 cfg.launch_at_startup = d.launch_at_startup;
                 cfg.freeze_screen = d.freeze_screen;

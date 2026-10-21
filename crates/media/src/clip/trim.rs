@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use glint_core::clip::crop::Crop;
 use glint_core::clip::export::{AAC_BYTES_PER_SECOND, Job, Video, VideoJob};
-use glint_core::clip::info::{Info, Track};
+use glint_core::clip::info::Info;
 use glint_core::clip::math::{Range, SECOND};
 use glint_core::clip::pcm::{self, Lane};
 use glint_core::log::log;
@@ -127,32 +127,61 @@ struct Mixdown {
     stereo: Vec<f32>,
 }
 
+// the aac encoder only takes 12000, 16000, 20000 or 24000 bytes per second.
+const SILENCE_AAC_BYTES_PER_SECOND: u64 = 12_000;
+
+unsafe fn aac_stream(writer: &IMFSinkWriter, rate: u32, channels: u32, bytes_per_second: u64) -> Result<u32, String> {
+    unsafe {
+        let out_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
+        out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
+        out_t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, bytes_per_second as u32).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29).ctx("mt")?;
+        let stream = writer.AddStream(&out_t).ctx("IMFSinkWriter::AddStream (audio)")?;
+        let in_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
+        in_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
+        in_t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, channels).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * channels).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * 2 * channels).ctx("mt")?;
+        writer.SetInputMediaType(stream, &in_t, None).ctx("IMFSinkWriter::SetInputMediaType (audio)")?;
+        Ok(stream)
+    }
+}
+
+unsafe fn write_pcm(writer: &IMFSinkWriter, stream: u32, rate: u32, from: i64, to: i64, bytes: &[u8]) -> Result<(), String> {
+    unsafe {
+        let buf = MFCreateMemoryBuffer(bytes.len() as u32).ctx("MFCreateMemoryBuffer")?;
+        let mut ptr = std::ptr::null_mut();
+        buf.Lock(&mut ptr, None, None).ctx("IMFMediaBuffer::Lock")?;
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+        let _ = buf.Unlock();
+        buf.SetCurrentLength(bytes.len() as u32).ctx("SetCurrentLength")?;
+        let sample = MFCreateSample().ctx("MFCreateSample")?;
+        sample.AddBuffer(&buf).ctx("AddBuffer")?;
+        let (t0, t1) = (pcm::hns(from, rate), pcm::hns(to, rate));
+        sample.SetSampleTime(t0).ctx("SetSampleTime")?;
+        sample.SetSampleDuration(t1 - t0).ctx("SetSampleDuration")?;
+        writer.WriteSample(stream, &sample).ctx("WriteSample (audio)")
+    }
+}
+
+fn aac_rate(rate: u32) -> bool {
+    rate == 44_100 || rate == 48_000
+}
+
 impl Mixdown {
     unsafe fn new(writer: &IMFSinkWriter, rate: u32) -> Result<Mixdown, String> {
-        if rate != 44_100 && rate != 48_000 {
+        if !aac_rate(rate) {
             return Err(format!("audio at {rate} Hz can't be mixed into one track"));
         }
-        unsafe {
-            let out_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
-            out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
-            out_t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_AAC).ctx("mt")?;
-            out_t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ctx("mt")?;
-            out_t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate).ctx("mt")?;
-            out_t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).ctx("mt")?;
-            out_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AAC_BYTES_PER_SECOND as u32).ctx("mt")?;
-            out_t.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29).ctx("mt")?;
-            let stream = writer.AddStream(&out_t).ctx("IMFSinkWriter::AddStream (audio)")?;
-            let in_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
-            in_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
-            in_t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_PCM).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_AUDIO_BLOCK_ALIGNMENT, 4).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, rate * 4).ctx("mt")?;
-            writer.SetInputMediaType(stream, &in_t, None).ctx("IMFSinkWriter::SetInputMediaType (audio)")?;
-            Ok(Mixdown { stream, rate, lanes: Vec::new(), written: 0, scratch: Vec::new(), stereo: Vec::new() })
-        }
+        let stream = unsafe { aac_stream(writer, rate, 2, AAC_BYTES_PER_SECOND)? };
+        Ok(Mixdown { stream, rate, lanes: Vec::new(), written: 0, scratch: Vec::new(), stereo: Vec::new() })
     }
 
     fn push(&mut self, lane: usize, sample: &IMFSample, at: i64, seg: Range, base: i64) -> Result<(), String> {
@@ -178,24 +207,45 @@ impl Mixdown {
         for (_, lane) in &mut self.lanes {
             lane.take_into(&mut out, 1.0);
         }
-        let bytes = pcm::to_i16(&out);
-        unsafe {
-            let buf = MFCreateMemoryBuffer(bytes.len() as u32).ctx("MFCreateMemoryBuffer")?;
-            let mut ptr = std::ptr::null_mut();
-            buf.Lock(&mut ptr, None, None).ctx("IMFMediaBuffer::Lock")?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-            let _ = buf.Unlock();
-            buf.SetCurrentLength(bytes.len() as u32).ctx("SetCurrentLength")?;
-            let sample = MFCreateSample().ctx("MFCreateSample")?;
-            sample.AddBuffer(&buf).ctx("AddBuffer")?;
-            let (t0, t1) = (pcm::hns(self.written, self.rate), pcm::hns(upto, self.rate));
-            sample.SetSampleTime(t0).ctx("SetSampleTime")?;
-            sample.SetSampleDuration(t1 - t0).ctx("SetSampleDuration")?;
-            writer.WriteSample(self.stream, &sample).ctx("WriteSample (audio)")?;
-        }
+        unsafe { write_pcm(writer, self.stream, self.rate, self.written, upto, &pcm::to_i16(&out))? };
         self.written = upto;
         Ok(())
     }
+}
+
+struct Silence {
+    stream: u32,
+    rate: u32,
+    written: i64,
+    zeros: Vec<u8>,
+}
+
+impl Silence {
+    unsafe fn new(writer: &IMFSinkWriter, rate: u32, channels: u32) -> Result<Silence, String> {
+        let stream = unsafe { aac_stream(writer, rate, channels, SILENCE_AAC_BYTES_PER_SECOND)? };
+        Ok(Silence { stream, rate, written: 0, zeros: vec![0; (rate / 10 * 2 * channels) as usize] })
+    }
+
+    unsafe fn fill(&mut self, writer: &IMFSinkWriter, upto: i64) -> Result<(), String> {
+        let upto = pcm::frames(upto, self.rate);
+        let chunk = self.rate as i64 / 10;
+        while self.written < upto {
+            let to = upto.min(self.written + chunk);
+            let bytes = self.zeros.len() * (to - self.written) as usize / chunk as usize;
+            unsafe { write_pcm(writer, self.stream, self.rate, self.written, to, &self.zeros[..bytes])? };
+            self.written = to;
+        }
+        Ok(())
+    }
+}
+
+fn silence_format(reader: &IMFSourceReader, info: &Info, job: &VideoJob) -> (u32, u32) {
+    let first = job.tracks.iter().find_map(|t| t.source).or((!info.tracks.is_empty()).then_some(0));
+    let native = first.and_then(|k| info.tracks.get(k)).and_then(|t| unsafe { reader.GetNativeMediaType(t.stream, 0).ok() });
+    let Some(native) = native else { return (48_000, 2) };
+    let rate = unsafe { native.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(48_000) };
+    let channels = unsafe { native.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(2) };
+    (if aac_rate(rate) { rate } else { 48_000 }, if channels == 1 && !job.combine { 1 } else { 2 })
 }
 
 /// Where a copied piece really starts: the keyframe media foundation lands on when seeking to `start`.
@@ -231,7 +281,6 @@ fn run(
         let writer = MFCreateSinkWriterFromURL(&HSTRING::from(out.as_os_str()), None, &attrs)
             .ctx("MFCreateSinkWriterFromURL")?;
 
-        let kept: Vec<&Track> = job.tracks.iter().filter_map(|&k| info.tracks.get(k)).collect();
         let mut targets: Vec<Option<Target>> = vec![None; streams.len()];
         reader.SetStreamSelection(media::ALL, false).ctx("SetStreamSelection")?;
         let Some(&(video, ..)) = streams.iter().find(|s| s.1 == MFMediaType_Video) else {
@@ -256,26 +305,36 @@ fn run(
                 Target::Encode(video_stream(&writer, codec, size, rate, bitrate, effort)?)
             }
         });
-        let mut mix = if job.combine && kept.len() > 1 {
-            Some(Mixdown::new(&writer, media::audio_rate(&reader, kept[0].stream))?)
-        } else {
-            None
-        };
-        for t in &kept {
-            let (i, native) = (t.stream, &streams[t.stream as usize].2);
+        let (silent_rate, silent_channels) = silence_format(&reader, info, job);
+        let mut mix: Option<Mixdown> = None;
+        let mut silences = Vec::new();
+        let mut names = Vec::with_capacity(job.tracks.len());
+        for t in &job.tracks {
+            let Some(source) = t.source.and_then(|k| info.tracks.get(k)) else {
+                silences.push(Silence::new(&writer, silent_rate, silent_channels)?);
+                names.push(t.name.clone());
+                continue;
+            };
+            let (i, native) = (source.stream, &streams[source.stream as usize].2);
             reader.SetStreamSelection(i, true).ctx("SetStreamSelection")?;
-            targets[i as usize] = Some(match &mut mix {
-                Some(m) => {
-                    let channels = media::float_output(&reader, i, m.rate)?;
-                    m.lanes.push((channels, Lane::new(0)));
-                    Target::Mix(m.lanes.len() - 1)
-                }
-                None => {
-                    reader.SetCurrentMediaType(i, None, native).ctx("audio type")?;
-                    let w = writer.AddStream(native).ctx("can't copy the audio")?;
-                    writer.SetInputMediaType(w, native, None).ctx("can't copy the audio")?;
-                    Target::Copy(w)
-                }
+            targets[i as usize] = Some(if job.combine {
+                let m = match &mut mix {
+                    Some(m) => m,
+                    None => {
+                        let sources = job.tracks.iter().filter(|t| t.source.is_some());
+                        names.push(sources.map(|t| t.name.as_str()).collect::<Vec<_>>().join(" + "));
+                        mix.insert(Mixdown::new(&writer, media::audio_rate(&reader, i))?)
+                    }
+                };
+                let channels = media::float_output(&reader, i, m.rate)?;
+                m.lanes.push((channels, Lane::new(0)));
+                Target::Mix(m.lanes.len() - 1)
+            } else {
+                reader.SetCurrentMediaType(i, None, native).ctx("audio type")?;
+                let w = writer.AddStream(native).ctx("can't copy the audio")?;
+                writer.SetInputMediaType(w, native, None).ctx("can't copy the audio")?;
+                names.push(t.name.clone());
+                Target::Copy(w)
             });
         }
         writer.BeginWriting().ctx("IMFSinkWriter::BeginWriting")?;
@@ -351,6 +410,9 @@ fn run(
                     }
                 };
                 let Some(target) = targets.get(i as usize).copied().flatten() else { continue };
+                for s in &mut silences {
+                    s.fill(&writer, out_ts(ts.clamp(seg.start, seg.end)))?;
+                }
                 let mut done = ts >= seg.end;
                 match target {
                     Target::Copy(w) if !done && ts >= seg.start => {
@@ -426,6 +488,9 @@ fn run(
             }
             any_video |= started || held.is_some() || pending.is_some();
             base += seg.len();
+            for s in &mut silences {
+                s.fill(&writer, base)?;
+            }
             if let Some(m) = &mut mix {
                 let end = pcm::frames(base, m.rate);
                 for (_, lane) in &mut m.lanes {
@@ -439,8 +504,6 @@ fn run(
         }
         writer.Finalize().ctx("IMFSinkWriter::Finalize")?;
         drop(processor);
-        let names: Vec<String> = kept.iter().map(|t| t.name.clone()).collect();
-        let names = if mix.is_some() { vec![names.join(" + ")] } else { names };
         if !names.is_empty()
             && let Err(e) = glint_core::record::mp4::name_tracks(out, &names)
         {

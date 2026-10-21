@@ -71,10 +71,10 @@ fn the_fast_path_copies_drops_a_muted_track_and_cuts() {
     edit.range = Range { start: SECOND / 2, end: 3 * SECOND };
     assert!(edit.split(3 * SECOND / 2, 1) && edit.split(2 * SECOND, 1));
     assert!(edit.toggle_removed(1));
-    edit.muted[1] = true;
+    edit.lanes[1].muted = true;
     let (job, estimate) = export_to(&src, &edit, &export::Settings::default(), &out);
     let Job::Video(VideoJob { video: Video::Copy, pieces, tracks, .. }) = &job else { panic!("{job:?}") };
-    assert_eq!(tracks, &[0]);
+    assert_eq!(tracks.iter().map(|t| t.source).collect::<Vec<_>>(), [Some(0)]);
     assert_eq!(pieces.iter().map(|p| (p.lead, p.end)).collect::<Vec<_>>(), [(0, 3 * SECOND / 2), (2 * SECOND, 3 * SECOND)]);
 
     let streams = probe(&out, "stream=codec_type,codec_name,width,height");
@@ -94,6 +94,84 @@ fn the_fast_path_copies_drops_a_muted_track_and_cuts() {
     assert!(same_start && same_cut, "the pieces start with the source's own keyframes");
     let off = (estimate as f64 - size as f64).abs() / size as f64;
     assert!(off < 0.05, "estimate {estimate} vs {size}");
+}
+
+fn max_volume(path: &Path, track: usize) -> f64 {
+    let p = path.to_string_lossy();
+    let map = format!("0:a:{track}");
+    let args = ["-v", "info", "-nostats", "-i", &p, "-map", &map, "-af", "volumedetect", "-f", "null", "-"];
+    let out = std::process::Command::new("ffmpeg").args(args).output().unwrap_or_else(|e| panic!("ffmpeg: {e}"));
+    let log = String::from_utf8_lossy(&out.stderr);
+    let line = log.lines().find_map(|l| l.split_once("max_volume: ")).unwrap_or_else(|| panic!("no volume for {map}: {log}")).1;
+    line.trim_end_matches(" dB").trim().parse().unwrap_or(f64::NEG_INFINITY)
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn deleted_reordered_renamed_and_empty_tracks_come_out_as_shown() {
+    let src = fixture("lanes", "640x360", "30", &["-g", "30", "-filter:a:1", "volume=0.1"]);
+    let info = {
+        let _com = Com::init();
+        media::probe(&src).unwrap()
+    };
+    let mut edit = Edit::new(3 * SECOND, 2);
+    edit.range = Range { start: SECOND, end: 3 * SECOND };
+    assert!(edit.delete_lane(0));
+    edit.add_empty();
+    assert!(edit.move_lane(1, 0));
+    assert!(edit.rename(1, "voice", &info.tracks));
+    let mut facts = Vec::new();
+    for (name, settings) in [("copy", export::Settings::default()), ("encode", export::Settings { height: Some(180), ..export::Settings::default() })] {
+        let out = src.with_file_name(format!("glint-clip-lanes-{name}-{}.mp4", std::process::id()));
+        let (job, estimate) = export_to(&src, &edit, &settings, &out);
+        let size = std::fs::metadata(&out).unwrap().len();
+        let streams = probe(&out, "stream=codec_type,codec_name,sample_rate,channels");
+        let names = probe(&out, "stream_tags=handler_name");
+        let lengths: Vec<f64> = probe(&out, "stream=duration").iter().map(|d| d.parse().unwrap()).collect();
+        let volumes = [max_volume(&out, 0), max_volume(&out, 1)];
+        let _ = std::fs::remove_file(&out);
+        facts.push((name, job, estimate, size, streams, names, lengths, volumes));
+    }
+    let _ = std::fs::remove_file(&src);
+
+    for (name, job, estimate, size, streams, names, lengths, volumes) in facts {
+        let Job::Video(v) = &job else { panic!("{job:?}") };
+        assert_eq!(v.video == Video::Copy, name == "copy", "{job:?}");
+        assert_eq!(v.tracks.iter().map(|t| (t.source, t.name.as_str())).collect::<Vec<_>>(), [(None, "empty"), (Some(1), "voice")]);
+        assert_eq!(streams[0], "h264,video", "{name}");
+        assert_eq!(streams[1..], ["aac,audio,48000,1", "aac,audio,48000,1"], "{name}: the empty track matches the kept one");
+        assert_eq!(names, ["VideoHandler", "empty", "voice"], "{name}");
+        assert!(volumes[0] < -90.0, "{name}: the empty track is silent: {volumes:?}");
+        assert!(volumes[1] > -45.0 && volumes[1] < -30.0, "{name}: the second track is the quiet mic: {volumes:?}");
+        for d in &lengths[1..] {
+            assert!((d - lengths[0]).abs() < 0.1, "{name}: every track runs the kept length: {lengths:?}");
+        }
+        if name == "copy" {
+            let off = (estimate as f64 - size as f64).abs() / size as f64;
+            assert!(off < 0.05, "estimate {estimate} vs {size}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn an_empty_track_stays_its_own_next_to_a_combined_mix() {
+    let src = fixture("mixempty", "640x360", "30", &["-g", "30"]);
+    let out = src.with_file_name(format!("glint-clip-mixempty-out-{}.mp4", std::process::id()));
+    let mut edit = Edit::new(3 * SECOND, 2);
+    edit.add_empty();
+    assert!(edit.move_lane(2, 1));
+    let (job, _) = export_to(&src, &edit, &export::Settings { combine: true, ..export::Settings::default() }, &out);
+    let streams = probe(&out, "stream=codec_type,codec_name,sample_rate,channels");
+    let names = probe(&out, "stream_tags=handler_name");
+    let volumes = [max_volume(&out, 0), max_volume(&out, 1)];
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+
+    assert!(matches!(&job, Job::Video(v) if v.combine && v.video == Video::Copy), "{job:?}");
+    assert_eq!(streams, ["h264,video", "aac,audio,48000,2", "aac,audio,48000,2"]);
+    assert_eq!(names, ["VideoHandler", "desktop + mic", "empty"]);
+    assert!(volumes[0] > -30.0 && volumes[1] < -90.0, "{volumes:?}");
 }
 
 #[test]

@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, ColorImage, Event, Id, Key, Modifiers, Rect, TextureHandle, TextureOptions, Ui, pos2, vec2};
+use eframe::egui::{
+    self, Color32, ColorImage, Event, Id, Key, Modifiers, Rect, TextureFilter, TextureHandle, TextureOptions, Ui, pos2, vec2,
+};
 use glint_core::clip::crop::{Aspect, Crop, Grip};
 use glint_core::clip::edit::{Edit, Undo};
 use glint_core::clip::export::{Format, Job, Source};
@@ -16,13 +18,13 @@ use glint_core::clip::viewer::Viewer;
 use glint_core::clip::{export, index, math};
 use glint_core::config::Config;
 use glint_core::history::{self, Kind as HistoryKind};
+use glint_core::icon::icon_rgba;
 use glint_core::log::log;
 use glint_core::upload::{Destination, Payload};
 use glint_media::clip::audio::{Audio, Clock};
 use glint_media::clip::media::Com;
 use glint_media::clip::trim::Progress;
 use glint_media::clip::{media, trim};
-use glint_ui::icon::icon_rgba;
 use glint_ui::widgets::{self, BAR_H, Look, TitleAction};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
@@ -221,6 +223,10 @@ struct ClipApp {
     save_rect: Rect,
     sheet: bool,
     confirm_delete: bool,
+    gone: bool,
+    lane_menu: Option<(usize, egui::Pos2, Rect)>,
+    renaming: Option<(usize, String)>,
+    lane_drag: Option<usize>,
     keyboard: bool,
     rounded: bool,
     light: Option<bool>,
@@ -236,7 +242,7 @@ fn fit(src: (u32, u32), area: egui::Vec2) -> egui::Vec2 {
 }
 
 fn decode_size(info: &Info, px: egui::Vec2) -> (u32, u32) {
-    let scaled = fit(info.size, px);
+    let scaled = fit(info.size, px * 2.0);
     if scaled.x >= info.size.0 as f32 {
         info.size
     } else {
@@ -306,6 +312,10 @@ impl ClipApp {
             upload: None,
             toast: None,
             flash: f64::NEG_INFINITY,
+            gone: false,
+            lane_menu: None,
+            renaming: None,
+            lane_drag: None,
             menu: false,
             save_rect: Rect::NOTHING,
             sheet: false,
@@ -352,8 +362,9 @@ impl ClipApp {
     fn sync_gains(&self) {
         let Some(a) = &self.audio else { return };
         a.gains.set_volume(self.saved.volume);
-        for (k, &muted) in self.edit.muted.iter().enumerate() {
-            a.gains.set_track(k, if muted { 0.0 } else { 1.0 });
+        for k in 0..self.info().map_or(0, |i| i.tracks.len()) {
+            let heard = self.edit.lanes.iter().any(|l| l.source == Some(k) && !l.muted);
+            a.gains.set_track(k, if heard { 1.0 } else { 0.0 });
         }
     }
 
@@ -431,13 +442,8 @@ impl ClipApp {
         changed
     }
 
-    fn set_muted(&mut self, k: usize, muted: bool) {
-        self.change(|e| {
-            if let Some(m) = e.muted.get_mut(k) {
-                *m = muted;
-            }
-            true
-        });
+    fn set_muted(&mut self, lane: usize, muted: bool) {
+        self.change(|e| e.set_muted(lane, muted));
         self.sync_gains();
     }
 
@@ -462,6 +468,9 @@ impl ClipApp {
     }
 
     fn start_media(&mut self, ctx: &egui::Context, shown_px: egui::Vec2, settled: bool) {
+        if self.gone {
+            return;
+        }
         let Some(info) = self.info().cloned() else { return };
         let want = decode_size(&info, shown_px);
         let resized = (want.0 as f32 - self.player_size.0 as f32).abs() > self.player_size.0 as f32 * 0.1;
@@ -512,7 +521,7 @@ impl ClipApp {
     }
 
     fn texture_options(&self) -> TextureOptions {
-        if self.nearest { TextureOptions::NEAREST } else { TextureOptions::LINEAR }
+        if self.nearest { TextureOptions::NEAREST } else { TextureOptions { mipmap_mode: Some(TextureFilter::Linear), ..TextureOptions::LINEAR } }
     }
 
     fn poll_player(&mut self, ctx: &egui::Context) {
@@ -753,7 +762,10 @@ impl ClipApp {
         self.scan = None;
         self.waves = None;
         match actions::recycle(self.owner(), &self.path) {
-            Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Ok(()) => {
+                self.gone = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
             Err(e) => {
                 log(&format!("clip: deleting {} failed: {e}", self.path.display()));
                 self.toast(Note::Failed(format!("couldn't delete: {e}")));
@@ -873,6 +885,7 @@ impl ClipApp {
         }
         if redo && self.undo.redo(&mut self.edit) || undo && self.undo.undo(&mut self.edit) {
             self.selected = None;
+            self.lane_menu = None;
             self.sync_gains();
         }
         if crop {
@@ -973,10 +986,10 @@ impl eframe::App for ClipApp {
         let body = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
         let side = Rect::from_min_max(pos2(body.right() - SIDE_W, body.top()), body.max);
         let main = Rect::from_min_max(body.min + vec2(PAD, PAD), pos2(side.left() - PAD, body.bottom() - GAP));
-        let tracks = self.info().map_or(0, |i| i.tracks.len());
+        let lanes = if self.info.is_ok() { self.edit.lanes.len() } else { 0 };
         let room = (main.height() - FILE_H - HINT_H - 3.0 * GAP) * 0.45;
-        let lane = timeline::lane_height(tracks, room);
-        let line_h = timeline::height(tracks, lane);
+        let lane = timeline::lane_height(lanes, room);
+        let line_h = timeline::height(lanes, lane);
         let hint = Rect::from_min_max(pos2(main.left(), main.bottom() - HINT_H), main.max);
         let line = Rect::from_min_max(pos2(main.left(), hint.top() - GAP - line_h), pos2(main.right(), hint.top() - GAP));
         let file = Rect::from_min_size(main.min, vec2(main.width(), FILE_H));
@@ -1004,12 +1017,17 @@ impl eframe::App for ClipApp {
         self.hint_row(ui, &look, hint);
         self.panel(ui, &look, side);
         self.menu_popup(&ctx, &look, self.save_rect);
+        self.lane_menu_popup(&ctx, &look);
         self.keys_sheet(&ctx, &look, body);
         self.show_toast(&ctx, &look, body);
         self.delete_dialog(&ctx, &look);
 
         if esc && !modal {
-            if self.sheet {
+            if self.renaming.is_some() {
+                self.renaming = None;
+            } else if self.lane_menu.is_some() {
+                self.lane_menu = None;
+            } else if self.sheet {
                 self.sheet = false;
             } else if self.menu {
                 self.menu = false;

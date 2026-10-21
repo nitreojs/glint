@@ -86,7 +86,7 @@ impl App {
         let install = done.install || std::mem::take(&mut self.update.install);
         let state = match done.result {
             Ok(Found::UpToDate) => {
-                log(&format!("update check: {} is the newest", Version::current()));
+                log(&format!("update check: {} is the newest", update::current()));
                 self.update.available = None;
                 update::State::UpToDate
             }
@@ -110,6 +110,7 @@ impl App {
                 }
                 self.update.install = install;
                 self.update.ready = Some(staged);
+                self.tray.set_update_ready(true);
                 self.update.available = None;
                 update::State::Ready { version: version.to_string() }
             }
@@ -177,7 +178,8 @@ impl App {
     fn restart_into_update(&mut self) {
         self.update.install = false;
         let Some(staged) = self.update.ready.take() else { return };
-        let args = [UPDATED_ARG.to_string(), Version::current().to_string()];
+        self.tray.set_update_ready(false);
+        let args = [UPDATED_ARG.to_string(), update::current().to_string()];
         match update::install(&staged, &args) {
             Ok(()) => {
                 self.exiting = true;

@@ -12,6 +12,7 @@ pub(super) const SHOT_HOTKEY_ID: i32 = 2;
 pub(super) const FULL_HOTKEY_ID: i32 = 3;
 pub(super) const PAUSE_HOTKEY_ID: i32 = 4;
 pub(super) const ESC_HOTKEY_ID: i32 = 5;
+pub(super) const MONITOR_HOTKEY_ID: i32 = 6;
 
 impl App {
     /// (Re-)registers one global hotkey; returns the combo it now holds.
@@ -39,12 +40,19 @@ impl App {
     pub(super) fn register_hotkeys(&mut self, before: Option<&Config>) {
         let cfg = self.cfg.clone();
         let changed = |pick: fn(&Config) -> &String| before.is_none_or(|b| pick(b) != pick(&cfg));
-        let announce = [changed(|c| &c.hotkey), changed(|c| &c.screenshot_hotkey), changed(|c| &c.fullscreen_hotkey)];
+        let announce = [
+            changed(|c| &c.hotkey),
+            changed(|c| &c.screenshot_hotkey),
+            changed(|c| &c.fullscreen_hotkey),
+            changed(|c| &c.monitor_hotkey),
+        ];
         self.hotkey = self.grab_hotkey(HOTKEY_ID, self.hotkey.is_some(), &cfg.hotkey, "recording", announce[0]);
         let (held, combo) = (self.shot_hotkey.is_some(), &cfg.screenshot_hotkey);
         self.shot_hotkey = self.grab_hotkey(SHOT_HOTKEY_ID, held, combo, "screenshot", announce[1]);
         let (held, combo) = (self.full_hotkey.is_some(), &cfg.fullscreen_hotkey);
         self.full_hotkey = self.grab_hotkey(FULL_HOTKEY_ID, held, combo, "all screens", announce[2]);
+        let (held, combo) = (self.monitor_hotkey.is_some(), &cfg.monitor_hotkey);
+        self.monitor_hotkey = self.grab_hotkey(MONITOR_HOTKEY_ID, held, combo, "monitor", announce[3]);
         if matches!(self.state, State::Recording { .. }) {
             self.grab_pause_hotkey();
         }
@@ -86,6 +94,7 @@ impl App {
             (HOTKEY_ID, self.hotkey.take()),
             (SHOT_HOTKEY_ID, self.shot_hotkey.take()),
             (FULL_HOTKEY_ID, self.full_hotkey.take()),
+            (MONITOR_HOTKEY_ID, self.monitor_hotkey.take()),
             (PAUSE_HOTKEY_ID, self.pause_hotkey.take()),
         ];
         for (id, held) in held {

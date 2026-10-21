@@ -49,11 +49,6 @@ impl Version {
         Some(Version { core, pre })
     }
 
-    /// The version this build was made from.
-    pub fn current() -> Version {
-        Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo.toml has a semver version")
-    }
-
     pub(crate) fn is_pre(&self) -> bool {
         !self.pre.is_empty()
     }
@@ -110,7 +105,6 @@ mod tests {
         for bad in ["", "1", "1.2", "1.2.3.4", "01.2.3", "1.2.x", "1.2.3-", "1.2.3-a..b", "1.2.3-01", "1.2.3-é", "vv1.2.3", " 1.2.3"] {
             assert_eq!(Version::parse(bad), None, "{bad:?}");
         }
-        assert_eq!(Version::current().to_string(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]

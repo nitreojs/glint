@@ -15,6 +15,8 @@ pub(super) const KBPS: std::ops::RangeInclusive<u32> = 200..=200_000;
 /// Decimal megabytes, so a "≤ 10 MB" file also fits limits counted in MiB.
 pub const MB: u64 = 1_000_000;
 pub const AAC_BYTES_PER_SECOND: u64 = 24_000;
+// measured: media foundation's aac encoder spends about 1.5 kbit/s on digital silence.
+pub const SILENCE_BYTES_PER_SECOND: u64 = 200;
 /// Aim this far under a size target.
 const UNDER: f64 = 0.96;
 const MUXING: f64 = 1.004;
@@ -161,10 +163,15 @@ pub enum Video {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sound {
+    pub source: Option<usize>,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VideoJob {
     pub pieces: Vec<Piece>,
-    /// Indices into `Info::tracks`.
-    pub tracks: Vec<usize>,
+    pub tracks: Vec<Sound>,
     pub combine: bool,
     pub video: Video,
     pub target: Option<u64>,
@@ -205,13 +212,17 @@ impl VideoJob {
         self.video == Video::Copy
             && !self.combine
             && self.tracks.len() == info.tracks.len()
+            && (self.tracks.iter().enumerate()).all(|(k, t)| t.source == Some(k) && t.name == info.tracks[k].name)
             && matches!(self.pieces[..], [p] if p.lead <= 0 && p.end >= info.duration)
     }
 }
 
-/// The audio lanes that aren't muted, which are the tracks the file gets.
-pub(super) fn tracks(muted: &[bool]) -> Vec<usize> {
-    (0..muted.len()).filter(|&k| !muted[k]).collect()
+/// The lanes that aren't muted, in order, which are the tracks the file gets.
+pub(super) fn sounds(edit: &Edit, info: &Info) -> Vec<Sound> {
+    (edit.lanes.iter())
+        .filter(|l| !l.muted && l.source.is_none_or(|k| k < info.tracks.len()))
+        .map(|l| Sound { source: l.source, name: l.name(&info.tracks).to_string() })
+        .collect()
 }
 
 /// The last keyframe at or before `t`, where a copied piece has to start.
@@ -287,8 +298,8 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
         }
         return Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target });
     }
-    let tracks = tracks(&edit.muted);
-    let combine = s.combine && tracks.len() > 1;
+    let tracks = sounds(edit, src.info);
+    let combine = s.combine && tracks.iter().filter(|t| t.source.is_some()).count() > 1;
     let height = s.height.filter(|&h| h < base.1);
     let fps = s.fps.filter(|&f| (f as f64) < src.info.fps - 0.01);
     let kbps = s.kbps.filter(|k| KBPS.contains(k));
@@ -318,11 +329,13 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
 
 pub(super) fn audio_bytes(job: &VideoJob, src: &Source) -> u64 {
     let len: i64 = job.pieces.iter().map(|p| p.end - p.lead).sum();
+    let per_second = |rate: u64| rate * len as u64 / SECOND as u64;
+    let silence = job.tracks.iter().filter(|t| t.source.is_none()).count() as u64 * per_second(SILENCE_BYTES_PER_SECOND);
     if job.combine {
-        return AAC_BYTES_PER_SECOND * len as u64 / SECOND as u64;
+        return per_second(AAC_BYTES_PER_SECOND) + silence;
     }
     let piece = |k: usize| job.pieces.iter().map(|p| src.audio_bytes(k, p.lead, p.end)).sum::<u64>();
-    job.tracks.iter().map(|&k| piece(k)).sum()
+    job.tracks.iter().filter_map(|t| t.source).map(piece).sum::<u64>() + silence
 }
 
 pub fn estimate(job: &Job, src: &Source) -> u64 {
@@ -390,17 +403,64 @@ mod tests {
 
     #[test]
     fn muted_lanes_drop_their_tracks_and_combining_needs_two() {
-        assert_eq!(tracks(&[false, true, false]), [0, 2]);
-        assert!(tracks(&[true, true]).is_empty());
         let (info, idx) = (info(3), index(3));
         let mut e = edit(3);
-        e.muted = vec![false, true, true];
+        e.lanes[1].muted = true;
+        e.lanes[2].muted = true;
         let s = Settings { combine: true, ..Settings::default() };
         let Job::Video(v) = plan(&e, &s, &src(&info, Some(&idx))) else { panic!() };
-        assert_eq!((v.tracks.clone(), v.combine), (vec![0], false));
-        e.muted[2] = false;
+        assert_eq!((sources(&v), v.combine), (vec![Some(0)], false));
+        e.lanes[2].muted = false;
         let Job::Video(v) = plan(&e, &s, &src(&info, Some(&idx))) else { panic!() };
-        assert_eq!((v.tracks, v.combine), (vec![0, 2], true));
+        assert_eq!((sources(&v), v.combine), (vec![Some(0), Some(2)], true));
+        e.lanes.iter_mut().for_each(|l| l.muted = true);
+        assert!(sounds(&e, &info).is_empty());
+    }
+
+    fn sources(v: &VideoJob) -> Vec<Option<usize>> {
+        v.tracks.iter().map(|t| t.source).collect()
+    }
+
+    #[test]
+    fn deleted_reordered_renamed_and_empty_lanes_shape_the_tracks_and_still_copy() {
+        let (info, idx) = (info(2), index(2));
+        let source = src(&info, Some(&idx));
+        let mut e = edit(2);
+        assert!(e.delete_lane(0));
+        e.add_empty();
+        assert!(e.move_lane(1, 0));
+        assert!(e.rename(1, "voice", &info.tracks));
+        let job = plan(&e, &Settings::default(), &source);
+        let Job::Video(v) = &job else { panic!() };
+        assert_eq!(v.video, Video::Copy);
+        let want = [Sound { source: None, name: "empty".into() }, Sound { source: Some(1), name: "voice".into() }];
+        assert_eq!(v.tracks, want);
+        assert!(!v.combine);
+        let payload = 13 * 30 * 50_000 + 13 * 4 * 5_000 + 13 * SILENCE_BYTES_PER_SECOND;
+        assert_eq!(estimate(&job, &source), muxed(payload));
+
+        let mut whole = Edit::new(20 * S, 2);
+        let is_whole = |e: &Edit| matches!(plan(e, &Settings::default(), &source), Job::Video(v) if v.whole(&info));
+        assert!(is_whole(&whole));
+        assert!(whole.move_lane(1, 0) && !is_whole(&whole));
+        assert!(whole.move_lane(1, 0) && is_whole(&whole));
+        assert!(whole.rename(0, "x", &info.tracks) && !is_whole(&whole));
+        assert!(whole.rename(0, "t0", &info.tracks) && is_whole(&whole));
+        whole.add_empty();
+        assert!(!is_whole(&whole));
+        assert!(whole.delete_lane(2) && whole.delete_lane(1) && !is_whole(&whole));
+
+        let combine = Settings { combine: true, ..Settings::default() };
+        let Job::Video(v) = plan(&e, &combine, &source) else { panic!() };
+        assert!(!v.combine, "one sound and one empty track don't combine");
+        let mut both = edit(2);
+        both.add_empty();
+        let job = plan(&both, &combine, &source);
+        let Job::Video(v) = &job else { panic!() };
+        assert!(v.combine && v.video == Video::Copy);
+        assert_eq!(sources(v), [Some(0), Some(1), None]);
+        let payload = 13 * 30 * 50_000 + 13 * AAC_BYTES_PER_SECOND + 13 * SILENCE_BYTES_PER_SECOND;
+        assert_eq!(estimate(&job, &source), muxed(payload));
     }
 
     #[test]
@@ -455,7 +515,7 @@ mod tests {
         let (info, idx) = (info(2), index(2));
         let source = src(&info, Some(&idx));
         let mut e = edit(2);
-        e.muted[1] = true;
+        e.lanes[1].muted = true;
         let job = plan(&e, &Settings::default(), &source);
         let payload = 13 * 30 * 50_000 + 13 * 4 * 5_000;
         assert_eq!(estimate(&job, &source), muxed(payload));

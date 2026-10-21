@@ -59,6 +59,7 @@ impl SettingsApp {
         self.hotkey_row(ui, look, "record hotkey", HotkeyField::Record);
         self.hotkey_row(ui, look, "screenshot hotkey", HotkeyField::Screenshot);
         self.hotkey_row(ui, look, "all screens hotkey", HotkeyField::Fullscreen);
+        self.hotkey_row(ui, look, "monitor hotkey", HotkeyField::Monitor);
         self.hotkey_row(ui, look, "pause hotkey", HotkeyField::Pause);
         row(ui, look, "launch at startup", 1.0, |ui| {
             let text = if self.cfg.launch_at_startup { "on" } else { "off" };

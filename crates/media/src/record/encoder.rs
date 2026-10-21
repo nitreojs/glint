@@ -1,12 +1,12 @@
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 
+use glint_core::geom::rect::Rect;
 use glint_core::log::log;
+use glint_core::record::Codec;
 use glint_core::record::mix::{RATE, frames_to_hns};
 use glint_core::record::mp4::name_tracks;
-use glint_core::record::timeline::{AudioPlacer, Pauses};
+use glint_core::record::pipeline::{Frames, Output, VideoConfig};
+use glint_core::record::pointer::PointerShape;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -17,7 +17,8 @@ use windows::core::{GUID, HSTRING, Interface, PWSTR};
 
 use super::capture::Capture;
 use super::cursor::CursorRenderer;
-use super::{Codec, Ctx, INFINITE, Msg, Params, RING, create_device, hns, lock, qpc, texture_desc};
+use super::win::{INFINITE, RING, create_device, texture_desc};
+use super::{Ctx, Params};
 
 /// 192 kbps, one of the four rates the media foundation aac encoder accepts.
 const AAC_BYTES_PER_SECOND: u32 = 24_000;
@@ -26,102 +27,124 @@ fn pack(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
-pub(super) struct Encoder {
-    pub(super) p: Params,
+pub(super) struct Composer {
+    region: Rect,
     device: ID3D11Device,
     ctx: ID3D11DeviceContext,
     mt: ID3D11Multithread,
     ring: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
     clean: ID3D11Texture2D,
     cursor: Option<CursorRenderer>,
-    writer: IMFSinkWriter,
-    stream: u32,
-    audio: Vec<u32>,
-    track_names: Vec<String>,
     alloc: IMFVideoSampleAllocatorEx,
     _mgr: IMFDXGIDeviceManager,
 }
 
-struct Video {
-    grid: f64,
-    start: Option<i64>,
-    /// The newest frame and its slot; it is handed to the encoder once a later slot begins.
-    pending: Option<(IMFSample, i64)>,
-    have_image: bool,
-    frames: u64,
-    dropped: u64,
-    cursor: Option<(i32, i32)>,
-    stale: bool,
+pub(super) struct SinkWriter {
+    writer: IMFSinkWriter,
+    stream: u32,
+    audio: Vec<u32>,
+    track_names: Vec<String>,
+    path: PathBuf,
 }
 
-impl Video {
-    fn slot_time(&self, slot: i64) -> i64 {
-        (slot as f64 * self.grid).round() as i64
-    }
+pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -> Result<(Composer, SinkWriter), String> {
+    unsafe {
+        let (device, ctx) = create_device(&cap.adapter, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)?;
+        // Media Foundation uses this device from its own worker threads.
+        let mt: ID3D11Multithread = ctx.cast().ctx("ID3D11Multithread")?;
+        let _ = mt.SetMultithreadProtected(true);
 
-    fn slot(&self, t: i64) -> i64 {
-        self.start.map_or(0, |s| (((t - s) as f64 / self.grid).round() as i64).max(0))
-    }
-}
+        let mut ring = Vec::with_capacity(RING);
+        for &h in &cap.handles {
+            let mut t: Option<ID3D11Texture2D> = None;
+            device.OpenSharedResource(h, &mut t).ctx("OpenSharedResource")?;
+            let t = t.unwrap();
+            let km: IDXGIKeyedMutex = t.cast().ctx("IDXGIKeyedMutex")?;
+            ring.push((t, km));
+        }
+        let r = p.region;
+        let mut clean = None;
+        device
+            .CreateTexture2D(&texture_desc(r, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_FLAG(0)), None, Some(&mut clean))
+            .ctx("CreateTexture2D")?;
 
-impl Encoder {
-    pub(super) unsafe fn new(p: Params, cap: &Capture, track_names: Vec<String>) -> Result<Self, String> {
-        unsafe {
-            let (device, ctx) = create_device(&cap.adapter, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)?;
-            // Media Foundation uses this device from its own worker threads.
-            let mt: ID3D11Multithread = ctx.cast().ctx("ID3D11Multithread")?;
-            let _ = mt.SetMultithreadProtected(true);
-
-            let mut ring = Vec::with_capacity(RING);
-            for &h in &cap.handles {
-                let mut t: Option<ID3D11Texture2D> = None;
-                device.OpenSharedResource(h, &mut t).ctx("OpenSharedResource")?;
-                let t = t.unwrap();
-                let km: IDXGIKeyedMutex = t.cast().ctx("IDXGIKeyedMutex")?;
-                ring.push((t, km));
-            }
-            let r = p.region;
-            let mut clean = None;
-            device
-                .CreateTexture2D(&texture_desc(r, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_FLAG(0)), None, Some(&mut clean))
-                .ctx("CreateTexture2D")?;
-
-            let cursor = if p.draw_cursor {
-                match CursorRenderer::new(&device) {
-                    Ok(c) => Some(c),
-                    Err(e) => {
-                        log(&format!("cursor rendering disabled: {e}"));
-                        None
-                    }
+        let cursor = if p.draw_cursor {
+            match CursorRenderer::new(&device) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log(&format!("cursor rendering disabled: {e}"));
+                    None
                 }
-            } else {
-                None
-            };
+            }
+        } else {
+            None
+        };
 
-            let mut token = 0;
-            let mut mgr = None;
-            MFCreateDXGIDeviceManager(&mut token, &mut mgr).ctx("MFCreateDXGIDeviceManager")?;
-            let mgr = mgr.unwrap();
-            mgr.ResetDevice(&device, token).ctx("IMFDXGIDeviceManager::ResetDevice")?;
+        let mut token = 0;
+        let mut mgr = None;
+        MFCreateDXGIDeviceManager(&mut token, &mut mgr).ctx("MFCreateDXGIDeviceManager")?;
+        let mgr = mgr.unwrap();
+        mgr.ResetDevice(&device, token).ctx("IMFDXGIDeviceManager::ResetDevice")?;
 
+        let config = VideoConfig { codec: p.codec, width: r.w as u32, height: r.h as u32, fps: p.fps, qp: p.qp, effort: p.effort };
+        let (output, in_t, name) = SinkWriter::new(&mgr, &config, track_names, &p.path)?;
+
+        let mut raw = std::ptr::null_mut();
+        MFCreateVideoSampleAllocatorEx(&IMFVideoSampleAllocatorEx::IID, &mut raw).ctx("MFCreateVideoSampleAllocatorEx")?;
+        let alloc = IMFVideoSampleAllocatorEx::from_raw(raw);
+        alloc.SetDirectXManager(&mgr).ctx("SetDirectXManager")?;
+        let aattrs = attributes(2)?;
+        aattrs
+            .SetUINT32(&MF_SA_D3D11_BINDFLAGS, (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32)
+            .ctx("attr")?;
+        aattrs.SetUINT32(&MF_SA_D3D11_USAGE, D3D11_USAGE_DEFAULT.0 as u32).ctx("attr")?;
+        alloc.InitializeSampleAllocatorEx(4, 16, &aattrs, &in_t).ctx("InitializeSampleAllocatorEx")?;
+
+        log(&format!(
+            "recording {}x{}@{:.3} {:?} qp={} effort={}{} -> {} [{name}]",
+            config.width,
+            config.height,
+            config.fps,
+            config.codec,
+            config.qp,
+            config.effort,
+            match output.audio.len() {
+                0 => String::new(),
+                n => format!(" + {n} aac track(s)"),
+            },
+            p.path.display()
+        ));
+        let composer = Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, alloc, _mgr: mgr };
+        Ok((composer, output))
+    }
+}
+
+impl SinkWriter {
+    unsafe fn new(
+        mgr: &IMFDXGIDeviceManager,
+        config: &VideoConfig,
+        track_names: Vec<String>,
+        path: &Path,
+    ) -> Result<(SinkWriter, IMFMediaType, String), String> {
+        unsafe {
             let attrs = attributes(3)?;
             attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ctx("attr")?;
-            attrs.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, &mgr).ctx("attr")?;
+            attrs.SetUnknown(&MF_SINK_WRITER_D3D_MANAGER, mgr).ctx("attr")?;
             attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1).ctx("attr")?;
-            if let Some(dir) = p.path.parent() {
+            if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
-            let writer = MFCreateSinkWriterFromURL(&HSTRING::from(p.path.as_os_str()), None, &attrs)
-                .ctx("MFCreateSinkWriterFromURL")?;
+            let writer =
+                MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs).ctx("MFCreateSinkWriterFromURL")?;
 
-            let (w, h) = (r.w as u32, r.h as u32);
-            let (subtype, profile) = match p.codec {
+            let (w, h) = (config.width, config.height);
+            let (subtype, profile) = match config.codec {
                 Codec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_High.0 as u32),
                 Codec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
             };
             // Only a header hint in constant-QP mode (~0.1 bit per pixel).
-            let nominal_bps = ((w as f64 * h as f64 * p.fps) / 10.0).clamp(2e6, 400e6) as u32;
-            let fps_milli = (p.fps * 1000.0).round() as u32;
+            let nominal_bps = ((w as f64 * h as f64 * config.fps) / 10.0).clamp(2e6, 400e6) as u32;
+            let fps_milli = (config.fps * 1000.0).round() as u32;
             let out_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
             out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
             out_t.SetGUID(&MF_MT_SUBTYPE, &subtype).ctx("mt")?;
@@ -150,231 +173,82 @@ impl Encoder {
             let enc = attributes(4)?;
             enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_Quality.0 as u32)
                 .ctx("enc")?;
-            enc.SetUINT64(&CODECAPI_AVEncVideoEncodeQP, p.qp.min(51) as u64).ctx("enc")?;
-            enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, p.effort.min(100)).ctx("enc")?;
-            enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (p.fps * 2.0).round() as u32).ctx("enc")?;
+            enc.SetUINT64(&CODECAPI_AVEncVideoEncodeQP, config.qp.min(51) as u64).ctx("enc")?;
+            enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, config.effort.min(100)).ctx("enc")?;
+            enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (config.fps * 2.0).round() as u32).ctx("enc")?;
             writer.SetInputMediaType(stream, &in_t, &enc).ctx("IMFSinkWriter::SetInputMediaType")?;
             let audio = track_names.iter().map(|_| add_audio_stream(&writer)).collect::<Result<Vec<u32>, String>>()?;
 
             let name = describe_encoder(&writer, stream);
             writer.BeginWriting().ctx("IMFSinkWriter::BeginWriting")?;
-
-            let mut raw = std::ptr::null_mut();
-            MFCreateVideoSampleAllocatorEx(&IMFVideoSampleAllocatorEx::IID, &mut raw)
-                .ctx("MFCreateVideoSampleAllocatorEx")?;
-            let alloc = IMFVideoSampleAllocatorEx::from_raw(raw);
-            alloc.SetDirectXManager(&mgr).ctx("SetDirectXManager")?;
-            let aattrs = attributes(2)?;
-            aattrs
-                .SetUINT32(&MF_SA_D3D11_BINDFLAGS, (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32)
-                .ctx("attr")?;
-            aattrs.SetUINT32(&MF_SA_D3D11_USAGE, D3D11_USAGE_DEFAULT.0 as u32).ctx("attr")?;
-            alloc.InitializeSampleAllocatorEx(4, 16, &aattrs, &in_t).ctx("InitializeSampleAllocatorEx")?;
-
-            log(&format!(
-                "recording {w}x{h}@{:.3} {:?} qp={} effort={}{} -> {} [{name}]",
-                p.fps,
-                p.codec,
-                p.qp,
-                p.effort,
-                match audio.len() {
-                    0 => String::new(),
-                    n => format!(" + {n} aac track(s)"),
-                },
-                p.path.display()
-            ));
-            Ok(Encoder {
-                p,
-                device,
-                ctx,
-                mt,
-                ring,
-                clean: clean.unwrap(),
-                cursor,
-                writer,
-                stream,
-                audio,
-                track_names,
-                alloc,
-                _mgr: mgr,
-            })
+            let path = path.to_path_buf();
+            Ok((SinkWriter { writer, stream, audio, track_names, path }, in_t, name))
         }
     }
+}
 
-    /// Consumes capture and audio messages until both have ended, then finalizes the file
-    /// (skipped when `abort` is set: the file is going to be deleted).
-    /// Returns (frames written, frames dropped, duration in seconds).
-    pub(super) unsafe fn run(
-        &mut self,
-        rx: &Receiver<Msg>,
-        free_tx: &Sender<usize>,
-        abort: &AtomicBool,
-        pauses: &Mutex<Pauses>,
-    ) -> Result<(u64, u64, f64), String> {
+impl Output for SinkWriter {
+    type Frame = IMFSample;
+
+    fn video(&mut self, sample: IMFSample, time: i64, duration: i64) -> Result<(), String> {
         unsafe {
-            // Capture times jitter by a millisecond or two around vsync (which would show up as
-            // judder), cursor-only updates arrive between vsyncs, and a capped fps means several
-            // captures per slot: everything that lands in the same slot is merged into one
-            // frame, the latest state wins.
-            let mut v = Video {
-                grid: 1e7 / self.p.fps,
-                start: None,
-                pending: None,
-                have_image: false,
-                frames: 0,
-                dropped: 0,
-                cursor: None,
-                stale: false,
-            };
-            let mut placer = AudioPlacer::default();
-            let mut early_audio: Vec<(i64, Vec<Vec<i16>>)> = Vec::new();
-            let mut audio_open = !self.audio.is_empty();
-            let mut end_qpc = None;
-
-            loop {
-                let msg = match rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(m) => Some(m),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => break,
-                };
-                match msg {
-                    None => {}
-                    Some(Msg::Shape(si, buf)) => {
-                        if let Some(c) = self.cursor.as_mut()
-                            && let Err(e) = c.set_shape(&self.device, &si, &buf)
-                        {
-                            log(&format!("pointer shape update failed: {e}"));
-                        }
-                    }
-                    Some(Msg::End { qpc }) => {
-                        end_qpc = Some(qpc);
-                        if !audio_open {
-                            break;
-                        }
-                    }
-                    Some(Msg::AudioEnd) => {
-                        audio_open = false;
-                        if end_qpc.is_some() {
-                            break;
-                        }
-                    }
-                    Some(Msg::Audio { start, tracks }) => match v.start {
-                        Some(origin) => {
-                            let at = placer.next;
-                            let out = placer.place(start, &tracks, &lock(pauses), origin);
-                            self.write_audio(at, &out)?;
-                        }
-                        None => early_audio.push((start, tracks)),
-                    },
-                    Some(Msg::Frame { slot: ring_slot, qpc, cursor }) => {
-                        if let Some(i) = ring_slot {
-                            let (tex, km) = &self.ring[i];
-                            self.mt.Enter();
-                            let r = km.AcquireSync(1, INFINITE);
-                            if r.is_ok() {
-                                self.ctx.CopyResource(&self.clean, tex);
-                                let _ = km.ReleaseSync(0);
-                            }
-                            self.mt.Leave();
-                            r.ctx("AcquireSync")?;
-                            let _ = free_tx.send(i);
-                            v.have_image = true;
-                        }
-                        v.cursor = cursor;
-                        if !v.have_image {
-                            continue;
-                        }
-                        let t = lock(pauses).active(hns(qpc));
-                        match t {
-                            Some(t) => self.frame(&mut v, t)?,
-                            None => v.stale = true,
-                        }
-                    }
-                }
-                if v.stale && end_qpc.is_none() {
-                    let t = lock(pauses).active(hns(qpc()));
-                    if let Some(t) = t {
-                        v.stale = false;
-                        self.frame(&mut v, t)?;
-                    }
-                }
-                if let Some(origin) = v.start
-                    && !early_audio.is_empty()
-                {
-                    for (start, tracks) in std::mem::take(&mut early_audio) {
-                        let at = placer.next;
-                        let out = placer.place(start, &tracks, &lock(pauses), origin);
-                        self.write_audio(at, &out)?;
-                    }
-                }
-            }
-
-            if abort.load(Ordering::SeqCst) {
-                return Ok((v.frames, v.dropped, 0.0));
-            }
-            let mut duration_s = 0.0;
-            if let Some((prev, ps)) = v.pending.take() {
-                let end = lock(pauses).active_clamped(hns(end_qpc.unwrap_or_else(qpc)));
-                let end_slot = v.slot(end).max(ps + 1);
-                prev.SetSampleDuration(v.slot_time(end_slot) - v.slot_time(ps)).ctx("SetSampleDuration")?;
-                self.writer.WriteSample(self.stream, &prev).ctx("WriteSample")?;
-                v.frames += 1;
-                duration_s = v.slot_time(end_slot) as f64 / 1e7;
-                let at = placer.next;
-                let pad = vec![0; 2 * placer.pad(v.slot_time(end_slot))];
-                self.write_audio(at, &vec![pad; self.audio.len()])?;
-            }
-            if v.frames == 0 {
-                return Err("no frames were captured".into());
-            }
-            self.writer.Finalize().ctx("IMFSinkWriter::Finalize")?;
-            if !self.track_names.is_empty()
-                && let Err(e) = name_tracks(&self.p.path, &self.track_names)
-            {
-                log(&format!("couldn't name the audio tracks: {e}"));
-            }
-            Ok((v.frames, v.dropped, duration_s))
+            sample.SetSampleTime(time).ctx("SetSampleTime")?;
+            sample.SetSampleDuration(duration).ctx("SetSampleDuration")?;
+            self.writer.WriteSample(self.stream, &sample).ctx("WriteSample")
         }
     }
 
-    unsafe fn frame(&self, v: &mut Video, t: i64) -> Result<(), String> {
-        unsafe {
-            v.start.get_or_insert(t);
-            let slot = v.slot(t);
-            match &v.pending {
-                Some((s, ps)) if slot <= *ps => self.compose(s, v.cursor)?,
-                _ => {
-                    let sample = match self.alloc.AllocateSample() {
-                        Ok(s) => s,
-                        Err(e) if e.code() == MF_E_SAMPLEALLOCATOR_EMPTY => {
-                            v.dropped += 1;
-                            return Ok(());
-                        }
-                        Err(e) => return Err(format!("AllocateSample: {}", e.message())),
-                    };
-                    self.compose(&sample, v.cursor)?;
-                    sample.SetSampleTime(v.slot_time(slot)).ctx("SetSampleTime")?;
-                    if let Some((prev, ps)) = v.pending.take() {
-                        prev.SetSampleDuration(v.slot_time(slot) - v.slot_time(ps)).ctx("SetSampleDuration")?;
-                        self.writer.WriteSample(self.stream, &prev).ctx("WriteSample")?;
-                        v.frames += 1;
-                    }
-                    v.pending = Some((sample, slot));
-                }
-            }
-            Ok(())
-        }
+    fn audio(&mut self, track: usize, at: i64, pcm: &[i16]) -> Result<(), String> {
+        unsafe { write_pcm(&self.writer, self.audio[track], at, pcm) }
     }
 
-    unsafe fn write_audio(&self, at: i64, tracks: &[Vec<i16>]) -> Result<(), String> {
-        for (&stream, data) in self.audio.iter().zip(tracks) {
-            unsafe { write_pcm(&self.writer, stream, at, data)? };
+    fn finish(&mut self) -> Result<(), String> {
+        unsafe { self.writer.Finalize().ctx("IMFSinkWriter::Finalize")? };
+        if !self.track_names.is_empty()
+            && let Err(e) = name_tracks(&self.path, &self.track_names)
+        {
+            log(&format!("couldn't name the audio tracks: {e}"));
         }
         Ok(())
     }
+}
+
+impl Frames for Composer {
+    type Image = usize;
+    type Frame = IMFSample;
+
+    fn latch(&mut self, &slot: &usize) -> Result<(), String> {
+        let (tex, km) = &self.ring[slot];
+        unsafe {
+            self.mt.Enter();
+            let r = km.AcquireSync(1, INFINITE);
+            if r.is_ok() {
+                self.ctx.CopyResource(&self.clean, tex);
+                let _ = km.ReleaseSync(0);
+            }
+            self.mt.Leave();
+            r.ctx("AcquireSync")
+        }
+    }
+
+    fn set_pointer(&mut self, shape: &PointerShape) {
+        if let Some(c) = self.cursor.as_mut()
+            && let Err(e) = c.set_shape(&self.device, shape)
+        {
+            log(&format!("pointer shape update failed: {e}"));
+        }
+    }
+
+    fn alloc(&mut self) -> Result<Option<IMFSample>, String> {
+        match unsafe { self.alloc.AllocateSample() } {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.code() == MF_E_SAMPLEALLOCATOR_EMPTY => Ok(None),
+            Err(e) => Err(format!("AllocateSample: {}", e.message())),
+        }
+    }
 
     /// Copies the clean region image into a pooled sample texture and draws the cursor on it.
-    unsafe fn compose(&self, sample: &IMFSample, cursor: Option<(i32, i32)>) -> Result<(), String> {
+    fn compose(&mut self, sample: &IMFSample, cursor: Option<(i32, i32)>) -> Result<(), String> {
         unsafe {
             let buf = sample.GetBufferByIndex(0).ctx("GetBufferByIndex")?;
             let dx: IMFDXGIBuffer = buf.cast().ctx("IMFDXGIBuffer")?;
@@ -388,7 +262,7 @@ impl Encoder {
                 let _ = buf.SetCurrentLength(len);
             }
 
-            let r = self.p.region;
+            let r = self.region;
             let rtv = match (&self.cursor, cursor) {
                 (Some(c), Some(_)) if c.size().is_some() => {
                     let mut desc = D3D11_RENDER_TARGET_VIEW_DESC {

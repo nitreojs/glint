@@ -1,4 +1,5 @@
 use super::crop::Crop;
+use super::info::Track;
 use super::math::Range;
 
 const UNDO_LIMIT: usize = 200;
@@ -10,13 +11,36 @@ pub struct Segment {
     pub removed: bool,
 }
 
-/// The timeline: the trimmed range, its pieces, markers, which sound lanes are muted, and the crop.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lane {
+    pub source: Option<usize>,
+    pub name: Option<String>,
+    pub muted: bool,
+}
+
+pub const EMPTY_TRACK: &str = "empty";
+
+impl Lane {
+    fn of(source: Option<usize>) -> Lane {
+        Lane { source, name: None, muted: false }
+    }
+
+    pub fn default_name<'a>(&self, tracks: &'a [Track]) -> &'a str {
+        self.source.and_then(|k| tracks.get(k)).map_or(EMPTY_TRACK, |t| &t.name)
+    }
+
+    pub fn name<'a>(&'a self, tracks: &'a [Track]) -> &'a str {
+        self.name.as_deref().unwrap_or_else(|| self.default_name(tracks))
+    }
+}
+
+/// The timeline: the trimmed range, its pieces, markers, the sound lanes, and the crop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edit {
     pub range: Range,
     pub segments: Vec<Segment>,
     pub markers: Vec<i64>,
-    pub muted: Vec<bool>,
+    pub lanes: Vec<Lane>,
     pub crop: Option<Crop>,
 }
 
@@ -27,7 +51,7 @@ impl Edit {
             range: Range::full(duration),
             segments: vec![Segment { start: 0, end: duration, removed: false }],
             markers: Vec::new(),
-            muted: vec![false; tracks],
+            lanes: (0..tracks).map(|k| Lane::of(Some(k))).collect(),
             crop: None,
         }
     }
@@ -104,6 +128,44 @@ impl Edit {
 
     pub fn next_marker(&self, t: i64, within: i64) -> Option<i64> {
         self.markers.iter().copied().find(|&m| m > t + within)
+    }
+
+    pub fn set_muted(&mut self, lane: usize, muted: bool) -> bool {
+        let Some(l) = self.lanes.get_mut(lane) else { return false };
+        let changed = l.muted != muted;
+        l.muted = muted;
+        changed
+    }
+
+    pub fn rename(&mut self, lane: usize, name: &str, tracks: &[Track]) -> bool {
+        let Some(l) = self.lanes.get_mut(lane) else { return false };
+        let name = name.trim();
+        let custom = (!name.is_empty() && name != l.default_name(tracks)).then(|| name.to_string());
+        let changed = l.name != custom;
+        l.name = custom;
+        changed
+    }
+
+    pub fn delete_lane(&mut self, lane: usize) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        self.lanes.remove(lane);
+        true
+    }
+
+    pub fn move_lane(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.lanes.len() || to >= self.lanes.len() || from == to {
+            return false;
+        }
+        let l = self.lanes.remove(from);
+        self.lanes.insert(to, l);
+        true
+    }
+
+    pub fn add_empty(&mut self) -> usize {
+        self.lanes.push(Lane::of(None));
+        self.lanes.len() - 1
     }
 }
 
@@ -294,5 +356,56 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, UNDO_LIMIT);
+    }
+
+    #[test]
+    fn lanes_rename_delete_reorder_and_grow_with_undo() {
+        let tracks = [Track { stream: 1, name: "desktop".into() }, Track { stream: 2, name: "mic".into() }];
+        let names = |e: &Edit| e.lanes.iter().map(|l| l.name(&tracks).to_string()).collect::<Vec<_>>();
+        let mut u = Undo::default();
+        let mut e = Edit::new(10 * S, 2);
+        let fresh = e.clone();
+        assert_eq!(names(&e), ["desktop", "mic"]);
+
+        let before = e.clone();
+        assert!(e.rename(1, "  voice ", &tracks));
+        u.record(before, &e);
+        assert_eq!(e.lanes[1].name.as_deref(), Some("voice"));
+        assert!(!e.rename(1, "voice", &tracks));
+        assert!(!e.rename(7, "x", &tracks));
+
+        let before = e.clone();
+        assert_eq!(e.add_empty(), 2);
+        u.record(before, &e);
+        assert_eq!(e.lanes[2], Lane { source: None, name: None, muted: false });
+        assert_eq!(names(&e), ["desktop", "voice", EMPTY_TRACK]);
+
+        let before = e.clone();
+        assert!(e.move_lane(2, 0));
+        u.record(before, &e);
+        assert!(!e.move_lane(0, 0) && !e.move_lane(0, 3) && !e.move_lane(5, 1));
+        assert_eq!(names(&e), [EMPTY_TRACK, "desktop", "voice"]);
+
+        let before = e.clone();
+        assert!(e.delete_lane(1));
+        u.record(before, &e);
+        assert!(!e.delete_lane(2));
+        assert_eq!(e.lanes.iter().map(|l| l.source).collect::<Vec<_>>(), [None, Some(1)]);
+
+        let before = e.clone();
+        assert!(e.set_muted(1, true) && !e.set_muted(1, true));
+        u.record(before, &e);
+        assert!(e.rename(1, "", &tracks) && e.lanes[1].name.is_none());
+        assert!(e.rename(0, "silence", &tracks) && !e.rename(0, "silence", &tracks));
+        assert!(e.rename(0, EMPTY_TRACK, &tracks) && e.lanes[0].name.is_none());
+
+        let mut back = e.clone();
+        let mut steps = 0;
+        while u.undo(&mut back) {
+            steps += 1;
+        }
+        assert_eq!((steps, &back), (5, &fresh));
+        assert!(u.redo(&mut back) && u.redo(&mut back) && u.redo(&mut back));
+        assert_eq!(names(&back), [EMPTY_TRACK, "desktop", "voice"]);
     }
 }

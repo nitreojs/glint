@@ -54,7 +54,7 @@ pub(super) fn hint_text(purpose: Purpose, monitors: usize, elements: UiElements)
     };
     let all = if monitors > 1 { "   ·   Ctrl+A for all screens" } else { "" };
     format!(
-        "Drag to select a region   ·   Click to {verb} what's highlighted{wheel}   ·   Ctrl+click to add more{all}   ·   Esc to cancel"
+        "Drag to select a region (Ctrl moves it, Alt skips snapping)   ·   Click to {verb} what's highlighted{wheel}   ·   Ctrl+click to add more{all}   ·   Esc to cancel"
     )
 }
 

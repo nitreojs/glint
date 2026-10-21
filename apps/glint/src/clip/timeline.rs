@@ -1,9 +1,10 @@
 use eframe::egui::{
-    self, Color32, CornerRadius, CursorIcon, Id, Mesh, Painter, Rect, Role, Sense, Shape, Stroke, StrokeKind, Ui,
+    self, Color32, CornerRadius, CursorIcon, Id, Mesh, Order, Painter, Rect, Role, Sense, Shape, Stroke, StrokeKind, Ui,
     WidgetInfo, pos2, vec2,
 };
 use glint_core::clip::edit::snap_to;
 use glint_core::clip::export::{self, Job, Video};
+use glint_core::clip::info::Info;
 use glint_core::clip::math::{self, SECOND};
 use glint_ui::widgets::{Look, anim, ease, medium, mix, sans};
 
@@ -18,6 +19,15 @@ const HEAD_H: f32 = 18.0;
 const LANE_MAX: f32 = 34.0;
 const LANE_MIN: f32 = 22.0;
 const SCROLL_H: f32 = 10.0;
+const ADD_H: f32 = 18.0;
+const HANDLE_W: f32 = 6.0;
+const HANDLE_HIT: f32 = 14.0;
+const RENAME_W: f32 = 140.0;
+const MENU_W: f32 = 180.0;
+const ITEM_H: f32 = 30.0;
+const HEADER: &str = "sound · muted tracks won't be in the file";
+const MUTED: &str = "· muted, not exported";
+const ADD_TEXT: &str = "+ add empty track";
 const SNAP_PX: f64 = 8.0;
 const MARKER: Color32 = Color32::from_rgb(0xF5, 0xC0, 0x4A);
 const WAVES: [Color32; 6] = [
@@ -29,10 +39,10 @@ const WAVES: [Color32; 6] = [
     Color32::from_rgb(0xE0, 0xD4, 0x6A),
 ];
 
-/// The timeline's height with `tracks` sound lanes `lane` tall.
-pub(super) fn height(tracks: usize, lane: f32) -> f32 {
-    let sound = if tracks > 0 { GAP + HEAD_H + GAP + tracks as f32 * (lane + GAP) - GAP } else { 0.0 };
-    TOP + VIDEO_H + sound + SCROLL_H
+/// The timeline's height with `lanes` sound lanes `lane` tall.
+pub(super) fn height(lanes: usize, lane: f32) -> f32 {
+    let sound = if lanes > 0 { GAP + HEAD_H + GAP + lanes as f32 * (lane + GAP) - GAP } else { 0.0 };
+    TOP + VIDEO_H + sound + GAP + ADD_H + SCROLL_H
 }
 
 /// Sound lanes shrink from 34 to 22 px to fit in `room`.
@@ -104,19 +114,62 @@ struct Rows {
     head: Rect,
     lanes: Vec<Rect>,
     span: Rect,
+    bands: Vec<Rect>,
+    add: Rect,
     bar: Rect,
 }
 
-fn rows(area: Rect, tracks: usize, lane: f32) -> Rows {
+struct Chip {
+    rect: Rect,
+    dots: Rect,
+    resp: egui::Response,
+    more: egui::Response,
+}
+
+#[derive(Clone, Copy)]
+enum LaneItem {
+    Rename,
+    Up,
+    Down,
+    Delete,
+}
+
+impl LaneItem {
+    fn label(self) -> &'static str {
+        match self {
+            LaneItem::Rename => "rename",
+            LaneItem::Up => "move up",
+            LaneItem::Down => "move down",
+            LaneItem::Delete => "delete track",
+        }
+    }
+}
+
+fn rows(area: Rect, lanes: usize, lane: f32) -> Rows {
     let video = Rect::from_min_size(pos2(area.left(), area.top() + TOP), vec2(area.width(), VIDEO_H));
     let head = Rect::from_min_size(pos2(area.left(), video.bottom() + GAP), vec2(area.width(), HEAD_H));
-    let lanes: Vec<Rect> = (0..tracks)
+    let lanes: Vec<Rect> = (0..lanes)
         .map(|k| Rect::from_min_size(pos2(area.left(), head.bottom() + GAP + k as f32 * (lane + GAP)), vec2(area.width(), lane)))
         .collect();
     let bottom = lanes.last().map_or(video.bottom(), |l| l.bottom());
     let span = Rect::from_min_max(video.min, pos2(area.right(), bottom));
-    let bar = Rect::from_min_size(pos2(area.left() + 6.0, bottom + 4.0), vec2(area.width() - 12.0, 4.0));
-    Rows { video, head, lanes, span, bar }
+    let mut bands = vec![video];
+    if let (Some(first), Some(last)) = (lanes.first(), lanes.last()) {
+        bands.push(Rect::from_min_max(first.min, last.max));
+    }
+    let add = Rect::from_min_size(pos2(area.left(), bottom + GAP), vec2(area.width(), ADD_H));
+    let bar = Rect::from_min_size(pos2(area.left() + 6.0, add.bottom() + 4.0), vec2(area.width() - 12.0, 4.0));
+    Rows { video, head, lanes, span, bands, add, bar }
+}
+
+fn grips(rows: &Rows, x: f32) -> Vec<Rect> {
+    rows.bands.iter().map(|b| Rect::from_center_size(pos2(x, b.center().y), vec2(HANDLE_HIT, b.height() + 4.0))).collect()
+}
+
+fn lane_slot(rows: &Rows, y: f32) -> usize {
+    let (Some(first), n) = (rows.lanes.first(), rows.lanes.len()) else { return 0 };
+    let pitch = first.height() + GAP;
+    (((y - first.top() + GAP / 2.0) / pitch).floor().max(0.0) as usize).min(n - 1)
 }
 
 impl ClipApp {
@@ -138,7 +191,7 @@ impl ClipApp {
             ui.painter().rect_filled(Rect::from_min_size(area.min + vec2(0.0, TOP), vec2(area.width(), VIDEO_H)), 6, p.ctl);
             return;
         };
-        let rows = rows(area, info.tracks.len(), lane_h);
+        let rows = rows(area, self.edit.lanes.len(), lane_h);
         let dur = info.duration.max(1);
         let frame = math::frame_len(info.fps);
         let inner = area.shrink2(vec2(6.0, 0.0));
@@ -146,7 +199,7 @@ impl ClipApp {
         self.view.clamp(dur, min_span);
         let light = self.light == Some(true);
 
-        let blocked = self.sheet || self.menu || self.confirm_delete;
+        let blocked = self.sheet || self.menu || self.confirm_delete || self.lane_menu.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| area.contains(*at));
         if let Some(at) = hover
             && !blocked
@@ -186,48 +239,72 @@ impl ClipApp {
                 (i, resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("click jumps here · right-click removes"))
             })
             .collect();
-        let chips: Vec<(Rect, egui::Response)> = (info.tracks.iter().enumerate())
-            .map(|(k, t)| {
-                let name = ui.painter().layout_no_wrap(t.name.clone(), medium(12.0), p.t1);
-                let extra = if self.edit.muted[k] {
-                    ui.painter().layout_no_wrap("· muted, not exported".into(), sans(12.0), p.t3).size().x + 6.0
-                } else {
-                    0.0
+        let lanes = self.edit.lanes.clone();
+        let renaming = self.renaming.as_ref().map(|(k, _)| *k);
+        let chips: Vec<Chip> = (lanes.iter().enumerate())
+            .map(|(k, lane)| {
+                let name = lane.name(&info.tracks);
+                let name_w = match renaming {
+                    Some(r) if r == k => RENAME_W,
+                    _ => ui.painter().layout_no_wrap(name.to_string(), medium(12.0), p.t1).size().x,
                 };
+                let extra = if lane.muted { ui.painter().layout_no_wrap(MUTED.into(), sans(12.0), p.t3).size().x + 6.0 } else { 0.0 };
                 let l = rows.lanes[k];
                 let h = (l.height() - 6.0).min(26.0);
-                let chip = Rect::from_min_size(pos2(l.left() + 8.0, l.center().y - h / 2.0), vec2(h + 6.0 + name.size().x + extra + 8.0, h));
-                let tip = if self.edit.muted[k] { "muted: not in the file · click to unmute" } else { "click to mute: muted sound isn't saved" };
-                let resp = ui
-                    .interact(chip, Id::unique(("clip-lane-mute", k)), Sense::click())
+                let rect = Rect::from_min_size(pos2(l.left() + 8.0, l.center().y - h / 2.0), vec2(h + 6.0 + name_w + extra + 8.0, h));
+                let tip = if lane.muted {
+                    "muted: not in the file · click to unmute · drag to reorder"
+                } else {
+                    "click to mute: muted sound isn't saved · drag to reorder · right-click for more"
+                };
+                let sense = if renaming == Some(k) { Sense::hover() } else { Sense::click_and_drag() };
+                let cursor = if self.lane_drag.is_some() { CursorIcon::Grabbing } else { CursorIcon::PointingHand };
+                let resp = ui.interact(rect, Id::unique(("clip-lane", k)), sense).on_hover_cursor(cursor).on_hover_text(tip);
+                resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, !lane.muted, format!("sound: {name}")));
+                let dots = Rect::from_min_size(pos2(rect.right() + 4.0, rect.top()), vec2(h, h));
+                let more = ui
+                    .interact(dots, Id::unique(("clip-lane-more", k)), Sense::click())
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text(tip);
-                resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, !self.edit.muted[k], format!("sound: {}", t.name)));
-                (chip, resp)
+                    .on_hover_text("rename, move or delete this track");
+                more.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{name}: more")));
+                Chip { rect, dots, resp, more }
             })
             .collect();
-        let all_muted = self.edit.muted.iter().all(|&m| m);
+        let all_muted = lanes.iter().all(|l| l.muted);
         let link_text = if all_muted { "unmute all" } else { "mute all" };
-        let link = (!info.tracks.is_empty()).then(|| {
+        let link = (!lanes.is_empty()).then(|| {
             let g = ui.painter().layout_no_wrap(link_text.into(), sans(12.0), p.t2);
             let r = Rect::from_min_size(pos2(rows.head.right() - g.size().x - 2.0, rows.head.center().y - 9.0), vec2(g.size().x + 2.0, 18.0));
             let resp = ui.interact(r, Id::unique("clip-mute-all"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
             resp.widget_info(|| WidgetInfo::labeled(Role::Link, true, link_text));
             (r, resp)
         });
-        let handle = |t: i64| Rect::from_center_size(pos2(x_of(t), rows.span.center().y), vec2(14.0, rows.span.height() + 8.0));
-        let (hs, he) = (handle(self.edit.range.start), handle(self.edit.range.end));
+        let add_w = ui.painter().layout_no_wrap(ADD_TEXT.into(), sans(12.0), p.t2).size().x;
+        let add_r = Rect::from_min_size(pos2(rows.add.left() + 8.0, rows.add.center().y - 9.0), vec2(add_w + 2.0, 18.0));
+        let add = ui
+            .interact(add_r, Id::unique("clip-add-track"), Sense::click())
+            .on_hover_cursor(CursorIcon::PointingHand)
+            .on_hover_text("a silent track, for editors and sites that expect a set number of tracks");
+        add.widget_info(|| WidgetInfo::labeled(Role::Button, true, ADD_TEXT));
         let start_tip = if pieces.is_some() {
             "drag to trim · snaps to keyframes so it saves instantly · ctrl + drag for an exact frame (the file then starts at the keyframe before it)"
         } else {
             "drag to trim · ctrl + drag: no snapping"
         };
-        let grip = |r: Rect, id: &str, tip: &str| {
-            visible(r.center().x).then(|| {
-                ui.interact(r, Id::unique(id), Sense::drag()).on_hover_cursor(CursorIcon::ResizeHorizontal).on_hover_text(tip)
+        let grip = |t: i64, id: &str, tip: &str| {
+            let x = x_of(t);
+            visible(x).then(|| {
+                (grips(&rows, x).into_iter().enumerate())
+                    .map(|(i, r)| {
+                        ui.interact(r, Id::unique((id, i)), Sense::drag())
+                            .on_hover_cursor(CursorIcon::ResizeHorizontal)
+                            .on_hover_text(tip)
+                    })
+                    .collect::<Vec<_>>()
             })
         };
-        let (start, end) = (grip(hs, "clip-in", start_tip), grip(he, "clip-out", "drag to trim · ctrl + drag: no snapping"));
+        let start = grip(self.edit.range.start, "clip-in", start_tip);
+        let end = grip(self.edit.range.end, "clip-out", "drag to trim · ctrl + drag: no snapping");
         let left = rows.bar.left() + rows.bar.width() * (v.start as f32 / dur as f32);
         let thumb = Rect::from_min_max(
             pos2(left, rows.bar.top()),
@@ -252,21 +329,46 @@ impl ClipApp {
             });
             self.selected = None;
         }
-        for (k, (_, r)) in chips.iter().enumerate() {
-            if r.clicked() {
-                self.set_muted(k, !self.edit.muted[k]);
+        for (k, chip) in chips.iter().enumerate() {
+            if chip.resp.clicked() {
+                self.set_muted(k, !lanes[k].muted);
+            }
+            if chip.resp.secondary_clicked() {
+                let at = chip.resp.interact_pointer_pos().unwrap_or(chip.rect.left_bottom());
+                self.lane_menu = Some((k, at, chip.rect));
+            }
+            if chip.more.clicked() {
+                let open = matches!(self.lane_menu, Some((j, ..)) if j == k);
+                self.lane_menu = (!open).then(|| (k, chip.dots.left_bottom() + vec2(0.0, 4.0), chip.dots));
+            }
+            if chip.resp.drag_started() && lanes.len() > 1 {
+                self.lane_drag = Some(k);
             }
         }
         if link.as_ref().is_some_and(|(_, r)| r.clicked()) {
             self.change(|e| {
-                e.muted.iter_mut().for_each(|m| *m = !all_muted);
+                e.lanes.iter_mut().for_each(|l| l.muted = !all_muted);
                 true
             });
             self.sync_gains();
         }
+        if add.clicked() {
+            self.change(|e| {
+                e.add_empty();
+                true
+            });
+        }
+        if let Some(from) = self.lane_drag
+            && !ui.input(|i| i.pointer.any_down())
+        {
+            self.lane_drag = None;
+            if let Some(at) = ui.input(|i| i.pointer.latest_pos()) {
+                self.change(|e| e.move_lane(from, lane_slot(&rows, at.y)));
+            }
+        }
 
         let head = self.pos;
-        let pressed = |r: &Option<egui::Response>| r.as_ref().is_some_and(|r| r.drag_started());
+        let pressed = |r: &Option<Vec<egui::Response>>| r.as_ref().is_some_and(|r| r.iter().any(|r| r.drag_started()));
         if pressed(&start) {
             self.drag = Some(Drag::Start { head });
             self.before_drag = Some(self.edit.clone());
@@ -339,10 +441,10 @@ impl ClipApp {
             ..WidgetInfo::labeled(role, true, label)
         };
         body.widget_info(|| timed(Role::Slider, "playhead", self.pos));
-        if let Some(r) = &start {
+        if let Some(r) = start.as_ref().and_then(|r| r.first()) {
             r.widget_info(|| timed(Role::Slider, "trim start", self.edit.range.start));
         }
-        if let Some(r) = &end {
+        if let Some(r) = end.as_ref().and_then(|r| r.first()) {
             r.widget_info(|| timed(Role::Slider, "trim end", self.edit.range.end));
         }
         for (i, r) in &markers {
@@ -396,25 +498,29 @@ impl ClipApp {
             }
         }
 
-        if !info.tracks.is_empty() {
-            painter.text(rows.head.left_center(), egui::Align2::LEFT_CENTER, "sound · muted tracks won't be in the file", sans(12.0), p.t3);
+        if !lanes.is_empty() {
+            painter.text(rows.head.left_center(), egui::Align2::LEFT_CENTER, HEADER, sans(12.0), p.t3);
         }
         let mut fades = Vec::with_capacity(rows.lanes.len());
         for (k, l) in rows.lanes.iter().enumerate() {
-            let muted = self.edit.muted[k];
-            let fade = 1.0 - 0.62 * ease(anim(ui, Id::unique(("clip-lane-fade", k)), muted, 0.3));
+            let fade = 1.0 - 0.62 * ease(anim(ui, Id::unique(("clip-lane-fade", k)), lanes[k].muted, 0.3));
             fades.push(fade);
             let clip = lane_clip(*l);
             clip.rect_filled(*l, 6, p.ctl.gamma_multiply(fade));
-            let peaks = &self.peaks[k];
-            if peaks.is_empty() {
+            let (x_start, stop) = (inner.left().max(x_of(0)), inner.right().min(x_of(dur)));
+            let Some(source) = lanes[k].source else {
+                let mut x = x_start;
+                while x < stop {
+                    clip.hline(x..=(x + 4.0).min(stop), l.center().y, Stroke::new(1.0, p.t3.gamma_multiply(fade)));
+                    x += 8.0;
+                }
                 continue;
-            }
-            let color = WAVES[k % WAVES.len()].gamma_multiply(0.75 * fade);
+            };
+            let Some(peaks) = self.peaks.get(source).filter(|v| !v.is_empty()) else { continue };
+            let color = WAVES[source % WAVES.len()].gamma_multiply(0.75 * fade);
             let mut mesh = Mesh::default();
             let (cy, room) = (l.center().y, l.height() * 0.8);
-            let mut x = inner.left().max(x_of(0));
-            let stop = inner.right().min(x_of(dur));
+            let mut x = x_start;
             while x < stop {
                 let (b0, b1) = ((t_raw(x).max(0) / BUCKET) as usize, (t_raw(x + 2.0).max(0) / BUCKET) as usize);
                 if b0 >= peaks.len() {
@@ -429,52 +535,76 @@ impl ClipApp {
         }
 
         let shade = Color32::from_black_alpha(if light { 70 } else { 158 });
-        let span_rect = |a: i64, b: i64| Rect::from_min_max(pos2(x_of(a), rows.span.top()), pos2(x_of(b), rows.span.bottom()));
-        let full_clip = lane_clip(Rect::from_min_max(pos2(area.left(), rows.span.top()), pos2(area.right(), rows.span.bottom())));
-        for s in self.edit.segments.iter().filter(|s| s.removed) {
-            let r = span_rect(s.start, s.end);
-            full_clip.rect_filled(r, 0, shade);
-            hatch(&full_clip, r, p.t3.gamma_multiply(0.6));
-        }
-        let (x0, x1) = (x_of(self.edit.range.start), x_of(self.edit.range.end));
-        full_clip.rect_filled(Rect::from_min_max(pos2(area.left(), rows.span.top()), pos2(x0, rows.span.bottom())), 0, shade);
-        full_clip.rect_filled(Rect::from_min_max(pos2(x1, rows.span.top()), pos2(area.right(), rows.span.bottom())), 0, shade);
-        if let Some(pieces) = &pieces {
-            for pc in pieces.iter().filter(|pc| pc.lead < pc.start) {
-                let r = span_rect(pc.lead, pc.start);
-                full_clip.rect_filled(r, 0, p.surf.gamma_multiply(0.35));
-                hatch(&full_clip, r, p.acc.gamma_multiply(0.5));
+        for band in &rows.bands {
+            let clip = lane_clip(Rect::from_min_max(pos2(area.left(), band.top()), pos2(area.right(), band.bottom())));
+            let span_rect = |a: i64, b: i64| Rect::from_min_max(pos2(x_of(a), band.top()), pos2(x_of(b), band.bottom()));
+            for s in self.edit.segments.iter().filter(|s| s.removed) {
+                let r = span_rect(s.start, s.end);
+                clip.rect_filled(r, 0, shade);
+                hatch(&clip, r, p.t3.gamma_multiply(0.6));
             }
-        }
-        if let Some(Selected::Segment(i)) = self.selected
-            && let Some(s) = self.edit.segments.get(i)
-        {
-            let r = span_rect(s.start, s.end).shrink2(vec2(1.5, 1.5));
-            full_clip.rect_stroke(r, 3, Stroke::new(2.0, p.t1), StrokeKind::Inside);
-        }
-        for t in self.edit.splits() {
-            let x = x_of(t);
-            if visible(x) {
-                full_clip.vline(x, rows.span.y_range(), Stroke::new(1.0, p.t2));
+            let (x0, x1) = (x_of(self.edit.range.start), x_of(self.edit.range.end));
+            clip.rect_filled(Rect::from_min_max(pos2(area.left(), band.top()), pos2(x0, band.bottom())), 0, shade);
+            clip.rect_filled(Rect::from_min_max(pos2(x1, band.top()), pos2(area.right(), band.bottom())), 0, shade);
+            if let Some(pieces) = &pieces {
+                for pc in pieces.iter().filter(|pc| pc.lead < pc.start) {
+                    let r = span_rect(pc.lead, pc.start);
+                    clip.rect_filled(r, 0, p.surf.gamma_multiply(0.35));
+                    hatch(&clip, r, p.acc.gamma_multiply(0.5));
+                }
+            }
+            if let Some(Selected::Segment(i)) = self.selected
+                && let Some(s) = self.edit.segments.get(i)
+            {
+                let r = span_rect(s.start, s.end).shrink2(vec2(1.5, 1.5));
+                clip.rect_stroke(r, 3, Stroke::new(2.0, p.t1), StrokeKind::Inside);
+            }
+            for t in self.edit.splits() {
+                let x = x_of(t);
+                if visible(x) {
+                    clip.vline(x, band.y_range(), Stroke::new(1.0, p.t2));
+                }
             }
         }
 
-        for (k, (chip, resp)) in chips.iter().enumerate() {
+        for (k, chip) in chips.iter().enumerate() {
             let fade = fades[k];
-            let muted = self.edit.muted[k];
+            let muted = lanes[k].muted;
             let clip = lane_clip(rows.lanes[k]);
-            clip.rect_filled(*chip, 5, p.ctl.gamma_multiply(0.85 * fade.max(0.6)));
-            let button = Rect::from_min_size(chip.min, vec2(chip.height(), chip.height()));
-            let h = anim(ui, resp.id.with("hov"), resp.hovered(), 0.12);
+            clip.rect_filled(chip.rect, 5, p.ctl.gamma_multiply(0.85 * fade.max(0.6)));
+            if self.lane_drag == Some(k) {
+                clip.rect_stroke(chip.rect, 5, Stroke::new(1.5, p.acc), StrokeKind::Inside);
+            }
+            let button = Rect::from_min_size(chip.rect.min, vec2(chip.rect.height(), chip.rect.height()));
+            let h = anim(ui, chip.resp.id.with("hov"), chip.resp.hovered(), 0.12);
             clip.rect_filled(button, 5, p.line2.gamma_multiply(h));
             speaker(&clip, button.center() - vec2(1.0, 0.0), p.t1.gamma_multiply(fade.max(0.7)), !muted);
-            let name = &info.tracks[k].name;
-            let g = clip.layout_no_wrap(name.clone(), medium(12.0), p.t1.gamma_multiply(fade.max(0.55)));
-            let at = pos2(button.right() + 6.0, chip.center().y - g.size().y / 2.0);
-            let nw = g.size().x;
-            clip.galley(at, g, p.t1);
+            let at = pos2(button.right() + 6.0, chip.rect.center().y);
+            let nw = if renaming == Some(k) {
+                RENAME_W
+            } else {
+                let g = clip.layout_no_wrap(lanes[k].name(&info.tracks).to_string(), medium(12.0), p.t1.gamma_multiply(fade.max(0.55)));
+                let nw = g.size().x;
+                clip.galley(at - vec2(0.0, g.size().y / 2.0), g, p.t1);
+                nw
+            };
             if muted {
-                clip.text(pos2(at.x + nw + 6.0, chip.center().y), egui::Align2::LEFT_CENTER, "· muted, not exported", sans(12.0), p.t3);
+                clip.text(pos2(at.x + nw + 6.0, at.y), egui::Align2::LEFT_CENTER, MUTED, sans(12.0), p.t3);
+            }
+            let open = matches!(self.lane_menu, Some((j, ..)) if j == k);
+            let hd = anim(ui, chip.more.id.with("hov"), chip.more.hovered() || open, 0.12);
+            clip.rect_filled(chip.dots, 5, p.line2.gamma_multiply(hd));
+            for dx in [-4.0, 0.0, 4.0] {
+                clip.circle_filled(chip.dots.center() + vec2(dx, 0.0), 1.3, mix(p.t3, p.t1, hd));
+            }
+        }
+        if let Some(from) = self.lane_drag
+            && let Some(at) = ui.input(|i| i.pointer.latest_pos())
+        {
+            let to = lane_slot(&rows, at.y);
+            if to != from {
+                let y = if to < from { rows.lanes[to].top() - GAP / 2.0 } else { rows.lanes[to].bottom() + GAP / 2.0 };
+                painter.hline(area.x_range(), y, Stroke::new(2.0, p.acc));
             }
         }
         if let Some((r, resp)) = &link {
@@ -488,6 +618,8 @@ impl ClipApp {
                 x += 3.0;
             }
         }
+        let h = anim(ui, add.id.with("hov"), add.hovered(), 0.12);
+        painter.text(add_r.left_center(), egui::Align2::LEFT_CENTER, ADD_TEXT, sans(12.0), mix(p.t3, p.t1, h));
 
         for (i, resp) in &markers {
             let x = x_of(self.edit.markers[*i]);
@@ -499,14 +631,16 @@ impl ClipApp {
             }
             painter.vline(x, rows.video.y_range(), Stroke::new(1.0, MARKER.gamma_multiply(0.45)));
         }
-        for (r, resp) in [(hs, &start), (he, &end)] {
+        for (t, resp) in [(self.edit.range.start, &start), (self.edit.range.end, &end)] {
             let Some(resp) = resp else { continue };
-            let h = ease(anim(ui, resp.id.with("hov"), resp.hovered() || resp.dragged(), 0.2));
-            let bar = Rect::from_center_size(r.center(), vec2(10.0, r.height() + 2.0 * h));
-            painter.rect_filled(bar.expand(3.0 + 3.0 * h), 4.0 + 3.0 * h, p.acc.gamma_multiply(0.15 + 0.07 * h));
-            painter.rect_filled(bar, 4, mix(p.acc, p.acch, h));
-            let c = bar.center();
-            painter.vline(c.x, c.y - 7.0..=c.y + 7.0, Stroke::new(1.5, p.on_acc.gamma_multiply(0.8)));
+            let lit = resp.iter().any(|r| r.hovered() || r.dragged());
+            let h = ease(anim(ui, resp[0].id.with("hov"), lit, 0.2));
+            let x = x_of(t);
+            for band in &rows.bands {
+                let bar = Rect::from_center_size(pos2(x, band.center().y), vec2(HANDLE_W + 2.0 * h, band.height()));
+                painter.rect_filled(bar.expand(2.0 + 2.0 * h), 3.0 + 2.0 * h, p.acc.gamma_multiply(0.15 + 0.07 * h));
+                painter.rect_filled(bar, 3, mix(p.acc, p.acch, h));
+            }
         }
         let x = x_of(self.pos);
         if visible(x) {
@@ -520,6 +654,99 @@ impl ClipApp {
             painter.rect_filled(rows.bar, CornerRadius::same(2), p.field);
             let lit = s.hovered() || matches!(self.drag, Some(Drag::Scroll { .. }));
             painter.rect_filled(thumb, CornerRadius::same(2), if lit { p.t3 } else { p.line3 });
+        }
+        self.rename_field(ui, look, &chips, &info);
+    }
+
+    fn rename_field(&mut self, ui: &mut Ui, look: &Look, chips: &[Chip], info: &Info) {
+        let Some((k, mut text)) = self.renaming.take() else { return };
+        let Some(chip) = chips.get(k) else { return };
+        let p = look.p;
+        let h = chip.rect.height();
+        let r = Rect::from_min_size(pos2(chip.rect.left() + h + 2.0, chip.rect.top() + 1.0), vec2(RENAME_W + 8.0, h - 2.0));
+        ui.painter().rect(r, 4, p.field, Stroke::new(1.0, p.acc), StrokeKind::Inside);
+        let edit = egui::TextEdit::singleline(&mut text)
+            .id(Id::unique(("clip-lane-name", k)))
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(4, 0)))
+            .font(medium(12.0))
+            .text_color(p.t1)
+            .align(egui::Align2::LEFT_CENTER)
+            .desired_width(r.width())
+            .min_size(r.size())
+            .char_limit(80);
+        let resp = ui.put(r, edit);
+        if resp.lost_focus() {
+            self.change(|e| e.rename(k, &text, &info.tracks));
+        } else {
+            if !resp.has_focus() {
+                resp.request_focus();
+            }
+            self.renaming = Some((k, text));
+        }
+    }
+
+    pub(super) fn lane_menu_popup(&mut self, ctx: &egui::Context, look: &Look) {
+        let Some((k, at, anchor)) = self.lane_menu else { return };
+        let n = self.edit.lanes.len();
+        let Some(tracks) = self.info().map(|i| i.tracks.clone()).filter(|_| k < n) else {
+            self.lane_menu = None;
+            return;
+        };
+        let p = look.p;
+        let items = [(LaneItem::Rename, true), (LaneItem::Up, k > 0), (LaneItem::Down, k + 1 < n), (LaneItem::Delete, true)];
+        let size = vec2(MENU_W, items.len() as f32 * ITEM_H + 8.0);
+        let screen = ctx.content_rect();
+        let y = if at.y + size.y > screen.bottom() - 4.0 { anchor.top() - 4.0 - size.y } else { at.y };
+        let rect = Rect::from_min_size(pos2(at.x.min(screen.right() - 4.0 - size.x), y), size);
+        let red = super::overlay::danger(self.light == Some(true));
+        let mut picked = None;
+        egui::Area::new(Id::unique("clip-lane-menu")).order(Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+            ui.painter().rect(rect, 8, p.surf, Stroke::new(1.0, p.line2), StrokeKind::Inside);
+            let mut y = rect.top() + 4.0;
+            for (i, (item, on)) in items.into_iter().enumerate() {
+                let r = Rect::from_min_size(pos2(rect.left() + 4.0, y), vec2(MENU_W - 8.0, ITEM_H));
+                let resp = ui.interact(r, Id::unique(("clip-lane-menu-item", i)), if on { Sense::click() } else { Sense::hover() });
+                let resp = if on { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp };
+                resp.widget_info(|| WidgetInfo::labeled(Role::MenuItem, on, item.label()));
+                let hov = anim(ui, resp.id.with("hov"), on && resp.hovered(), 0.1);
+                let painter = ui.painter();
+                painter.rect_filled(r, 5, p.ctlh.gamma_multiply(hov));
+                let color = match (item, on) {
+                    (_, false) => p.t3,
+                    (LaneItem::Delete, _) => red,
+                    _ => mix(p.t2, p.t1, hov),
+                };
+                painter.text(pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, item.label(), sans(13.0), color);
+                if on && resp.clicked() {
+                    picked = Some(item);
+                }
+                y += ITEM_H;
+            }
+        });
+        let outside = ctx.input(|i| {
+            i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|at| !rect.contains(at) && !anchor.contains(at))
+        });
+        if outside {
+            self.lane_menu = None;
+        }
+        let Some(item) = picked else { return };
+        self.lane_menu = None;
+        match item {
+            LaneItem::Rename => {
+                let name = self.edit.lanes[k].name(&tracks).to_string();
+                self.renaming = Some((k, name));
+            }
+            LaneItem::Up => {
+                self.change(|e| e.move_lane(k, k - 1));
+            }
+            LaneItem::Down => {
+                self.change(|e| e.move_lane(k, k + 1));
+            }
+            LaneItem::Delete => {
+                self.renaming = None;
+                self.change(|e| e.delete_lane(k));
+                self.sync_gains();
+            }
         }
     }
 }
@@ -556,15 +783,43 @@ mod tests {
 
     #[test]
     fn lanes_shrink_to_fit_and_every_track_gets_one() {
-        assert_eq!(height(0, 34.0), TOP + VIDEO_H + SCROLL_H);
-        assert_eq!(height(3, 34.0), TOP + VIDEO_H + GAP + HEAD_H + GAP + 3.0 * 40.0 - GAP + SCROLL_H);
+        let add = GAP + ADD_H;
+        assert_eq!(height(0, 34.0), TOP + VIDEO_H + add + SCROLL_H);
+        assert_eq!(height(3, 34.0), TOP + VIDEO_H + GAP + HEAD_H + GAP + 3.0 * 40.0 - GAP + add + SCROLL_H);
         assert_eq!(lane_height(3, 1000.0), LANE_MAX);
         assert_eq!(lane_height(8, 100.0), LANE_MIN);
-        let fit = lane_height(3, 200.0);
-        assert!((height(3, fit) - 200.0).abs() < 0.01 && fit < LANE_MAX && fit > LANE_MIN, "{fit}");
+        let fit = lane_height(3, 230.0);
+        assert!((height(3, fit) - 230.0).abs() < 0.01 && fit < LANE_MAX && fit > LANE_MIN, "{fit}");
         let r = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(2, 30.0))), 2, 30.0);
         assert_eq!(r.lanes.len(), 2);
         assert_eq!(r.span.bottom(), r.lanes[1].bottom());
+        assert!(r.add.top() > r.span.bottom() && r.bar.top() > r.add.bottom());
         assert!(r.bar.bottom() <= height(2, 30.0));
+    }
+
+    #[test]
+    fn trim_grips_cover_the_video_and_the_sound_lanes_but_never_the_header() {
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0)));
+        let r = rows(area, 3, 30.0);
+        for x in [6.0, 400.0, 794.0] {
+            let g = grips(&r, x);
+            assert_eq!(g.len(), 2);
+            assert!(g.iter().all(|g| !g.intersects(r.head) && g.width() == HANDLE_HIT), "{g:?} vs {:?}", r.head);
+            assert!(g[0].contains(pos2(x, r.video.top())) && g[0].contains(pos2(x, r.video.bottom())));
+            assert!(g[1].contains(pos2(x, r.lanes[0].top())) && g[1].contains(pos2(x, r.lanes[2].bottom())));
+        }
+        let silent = rows(area, 0, 30.0);
+        assert_eq!(grips(&silent, 400.0).len(), 1);
+    }
+
+    #[test]
+    fn a_dragged_lane_lands_in_the_slot_under_the_pointer() {
+        let r = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0))), 3, 30.0);
+        assert_eq!(lane_slot(&r, r.head.top()), 0);
+        assert_eq!(lane_slot(&r, r.lanes[0].center().y), 0);
+        assert_eq!(lane_slot(&r, r.lanes[1].top() - 1.0), 1);
+        assert_eq!(lane_slot(&r, r.lanes[1].center().y), 1);
+        assert_eq!(lane_slot(&r, r.lanes[2].bottom() + 50.0), 2);
+        assert_eq!(lane_slot(&rows(r.span, 0, 30.0), 10.0), 0);
     }
 }

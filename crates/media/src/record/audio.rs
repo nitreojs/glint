@@ -1,11 +1,10 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Sender};
-use std::time::{Duration, Instant};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use glint_core::config::audio::{AudioSource, SourceKind, app_name};
 use glint_core::log::log;
-use glint_core::record::mix::{Format, HNS, Mix, Placement, RATE, Sample, frames_to_hns, hns_to_frames, mix_tracks};
-use glint_core::record::tracks::{Track, plan};
+use glint_core::record::mix::{Format, HNS, Mix, Placement, RATE, Sample, hns_to_frames};
+use glint_core::record::pipeline::AudioInput;
 use windows::Win32::Devices::FunctionDiscovery::{PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName};
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::*;
@@ -16,12 +15,10 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
 use windows::core::{HSTRING, Interface, Ref, implement};
 
+use super::Ctx;
 use super::apps::{Proc, processes, roots};
-use super::{Ctx, Msg, hns, qpc};
 
-const LATENCY: i64 = HNS / 10;
 const BUFFER: i64 = HNS / 2;
-const RESCAN: Duration = Duration::from_secs(1);
 const ACTIVATE_TIMEOUT: Duration = Duration::from_secs(2);
 const WAVE_FORMAT_PCM: u16 = 1;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
@@ -42,46 +39,27 @@ enum Target {
 }
 
 pub(super) struct Source {
-    pub name: String,
-    pub gain: f32,
+    name: String,
+    gain: f32,
     target: Target,
     clients: Vec<Client>,
     mix: Mix,
+    scratch: Vec<f32>,
     seen_app: bool,
     failed: Vec<u32>,
     live: bool,
 }
 
-pub(super) struct Opened {
-    pub sources: Vec<Source>,
-    pub tracks: Vec<Track>,
-    pub issues: Vec<String>,
-}
-
-pub(super) unsafe fn open_all(cfg: &[AudioSource], track_names: &[String]) -> Opened {
-    let (mut sources, mut opened, mut issues) = (Vec::new(), Vec::new(), Vec::new());
-    for c in cfg.iter().filter(|c| c.enabled && c.records()) {
-        match unsafe { open(c) } {
-            Ok(s) => {
-                sources.push(s);
-                opened.push(c);
-            }
-            Err(e) => {
-                log(&format!("audio: {e}"));
-                issues.push(e);
-            }
-        }
-    }
-    let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();
-    Opened { tracks: plan(&names, &opened, track_names), sources, issues }
-}
+// wasapi objects are free-threaded; after the move only the audio thread touches them.
+unsafe impl Send for Source {}
 
 unsafe fn open(cfg: &AudioSource) -> Result<Source, String> {
     unsafe {
         let gain = cfg.volume as f32 / 100.0;
         let source = |name: String, target, clients: Vec<Client>| {
             let seen_app = !clients.is_empty();
-            Source { name, gain, target, clients, mix: Mix::default(), seen_app, failed: Vec::new(), live: true }
+            let (mix, scratch, failed) = (Mix::default(), Vec::new(), Vec::new());
+            Source { name, gain, target, clients, mix, scratch, seen_app, failed, live: true }
         };
         match cfg.kind {
             SourceKind::Desktop if !app_name(&cfg.exclude).is_empty() => {
@@ -276,14 +254,14 @@ impl Client {
 }
 
 impl Source {
-    unsafe fn read(&mut self, origin: i64, scratch: &mut Vec<f32>, issues: &mut Vec<String>) {
+    unsafe fn drain(&mut self, origin: i64, issues: &mut Vec<String>) {
         if !self.live {
             return;
         }
         let mut i = 0;
         while i < self.clients.len() {
             let c = &mut self.clients[i];
-            let Err(e) = (unsafe { c.read(origin, &mut self.mix, scratch) }) else {
+            let Err(e) = (unsafe { c.read(origin, &mut self.mix, &mut self.scratch) }) else {
                 i += 1;
                 continue;
             };
@@ -298,7 +276,7 @@ impl Source {
         }
     }
 
-    unsafe fn rescan(&mut self, procs: &[Proc], origin: i64, scratch: &mut Vec<f32>) {
+    unsafe fn follow(&mut self, procs: &[Proc], origin: i64) {
         if !self.live {
             return;
         }
@@ -336,7 +314,7 @@ impl Source {
                         Ok(c) if c.client.Start().is_ok() => {
                             log(&format!("audio: {exe} started (pid {pid}), leaving it out of desktop audio"));
                             for mut old in std::mem::take(&mut self.clients) {
-                                let _ = old.read(origin, &mut self.mix, scratch);
+                                let _ = old.read(origin, &mut self.mix, &mut self.scratch);
                                 let _ = old.client.Stop();
                             }
                             self.clients.push(c);
@@ -356,61 +334,56 @@ impl Source {
     }
 }
 
-pub(super) unsafe fn run(mut sources: Vec<Source>, tracks: &[Vec<usize>], stop: &AtomicBool, tx: &Sender<Msg>) -> Vec<String> {
-    unsafe {
-        let mut issues = Vec::new();
-        for s in &mut sources {
-            s.clients.retain(|c| match c.client.Start() {
-                Ok(()) => true,
-                Err(e) => {
-                    issues.push(format!("{} failed to start: {}", s.name, e.message()));
-                    false
-                }
-            });
+impl AudioInput for Source {
+    fn open(config: &AudioSource) -> Result<Self, String> {
+        unsafe { open(config) }
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn gain(&self) -> f32 {
+        self.gain
+    }
+
+    fn watches(&self) -> bool {
+        !matches!(self.target, Target::Endpoint)
+    }
+
+    fn start(&mut self, issues: &mut Vec<String>) {
+        let name = &self.name;
+        self.clients.retain(|c| match unsafe { c.client.Start() } {
+            Ok(()) => true,
+            Err(e) => {
+                issues.push(format!("{name} failed to start: {}", e.message()));
+                false
+            }
+        });
+    }
+
+    fn read(&mut self, origin: i64, issues: &mut Vec<String>) {
+        unsafe { self.drain(origin, issues) }
+    }
+
+    fn rescan(sources: &mut [Self], origin: i64) {
+        let procs = processes();
+        for s in sources {
+            unsafe { s.follow(&procs, origin) };
         }
-        let gains: Vec<f32> = sources.iter().map(|s| s.gain).collect();
-        let watch = sources.iter().any(|s| !matches!(s.target, Target::Endpoint));
-        let origin = hns(qpc());
-        let mut sent = 0;
-        let mut scratch = Vec::new();
-        let mut scanned = Instant::now();
-        loop {
-            let stopping = stop.load(Ordering::SeqCst);
-            for s in &mut sources {
-                s.read(origin, &mut scratch, &mut issues);
-            }
-            if watch && !stopping && scanned.elapsed() >= RESCAN {
-                scanned = Instant::now();
-                let procs = processes();
-                for s in &mut sources {
-                    s.rescan(&procs, origin, &mut scratch);
-                }
-            }
-            let behind = if stopping { 0 } else { LATENCY };
-            let upto = hns_to_frames(hns(qpc()) - origin - behind);
-            if upto > sent {
-                let start = origin + frames_to_hns(sent);
-                let bufs: Vec<Vec<f32>> = sources.iter_mut().map(|s| s.mix.take(upto)).collect();
-                sent = upto;
-                if tx.send(Msg::Audio { start, tracks: mix_tracks(&bufs, &gains, tracks) }).is_err() {
-                    break;
-                }
-            }
-            if stopping {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
+    }
+
+    fn take(&mut self, upto: i64) -> Vec<f32> {
+        self.mix.take(upto)
+    }
+
+    fn finish(&mut self, issues: &mut Vec<String>) {
+        for c in &self.clients {
+            let _ = unsafe { c.client.Stop() };
         }
-        for s in &sources {
-            for c in &s.clients {
-                let _ = c.client.Stop();
-            }
-            if !s.seen_app {
-                issues.push(format!("{} wasn't running, its track is silent", s.name));
-            }
+        if !self.seen_app {
+            issues.push(format!("{} wasn't running, its track is silent", self.name));
         }
-        let _ = tx.send(Msg::AudioEnd);
-        issues
     }
 }
 

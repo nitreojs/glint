@@ -1,5 +1,6 @@
 use std::time::Instant;
 
+use glint_core::geom::outline::{inward, outer};
 use glint_core::geom::rect::Rect;
 use glint_core::log::log;
 use glint_media::rect::WinRect;
@@ -36,8 +37,9 @@ impl State {
                 let _ = DeleteObject(r.into());
             };
             // Pixels that switch between dimmed and bright, and every ring.
-            let [a, a_white, a_black] = regions(&old.0, old.1);
-            let [b, b_white, b_black] = regions(&self.lit, self.sel);
+            let monitors = self.monitors();
+            let [a, a_white, a_black] = regions(&old.0, old.1, &monitors);
+            let [b, b_white, b_black] = regions(&self.lit, self.sel, &monitors);
             add(combine(a, b, RGN_XOR));
             for r in [a, b] {
                 let _ = DeleteObject(r.into());
@@ -70,6 +72,7 @@ impl State {
 
     /// Every pixel is written exactly once per paint, so nothing flickers.
     pub(super) unsafe fn paint(&mut self) {
+        let monitors = self.monitors();
         if let Screen::Live(live) = &mut self.screen {
             unsafe {
                 let mut ps = PAINTSTRUCT::default();
@@ -78,50 +81,93 @@ impl State {
                 FillRect(hdc, &ps.rcPaint, self.black);
                 let _ = EndPaint(self.hwnd, &ps);
             }
-            return live.sync(&self.lit, self.sel, self.label.as_ref(), &self.painter, &self.font);
+            return live.sync(&self.lit, self.sel, self.label.as_ref(), &monitors, &self.painter, &self.font);
         }
         // Rendering can change what the editor covers (a tooltip appears): paint that too.
         if let (Some(ed), Screen::Frozen(f)) = (self.edit.as_mut(), &self.screen) {
-            match ed.render(&f.bright, &self.painter, &self.font) {
+            let moved = if self.region {
+                Ok(ed.render_chrome(&self.painter, &self.font))
+            } else {
+                ed.render(&f.bright, &self.painter, &self.font)
+            };
+            match moved {
                 Ok(moved) => self.invalidate(&moved),
                 Err(e) => log(&format!("editor render failed: {e}")),
             }
         }
-        let Screen::Frozen(f) = &self.screen else { return };
+        let f = match (&self.flat, &self.screen) {
+            (Some(flat), _) => flat,
+            (None, Screen::Frozen(f)) => f,
+            (None, Screen::Live(_)) => return,
+        };
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(self.hwnd, &mut ps);
             self.last_paint.set(Instant::now());
             let rp = Rect::from_win(&ps.rcPaint);
             let label = self.label.as_ref();
+            // Draw-first's region tool: the toolbar and its pills stay over the picker.
+            let chrome: Vec<Rect> = match &self.edit {
+                Some(ed) if self.region => ed.chrome().into_iter().filter_map(|c| c.intersect(&rp)).collect(),
+                _ => Vec::new(),
+            };
 
-            if let Some(ed) = self.edit.as_mut() {
-                // Dimmed screen around everything else.
-                let saved = SaveDC(hdc);
-                let mut holes = ed.extent();
-                holes.extend(label.map(|l| l.rect));
-                for h in &holes {
-                    ExcludeClipRect(hdc, h.x, h.y, h.right(), h.bottom());
-                }
-                let _ = BitBlt(hdc, rp.x, rp.y, rp.w, rp.h, Some(f.dim.dc), rp.x, rp.y, SRCCOPY);
-                let _ = RestoreDC(hdc, saved);
+            match self.edit.as_mut() {
+                Some(ed) if !self.region => {
+                    // Dimmed screen around everything else.
+                    let saved = SaveDC(hdc);
+                    let mut holes = ed.extent();
+                    holes.extend(label.map(|l| l.rect));
+                    for h in &holes {
+                        ExcludeClipRect(hdc, h.x, h.y, h.right(), h.bottom());
+                    }
+                    let _ = BitBlt(hdc, rp.x, rp.y, rp.w, rp.h, Some(f.dim.dc), rp.x, rp.y, SRCCOPY);
+                    let _ = RestoreDC(hdc, saved);
 
-                let saved = SaveDC(hdc);
-                if let Some(l) = label {
-                    ExcludeClipRect(hdc, l.rect.x, l.rect.y, l.rect.right(), l.rect.bottom());
+                    let saved = SaveDC(hdc);
+                    if let Some(l) = label {
+                        ExcludeClipRect(hdc, l.rect.x, l.rect.y, l.rect.right(), l.rect.bottom());
+                    }
+                    if let Err(e) = ed.paint(hdc, rp, &f.dim, &self.painter, &self.font) {
+                        log(&format!("editor paint failed: {e}"));
+                    }
+                    let _ = RestoreDC(hdc, saved);
                 }
-                if let Err(e) = ed.paint(hdc, rp, &f.dim, &self.painter, &self.font) {
-                    log(&format!("editor paint failed: {e}"));
+                _ => {
+                    let brushes = [self.white, self.black];
+                    let mut holes = chrome.clone();
+                    holes.extend(label.map(|l| l.rect));
+                    paint_pick(hdc, rp, (0, 0), f, &self.lit, self.sel, &holes, &monitors, brushes);
+                    if let Some(ed) = &self.edit {
+                        for &c in &chrome {
+                            // composed off-screen so each pixel is written once
+                            let Ok(back) = Dib::new(c.w, c.h) else { continue };
+                            paint_pick(back.dc, c, (c.x, c.y), f, &self.lit, self.sel, &[], &monitors, brushes);
+                            if let Some(l) = label.filter(|l| l.rect.intersect(&c).is_some())
+                                && let Some(dib) = &l.dib
+                            {
+                                let r = l.rect.offset(-c.x, -c.y);
+                                let _ = BitBlt(back.dc, r.x, r.y, r.w, r.h, Some(dib.dc), 0, 0, SRCCOPY);
+                            }
+                            if let Err(e) = ed.draw_chrome(back.dc, c, c, &self.painter, &self.font) {
+                                log(&format!("toolbar paint failed: {e}"));
+                            }
+                            let _ = GdiFlush();
+                            let _ = BitBlt(hdc, c.x, c.y, c.w, c.h, Some(back.dc), 0, 0, SRCCOPY);
+                        }
+                    }
                 }
-                let _ = RestoreDC(hdc, saved);
-            } else {
-                paint_pick(hdc, rp, f, &self.lit, self.sel, label.map(|l| l.rect), [self.white, self.black]);
             }
             if let Some(l) = label
                 && let Some(dib) = &l.dib
             {
                 let r = l.rect;
+                let saved = SaveDC(hdc);
+                for c in &chrome {
+                    ExcludeClipRect(hdc, c.x, c.y, c.right(), c.bottom());
+                }
                 let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(dib.dc), 0, 0, SRCCOPY);
+                let _ = RestoreDC(hdc, saved);
             }
             let _ = EndPaint(self.hwnd, &ps);
         }
@@ -132,8 +178,8 @@ impl State {
 fn union(rects: &[Rect], by: i32) -> HRGN {
     unsafe {
         let all = CreateRectRgn(0, 0, 0, 0);
-        for r in rects {
-            let one = rgn(r.inflate(by));
+        for r in rects.iter().map(|r| r.inflate(by)).filter(|r| r.w > 0 && r.h > 0) {
+            let one = rgn(r);
             CombineRgn(Some(all), Some(all), Some(one), RGN_OR);
             let _ = DeleteObject(one.into());
         }
@@ -150,11 +196,14 @@ fn combine(a: HRGN, b: HRGN, mode: RGN_COMBINE_MODE) -> HRGN {
 }
 
 /// What's bright, in the 1 px white ring and in the 1 px black ring around it. Overlapping
-/// chosen rects share one outline; the selection's ring stays whole over them.
-fn regions(chosen: &[Rect], sel: Option<Rect>) -> [HRGN; 3] {
-    let sel: Vec<Rect> = sel.into_iter().collect();
-    let s = [union(&sel, 0), union(&sel, 1), union(&sel, RING)];
-    let c = [union(chosen, 0), union(chosen, 1), union(chosen, RING)];
+/// chosen rects share one outline; the selection's ring stays whole over them. Rings go around
+/// the rects, or just inside them on sides at the edge of their `monitors`.
+fn regions(chosen: &[Rect], sel: Option<Rect>, monitors: &[Rect]) -> [HRGN; 3] {
+    let outline = |r: &Rect| outer(*r, inward(*r, monitors, RING), RING);
+    let sel: Vec<Rect> = sel.iter().map(outline).collect();
+    let chosen: Vec<Rect> = chosen.iter().map(outline).collect();
+    let s = [union(&sel, -RING), union(&sel, 1 - RING), union(&sel, 0)];
+    let c = [union(&chosen, -RING), union(&chosen, 1 - RING), union(&chosen, 0)];
     let bright = combine(c[0], s[2], RGN_DIFF);
     unsafe {
         CombineRgn(Some(bright), Some(bright), Some(s[0]), RGN_OR);
@@ -179,33 +228,40 @@ fn regions(chosen: &[Rect], sel: Option<Rect>) -> [HRGN; 3] {
 }
 
 /// Pick mode: the lit rects and the selection bright inside their rings, dimmed screen elsewhere,
-/// the label's pixels left out.
+/// `holes` left out. Draws client `rp` at `rp - org` on `hdc`.
+#[allow(clippy::too_many_arguments)]
 unsafe fn paint_pick(
     hdc: HDC,
     rp: Rect,
+    org: (i32, i32),
     f: &Frozen,
     chosen: &[Rect],
     sel: Option<Rect>,
-    label: Option<Rect>,
+    holes: &[Rect],
+    monitors: &[Rect],
     brushes: [HBRUSH; 2],
 ) {
     unsafe {
         let free = rgn(rp);
-        if let Some(l) = label {
-            let l = rgn(l);
-            CombineRgn(Some(free), Some(free), Some(l), RGN_DIFF);
-            let _ = DeleteObject(l.into());
+        for &h in holes {
+            let h = rgn(h);
+            CombineRgn(Some(free), Some(free), Some(h), RGN_DIFF);
+            let _ = DeleteObject(h.into());
         }
-        let [bright, white, black] = regions(chosen, sel);
+        let [bright, white, black] = regions(chosen, sel, monitors);
         let dim = combine(free, bright, RGN_DIFF);
         for r in [white, black] {
             CombineRgn(Some(dim), Some(dim), Some(r), RGN_DIFF);
         }
-        layer(hdc, rp, dim, &f.dim, f.hints.iter().map(|h| &h.0));
-        CombineRgn(Some(bright), Some(bright), Some(free), RGN_AND);
-        layer(hdc, rp, bright, &f.bright, f.hints.iter().map(|h| &h.1));
+        for r in [bright, white, black] {
+            CombineRgn(Some(r), Some(r), Some(free), RGN_AND);
+        }
+        for r in [dim, bright, white, black] {
+            OffsetRgn(r, -org.0, -org.1);
+        }
+        layer(hdc, rp, org, dim, &f.dim, f.hints.iter().map(|h| &h.0));
+        layer(hdc, rp, org, bright, &f.bright, f.hints.iter().map(|h| &h.1));
         for (ring, brush) in [white, black].into_iter().zip(brushes) {
-            CombineRgn(Some(ring), Some(ring), Some(free), RGN_AND);
             let _ = FillRgn(hdc, ring, brush);
         }
         for r in [free, dim, bright, white, black] {
@@ -214,24 +270,33 @@ unsafe fn paint_pick(
     }
 }
 
-/// Draws `base` inside `clip`, with the pills over it, writing each pixel once.
-unsafe fn layer<'a>(hdc: HDC, rp: Rect, clip: HRGN, base: &Dib, pills: impl Iterator<Item = &'a Pill> + Clone) {
+/// Draws `base` inside `clip` (device coordinates, client minus `org`), with the pills over it,
+/// writing each pixel once.
+unsafe fn layer<'a>(
+    hdc: HDC,
+    rp: Rect,
+    org: (i32, i32),
+    clip: HRGN,
+    base: &Dib,
+    pills: impl Iterator<Item = &'a Pill> + Clone,
+) {
     unsafe {
         let rest = combine(clip, clip, RGN_COPY);
         for p in pills.clone() {
-            let r = rgn(p.rect);
+            let r = rgn(p.rect.offset(-org.0, -org.1));
             CombineRgn(Some(rest), Some(rest), Some(r), RGN_DIFF);
             let _ = DeleteObject(r.into());
         }
         SelectClipRgn(hdc, Some(rest));
-        let _ = BitBlt(hdc, rp.x, rp.y, rp.w, rp.h, Some(base.dc), rp.x, rp.y, SRCCOPY);
+        let _ = BitBlt(hdc, rp.x - org.0, rp.y - org.1, rp.w, rp.h, Some(base.dc), rp.x, rp.y, SRCCOPY);
         let _ = DeleteObject(rest.into());
         for p in pills {
             let Some(dib) = &p.dib else { continue };
-            let r = rgn(p.rect);
+            let at = p.rect.offset(-org.0, -org.1);
+            let r = rgn(at);
             CombineRgn(Some(r), Some(r), Some(clip), RGN_AND);
             SelectClipRgn(hdc, Some(r));
-            let _ = BitBlt(hdc, p.rect.x, p.rect.y, p.rect.w, p.rect.h, Some(dib.dc), 0, 0, SRCCOPY);
+            let _ = BitBlt(hdc, at.x, at.y, at.w, at.h, Some(dib.dc), 0, 0, SRCCOPY);
             let _ = DeleteObject(r.into());
         }
         SelectClipRgn(hdc, None);

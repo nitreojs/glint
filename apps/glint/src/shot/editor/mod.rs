@@ -1,14 +1,17 @@
 //! Screenshot markup on the frozen picker. Once a region is picked, a toolbar appears next to
 //! it: pen, highlighter, arrow, rectangle, blur, pixelate, smart eraser, text and step markers,
 //! five colours, three sizes, undo and redo, and copy / save / upload / pin / done / cancel. The
-//! selection keeps handles for resizing and can be dragged while no tool is active. In canvas mode
-//! ([`Editor::canvas`]) there is no selection until one is picked: the whole screen is drawable and
-//! the toolbar shows at the mouse on right-click or while Tab is held.
+//! selection keeps handles for resizing (Ctrl moves it instead) and can be dragged while no tool
+//! is active. In canvas mode ([`Editor::canvas`]) there is no selection until one is picked: the
+//! toolbar is docked at the top of the monitor under the mouse (right-click or Tab brings it to
+//! the mouse), the whole screen is drawable, and with no drawing tool the region tool is on: the
+//! picker picks, and the picked region is the finished shot (or, with Shift, opens in here).
 //!
 //! Marks live in screen (client) coordinates, so resizing or moving the selection reframes
 //! the shot instead of dragging the marks along. Blur and pixelate hide what's on screen, so
 //! they always sit under the drawn shapes. Area tools (rectangle, blur, pixelate, eraser)
 //! highlight the window, client area or UI element under the mouse; a click covers it.
+//! Right-click deletes a mark, or cancels the drag in progress.
 
 use std::time::{Duration, Instant};
 
@@ -16,7 +19,7 @@ use glint_core::geom::rect::Rect;
 use glint_core::geom::snap;
 use glint_media::rect::WinRect;
 use windows::Win32::Foundation::RECT;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetDoubleClickTime, GetKeyState, VK_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IDC_CROSS, IDC_HAND, IDC_IBEAM, IDC_SIZEALL, IDC_SIZENESW, IDC_SIZENS, IDC_SIZENWSE, IDC_SIZEWE,
 };
@@ -40,7 +43,7 @@ use typing::Typing;
 const NOTICE: Duration = Duration::from_millis(1200);
 const WHEEL_GROUP: Duration = Duration::from_secs(1);
 const WHEEL_DELTA: i32 = 120;
-const HINT: &str = "right-click for tools";
+const HINT: &str = "drag and release to capture   ·   draw first or hold Shift to edit";
 const HINT_SHOW: Duration = Duration::from_millis(2000);
 const HINT_FADE: Duration = Duration::from_millis(300);
 const FADE_FRAME: Duration = Duration::from_millis(16);
@@ -63,8 +66,6 @@ pub(crate) enum Event {
     Repaint,
     Finish(Output),
     Cancel,
-    /// Canvas mode's region tool: pick (or re-pick) the shot's region.
-    PickRegion,
 }
 
 fn edge_cursor(e: Edges) -> PCWSTR {
@@ -101,7 +102,8 @@ enum Drag {
     Mark { mark: Mark, anchor: (i32, i32), press: (i32, i32), click: Option<Rect> },
     Edit { index: usize, grip: Option<Grip>, grab: (i32, i32), from: Mark },
     Move { grab: (i32, i32), from: Rect },
-    Resize { edges: Edges, grab: (i32, i32), from: Rect },
+    /// `from` and `grab` move along while Ctrl moves the selection; `start` is the selection before.
+    Resize { edges: Edges, grab: (i32, i32), from: Rect, start: Rect },
     /// A toolbar button is held; it fires on release over the same button.
     Bar(Item),
 }
@@ -143,13 +145,16 @@ pub(crate) struct Editor {
     cutout: Option<Vec<Rect>>,
     /// False in canvas mode until a region is picked.
     selected: bool,
-    /// The toolbar has the region tool (canvas mode).
+    /// Canvas mode: the toolbar has the region tool, which is on while no drawing tool is.
     region: bool,
     /// Last mouse position; with no selection, the shot is the monitor under it.
     mouse: (i32, i32),
     monitors: Vec<Rect>,
-    /// Edges the selection snaps to while it's moved or resized (Ctrl held: no snapping).
+    /// Edges the selection snaps to while it's moved or resized (Alt held: no snapping).
     snap: snap::Edges,
+    /// Ctrl and Alt are held, as of the last mouse or key message.
+    ctrl: bool,
+    alt: bool,
     area: Rect,
     bar_monitor: Rect,
     marks: Vec<Mark>,
@@ -184,6 +189,7 @@ pub(crate) struct Editor {
     cells: Vec<(Item, Rect)>,
     pub bar: Rect,
     pill: Option<(Rect, Item, String)>,
+    /// Canvas mode: the toolbar is at the mouse instead of docked at the top of its monitor.
     summoned: bool,
     hint: Option<(Instant, Option<Rect>)>,
     windows: Vec<(Rect, Option<Rect>)>,
@@ -223,6 +229,8 @@ impl Editor {
             mouse,
             monitors,
             snap: snap::Edges::default(),
+            ctrl: false,
+            alt: false,
             area,
             bar_monitor: area,
             marks: Vec::new(),
@@ -262,7 +270,7 @@ impl Editor {
     }
 
     /// Canvas mode picked a region: from now on it behaves like select-first, keeping the marks.
-    pub(crate) fn set_selection(&mut self, sel: Rect, cutout: Option<Vec<Rect>>) {
+    fn set_selection(&mut self, sel: Rect, cutout: Option<Vec<Rect>>) {
         self.commit();
         self.sel = sel;
         self.cutout = cutout;
@@ -274,9 +282,25 @@ impl Editor {
         self.touch();
     }
 
+    /// Canvas mode with no drawing tool: the region tool is on, and the picker picks.
+    pub(crate) fn picks_region(&self) -> bool {
+        self.region && !self.selected && self.tool.is_none()
+    }
+
+    /// The region tool picked `sel`: that's the shot, finished, unless `edit` opens it in here.
+    pub(crate) fn region_picked(&mut self, sel: Rect, cutout: Option<Vec<Rect>>, edit: bool) -> Event {
+        self.set_selection(sel, cutout);
+        if edit { Event::Repaint } else { Event::Finish(Output::Default) }
+    }
+
     /// What the selection snaps to (client coordinates).
-    pub(crate) fn set_snap(&mut self, rects: Vec<Rect>) {
-        self.snap = snap::edges(&rects);
+    pub(crate) fn set_snap(&mut self, edges: snap::Edges) {
+        self.snap = edges;
+    }
+
+    /// Ctrl moves the selection instead of resizing it; Alt stops snapping.
+    pub(crate) fn set_mods(&mut self, ctrl: bool, alt: bool) {
+        (self.ctrl, self.alt) = (ctrl, alt);
     }
 
     pub(crate) fn set_windows(&mut self, windows: Vec<(Rect, Option<Rect>)>) {
@@ -303,12 +327,18 @@ impl Editor {
         Event::Repaint
     }
 
-    pub(crate) fn has_selection(&self) -> bool {
-        self.selected
+    /// The marks changed since `before` was taken: anything drawn from them is stale.
+    pub(crate) fn marks_changed(&self, before: &Frame) -> bool {
+        self.rev != before.rev
     }
 
-    fn bar_shown(&self) -> bool {
-        self.selected || self.summoned
+    pub(crate) fn has_marks(&self) -> bool {
+        !self.marks.is_empty()
+    }
+
+    /// A press is in progress (in canvas mode's region tool, only ever on the toolbar).
+    pub(crate) fn dragging(&self) -> bool {
+        self.drag.is_some()
     }
 
     /// What the finished shot covers: the selection, or with none the monitor under the mouse.
@@ -332,8 +362,9 @@ impl Editor {
         self.sel.inflate(self.px(8.0) as i32)
     }
 
-    fn chrome(&self) -> Vec<Rect> {
-        let mut v: Vec<Rect> = self.bar_shown().then_some(self.bar).into_iter().collect();
+    /// The toolbar and the pills over everything else.
+    pub(crate) fn chrome(&self) -> Vec<Rect> {
+        let mut v = vec![self.bar];
         v.extend(self.pill.as_ref().map(|p| p.0));
         v.extend(self.hint.and_then(|(_, r)| r));
         v
@@ -474,13 +505,11 @@ impl Editor {
     }
 
     fn hit(&self, p: (i32, i32)) -> Hit {
-        if self.bar_shown() {
-            if let Some((item, _)) = self.cells.iter().find(|(_, r)| r.contains(p.0, p.1)) {
-                return Hit::Bar(*item);
-            }
-            if self.bar.contains(p.0, p.1) {
-                return Hit::Outside; // the bar's padding
-            }
+        if let Some((item, _)) = self.cells.iter().find(|(_, r)| r.contains(p.0, p.1)) {
+            return Hit::Bar(*item);
+        }
+        if self.bar.contains(p.0, p.1) {
+            return Hit::Outside; // the bar's padding
         }
         if let Some(t) = &self.typing
             && self.outline(&self.marks[t.index]).contains(p.0, p.1)
@@ -506,13 +535,15 @@ impl Editor {
         if !s.contains(p.0, p.1) {
             return Hit::Outside;
         }
-        match self.mark_at(at) {
+        match self.mark_at(at, false) {
             Some(i) => Hit::Mark(i),
             None => Hit::Inside,
         }
     }
 
-    fn mark_at(&self, at: (f32, f32)) -> Option<usize> {
+    /// The mark at `at`, the picked one first, then shapes over effects; `any` ignores the tool,
+    /// which otherwise reaches only its own kind.
+    fn mark_at(&self, at: (f32, f32), any: bool) -> Option<usize> {
         let n = self.marks.len();
         let shapes = (0..n).rev().filter(|&i| !self.marks[i].is_effect());
         let effects = (0..n).rev().filter(|&i| self.marks[i].is_effect());
@@ -520,7 +551,7 @@ impl Editor {
             .into_iter()
             .chain(shapes)
             .chain(effects)
-            .filter(|&i| self.tool.is_none_or(|t| t == self.marks[i].tool()))
+            .filter(|&i| any || self.tool.is_none_or(|t| t == self.marks[i].tool()))
             .find(|&i| self.marks[i].hit(at, self.scale))
     }
 
@@ -565,11 +596,12 @@ impl Editor {
     }
 
     fn snap_threshold(&self) -> i32 {
-        if unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0 { -1 } else { snap::threshold(self.scale) }
+        if self.alt { -1 } else { snap::threshold(self.scale) }
     }
 
+    /// `(x, y)` with each coordinate on a nearby edge that runs past it.
     fn snapped(&self, (x, y): (i32, i32), th: i32) -> (i32, i32) {
-        (snap::snap_edge(x, &self.snap.xs, th), snap::snap_edge(y, &self.snap.ys, th))
+        (snap::snap_edge(x, (y, y), &self.snap.xs, th), snap::snap_edge(y, (x, x), &self.snap.ys, th))
     }
 
     /// Whether a press at `p` completes a double-click.
@@ -610,7 +642,7 @@ impl Editor {
             Hit::Bar(item) => Some(Drag::Bar(item)),
             Hit::Grip(grip) => self.picked.map(|index| self.grab(index, Some(grip), p)),
             Hit::Mark(index) => Some(self.grab(index, None, p)),
-            Hit::Handle(edges) => Some(Drag::Resize { edges, grab: p, from: self.sel }),
+            Hit::Handle(edges) => Some(Drag::Resize { edges, grab: p, from: self.sel, start: self.sel }),
             Hit::Inside => match self.tool {
                 None if self.selected => Some(Drag::Move { grab: p, from: self.sel }),
                 None => None,
@@ -641,7 +673,7 @@ impl Editor {
     }
 
     pub(crate) fn mouse_move(&mut self, p: (i32, i32)) -> Event {
-        self.mouse = p;
+        let last = std::mem::replace(&mut self.mouse, p);
         let b = self.area;
         let slop = self.px(4.0);
         let th = self.snap_threshold();
@@ -667,7 +699,8 @@ impl Editor {
                     | Mark::Pixelate { rect, .. }
                     | Mark::Eraser { rect, .. } => {
                         if !clicking {
-                            let (x, y) = (snap::snap_edge(q.0, &snap.xs, th), snap::snap_edge(q.1, &snap.ys, th));
+                            let x = snap::snap_edge(q.0, (q.1, q.1), &snap.xs, th);
+                            let y = snap::snap_edge(q.1, (q.0, q.0), &snap.ys, th);
                             *rect = Rect::from_points(anchor.0, anchor.1, x, y);
                         }
                     }
@@ -704,22 +737,32 @@ impl Editor {
                 let y = moved.y.clamp(b.y, (b.bottom() - from.h).max(b.y));
                 self.set_sel(Rect { x, y, ..from })
             }
-            &mut Some(Drag::Resize { edges, grab, from }) => {
+            &mut Some(Drag::Resize { edges, start, .. }) if self.ctrl => {
+                let (dx, dy) = shift_within(self.sel, (p.0 - last.0, p.1 - last.1), b);
+                let moved = self.sel.offset(dx, dy);
+                // resizing picks up from here once Ctrl is let go
+                self.drag = Some(Drag::Resize { edges, grab: p, from: moved, start });
+                self.set_sel(moved)
+            }
+            &mut Some(Drag::Resize { edges, grab, from, .. }) => {
                 let resized = resize(from, edges, (p.0 - grab.0, p.1 - grab.1), b, 1);
-                self.set_sel(snap_resized(resized, edges, snap, th))
+                self.set_sel(snap_resized(resized, edges, p, snap, th))
             }
             Some(Drag::Bar(_)) => Event::None,
             None => {
-                let hide = self.summoned && !self.selected && far(self.bar, p, self.px(SUMMON_REACH));
-                if hide {
+                let docked = !self.selected && !self.summoned;
+                let away = self.summoned && far(self.bar, p, self.px(SUMMON_REACH));
+                let redock = away || (docked && nearest(&self.monitors, p) != self.bar_monitor);
+                if redock {
                     self.summoned = false;
+                    self.place_bar();
                 }
                 let hover = match self.hit(p) {
                     Hit::Bar(item) => Some(item),
                     _ => None,
                 };
                 let pick = self.hover_pick(p);
-                if !hide && hover == self.hover && pick == self.pick {
+                if !redock && hover == self.hover && pick == self.pick {
                     return Event::None;
                 }
                 self.hover = hover;
@@ -821,11 +864,18 @@ impl Editor {
     }
 
     fn delete(&mut self) -> Event {
-        let Some(i) = self.picked else { return Event::None };
+        match self.picked {
+            Some(i) => self.delete_at(i),
+            None => Event::None,
+        }
+    }
+
+    fn delete_at(&mut self, i: usize) -> Event {
         self.remember();
         self.marks.remove(i);
-        self.picked = None;
+        self.picked = self.picked.filter(|&p| p != i).map(|p| if p > i { p - 1 } else { p });
         self.touch();
+        self.pick = self.hover_pick(self.mouse);
         Event::Repaint
     }
 
@@ -847,13 +897,27 @@ impl Editor {
     }
 
     fn activate(&mut self, item: Item) -> Event {
-        if let Item::Region | Item::Tool(_) | Item::Color(_) | Item::Size(_) = item {
+        if let Item::Region | Item::Tool(_) | Item::Color(_) | Item::Size(_) = item
+            && self.summoned
+        {
             self.summoned = false;
+            self.place_bar();
         }
         match item {
             Item::Region => {
                 self.commit();
-                return Event::PickRegion;
+                self.tool = None;
+                self.picked = None;
+                self.pick = None;
+                if self.selected {
+                    // back to the whole screen, marks and all, to pick again
+                    self.selected = false;
+                    self.sel = self.area;
+                    self.cutout = None;
+                    self.base = None;
+                    self.touch();
+                }
+                self.place_bar();
             }
             Item::Tool(t) => {
                 self.commit();
@@ -943,12 +1007,47 @@ impl Editor {
         self.summoned = false;
         self.hover = None;
         self.pick = self.hover_pick(self.mouse);
+        self.place_bar();
         Event::Repaint
     }
 
+    /// Right-click: cancels the drag in progress, else deletes the mark under `p`, else in
+    /// canvas mode brings the toolbar to the cursor.
     pub(crate) fn right_click(&mut self, p: (i32, i32)) -> Event {
         self.mouse = p;
-        self.summon()
+        if let Some(drag) = self.drag.take() {
+            return self.abandon(drag);
+        }
+        if let Some(i) = self.typing.as_ref().map(|t| t.index)
+            && matches!(self.hit(p), Hit::Typing)
+        {
+            let n = self.marks.len();
+            self.commit();
+            // an empty text is gone already
+            return if self.marks.len() < n { Event::Repaint } else { self.delete_at(i) };
+        }
+        let on_canvas = self.sel.contains(p.0, p.1) && !self.bar.contains(p.0, p.1);
+        match self.mark_at((p.0 as f32, p.1 as f32), true).filter(|_| on_canvas) {
+            Some(i) => self.delete_at(i),
+            None => self.summon(),
+        }
+    }
+
+    /// Puts back what `drag` changed, as if the button never went down.
+    fn abandon(&mut self, drag: Drag) -> Event {
+        match drag {
+            Drag::Mark { mark, .. } => self.repaint_ink(vec![mark.ink(self.scale)]),
+            Drag::Edit { index, from, .. } => {
+                self.marks[index] = from;
+                self.touch();
+            }
+            Drag::Move { from: start, .. } | Drag::Resize { start, .. } => {
+                self.set_sel(start);
+            }
+            Drag::Bar(_) => {}
+        }
+        self.pick = self.hover_pick(self.mouse);
+        Event::Repaint
     }
 
     pub(crate) fn key_up(&mut self, vk: u32) -> Event {
@@ -1053,31 +1152,33 @@ fn pick_ring(r: Rect) -> [RECT; 4] {
     ring(r, r.inflate(-2))
 }
 
-/// `r` moved so whichever of its edges is nearer a snap edge (per axis) lands on it.
+/// `r` moved so whichever of its sides is nearer an edge running alongside it (per axis) lands on it.
 fn snap_moved(r: Rect, to: &snap::Edges, th: i32) -> Rect {
-    let axis = |lo: i32, len: i32, edges: &[i32]| {
-        let a = snap::snap_edge(lo, edges, th) - lo;
-        let b = snap::snap_edge(lo + len, edges, th) - (lo + len);
+    let axis = |lo: i32, len: i32, across: (i32, i32), edges: &[snap::Segment]| {
+        let a = snap::snap_edge(lo, across, edges, th) - lo;
+        let b = snap::snap_edge(lo + len, across, edges, th) - (lo + len);
         lo + if a != 0 && (b == 0 || a.abs() <= b.abs()) { a } else { b }
     };
-    Rect { x: axis(r.x, r.w, &to.xs), y: axis(r.y, r.h, &to.ys), ..r }
+    let x = axis(r.x, r.w, (r.y, r.bottom()), &to.xs);
+    Rect { x, y: axis(r.y, r.h, (r.x, r.right()), &to.ys), ..r }
 }
 
-/// `r` with its dragged `edges` snapped, never inverting it.
-fn snap_resized(r: Rect, edges: Edges, to: &snap::Edges, th: i32) -> Rect {
+/// `r` with its dragged `edges` snapped to edges running past the cursor `at`, never inverting it.
+fn snap_resized(r: Rect, edges: Edges, at: (i32, i32), to: &snap::Edges, th: i32) -> Rect {
     let (mut x0, mut y0, mut x1, mut y1) = (r.x, r.y, r.right(), r.bottom());
-    let near = |v: i32, c: &[i32]| snap::snap_edge(v, c, th);
+    let x = |v: i32| snap::snap_edge(v, (at.1, at.1), &to.xs, th);
+    let y = |v: i32| snap::snap_edge(v, (at.0, at.0), &to.ys, th);
     if edges.l {
-        x0 = near(x0, &to.xs).min(x1 - 1);
+        x0 = x(x0).min(x1 - 1);
     }
     if edges.r {
-        x1 = near(x1, &to.xs).max(x0 + 1);
+        x1 = x(x1).max(x0 + 1);
     }
     if edges.t {
-        y0 = near(y0, &to.ys).min(y1 - 1);
+        y0 = y(y0).min(y1 - 1);
     }
     if edges.b {
-        y1 = near(y1, &to.ys).max(y0 + 1);
+        y1 = y(y1).max(y0 + 1);
     }
     Rect::from_points(x0, y0, x1, y1)
 }
@@ -1221,11 +1322,7 @@ mod tests {
         let screen = Rect { x: 0, y: 0, w: 5360, h: 3060 };
         let mut ed = Editor::canvas(screen, monitors.clone(), 1.0, (100, 2500));
         assert_eq!(ed.output_rect(), monitors[1]);
-        assert!(!ed.chrome().contains(&ed.bar), "no toolbar until it's summoned");
-        assert!(matches!(ed.right_click((100, 2500)), Event::Repaint));
-        assert!(ed.chrome().contains(&ed.bar));
-        assert_eq!((ed.bar.x + ed.bar.w / 2, ed.bar.y), (100.max(10 + ed.bar.w / 2), 2510), "under the cursor");
-        assert!(matches!(ed.key(0x51, false, false), Event::PickRegion));
+        assert!(ed.picks_region(), "the region tool is on from the start");
         ed.mouse_move((3000, 700));
         assert_eq!(ed.output_rect(), monitors[2]);
         ed.mouse_move((1910, 1300));
@@ -1233,14 +1330,43 @@ mod tests {
         let sel = Rect { x: 2000, y: 1500, w: 300, h: 200 };
         ed.set_selection(sel, None);
         assert_eq!(ed.output_rect(), sel);
-        assert!(ed.has_selection() && matches!(ed.key(0x51, false, false), Event::PickRegion));
-        assert!(matches!(editor().key(0x51, false, false), Event::None), "no region tool select-first");
+        assert!(!ed.picks_region());
+        assert!(matches!(ed.key(0x51, false, false), Event::Repaint) && ed.picks_region(), "Q picks again");
+        assert_eq!((ed.sel, ed.selected), (screen, false));
+        let mut select_first = editor();
+        select_first.key(0x51, false, false);
+        assert!(select_first.selected && !select_first.picks_region(), "no region tool select-first");
+    }
+
+    #[test]
+    fn draw_first_captures_on_release_or_edits_with_shift() {
+        let screen = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+        let sel = Rect { x: 100, y: 200, w: 300, h: 150 };
+        let mut ed = Editor::canvas(screen, vec![screen], 1.0, (500, 400));
+        assert!(ed.picks_region());
+        assert!(matches!(ed.region_picked(sel, None, false), Event::Finish(Output::Default)), "release: done");
+        assert_eq!(ed.output_rect(), sel);
+
+        let mut ed = Editor::canvas(screen, vec![screen], 1.0, (500, 400));
+        ed.key(0x50, false, false); // P
+        assert!(!ed.picks_region(), "a drawing tool draws");
+        ed.mouse_down((150, 250), 0);
+        ed.mouse_move((200, 300));
+        ed.mouse_up((200, 300));
+        assert_eq!(ed.marks.len(), 1);
+        let q = cell(&ed, Item::Region);
+        click(&mut ed, q);
+        assert!(ed.picks_region(), "the region button switches back");
+        assert!(matches!(ed.region_picked(sel, None, true), Event::Repaint), "Shift: keep editing");
+        assert!(ed.selected && !ed.picks_region() && ed.marks.len() == 1, "the marks come along");
+        assert_eq!(ed.bar.y, sel.bottom() + 10, "docked under the selection");
+        assert!(matches!(ed.key(0x0D, false, false), Event::Finish(Output::Default)), "Enter finishes");
     }
 
     #[test]
     fn selection_snaps_to_nearby_edges() {
         let mut ed = editor();
-        ed.set_snap(vec![Rect { x: 500, y: 0, w: 300, h: 400 }]);
+        ed.set_snap(snap::edges(&[Rect { x: 500, y: 0, w: 300, h: 400 }]));
         ed.mouse_down((200, 150), 0);
         ed.mouse_move((295, 155));
         assert_eq!(ed.sel, Rect { x: 100, y: 0, w: 400, h: 300 }, "the right edge snaps to x 500");
@@ -1371,40 +1497,100 @@ mod tests {
     }
 
     #[test]
-    fn canvas_toolbar_comes_to_the_cursor_and_goes() {
+    fn canvas_toolbar_docks_and_comes_to_the_cursor() {
         let screen = Rect { x: 0, y: 0, w: 1920, h: 1080 };
-        let mut ed = Editor::canvas(screen, vec![screen], 1.0, (500, 400));
-        assert!(ed.hint.is_some() && !shown(&ed));
+        let second = Rect { x: 1920, y: 0, w: 1280, h: 1024 };
+        let mut ed = Editor::canvas(screen, vec![screen, second], 1.0, (500, 400));
+        let docked = |ed: &Editor, m: Rect| ed.bar.y == m.y + 10 && (ed.bar.x + ed.bar.w / 2 - m.x - m.w / 2).abs() <= 1;
+        assert!(ed.hint.is_some() && shown(&ed) && docked(&ed, screen), "docked at the top from the start");
+        ed.mouse_move((2500, 600));
+        assert!(docked(&ed, second), "it follows the mouse to its monitor");
+        ed.mouse_move((960, 600));
         ed.right_click((960, 500));
-        assert!(shown(&ed) && ed.hint.is_none(), "right-click summons it and retires the hint");
-        assert_eq!((ed.bar.x + ed.bar.w / 2 - 960, ed.bar.y), (0, 510));
+        assert!(ed.hint.is_none(), "right-click retires the hint");
+        assert_eq!((ed.bar.x + ed.bar.w / 2 - 960, ed.bar.y), (0, 510), "and brings the bar");
         ed.mouse_move((960, 420));
-        assert!(shown(&ed), "still close enough");
+        assert!(!docked(&ed, screen), "still close enough");
         assert!(matches!(ed.mouse_move((960, 300)), Event::Repaint));
-        assert!(!shown(&ed), "moving away hides it");
+        assert!(docked(&ed, screen), "moving away docks it again");
 
         ed.key(VK_TAB, false, false);
-        assert!(shown(&ed) && ed.bar.y == 310);
+        assert!(ed.bar.y == 310);
         ed.key_up(VK_TAB);
-        assert!(!shown(&ed), "releasing Tab off the bar hides it");
+        assert!(docked(&ed, screen), "releasing Tab off the bar docks it");
         ed.key(VK_TAB, false, false);
         ed.mouse_move(cell(&ed, Item::Color(2)));
         ed.key_up(VK_TAB);
-        assert!(shown(&ed), "releasing Tab on the bar keeps it");
+        assert!(ed.bar.y == 310, "releasing Tab on the bar keeps it here");
         let pen = cell(&ed, Item::Tool(Tool::Pen));
         click(&mut ed, pen);
         assert_eq!(ed.tool, Some(Tool::Pen));
-        assert!(!shown(&ed), "picking a tool hides it");
+        assert!(docked(&ed, screen), "picking a tool docks it");
 
         ed.right_click((960, 500));
-        assert!(matches!(ed.key(0x1B, false, false), Event::Repaint) && !shown(&ed), "Esc hides it first");
+        assert!(matches!(ed.key(0x1B, false, false), Event::Repaint) && docked(&ed, screen), "Esc docks it first");
         assert!(matches!(ed.key(0x1B, false, false), Event::Cancel));
-        ed.key(0x32, false, false);
-        assert_eq!(ed.tool, Some(Tool::Highlighter), "keys work with the bar hidden");
 
         ed.set_selection(Rect { x: 100, y: 100, w: 400, h: 300 }, None);
         assert!(shown(&ed) && ed.bar.y == 410, "a picked region docks it under the selection");
-        assert!(matches!(ed.right_click((960, 500)), Event::None));
+        assert!(matches!(ed.right_click((960, 500)), Event::None), "select-first: nothing");
+    }
+
+    #[test]
+    fn right_click_deletes_marks_and_cancels_drags() {
+        let mut ed = editor();
+        ed.key(0x52, false, false); // R
+        for x in [50, 200] {
+            ed.mouse_down((x, 50), 0);
+            ed.mouse_move((x + 100, 150));
+            ed.mouse_up((x + 100, 150));
+        }
+        assert_eq!(ed.marks.len(), 2);
+        ed.key(0x50, false, false); // P: right-click reaches every kind of mark
+        assert!(matches!(ed.right_click((50, 100)), Event::Repaint));
+        assert_eq!(ed.marks.len(), 1);
+        assert_eq!(area_of(&ed.marks[0]).x, 200);
+        ed.undo();
+        assert_eq!(ed.marks.len(), 2, "undoable");
+
+        ed.mouse_down((60, 200), 0);
+        ed.mouse_move((150, 250));
+        assert!(matches!(ed.right_click((150, 250)), Event::Repaint));
+        assert!(matches!(ed.mouse_up((150, 250)), Event::None));
+        assert_eq!(ed.marks.len(), 2, "the stroke being drawn is dropped");
+
+        ed.tool = None;
+        let start = ed.sel;
+        ed.mouse_down((400, 150), 0);
+        ed.mouse_move((450, 150));
+        assert_eq!(ed.sel.w, 450);
+        ed.right_click((450, 150));
+        ed.mouse_up((450, 150));
+        assert_eq!(ed.sel, start, "a resize is undone");
+        assert_eq!(ed.marks.len(), 2, "cancelling deletes nothing");
+        assert!(matches!(ed.right_click((350, 280)), Event::None), "off the marks: nothing select-first");
+    }
+
+    #[test]
+    fn ctrl_moves_the_selection_and_alt_stops_snapping() {
+        let mut ed = editor();
+        ed.set_snap(snap::edges(&[Rect { x: 500, y: 0, w: 300, h: 400 }]));
+        ed.mouse_down((400, 150), 0);
+        ed.mouse_move((420, 150));
+        assert_eq!(ed.sel, Rect { x: 0, y: 0, w: 420, h: 300 });
+        ed.set_mods(true, false);
+        ed.mouse_move((450, 170));
+        assert_eq!(ed.sel, Rect { x: 30, y: 20, w: 420, h: 300 }, "Ctrl moves the whole box");
+        ed.set_mods(false, false);
+        ed.mouse_move((460, 170));
+        assert_eq!(ed.sel, Rect { x: 30, y: 20, w: 430, h: 300 }, "letting go resizes from there");
+        ed.mouse_move((495, 170));
+        assert_eq!(ed.sel.right(), 500, "and snaps");
+        ed.set_mods(false, true);
+        ed.mouse_move((495, 170));
+        assert_eq!(ed.sel.right(), 495, "unless Alt is held");
+        ed.right_click((495, 170));
+        assert_eq!(ed.sel, Rect { x: 0, y: 0, w: 400, h: 300 }, "cancelling goes back to before the drag");
     }
 
     #[test]
@@ -1459,7 +1645,7 @@ mod tests {
     #[test]
     fn area_drags_snap_to_edges() {
         let mut ed = editor();
-        ed.set_snap(vec![Rect { x: 100, y: 100, w: 100, h: 100 }]);
+        ed.set_snap(snap::edges(&[Rect { x: 100, y: 100, w: 100, h: 100 }]));
         ed.key(0x52, false, false);
         ed.mouse_down((104, 97), 0);
         ed.mouse_move((195, 150));

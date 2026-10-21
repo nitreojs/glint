@@ -21,6 +21,7 @@ const ID_EXIT: usize = 104;
 const ID_PAUSE: usize = 107;
 const ID_TRIM: usize = 108;
 const ID_UPDATE: usize = 109;
+const ID_SHOT_MONITOR: usize = 110;
 const ID_RECENT: usize = 1000;
 const ID_CLEAR_HISTORY: usize = 1199;
 const RECENT: usize = 10;
@@ -91,18 +92,19 @@ fn recent_action(hwnd: HWND, e: &Entry, action: usize) {
 }
 
 pub(super) fn show_menu(hwnd: HWND) {
-    let Some((counting, paused, busy, hotkey, shot_hotkey, full_hotkey, pause_hotkey)) = with_app(|a| {
+    let Some((counting, paused, busy, keys)) = with_app(|a| {
         let paused = match &a.state {
             State::Recording { rec, .. } => Some(rec.paused()),
             _ => None,
         };
         let counting = matches!(a.state, State::Countdown { .. });
         let busy = matches!(a.state, State::Stopping { .. } | State::Selecting(_));
-        let keys = (a.hotkey.clone(), a.shot_hotkey.clone(), a.full_hotkey.clone(), a.pause_hotkey.clone());
-        (counting, paused, busy, keys.0, keys.1, keys.2, keys.3)
+        let keys = [&a.hotkey, &a.shot_hotkey, &a.full_hotkey, &a.monitor_hotkey, &a.pause_hotkey].map(Clone::clone);
+        (counting, paused, busy, keys)
     }) else {
         return;
     };
+    let [hotkey, shot_hotkey, full_hotkey, monitor_hotkey, pause_hotkey] = keys;
     let with_key = |text: &str, key: Option<String>| match key {
         Some(k) => format!("{text}\t{k}"),
         None => text.to_string(),
@@ -117,12 +119,14 @@ pub(super) fn show_menu(hwnd: HWND) {
     let pause_label = paused.map(|p| wide(&with_key(if p { "Resume recording" } else { "Pause recording" }, pause_hotkey)));
     let shot_label = with_key("Take screenshot", shot_hotkey);
     let full_label = with_key("Screenshot all screens", full_hotkey);
+    let monitor_label = with_key("Screenshot this monitor", monitor_hotkey);
     let last = history::last_recording();
     let recent = history::recent(RECENT);
     let update_label = with_app(|a| a.ready_version()).flatten().map(|v| wide(&format!("Restart to update to {v}")));
     let cmd = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let (label, shot_label, full_label) = (wide(&label), wide(&shot_label), wide(&full_label));
+        let monitor_label = wide(&monitor_label);
         let flags = if busy { MF_STRING | MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(menu, flags, ID_RECORD, PCWSTR(label.as_ptr()));
         if let Some(pause_label) = &pause_label {
@@ -131,6 +135,7 @@ pub(super) fn show_menu(hwnd: HWND) {
         let shot_flags = if busy || recording { MF_STRING | MF_GRAYED } else { MF_STRING };
         let _ = AppendMenuW(menu, shot_flags, ID_SHOT, PCWSTR(shot_label.as_ptr()));
         let _ = AppendMenuW(menu, shot_flags, ID_SHOT_ALL, PCWSTR(full_label.as_ptr()));
+        let _ = AppendMenuW(menu, shot_flags, ID_SHOT_MONITOR, PCWSTR(monitor_label.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let trim_flags = if last.is_some() { MF_STRING } else { MF_STRING | MF_GRAYED };
         let _ = AppendMenuW(menu, trim_flags, ID_TRIM, w!("Trim last recording"));
@@ -162,8 +167,8 @@ pub(super) fn show_menu(hwnd: HWND) {
         ID_SHOT => {
             with_app(|a| a.toggle(true));
         }
-        ID_SHOT_ALL => {
-            with_app(|a| a.shot_all_screens());
+        ID_SHOT_ALL | ID_SHOT_MONITOR => {
+            with_app(|a| a.shot_screens(cmd == ID_SHOT_MONITOR));
         }
         ID_TRIM => {
             if let Some(path) = last

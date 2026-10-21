@@ -7,10 +7,11 @@ use glint_core::format::{human_duration, human_size};
 use glint_core::geom::rect::Rect;
 use glint_core::history::{self, Kind};
 use glint_core::log::log;
+use glint_core::naming::Subject;
+use glint_core::record::pipeline::{Outcome, Recorder};
 use glint_core::update::notes_url;
-use glint_core::update::version::Version;
 use glint_core::wide::wide;
-use glint_media::record::{Outcome, Params, Recorder, Source};
+use glint_media::record::{self, Params, Source};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -25,7 +26,7 @@ use crate::picker::{self, Picked, Purpose};
 use crate::platform::capture;
 use crate::platform::log::log_path;
 use crate::platform::monitors;
-use crate::platform::paths::unique_path;
+use crate::platform::paths::{migrate_output_dir, unique_path};
 use crate::shot::editor::Output;
 use crate::shot::{self, Delivered, Shot};
 use crate::update::{self, Checked, UPDATED_ARG};
@@ -38,7 +39,7 @@ mod menu;
 pub(crate) mod tray;
 pub(crate) mod updates;
 
-use hotkeys::{ESC_HOTKEY_ID, FULL_HOTKEY_ID, HOTKEY_ID, PAUSE_HOTKEY_ID, SHOT_HOTKEY_ID};
+use hotkeys::{ESC_HOTKEY_ID, FULL_HOTKEY_ID, HOTKEY_ID, MONITOR_HOTKEY_ID, PAUSE_HOTKEY_ID, SHOT_HOTKEY_ID};
 use menu::show_menu;
 use tray::{IDLE_TIP, Tray};
 
@@ -77,10 +78,11 @@ enum ClickTarget {
 struct App {
     hwnd: HWND,
     cfg: Config,
-    /// The record, screenshot and all-screens hotkeys, while registered.
+    /// The record, screenshot, all-screens and monitor hotkeys, while registered.
     hotkey: Option<String>,
     shot_hotkey: Option<String>,
     full_hotkey: Option<String>,
+    monitor_hotkey: Option<String>,
     pause_hotkey: Option<String>,
     state: State,
     tray: Tray,
@@ -119,6 +121,7 @@ impl App {
                 let hotkeys_changed = self.hotkey.as_deref() != Some(cfg.hotkey.as_str())
                     || self.shot_hotkey.as_deref() != Some(cfg.screenshot_hotkey.as_str())
                     || self.full_hotkey.as_deref() != Some(cfg.fullscreen_hotkey.as_str())
+                    || self.monitor_hotkey.as_deref() != Some(cfg.monitor_hotkey.as_str())
                     || recording && self.pause_hotkey.as_deref() != Some(cfg.pause_hotkey.as_str());
                 let startup_changed = self.cfg.launch_at_startup != cfg.launch_at_startup;
                 let accent_changed = self.cfg.accent_rgb() != cfg.accent_rgb();
@@ -211,17 +214,19 @@ impl App {
         }
     }
 
-    /// Screenshots every monitor at once, without the picker; ignored while anything else runs.
-    fn shot_all_screens(&mut self) {
+    /// Screenshots every monitor at once, or only the one under the mouse, without the picker;
+    /// ignored while anything else runs.
+    fn shot_screens(&mut self, under_mouse: bool) {
         if !matches!(self.state, State::Idle) {
             return;
         }
-        let captured = capture::virtual_screen();
+        let captured = if under_mouse { capture::monitor_under_mouse() } else { capture::virtual_screen() };
         self.reload();
         match captured {
             Ok((pixels, at)) => {
                 let (w, h) = (at.w as u32, at.h as u32);
-                self.finish_shot(Shot { pixels, w, h, alpha: false, at, output: Output::Default })
+                let shot = Shot { pixels, w, h, alpha: false, at, output: Output::Default, source: None };
+                self.finish_shot(shot, Subject::Screen)
             }
             Err(e) => {
                 log(&format!("screenshot: {e}"));
@@ -236,7 +241,7 @@ impl App {
             Some(Picked::Region(sel)) if !self.exiting => sel,
             Some(Picked::Shot(shot)) if !self.exiting => {
                 picker::dismiss(picker);
-                return self.finish_shot(shot);
+                return self.finish_shot(shot, Subject::Region);
             }
             _ => return picker::dismiss(picker),
         };
@@ -245,7 +250,8 @@ impl App {
             0 => native,
             cap => (cap as f64).min(native),
         };
-        let path = unique_path(&self.cfg, "mp4");
+        let subject = sel.source.as_ref().map_or(Subject::Region, Subject::Window);
+        let path = unique_path(&self.cfg, Kind::Recording, subject, "mp4");
         let params = Params {
             sources: sel
                 .outputs
@@ -336,7 +342,7 @@ impl App {
         };
         // The pipeline initializes while the picker or the countdown bubble fades out; capture
         // starts once they're gone.
-        let started = Recorder::start(params, done);
+        let started = record::start(params, done);
         if let Some(p) = picker {
             picker::dismiss(p);
         }
@@ -362,7 +368,8 @@ impl App {
         }
     }
 
-    fn finish_shot(&mut self, shot: Shot) {
+    /// Copies / saves / uploads `shot`; `subject` names its file when it isn't one app's window.
+    fn finish_shot(&mut self, shot: Shot, subject: Subject) {
         if shot.output == Output::Pin {
             if let Err(e) = shot::pin::open(shot, self.hwnd, WM_APP_PIN) {
                 log(&format!("pin: {e}"));
@@ -371,7 +378,7 @@ impl App {
             return;
         }
         let size = format!("{}×{}", shot.w, shot.h);
-        let Delivered { copied, saved, uploading } = match shot::deliver(&shot, &self.cfg, self.hwnd) {
+        let Delivered { copied, saved, uploading } = match shot::deliver(&shot, &self.cfg, self.hwnd, subject) {
             Ok(delivered) => delivered,
             Err(text) => {
                 log(&format!("screenshot: {text}"));
@@ -568,8 +575,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.toggle(wp.0 as i32 == SHOT_HOTKEY_ID));
             return LRESULT(0);
         }
-        WM_HOTKEY if wp.0 as i32 == FULL_HOTKEY_ID => {
-            with_app(|a| a.shot_all_screens());
+        WM_HOTKEY if wp.0 as i32 == FULL_HOTKEY_ID || wp.0 as i32 == MONITOR_HOTKEY_ID => {
+            with_app(|a| a.shot_screens(wp.0 as i32 == MONITOR_HOTKEY_ID));
             return LRESULT(0);
         }
         WM_HOTKEY if wp.0 as i32 == PAUSE_HOTKEY_ID => {
@@ -649,7 +656,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let handled = with_app(|a| unsafe {
                 match msg {
                     WM_APP_SELECTION => a.on_selection(*Box::from_raw(lp.0 as *mut Option<Picked>)),
-                    WM_APP_PIN => a.finish_shot(*Box::from_raw(lp.0 as *mut Shot)),
+                    WM_APP_PIN => a.finish_shot(*Box::from_raw(lp.0 as *mut Shot), Subject::Region),
                     upload::WM_UPLOADED => a.on_uploaded(*Box::from_raw(lp.0 as *mut Done)),
                     update::WM_UPDATE_DONE => a.on_checked(*Box::from_raw(lp.0 as *mut Checked)),
                     _ => a.on_done(*Box::from_raw(lp.0 as *mut Result<Outcome, String>)),
@@ -727,16 +734,19 @@ pub fn run() {
             let _ = std::fs::write(log_path(), "");
         }
         update::tidy(updated_from.is_some());
-        let (cfg, cfg_err) = match Config::load() {
+        let (mut cfg, cfg_err) = match Config::load() {
             Ok(c) => (c, None),
             Err(e) => (Config::default(), Some(e)),
         };
+        if cfg_err.is_none() {
+            migrate_output_dir(&mut cfg);
+        }
         let mut update_error = None;
         if cfg_err.is_none()
             && cfg.update_mode != UpdateMode::Off
             && let Some(staged) = update::staged()
         {
-            let mut args = vec![UPDATED_ARG.to_string(), Version::current().to_string()];
+            let mut args = vec![UPDATED_ARG.to_string(), update::current().to_string()];
             if autostarted {
                 args.push(autostart::ARG.into());
             }
@@ -783,6 +793,7 @@ pub fn run() {
             hotkey: None,
             shot_hotkey: None,
             full_hotkey: None,
+            monitor_hotkey: None,
             pause_hotkey: None,
             state: State::Idle,
             tray,
@@ -793,24 +804,27 @@ pub fn run() {
         };
         app.register_hotkeys(None);
         if let Some(old) = &updated_from {
-            log(&format!("updated from {old} to {}", Version::current()));
+            log(&format!("updated from {old} to {}", update::current()));
         }
         match cfg_err {
             Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
             None => {
                 app.sync_autostart(); // keeps the entry pointing at this exe
-                let all_held = app.hotkey.is_some() && app.shot_hotkey.is_some() && app.full_hotkey.is_some();
+                let all_held = app.hotkey.is_some()
+                    && app.shot_hotkey.is_some()
+                    && app.full_hotkey.is_some()
+                    && app.monitor_hotkey.is_some();
                 if let Some(e) = &update_error {
                     app.notify("glint: couldn't update", e, true, ClickTarget::Log);
                 } else if let Some(old) = &updated_from {
-                    let now = Version::current();
+                    let now = update::current();
                     let notes = ClickTarget::Link(notes_url(&format!("v{now}")));
                     app.notify_done(&format!("updated to {now}"), &format!("from {old} · click for what's new"), notes);
                 } else if all_held && !autostarted {
                     let text = format!(
-                        "{} records a region, {} takes a screenshot, {} captures all screens. \
-                         Double-click the tray icon for settings.",
-                        app.cfg.hotkey, app.cfg.screenshot_hotkey, app.cfg.fullscreen_hotkey
+                        "{} records a region, {} takes a screenshot, {} captures all screens, {} the \
+                         monitor under the mouse. Double-click the tray icon for settings.",
+                        app.cfg.hotkey, app.cfg.screenshot_hotkey, app.cfg.fullscreen_hotkey, app.cfg.monitor_hotkey
                     );
                     app.notify_done("glint is running", &text, ClickTarget::None);
                 }
@@ -818,8 +832,8 @@ pub fn run() {
         }
         app.schedule_update_check(updates::FIRST_CHECK_MS);
         log(&format!(
-            "started, hotkeys record {:?}, screenshot {:?}, all screens {:?}",
-            app.hotkey, app.shot_hotkey, app.full_hotkey
+            "started, hotkeys record {:?}, screenshot {:?}, all screens {:?}, monitor {:?}",
+            app.hotkey, app.shot_hotkey, app.full_hotkey, app.monitor_hotkey
         ));
         APP.with(|a| *a.borrow_mut() = Some(app));
 

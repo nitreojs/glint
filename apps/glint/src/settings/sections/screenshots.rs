@@ -20,7 +20,7 @@ impl SettingsApp {
             let styles = [(ShotStyle::Select, "select first"), (ShotStyle::Sharex, "draw first")];
             widgets::segmented(ui, look, &mut self.cfg.screenshot_style, &styles, Some(220.0));
             let frozen = if self.cfg.freeze_screen { "" } else { " · the screen freezes anyway" };
-            hint(ui, format!("draw first — like sharex: draw on the screen, then pick a region with Q{frozen}"), p.t3);
+            hint(ui, format!("draw first — like sharex: drag and release to capture; draw before or hold shift to edit{frozen}"), p.t3);
         });
         row(ui, look, "format", 7.0, |ui| {
             let formats = [(ShotFormat::Png, "png"), (ShotFormat::Jpg, "jpg")];

@@ -88,9 +88,10 @@ impl Elements {
         self.sh.lock().latest.clone()
     }
 
-    /// Every distinct rect found so far (windows, client areas, child windows, elements),
-    /// clipped to their window, except those entirely behind a window above; desktop px.
-    pub(crate) fn known(&self) -> Vec<Rect> {
+    /// Every distinct rect found so far (windows, client areas, child windows, elements) with the
+    /// index of its window in the snapshot, clipped to the window, except those entirely behind a
+    /// window above; desktop px.
+    pub(crate) fn known(&self) -> Vec<(usize, Rect)> {
         self.sh.lock().known.clone()
     }
 }
@@ -183,7 +184,7 @@ struct State {
     /// A point the worker still has to go deeper for.
     pending: Option<(i32, i32)>,
     latest: Option<((i32, i32), Vec<Rect>)>,
-    known: Vec<Rect>,
+    known: Vec<(usize, Rect)>,
     seen: HashSet<(i32, i32, i32, i32)>,
     /// `known` grew since the last notification.
     dirty: bool,
@@ -208,7 +209,7 @@ impl State {
     fn remember(&mut self, win: usize, r: Rect) {
         let behind = self.wins[..win].iter().any(|w| w.rect.intersect(&r) == Some(r));
         if !behind && self.seen.insert((r.x, r.y, r.w, r.h)) {
-            self.known.push(r);
+            self.known.push((win, r));
             self.dirty = true;
         }
     }

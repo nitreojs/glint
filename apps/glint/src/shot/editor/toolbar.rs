@@ -62,7 +62,7 @@ fn groups(region: bool) -> Vec<Vec<Item>> {
 
 impl Editor {
     /// Lays the toolbar out under the selection, or above it, or inside it when neither fits; with
-    /// no selection, centred under the mouse.
+    /// no selection, docked at the top of the monitor under the mouse, or summoned to the mouse.
     pub(super) fn place_bar(&mut self) {
         let (cell, pad, gap) = (self.px(32.0) as i32, self.px(4.0) as i32, self.px(9.0) as i32);
         let groups = groups(self.region);
@@ -72,8 +72,10 @@ impl Editor {
         let margin = self.px(10.0) as i32;
         let (bar, monitor) = if self.selected {
             place(self.sel, (w, h), margin, &self.monitors)
-        } else {
+        } else if self.summoned {
             summon(self.mouse, (w, h), margin, &self.monitors)
+        } else {
+            dock(self.mouse, (w, h), margin, &self.monitors)
         };
         self.bar_monitor = monitor;
         let (x, y) = (bar.x, bar.y);
@@ -95,14 +97,10 @@ impl Editor {
         self.pill = None;
     }
 
-    /// Tooltip for the hovered button, on the side of the bar away from the selection; with the
-    /// bar hidden, next to the mouse.
+    /// Tooltip for the hovered button, on the side of the bar away from the selection.
     pub(super) fn place_pill(&self, item: Item, text: &str, painter: &Painter, font: &IDWriteTextFormat) -> Rect {
         let (tw, _) = painter.measure(text, font);
         let (w, h) = ((tw.ceil() + self.px(20.0)) as i32, self.px(26.0) as i32);
-        if !self.bar_shown() {
-            return beside(self.mouse, (w, h), self.px(16.0) as i32, nearest(&self.monitors, self.mouse));
-        }
         let b = self.bar;
         let cell = self.cells.iter().find(|(i, _)| *i == item).map(|(_, r)| *r).unwrap_or(b);
         let gap = self.px(6.0) as i32;
@@ -135,6 +133,7 @@ impl Editor {
             let (x, y) = ((r.x - b.x) as f32, (r.y - b.y) as f32);
             let (cw, ch) = (r.w as f32, r.h as f32);
             let active = match item {
+                Item::Region => self.picks_region(),
                 Item::Tool(t) => self.tool == Some(t),
                 Item::Size(n) => size.is_some_and(|(_, s, v)| s.presets[n] == v),
                 _ => false,
@@ -181,6 +180,13 @@ fn place(sel: Rect, (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect
     }
     let inside = (sel.bottom() - margin - h).min(low.bottom() - margin - h).max(low.y + margin);
     (on(low, inside), low)
+}
+
+/// The bar at the top centre of the monitor under (or nearest) the mouse.
+fn dock(mouse: (i32, i32), (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect, Rect) {
+    let m = nearest(monitors, mouse);
+    let x = (m.x + (m.w - w) / 2).max(m.x);
+    (Rect { x, y: m.y + margin, w, h }, m)
 }
 
 fn summon((x, y): (i32, i32), (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect, Rect) {
@@ -359,6 +365,15 @@ mod tests {
                 assert_eq!(m.intersect(&b), Some(b), "({x}, {y}) put the bar at {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn docked_bar_sits_at_the_top_of_the_mouses_monitor() {
+        let at = |p: (i32, i32)| dock(p, SIZE, MARGIN, &MONITORS);
+        assert_eq!(at((100, 1300)), (Rect { x: 1442, y: 10, w: 556, h: 40 }, MONITORS[0]));
+        assert_eq!(at((-1000, 1000)), (Rect { x: -1238, y: 550, w: 556, h: 40 }, MONITORS[1]));
+        assert_eq!(at((2000, -5)), (Rect { x: 1367, y: -1430, w: 556, h: 40 }, MONITORS[2]));
+        assert_eq!(at((-100, 200)).1, MONITORS[0], "from a gap, the nearest");
     }
 
     #[test]

@@ -35,7 +35,10 @@ impl Waves {
         let stop = cancel.clone();
         let thread = std::thread::spawn(move || {
             let _com = Com::init();
-            if let Err(e) = run(&path, &streams, &tx, &stop, &ctx) {
+            if let Err(e) = run(&path, &streams, &tx, &stop, &ctx)
+                && !stop.load(Ordering::Relaxed)
+                && path.exists()
+            {
                 log(&format!("clip: drawing the waveforms stopped: {e}"));
             }
             ctx.request_repaint();

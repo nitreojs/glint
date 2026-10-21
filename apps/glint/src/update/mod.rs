@@ -23,13 +23,20 @@ mod verify;
 
 /// The public half of glint's release signing key (minisign, ed25519, key id 7EC36F307DC07BB7).
 pub(crate) const PUBLIC_KEY: &str = "RWS3e8B9MG/DfriGVzlxJqGcJ1GUR6vEqX8+9nW2keufnCNTmzznWq0I";
-const RELEASES_API: &str = "https://api.github.com/repos/nitreojs/glint/releases?per_page=30";
+const RELEASES_API: &str = "https://api.github.com/repos/nitreojs/glint/releases?per_page=100";
+/// Release list pages read per check; other apps' releases share the list.
+const MAX_PAGES: usize = 5;
 /// Passed to the new exe after a swap, with the version it replaced.
 pub(crate) const UPDATED_ARG: &str = "--updated";
 /// A finished check: a `Box<Checked>` in LPARAM.
 pub(crate) const WM_UPDATE_DONE: u32 = WM_APP + 60;
 const MAX_EXE: u64 = 256 * 1024 * 1024;
 const STATUS: &str = "status.json";
+
+/// The version this build was made from.
+pub(crate) fn current() -> Version {
+    Version::parse(env!("CARGO_PKG_VERSION")).expect("Cargo.toml has a semver version")
+}
 
 /// `%APPDATA%\glint\update`.
 pub(crate) fn dir() -> PathBuf {
@@ -165,13 +172,20 @@ fn refused(what: &str, r: &Response) -> String {
 
 /// The newest release above `current` (pre-releases too with `beta`), if there is one.
 pub(crate) fn latest(src: &Source, current: &Version, beta: bool, proxy: &Setting) -> Result<Option<Candidate>, String> {
-    let mut req = get(&src.api, "application/vnd.github+json");
-    req.headers.push(("X-GitHub-Api-Version".into(), "2022-11-28".into()));
-    let r = http::send(&req, proxy, &mut |_, _| {})?;
-    if !r.ok() {
-        return Err(refused("the release list", &r));
+    let mut releases = Vec::new();
+    let mut url = Some(src.api.clone());
+    for _ in 0..MAX_PAGES {
+        let Some(page) = url.take() else { break };
+        let mut req = get(&page, "application/vnd.github+json");
+        req.headers.push(("X-GitHub-Api-Version".into(), "2022-11-28".into()));
+        let r = http::send(&req, proxy, &mut |_, _| {})?;
+        if !r.ok() {
+            return Err(refused("the release list", &r));
+        }
+        releases.extend(release::parse(&r.text)?);
+        url = release::next_page(r.header("link"));
     }
-    Ok(release::pick(&release::parse(&r.text)?, current, beta))
+    Ok(release::pick(&releases, current, beta))
 }
 
 fn fetch_text(asset: &Asset, proxy: &Setting) -> Result<String, String> {
@@ -230,7 +244,7 @@ pub(crate) fn start(job: Job, notify: HWND) -> Result<(), String> {
     std::thread::Builder::new()
         .name("update".into())
         .spawn(move || {
-            let result = run(&job, &Source::github(), &Version::current(), &dir());
+            let result = run(&job, &Source::github(), &current(), &dir());
             let done = Box::into_raw(Box::new(Checked { manual: job.manual, install: job.install, result }));
             unsafe {
                 if PostMessageW(Some(HWND(hwnd as _)), WM_UPDATE_DONE, WPARAM(0), LPARAM(done as isize)).is_err() {
@@ -287,7 +301,7 @@ pub(crate) fn staged_in(dir: &Path, key: &str, current: &Version) -> Option<Stag
 
 /// The update downloaded for this build, verified again.
 pub(crate) fn staged() -> Option<Staged> {
-    staged_in(&dir(), PUBLIC_KEY, &Version::current())
+    staged_in(&dir(), PUBLIC_KEY, &current())
 }
 
 /// Start-up housekeeping: old exes left by an update, downloads for this version or older,
@@ -300,7 +314,7 @@ pub(crate) fn tidy(updated: bool) {
     if updated {
         clear(&dir());
     }
-    let current = Version::current();
+    let current = current();
     let newer = |v: &str| Version::parse(v).is_some_and(|v| v > current);
     let status = Status::load();
     let stale = match &status.state {

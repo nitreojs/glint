@@ -1,7 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::naming::{DEFAULT_PATTERN, pattern_problem};
 use crate::paths::app_dir;
 use crate::record::Codec;
 
@@ -18,13 +19,14 @@ pub struct Config {
     pub hotkey: String,
     pub screenshot_hotkey: String,
     pub fullscreen_hotkey: String,
+    pub monitor_hotkey: String,
     pub pause_hotkey: String,
     pub launch_at_startup: bool,
     pub freeze_screen: bool,
     pub ui_elements: UiElements,
     pub notify_success: bool,
     pub output_dir: String,
-    /// File name pattern without the extension; see [`Config::file_stem`].
+    /// File name pattern without the extension; see [`crate::naming::expand`].
     pub file_name: String,
     pub fps: u32,
     pub codec: CodecName,
@@ -55,7 +57,6 @@ pub struct Config {
     pub update_beta: bool,
 }
 
-pub const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
 pub const DEFAULT_ACCENT: &str = "#E5402F";
 /// Characters Windows doesn't allow in file names.
 pub(crate) const BAD_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
@@ -159,13 +160,14 @@ impl Default for Config {
             hotkey: "Ctrl+Alt+PrintScreen".into(),
             screenshot_hotkey: "Ctrl+PrintScreen".into(),
             fullscreen_hotkey: "PrintScreen".into(),
+            monitor_hotkey: "Alt+PrintScreen".into(),
             pause_hotkey: "Pause".into(),
             launch_at_startup: false,
             freeze_screen: true,
             ui_elements: UiElements::Shift,
             notify_success: true,
             output_dir: String::new(),
-            file_name: DEFAULT_FILE_NAME.into(),
+            file_name: DEFAULT_PATTERN.into(),
             fps: 0,
             codec: CodecName::H264,
             quality: 22,
@@ -201,13 +203,32 @@ impl Config {
     }
 
     fn parse(text: &str) -> Result<Config, toml::de::Error> {
-        let table: toml::Table = toml::from_str(text)?;
-        if !audio::is_legacy(&table) {
-            return toml::from_str(text);
+        let mut table: toml::Table = toml::from_str(text)?;
+        let has_monitor_hotkey = table.contains_key("monitor_hotkey");
+        let mut cfg: Config = if audio::is_legacy(&table) {
+            audio::migrate(&mut table);
+            toml::Value::Table(table).try_into()?
+        } else {
+            toml::from_str(text)?
+        };
+        if !has_monitor_hotkey {
+            cfg.monitor_hotkey = cfg.free_monitor_hotkey();
         }
-        let mut table = table;
-        audio::migrate(&mut table);
-        toml::Value::Table(table).try_into()
+        Ok(cfg)
+    }
+
+    /// The monitor hotkey for settings from before it existed: the default, unless another
+    /// hotkey already uses that combo.
+    fn free_monitor_hotkey(&self) -> String {
+        let taken: Vec<_> = [&self.hotkey, &self.screenshot_hotkey, &self.fullscreen_hotkey, &self.pause_hotkey]
+            .into_iter()
+            .filter_map(|h| parse_hotkey(h).ok())
+            .collect();
+        ["Alt+PrintScreen", "Shift+PrintScreen", "Ctrl+Shift+PrintScreen", "Ctrl+Alt+Shift+PrintScreen"]
+            .into_iter()
+            .find(|c| parse_hotkey(c).is_ok_and(|c| !taken.contains(&c)))
+            .unwrap_or("Ctrl+Alt+Shift+F12")
+            .to_string()
     }
 
     /// Loads the settings file, creating it with defaults on first run.
@@ -218,20 +239,7 @@ impl Config {
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
         let cfg = Config::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let hotkeys = [
-            ("hotkey", &cfg.hotkey),
-            ("screenshot_hotkey", &cfg.screenshot_hotkey),
-            ("fullscreen_hotkey", &cfg.fullscreen_hotkey),
-            ("pause_hotkey", &cfg.pause_hotkey),
-        ];
-        let mut combos = Vec::with_capacity(hotkeys.len());
-        for (name, combo) in hotkeys {
-            let parsed = parse_hotkey(combo).map_err(|e| format!("{name}: {e}"))?;
-            if let Some((other, _)) = combos.iter().find(|(_, c)| *c == parsed) {
-                return Err(format!("{other} and {name} must differ"));
-            }
-            combos.push((name, parsed));
-        }
+        cfg.check_hotkeys()?;
         if cfg.quality > 51 {
             return Err(format!("quality must be 0-51, got {}", cfg.quality));
         }
@@ -241,7 +249,7 @@ impl Config {
         if !(50..=100).contains(&cfg.screenshot_quality) {
             return Err(format!("screenshot_quality must be 50-100, got {}", cfg.screenshot_quality));
         }
-        if let Some(problem) = file_name_problem(&cfg.file_name) {
+        if let Some(problem) = pattern_problem(&cfg.file_name) {
             return Err(format!("file_name {}: {problem}", toml::Value::String(cfg.file_name.clone())));
         }
         if parse_hex(&cfg.accent).is_none() {
@@ -256,6 +264,26 @@ impl Config {
             return Err(format!("audio_track_names has {} names, at most {} fit", cfg.audio_track_names.len(), audio::MAX_TRACKS));
         }
         Ok(cfg)
+    }
+
+    /// Every hotkey parses, and no two are the same combo.
+    fn check_hotkeys(&self) -> Result<(), String> {
+        let hotkeys = [
+            ("hotkey", &self.hotkey),
+            ("screenshot_hotkey", &self.screenshot_hotkey),
+            ("fullscreen_hotkey", &self.fullscreen_hotkey),
+            ("monitor_hotkey", &self.monitor_hotkey),
+            ("pause_hotkey", &self.pause_hotkey),
+        ];
+        let mut combos = Vec::with_capacity(hotkeys.len());
+        for (name, combo) in hotkeys {
+            let parsed = parse_hotkey(combo).map_err(|e| format!("{name}: {e}"))?;
+            if let Some((other, _)) = combos.iter().find(|(_, c)| *c == parsed) {
+                return Err(format!("{other} and {name} must differ"));
+            }
+            combos.push((name, parsed));
+        }
+        Ok(())
     }
 
     /// Writes the settings file (with its explanatory comments).
@@ -315,6 +343,9 @@ screenshot_hotkey = {screenshot_hotkey}
 # Screenshots every monitor at once, straight to the clipboard / folder, without selecting.
 fullscreen_hotkey = {fullscreen_hotkey}
 
+# Screenshots the monitor under the mouse, straight to the clipboard / folder, without selecting.
+monitor_hotkey = {monitor_hotkey}
+
 # Pauses and resumes a running recording (only held while recording).
 pause_hotkey = {pause_hotkey}
 
@@ -334,11 +365,14 @@ ui_elements = "{ui_elements}"
 # something goes wrong (false).
 notify_success = {notify_success}
 
-# Folder for recordings and screenshots. Empty = <Videos>\glint
+# Folder for recordings and screenshots. Empty = <Documents>\glint
 output_dir = {output_dir}
 
 # File names, without the extension. {{date}} becomes 2026-10-20 and {{time}} 14-32-07
-# (local time); a number is appended if the file already exists.
+# (local time), {{app}} the captured window's app ("screen" for whole monitors), {{title}} its
+# title, {{kind}} "screenshots" or "recordings"; a / makes folders, e.g. "{{app}}/{{app}}_{{date}}_{{time}}"
+# (captures that aren't one app's window go to "other"). A number is appended if the file
+# already exists.
 file_name = {file_name}
 
 # Frame rate cap. 0 = the native refresh rate of the monitor being recorded.
@@ -422,6 +456,7 @@ update_beta = {update_beta}
             hotkey = q(&self.hotkey),
             screenshot_hotkey = q(&self.screenshot_hotkey),
             fullscreen_hotkey = q(&self.fullscreen_hotkey),
+            monitor_hotkey = q(&self.monitor_hotkey),
             pause_hotkey = q(&self.pause_hotkey),
             launch_at_startup = self.launch_at_startup,
             freeze_screen = self.freeze_screen,
@@ -450,21 +485,12 @@ update_beta = {update_beta}
         )
     }
 
-    pub fn output_dir_or(&self, videos: impl FnOnce() -> PathBuf) -> PathBuf {
+    pub fn output_dir_or(&self, documents: impl FnOnce() -> PathBuf) -> PathBuf {
         if self.output_dir.trim().is_empty() {
-            videos().join("glint")
+            documents().join("glint")
         } else {
             PathBuf::from(self.output_dir.trim())
         }
-    }
-
-    /// File name (without extension) for a capture made at `date` / `time`.
-    pub fn file_stem(&self, date: &str, time: &str) -> String {
-        let pattern = match self.file_name.trim() {
-            "" => DEFAULT_FILE_NAME,
-            p => p,
-        };
-        pattern.replace("{date}", date).replace("{time}", time).trim_end_matches(['.', ' ']).to_string()
     }
 
     /// The accent as RGB; the default red if the setting isn't a valid colour.
@@ -477,9 +503,12 @@ update_beta = {update_beta}
     }
 }
 
-/// Why `pattern` can't name files, if it can't.
-pub fn file_name_problem(pattern: &str) -> Option<&'static str> {
-    pattern.contains(BAD_NAME_CHARS).then_some("file names can't contain \\ / : * ? \" < > |")
+/// Up to 0.1 the default folder was `<Videos>\glint`. On the first start after that changed,
+/// settings that use the default while `old` (that folder) holds files of its own keep it:
+/// returns the folder to write into `output_dir`, so nothing seems to move.
+pub fn pinned_output_dir(output_dir: &str, old: &Path, old_files: &[&str]) -> Option<String> {
+    let captures = old_files.iter().any(|f| !f.eq_ignore_ascii_case("desktop.ini") && !f.eq_ignore_ascii_case("thumbs.db"));
+    (output_dir.trim().is_empty() && captures).then(|| old.display().to_string())
 }
 
 /// `#RRGGBB` or `#RGB`, the `#` optional, surrounding spaces ignored.
@@ -512,13 +541,14 @@ mod tests {
             hotkey: "Shift+Pause".into(),
             screenshot_hotkey: "Win+Shift+S".into(),
             fullscreen_hotkey: "Alt+F12".into(),
+            monitor_hotkey: "Shift+F12".into(),
             pause_hotkey: "Ctrl+Pause".into(),
             launch_at_startup: true,
             freeze_screen: false,
             ui_elements: UiElements::Always,
             notify_success: false,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),
-            file_name: "clip {date} at {time}".into(),
+            file_name: "{app}/clip {date} at {time}".into(),
             fps: 60,
             codec: CodecName::Hevc,
             quality: 18,
@@ -555,14 +585,34 @@ mod tests {
     }
 
     #[test]
-    fn file_names_fill_in_the_pattern() {
-        let named = |pattern: &str| Config { file_name: pattern.into(), ..Config::default() };
-        assert_eq!(named(DEFAULT_FILE_NAME).file_stem("2026-10-20", "14-32-07"), "glint_2026-10-20_14-32-07");
-        assert_eq!(named("{time} {time}").file_stem("d", "t"), "t t");
-        // Empty means the default; trailing dots and spaces aren't valid at the end of a name.
-        assert_eq!(named("  ").file_stem("d", "t"), "glint_d_t");
-        assert_eq!(named("clip {date}. ").file_stem("d", "t"), "clip d");
-        assert!(file_name_problem("a/b").is_some() && file_name_problem("glint {date}").is_none());
+    fn hotkeys_must_all_differ() {
+        assert_eq!(Config::default().check_hotkeys(), Ok(()));
+        assert_eq!(Config::default().monitor_hotkey, "Alt+PrintScreen");
+        let clash = Config { monitor_hotkey: "printscreen".into(), ..Config::default() };
+        assert_eq!(clash.check_hotkeys(), Err("fullscreen_hotkey and monitor_hotkey must differ".into()));
+        let clash = Config { pause_hotkey: "alt+prtsc".into(), ..Config::default() };
+        assert_eq!(clash.check_hotkeys(), Err("monitor_hotkey and pause_hotkey must differ".into()));
+        let bad = Config { monitor_hotkey: "Alt".into(), ..Config::default() };
+        assert!(bad.check_hotkeys().unwrap_err().starts_with("monitor_hotkey: "));
+        let old = Config::parse("hotkey = \"Ctrl+F9\"").unwrap();
+        assert_eq!(old.monitor_hotkey, "Alt+PrintScreen");
+        let old = Config::parse("fullscreen_hotkey = \"Alt+PrtSc\"\nhotkey = \"Shift+PrintScreen\"").unwrap();
+        assert_eq!((old.monitor_hotkey.as_str(), old.check_hotkeys()), ("Ctrl+Shift+PrintScreen", Ok(())));
+        let chosen = Config::parse("fullscreen_hotkey = \"Alt+PrtSc\"\nmonitor_hotkey = \"Alt+PrintScreen\"").unwrap();
+        assert!(chosen.check_hotkeys().is_err());
+    }
+
+    #[test]
+    fn the_old_default_folder_is_kept_only_when_it_has_captures() {
+        let old = Path::new(r"C:\Users\a\Videos\glint");
+        let pinned = pinned_output_dir("", old, &["glint_2026-10-20_14-32-07.mp4", "desktop.ini"]);
+        assert_eq!(pinned.as_deref(), Some(r"C:\Users\a\Videos\glint"));
+        assert_eq!(pinned_output_dir("  ", old, &["a.png"]).as_deref(), Some(r"C:\Users\a\Videos\glint"));
+        assert_eq!(pinned_output_dir("", old, &[]), None);
+        assert_eq!(pinned_output_dir("", old, &["desktop.ini", "Thumbs.db"]), None);
+        assert_eq!(pinned_output_dir(r"D:\clips", old, &["a.png"]), None);
+        let documents = Config::default().output_dir_or(|| PathBuf::from("docs"));
+        assert_eq!(documents, Path::new("docs").join("glint"));
     }
 
     #[test]

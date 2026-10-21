@@ -1,5 +1,7 @@
 use glint_core::geom::rect::Rect;
+use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{BitBlt, CAPTUREBLT, GdiFlush, GetDC, ROP_CODE, ReleaseDC, SRCCOPY};
+use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 use super::gfx::Dib;
 use super::monitors;
@@ -17,6 +19,31 @@ pub(crate) fn virtual_screen() -> Result<(Vec<u32>, Rect), String> {
     let mut dib = Dib::new(area.w, area.h)?;
     grab(&mut dib, area, &monitors)?;
     Ok((dib.pixels().to_vec(), area))
+}
+
+/// The monitor under the mouse as opaque 0xFFRRGGBB rows, and where it is on the desktop.
+pub(crate) fn monitor_under_mouse() -> Result<(Vec<u32>, Rect), String> {
+    let monitors: Vec<Rect> = monitors::enumerate()
+        .map_err(|e| format!("can't list monitors: {}", e.message()))?
+        .into_iter()
+        .map(|o| o.rect)
+        .collect();
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }.map_err(|e| format!("can't find the mouse: {e}"))?;
+    let area = under(&monitors, pt.x, pt.y).ok_or("no monitors found")?;
+    let mut dib = Dib::new(area.w, area.h)?;
+    grab(&mut dib, area, &[area])?;
+    Ok((dib.pixels().to_vec(), area))
+}
+
+/// The monitor containing (x, y), else the nearest one.
+fn under(monitors: &[Rect], x: i32, y: i32) -> Option<Rect> {
+    let gap = |m: &Rect| {
+        let dx = (m.x - x).max(x - (m.right() - 1)).max(0) as i64;
+        let dy = (m.y - y).max(y - (m.bottom() - 1)).max(0) as i64;
+        dx * dx + dy * dy
+    };
+    monitors.iter().min_by_key(|m| gap(m)).copied()
 }
 
 /// Copies the desktop's `area` into `dib` (sized like `area`); pixels outside `monitors` become black.
@@ -85,5 +112,20 @@ mod tests {
             lit,  lit,  dark, dark, dark, dark,
         ];
         assert_eq!(pixels, want);
+    }
+
+    #[test]
+    fn the_monitor_under_the_mouse_or_the_nearest() {
+        let wide = Rect { x: 0, y: 0, w: 3440, h: 1440 };
+        let left = Rect { x: -1920, y: 540, w: 1920, h: 1080 };
+        let top = Rect { x: 365, y: -1440, w: 2560, h: 1440 };
+        let all = [wide, left, top];
+        assert_eq!(under(&all, 100, 100), Some(wide));
+        assert_eq!(under(&all, 3439, 1439), Some(wide));
+        assert_eq!(under(&all, -1, 600), Some(left));
+        assert_eq!(under(&all, 400, -1), Some(top));
+        assert_eq!(under(&all, -1, -1), Some(wide)); // in no monitor: the nearest
+        assert_eq!(under(&all, -5000, 1000), Some(left));
+        assert_eq!(under(&[], 0, 0), None);
     }
 }

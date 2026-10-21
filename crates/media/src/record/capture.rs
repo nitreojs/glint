@@ -4,6 +4,8 @@ use std::thread;
 
 use glint_core::geom::rect::Rect;
 use glint_core::log::log;
+use glint_core::record::pipeline::{self, CaptureStats, Event};
+use glint_core::record::pointer::{PointerKind, PointerShape};
 use windows::Win32::Foundation::{E_ACCESSDENIED, HANDLE, RECT};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -11,13 +13,9 @@ use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::core::Interface;
 
 use super::rotate::{Rotation, Rotator, surface_rect, texel_map};
-use super::{Ctx, INFINITE, Msg, Params, RING, adapter, create_device, qpc, texture_desc};
+use super::win::{INFINITE, RING, adapter, create_device, hns, qpc, texture_desc};
+use super::{Ctx, Params};
 use crate::rect::WinRect;
-
-pub(super) struct CaptureStats {
-    pub(super) dropped: u64,
-    pub(super) coalesced: u64,
-}
 
 /// One duplicated output and the part of the region it covers.
 struct Feed {
@@ -43,8 +41,8 @@ struct Pointer {
     pos: (i32, i32),
     /// QPC time of the last position update.
     time: i64,
-    /// Latest shape from this output's duplication, with its size and a change counter.
-    shape: Option<(DXGI_OUTDUPL_POINTER_SHAPE_INFO, Vec<u8>, (i32, i32))>,
+    /// Latest shape from this output's duplication and a change counter.
+    shape: Option<PointerShape>,
     generation: u64,
 }
 
@@ -80,6 +78,9 @@ pub(super) struct Capture {
     meta: Vec<u32>,
     stats: CaptureStats,
 }
+
+// d3d11/dxgi objects are free-threaded; after the move only the capture thread touches them.
+unsafe impl Send for Capture {}
 
 impl Capture {
     pub(super) unsafe fn new(p: &Params) -> Result<Self, String> {
@@ -171,7 +172,12 @@ impl Capture {
         }
     }
 
-    pub(super) unsafe fn run(&mut self, stop: &AtomicBool, tx: &Sender<Msg>, free_rx: &Receiver<usize>) -> Result<CaptureStats, String> {
+    unsafe fn duplicate(
+        &mut self,
+        stop: &AtomicBool,
+        tx: &Sender<Event<usize>>,
+        free_rx: &Receiver<usize>,
+    ) -> Result<CaptureStats, String> {
         unsafe {
             let r = self.region;
             // acquirenextframe timeouts round up to the system timer tick (15.6 ms by default).
@@ -213,10 +219,10 @@ impl Capture {
                 if self.draw_cursor {
                     let mut shape_sent = false;
                     if let Some(t) = self.shape_source(sent_shape.map(|s| s.0))
-                        && let Some((si, buf, _)) = &self.feeds[t].pointer.shape
+                        && let Some(shape) = &self.feeds[t].pointer.shape
                         && sent_shape != Some((t, self.feeds[t].pointer.generation))
                     {
-                        let _ = tx.send(Msg::Shape(*si, buf.clone()));
+                        let _ = tx.send(Event::Pointer(shape.clone()));
                         sent_shape = Some((t, self.feeds[t].pointer.generation));
                         shape_sent = true;
                     }
@@ -230,7 +236,7 @@ impl Capture {
                 if changed && ready {
                     let cursor = after.map(|p| (p.x, p.y));
                     let qpc = if stamp != 0 { stamp } else { qpc() };
-                    if tx.send(Msg::Frame { slot: tick.slot, qpc, cursor }).is_err() {
+                    if tx.send(Event::Frame { image: tick.slot, at: hns(qpc), cursor }).is_err() {
                         break; // encoder gave up
                     }
                 }
@@ -238,7 +244,17 @@ impl Capture {
             Ok(CaptureStats { dropped: self.stats.dropped, coalesced: self.stats.coalesced })
         }
     }
+}
 
+impl pipeline::Capture for Capture {
+    type Image = usize;
+
+    fn run(&mut self, stop: &AtomicBool, out: &Sender<Event<usize>>, free: &Receiver<usize>) -> Result<CaptureStats, String> {
+        unsafe { self.duplicate(stop, out, free) }
+    }
+}
+
+impl Capture {
     /// Takes the next frame of output `i` if one arrives within `timeout` ms: its part of the
     /// region goes into the ring (single output) or the composed image, pointer updates are kept.
     unsafe fn poll(&mut self, i: usize, timeout: u32, stop: &AtomicBool, tick: &mut Tick) -> Result<(), String> {
@@ -299,11 +315,11 @@ impl Capture {
                 let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
                 let mut need = 0;
                 let mut si = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
-                if dupl.GetFramePointerShape(buf.len() as u32, buf.as_mut_ptr() as _, &mut need, &mut si).is_ok() {
+                if dupl.GetFramePointerShape(buf.len() as u32, buf.as_mut_ptr() as _, &mut need, &mut si).is_ok()
+                    && let Some(kind) = pointer_kind(si.Type)
+                {
                     buf.truncate(need as usize);
-                    let mono = si.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 as u32;
-                    let size = (si.Width as i32, if mono { si.Height as i32 / 2 } else { si.Height as i32 });
-                    f.pointer.shape = Some((si, buf, size));
+                    f.pointer.shape = Some(PointerShape { kind, width: si.Width, height: si.Height, pitch: si.Pitch, data: buf });
                     f.pointer.generation += 1;
                 }
             }
@@ -317,7 +333,7 @@ impl Capture {
     /// to the encoder (empty when none was).
     fn pointer(&self, sent_shape: Option<(usize, u64)>) -> Option<Rect> {
         let p = &self.feeds[newest_visible(self.feeds.iter().map(|f| (f.pointer.visible, f.pointer.time)))?].pointer;
-        let (w, h) = sent_shape.and_then(|(i, _)| self.feeds[i].pointer.shape.as_ref()).map_or((0, 0), |s| s.2);
+        let (w, h) = sent_shape.and_then(|(i, _)| self.feeds[i].pointer.shape.as_ref()).map_or((0, 0), |s| s.size());
         Some(Rect { x: p.pos.0, y: p.pos.1, w, h })
     }
 
@@ -435,6 +451,15 @@ fn pacer(rates: &[f64]) -> usize {
 /// between waits, so it must not exceed a frame.
 fn wait_ms(fps: f64, outputs: usize) -> u32 {
     if outputs > 1 { (1000.0 / fps).floor().clamp(1.0, 50.0) as u32 } else { 50 }
+}
+
+fn pointer_kind(t: u32) -> Option<PointerKind> {
+    match t as i32 {
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 => Some(PointerKind::Color),
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 => Some(PointerKind::Monochrome),
+        t if t == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 => Some(PointerKind::MaskedColor),
+        _ => None,
+    }
 }
 
 /// Among (visible, last update time) pointer states, the most recently updated visible one.

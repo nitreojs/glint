@@ -1,3 +1,4 @@
+use glint_core::geom::outline::{Sides, inward, outer};
 use glint_core::geom::rect::Rect;
 use glint_media::rect::WinRect;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
@@ -8,7 +9,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 
 use super::effects::apply_effect;
-use super::marks::{GRIPS, Mark, draw_mark, edge_point, numbered};
+use super::marks::{Edges, GRIPS, Mark, draw_mark, edge_point, numbered};
 use super::text::Typesetter;
 use super::toolbar::{BAR_BG, WHITE, beside, nearest};
 use super::{Drag, Editor, HINT, hint_alpha, hull};
@@ -19,7 +20,7 @@ use crate::platform::rect::ring;
 const GRIP_EDGE: D2D1_COLOR_F = rgba(20, 20, 24, 0.9);
 
 impl Editor {
-    /// Brings `view` and the pill's placement up to date. `bright` is the frozen screen. Returns
+    /// Brings `view` and the pills' placement up to date. `bright` is the frozen screen. Returns
     /// the pixels a moved pill changes.
     pub(crate) fn render(
         &mut self,
@@ -34,6 +35,11 @@ impl Editor {
         } else if let Some(part) = self.patch.take() {
             self.render_view(bright, painter, Some(part))?;
         }
+        Ok(self.render_chrome(painter, font))
+    }
+
+    /// Places the hint and the tooltip; returns the pixels that changed.
+    pub(crate) fn render_chrome(&mut self, painter: &Painter, font: &IDWriteTextFormat) -> Vec<Rect> {
         let mut moved = Vec::new();
         if self.hint.is_some_and(|(_, r)| r.is_none()) {
             let (tw, _) = painter.measure(HINT, font);
@@ -48,7 +54,7 @@ impl Editor {
             self.pill = want.map(|(item, text)| (self.place_pill(item, &text, painter, font), item, text));
             moved.extend(self.pill.as_ref().map(|(r, ..)| *r));
         }
-        Ok(moved)
+        moved
     }
 
     /// Redraws the view, or only its `part` (client coordinates) when the base is still good.
@@ -187,18 +193,19 @@ impl Editor {
                 let _ = BitBlt(dc, s.x, s.y, s.w, s.h, Some(v.dc), 0, 0, SRCCOPY);
             }
             if self.selected {
-                // 1 px white inside 1 px black, outside the shot, like the picker.
-                for (outer, inner, brush) in [(s.inflate(1), s, white), (s.inflate(2), s.inflate(1), black)] {
+                // 1 px white inside 1 px black, outside the shot like the picker, except on
+                // sides at the edge of its monitors, where it goes just inside.
+                let o = local(outer(self.sel, inward(self.sel, &self.monitors, 2), 2));
+                for (outer, inner, brush) in [(o.inflate(-1), o.inflate(-2), white), (o, o.inflate(-1), black)] {
                     for e in ring(outer, inner) {
                         FillRect(dc, &e, brush);
                     }
                 }
                 // Handles at the corners and edge midpoints.
                 let hs = self.px(7.0) as i32;
+                let sides = inward(self.sel, &self.monitors, hs / 2 + 1);
                 for e in GRIPS {
-                    let (x, y) = edge_point(s, e);
-                    let (x, y) = (x as i32, y as i32);
-                    let outer = Rect { x: x - hs / 2 - 1, y: y - hs / 2 - 1, w: hs + 2, h: hs + 2 };
+                    let outer = local(handle_box(self.sel, e, hs, sides));
                     FillRect(dc, &outer.to_win(), black);
                     FillRect(dc, &outer.inflate(-1).to_win(), white);
                 }
@@ -231,27 +238,42 @@ impl Editor {
                     }
                 }
             }
-            if self.bar_shown() && visible(self.bar) {
-                painter.draw_on(dc, local(self.bar).to_win(), |c| self.draw_bar(c))?;
-            }
-            if let Some((r, _, text)) = &self.pill
-                && visible(*r)
-            {
-                let (w, h, pad) = (r.w as f32, r.h as f32, self.px(10.0));
-                painter.draw_on(dc, local(*r).to_win(), |c| {
-                    c.round_rect(0.0, 0.0, w, h, h / 2.0, BAR_BG);
-                    c.text(text, font, [pad, 0.0, w - pad, h], WHITE);
-                })?;
-            }
-            if let Some((at, Some(r))) = self.hint
-                && visible(r)
-            {
-                let (w, h, pad, a) = (r.w as f32, r.h as f32, self.px(10.0), hint_alpha(at.elapsed()));
-                painter.draw_on(dc, local(r).to_win(), |c| {
-                    c.round_rect(0.0, 0.0, w, h, h / 2.0, D2D1_COLOR_F { a: BAR_BG.a * a, ..BAR_BG });
-                    c.text(HINT, font, [pad, 0.0, w - pad, h], D2D1_COLOR_F { a: WHITE.a * a, ..WHITE });
-                })?;
-            }
+            self.draw_chrome(dc, area, rp, painter, font)
+        }
+    }
+
+    /// Draws the toolbar and the pills onto `dc`, which shows client `area`; those not reaching
+    /// `rp` are skipped.
+    pub(crate) fn draw_chrome(
+        &self,
+        dc: HDC,
+        area: Rect,
+        rp: Rect,
+        painter: &Painter,
+        font: &IDWriteTextFormat,
+    ) -> Result<(), String> {
+        let local = |r: Rect| r.offset(-area.x, -area.y);
+        let visible = |r: Rect| r.intersect(&rp).is_some();
+        if visible(self.bar) {
+            painter.draw_on(dc, local(self.bar).to_win(), |c| self.draw_bar(c))?;
+        }
+        if let Some((r, _, text)) = &self.pill
+            && visible(*r)
+        {
+            let (w, h, pad) = (r.w as f32, r.h as f32, self.px(10.0));
+            painter.draw_on(dc, local(*r).to_win(), |c| {
+                c.round_rect(0.0, 0.0, w, h, h / 2.0, BAR_BG);
+                c.text(text, font, [pad, 0.0, w - pad, h], WHITE);
+            })?;
+        }
+        if let Some((at, Some(r))) = self.hint
+            && visible(r)
+        {
+            let (w, h, pad, a) = (r.w as f32, r.h as f32, self.px(10.0), hint_alpha(at.elapsed()));
+            painter.draw_on(dc, local(r).to_win(), |c| {
+                c.round_rect(0.0, 0.0, w, h, h / 2.0, D2D1_COLOR_F { a: BAR_BG.a * a, ..BAR_BG });
+                c.text(HINT, font, [pad, 0.0, w - pad, h], D2D1_COLOR_F { a: WHITE.a * a, ..WHITE });
+            })?;
         }
         Ok(())
     }
@@ -287,6 +309,27 @@ fn draw_shapes<'a>(
     for (m, step) in numbered(marks.filter(|m| !m.is_effect())) {
         draw_mark(c, m, shift, scale, fonts, step);
     }
+}
+
+/// The selection handle at `e` of `s`, `hs` px plus a 1 px border, centred on the edge; on
+/// `inside` sides it sits just inside the selection instead.
+fn handle_box(s: Rect, e: Edges, hs: i32, inside: Sides) -> Rect {
+    let (x, y) = edge_point(s, e);
+    let size = hs + 2;
+    let mut b = Rect { x: x as i32 - hs / 2 - 1, y: y as i32 - hs / 2 - 1, w: size, h: size };
+    if e.l && inside.l {
+        b.x = s.x;
+    }
+    if e.r && inside.r {
+        b.x = s.right() - size;
+    }
+    if e.t && inside.t {
+        b.y = s.y;
+    }
+    if e.b && inside.b {
+        b.y = s.bottom() - size;
+    }
+    b
 }
 
 fn dim(p: u32) -> u32 {
@@ -381,5 +424,20 @@ mod tests {
             runs.push((y, a, b))
         });
         assert_eq!(runs, [(7, 5, 9), (8, 5, 6), (8, 7, 9)]);
+    }
+
+    #[test]
+    fn handles_on_a_monitors_edge_stay_inside() {
+        let monitors = [Rect { x: 0, y: 0, w: 3440, h: 1440 }, Rect { x: 365, y: -1440, w: 2560, h: 1440 }];
+        let s = Rect { x: 1000, y: 0, w: 400, h: 300 };
+        let sides = inward(s, &monitors, 4);
+        assert_eq!(sides, Sides { t: true, ..Sides::default() });
+        let at = |l, t, r, b| handle_box(s, Edges { l, t, r, b }, 7, sides);
+        assert_eq!(at(false, true, false, false), Rect { x: 1196, y: 0, w: 9, h: 9 }, "top edge: inside");
+        assert_eq!(at(true, true, false, false), Rect { x: 996, y: 0, w: 9, h: 9 }, "top left: only down");
+        assert_eq!(at(false, false, true, true), Rect { x: 1396, y: 296, w: 9, h: 9 }, "elsewhere centred");
+        let sides = inward(monitors[0], &monitors, 4);
+        let corner = handle_box(monitors[0], Edges { l: false, t: false, r: true, b: true }, 7, sides);
+        assert_eq!(corner, Rect { x: 3431, y: 1431, w: 9, h: 9 });
     }
 }

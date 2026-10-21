@@ -157,7 +157,8 @@ impl Pin {
     /// Hands a copy of the shot to the owner (copy / save), like the editor's buttons.
     fn send(&self, output: Output) {
         let s = &self.shot;
-        let shot = Shot { pixels: s.pixels.clone(), w: s.w, h: s.h, alpha: s.alpha, at: s.at, output };
+        let (pixels, source) = (s.pixels.clone(), s.source.clone());
+        let shot = Shot { pixels, w: s.w, h: s.h, alpha: s.alpha, at: s.at, output, source };
         unsafe {
             let boxed = Box::into_raw(Box::new(shot));
             if PostMessageW(Some(self.owner), self.msg, WPARAM(0), LPARAM(boxed as isize)).is_err() {

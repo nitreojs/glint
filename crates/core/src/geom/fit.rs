@@ -86,6 +86,13 @@ pub fn output_at(outputs: &[Output], x: i32, y: i32) -> Option<usize> {
     outputs.iter().position(|o| o.rect.contains(x, y))
 }
 
+/// How far a drag from `anchor` to `corner` moves when the cursor moves by `d`: the whole box goes
+/// along but stays inside `area` (a drag's points may sit on its right and bottom edges).
+pub fn shift_drag(anchor: (i32, i32), corner: (i32, i32), d: (i32, i32), area: Rect) -> (i32, i32) {
+    let axis = |a: i32, c: i32, d: i32, lo: i32, hi: i32| d.clamp((lo - a.min(c)).min(0), (hi - a.max(c)).max(0));
+    (axis(anchor.0, corner.0, d.0, area.x, area.right()), axis(anchor.1, corner.1, d.1, area.y, area.bottom()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +241,15 @@ mod tests {
         let (rect, cut) = multi_pick(&[a, b], AREA, Fit::ANY, true).unwrap();
         assert_eq!(rect, Rect { x: 3000, y: 1000, w: 440, h: 620 });
         assert_eq!(cut, Some(vec![Rect { x: 3300, y: 1300, w: 140, h: 320 }, b]));
+    }
+
+    #[test]
+    fn moved_drags_stay_inside_the_virtual_screen() {
+        let (a, c) = ((100, 200), (400, 50));
+        assert_eq!(shift_drag(a, c, (30, -20), AREA), (30, -20));
+        assert_eq!(shift_drag(a, c, (-5000, 0), AREA), (-2020, 0), "stopped at the left edge");
+        assert_eq!(shift_drag(a, c, (0, -5000), AREA), (0, -1490), "stopped at the top edge");
+        assert_eq!(shift_drag(a, c, (9000, 9000), AREA), (3040, 1420), "right and bottom edges are reachable");
+        assert_eq!(shift_drag((-1920, 0), (0, 10), (-1, 0), AREA), (0, 0), "already at the edge");
     }
 }

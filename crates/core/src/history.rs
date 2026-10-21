@@ -62,6 +62,26 @@ pub fn clear() {
     let _ = std::fs::remove_file(file());
 }
 
+/// Points entries at the files' new places after `moved` (from, to) were moved.
+pub fn relocate(moved: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    relocate_in(&file(), moved)
+}
+
+fn relocate_in(file: &Path, moved: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    let mut entries = read(file);
+    let mut changed = false;
+    for e in &mut entries {
+        if let Some((_, to)) = moved.iter().find(|(from, _)| e.path.as_ref() == Some(from)) {
+            e.path = Some(to.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    write(file, &entries)
+}
+
 impl Entry {
     pub fn exists(&self) -> bool {
         self.path.as_deref().is_some_and(Path::is_file)
@@ -116,8 +136,12 @@ fn append(file: &Path, entry: &Entry) -> Result<(), String> {
 
 fn compact(file: &Path) -> Result<(), String> {
     let entries = read(file);
+    write(file, &entries[entries.len().saturating_sub(KEEP)..])
+}
+
+fn write(file: &Path, entries: &[Entry]) -> Result<(), String> {
     let mut text = String::new();
-    for e in &entries[entries.len().saturating_sub(KEEP)..] {
+    for e in entries {
         text += &serde_json::to_string(e).map_err(|e| e.to_string())?;
         text.push('\n');
     }
@@ -165,6 +189,10 @@ mod tests {
         assert!(std::fs::read_to_string(&file).unwrap().contains(r#""kind":"recording""#));
         compact(&file).unwrap();
         assert_eq!(read(&file), back);
+        let moved = dir.join("sub").join("b.mp4");
+        relocate_in(&file, &[(dir.join("b.mp4"), moved.clone()), (dir.join("gone.png"), dir.join("x.png"))]).unwrap();
+        let paths: Vec<_> = read(&file).into_iter().map(|e| e.path).collect();
+        assert_eq!(paths, [Some(dir.join("a.png")), Some(moved), None]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

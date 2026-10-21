@@ -16,5 +16,9 @@ toml.workspace = true
 windows.workspace = true
 windows-numerics.workspace = true
 
+[build-dependencies]
+embed-resource.workspace = true
+glint-core.workspace = true
+
 [dev-dependencies]
 glint-ui = { workspace = true, features = ["test-rows"] }

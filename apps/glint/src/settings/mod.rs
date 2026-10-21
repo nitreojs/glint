@@ -11,9 +11,10 @@ use std::sync::OnceLock;
 use eframe::egui::{
     self, Align, Align2, Color32, CornerRadius, Id, Key, Layout, Margin, Rect, RichText, Stroke, Ui, UiBuilder, pos2, vec2,
 };
-use glint_core::config::{Config, file_name_problem};
+use glint_core::config::Config;
+use glint_core::icon::icon_rgba;
+use glint_core::naming::pattern_problem;
 use glint_core::paths::app_dir;
-use glint_ui::icon::icon_rgba;
 use glint_ui::theme::{FONT_LICENSE, fonts, visuals};
 use glint_ui::widgets::{
     self, BAR_H, CONTENT_X, FOOTER_H, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, mono, sans, semibold,
@@ -24,13 +25,14 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 use crate::app::ipc::{self, SETTINGS_TITLE, WM_RELOAD};
-use crate::platform::paths::output_dir;
+use crate::platform::paths::{output_dir, remember_previous_output_dir};
 
 mod hotkey_capture;
 mod sections;
 
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, Listener};
+use sections::output::Mover;
 use sections::updates::Updater;
 use sections::uploads::Uploaders;
 use sections::{SECTIONS, Section};
@@ -86,6 +88,7 @@ pub fn run() {
         uploaders: Uploaders::load(),
         updater: Updater::load(),
         audio_devices: None,
+        mover: Mover::default(),
         shown: None,
         pinned: false,
         size: (size, size),
@@ -136,6 +139,7 @@ struct SettingsApp {
     uploaders: Uploaders,
     updater: Updater,
     audio_devices: Option<sections::audio::Devices>,
+    mover: Mover,
     shown: Option<Section>,
     pinned: bool,
     /// What's typed in the custom accent field; `cfg.accent` follows it while it's a colour.
@@ -158,7 +162,7 @@ impl SettingsApp {
     }
 
     fn can_save(&self) -> bool {
-        self.changes() > 0 && self.listening.is_none() && file_name_problem(&self.cfg.file_name).is_none()
+        self.changes() > 0 && self.listening.is_none() && pattern_problem(&self.cfg.file_name).is_none()
     }
 
     /// Writes config.toml and tells the tray app; returns whether it worked.
@@ -170,6 +174,10 @@ impl SettingsApp {
         }
         match self.cfg.save() {
             Ok(()) => {
+                let before = output_dir(&self.saved);
+                if before != dir {
+                    remember_previous_output_dir(&before);
+                }
                 ipc::post_to_main(WM_RELOAD, 0);
                 self.saved = self.cfg.clone();
                 self.error = None;
@@ -396,7 +404,7 @@ impl SettingsApp {
                             self.dialog = None;
                         }
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let valid = file_name_problem(&self.cfg.file_name).is_none();
+                            let valid = pattern_problem(&self.cfg.file_name).is_none();
                             if widgets::button(ui, look, "save", Kind::Primary, 30.0, valid).clicked() && self.save() {
                                 self.close(ctx);
                             }
@@ -470,6 +478,7 @@ mod tests {
                 uploaders: Uploaders::load(),
                 updater: Updater::at(std::env::temp_dir().join("glint-tests-no-update-status.json")),
                 audio_devices: None,
+                mover: Mover::default(),
                 shown: None,
                 pinned: false,
                 accent_text: String::new(),
@@ -714,6 +723,67 @@ mod tests {
             }
         }
         eprintln!("{}", counts.join("\n"));
+    }
+
+    #[test]
+    fn output_section_names_files_after_windows_and_moves_old_captures() {
+        use egui::accesskit::Role;
+        use sections::output::Leftover;
+        use sections::output::tests::temp;
+        let mut h = Harness::new();
+        h.ctx.enable_accesskit();
+        h.screen = vec2(WINDOW[0], 1400.0);
+        let root = temp("harness");
+        let (old, now) = (root.join("old"), root.join("now"));
+        std::fs::create_dir_all(old.join("Telegram")).unwrap();
+        std::fs::write(old.join("Telegram").join("a.png"), b"x").unwrap();
+        h.app.saved.output_dir = now.display().to_string();
+        h.app.cfg.output_dir = h.app.saved.output_dir.clone();
+        h.app.mover.scanned = Some(now.clone());
+        h.app.mover.leftovers = vec![Leftover { from: old.clone(), files: vec![old.join("Telegram").join("a.png")] }];
+        h.app.go(Section::Output);
+        h.settle();
+
+        let toggle = |h: &mut Harness, label: &str| {
+            let c = h.control(label);
+            h.click(pos2(c.left() + 18.0, c.top() + 10.0));
+        };
+        toggle(&mut h, "name files after the window");
+        assert_eq!(h.app.cfg.file_name, "{app}_{date}_{time}");
+        toggle(&mut h, "sort into folders by app");
+        assert_eq!(h.app.cfg.file_name, "{app}/{app}_{date}_{time}");
+        toggle(&mut h, "name files after the window");
+        assert_eq!(h.app.cfg.file_name, "{app}/glint_{date}_{time}");
+        assert_eq!(Section::Output.changes(&h.app.cfg, &h.app.saved), 1);
+        Section::Output.reset(&mut h.app.cfg);
+        assert_eq!((h.app.cfg.file_name.as_str(), h.app.cfg.output_dir.as_str()), ("glint_{date}_{time}", ""));
+        h.app.cfg.output_dir = h.app.saved.output_dir.clone();
+
+        let shows = |tree: &[(egui::accesskit::NodeId, egui::accesskit::Node)], text: &str| {
+            tree.iter().any(|(_, n)| n.role() == Role::Label && (n.value() == Some(text) || n.label() == Some(text)))
+        };
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        let text = format!("1 capture is still in {}", old.display());
+        assert!(shows(&tree, &text), "{text}");
+        let button = tree
+            .iter()
+            .find(|(_, n)| n.role() == Role::Button && n.label() == Some("move my files here"))
+            .and_then(|(_, n)| n.bounds())
+            .expect("the move button");
+        h.click(pos2(((button.x0 + button.x1) / 2.0) as f32, ((button.y0 + button.y1) / 2.0) as f32));
+        for _ in 0..200 {
+            if !h.app.mover.leftovers.iter().any(|l| l.from == old) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            h.frame(Vec::new(), "");
+        }
+        h.settle();
+        assert!(now.join("Telegram").join("a.png").is_file() && !old.join("Telegram").join("a.png").exists());
+        let tree = std::mem::take(&mut h.tree);
+        assert!(shows(&tree, "moved 1 file"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

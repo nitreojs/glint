@@ -1,14 +1,11 @@
 //! Draws the mouse pointer onto captured frames. Desktop Duplication delivers the
 //! desktop image without the cursor, plus the pointer shape and position separately.
 
+use glint_core::record::pointer::PointerShape;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile};
 use windows::Win32::Graphics::Direct3D::{D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP, ID3DBlob};
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
-use windows::Win32::Graphics::Dxgi::{
-    DXGI_OUTDUPL_POINTER_SHAPE_INFO, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR, DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR,
-    DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME,
-};
 use windows::core::{Error, PCSTR, Result, s};
 
 const SHADER: &str = r#"
@@ -166,72 +163,18 @@ impl CursorRenderer {
         self.shape.as_ref().map(|s| (s.w, s.h))
     }
 
-    /// Converts a Desktop Duplication pointer shape into BGRA textures.
-    pub(crate) fn set_shape(&mut self, dev: &ID3D11Device, info: &DXGI_OUTDUPL_POINTER_SHAPE_INFO, buf: &[u8]) -> Result<()> {
-        let w = info.Width as usize;
-        let pitch = info.Pitch as usize;
-        let ty = info.Type as i32;
-        let (h, normal, invert) = if ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR.0 {
-            let h = info.Height as usize;
-            let mut px = vec![0u32; w * h];
-            for y in 0..h {
-                for x in 0..w {
-                    let o = y * pitch + x * 4;
-                    px[y * w + x] = u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-                }
-            }
-            (h, px, None)
-        } else if ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME.0 {
-            // Top half is the AND mask, bottom half the XOR mask, 1 bit per pixel.
-            let h = info.Height as usize / 2;
-            let bit = |row: usize, x: usize| buf[row * pitch + x / 8] & (0x80 >> (x % 8)) != 0;
-            let mut normal = vec![0u32; w * h];
-            let mut invert = vec![0u32; w * h];
-            for y in 0..h {
-                for x in 0..w {
-                    let (and, xor) = (bit(y, x), bit(y + h, x));
-                    normal[y * w + x] = match (and, xor) {
-                        (false, false) => 0xFF000000,
-                        (false, true) => 0xFFFFFFFF,
-                        _ => 0,
-                    };
-                    if and && xor {
-                        invert[y * w + x] = 0xFFFFFFFF;
-                    }
-                }
-            }
-            (h, normal, Some(invert))
-        } else if ty == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR.0 {
-            // Alpha 0x00: replace with RGB; alpha 0xFF: XOR RGB with the screen.
-            let h = info.Height as usize;
-            let mut normal = vec![0u32; w * h];
-            let mut invert = vec![0u32; w * h];
-            for y in 0..h {
-                for x in 0..w {
-                    let o = y * pitch + x * 4;
-                    let p = u32::from_le_bytes(buf[o..o + 4].try_into().unwrap());
-                    if p >> 24 == 0 {
-                        normal[y * w + x] = p | 0xFF000000;
-                    } else {
-                        invert[y * w + x] = p | 0xFF000000;
-                    }
-                }
-            }
-            (h, normal, Some(invert))
-        } else {
+    /// Converts a pointer shape into BGRA textures.
+    pub(crate) fn set_shape(&mut self, dev: &ID3D11Device, shape: &PointerShape) -> Result<()> {
+        let Some(b) = shape.bitmaps() else {
             self.shape = None;
             return Ok(());
         };
-        if w == 0 || h == 0 {
-            self.shape = None;
-            return Ok(());
-        }
-        let normal = Self::texture(dev, w, h, &normal)?;
-        let invert = match invert {
-            Some(px) if px.iter().any(|&p| p != 0) => Some(Self::texture(dev, w, h, &px)?),
-            _ => None,
+        let normal = Self::texture(dev, b.width, b.height, &b.normal)?;
+        let invert = match b.invert {
+            Some(px) => Some(Self::texture(dev, b.width, b.height, &px)?),
+            None => None,
         };
-        self.shape = Some(Shape { w: w as i32, h: h as i32, normal, invert });
+        self.shape = Some(Shape { w: b.width as i32, h: b.height as i32, normal, invert });
         Ok(())
     }
 

@@ -69,8 +69,11 @@ fn sound_line(job: &Job, tracks: usize) -> String {
     match job {
         Job::Gif(_) => "no sound (gif)".into(),
         Job::Video(v) if v.tracks.is_empty() => "no sound".into(),
-        Job::Video(v) if v.combine => "sound combined into 1 track".into(),
-        Job::Video(v) if v.tracks.len() == 1 && tracks == 1 => "with sound".into(),
+        Job::Video(v) if v.combine => match v.tracks.iter().filter(|t| t.source.is_none()).count() {
+            0 => "sound combined into 1 track".into(),
+            n => format!("sound combined into 1 track + {n} empty"),
+        },
+        Job::Video(v) if v.tracks.len() == 1 && v.tracks[0].source.is_some() && tracks == 1 => "with sound".into(),
         Job::Video(v) => format!("{} sound track{}", v.tracks.len(), if v.tracks.len() == 1 { "" } else { "s" }),
     }
 }
@@ -211,7 +214,7 @@ impl ClipApp {
                 }
             }
         }
-        let unmuted = self.edit.muted.iter().filter(|&&m| !m).count();
+        let unmuted = self.edit.lanes.iter().filter(|l| !l.muted && l.source.is_some()).count();
         if s.format == Format::Video && unmuted > 1 {
             gap(ui);
             widgets::checkbox(ui, look, &mut s.combine, "combine sound into one track")

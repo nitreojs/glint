@@ -162,18 +162,25 @@ pub(super) enum HotkeyField {
     Record,
     Screenshot,
     Fullscreen,
+    Monitor,
     Pause,
 }
 
 impl HotkeyField {
-    const ALL: [HotkeyField; 4] =
-        [HotkeyField::Record, HotkeyField::Screenshot, HotkeyField::Fullscreen, HotkeyField::Pause];
+    const ALL: [HotkeyField; 5] = [
+        HotkeyField::Record,
+        HotkeyField::Screenshot,
+        HotkeyField::Fullscreen,
+        HotkeyField::Monitor,
+        HotkeyField::Pause,
+    ];
 
     fn name(self) -> &'static str {
         match self {
             HotkeyField::Record => "record",
             HotkeyField::Screenshot => "screenshot",
             HotkeyField::Fullscreen => "all screens",
+            HotkeyField::Monitor => "monitor",
             HotkeyField::Pause => "pause",
         }
     }
@@ -183,6 +190,7 @@ impl HotkeyField {
             HotkeyField::Record => &mut cfg.hotkey,
             HotkeyField::Screenshot => &mut cfg.screenshot_hotkey,
             HotkeyField::Fullscreen => &mut cfg.fullscreen_hotkey,
+            HotkeyField::Monitor => &mut cfg.monitor_hotkey,
             HotkeyField::Pause => &mut cfg.pause_hotkey,
         }
     }

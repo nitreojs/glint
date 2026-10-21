@@ -43,6 +43,16 @@ pub fn parse(json: &str) -> Result<Vec<Release>, String> {
     serde_json::from_str(json).map_err(|e| format!("github sent a release list glint couldn't read: {e}"))
 }
 
+/// The `rel="next"` page of a paginated GitHub list, from its `Link` header.
+pub fn next_page(link: Option<&str>) -> Option<String> {
+    link?.split(',').find_map(|part| {
+        let (url, params) = part.split_once(';')?;
+        let next = params.split(';').any(|p| p.trim().replace(' ', "") == "rel=\"next\"");
+        let url = url.trim().strip_prefix('<')?.strip_suffix('>')?;
+        (next && url.starts_with("https://")).then(|| url.to_string())
+    })
+}
+
 /// The newest release above `current` with a signed exe; pre-releases only on the beta channel.
 pub fn pick(releases: &[Release], current: &Version, beta: bool) -> Option<Candidate> {
     releases
@@ -121,6 +131,24 @@ mod tests {
         assert_eq!(pick(&releases, &v("0.3.0-beta.1"), true), None);
         // a beta user leaving the channel still gets the next stable release above them
         assert_eq!(pick(&releases, &v("0.2.0-beta.3"), false).unwrap().tag, "v0.2.0");
+    }
+
+    #[test]
+    fn pages_follow_the_link_header() {
+        let page2 = "https://api.github.com/repositories/1/releases?per_page=100&page=2";
+        let first = format!(r#"<{page2}>; rel="next", <https://api.github.com/repositories/1/releases?per_page=100&page=4>; rel="last""#);
+        assert_eq!(next_page(Some(&first)).as_deref(), Some(page2));
+        let middle = format!(r#"<https://x/?page=1>; rel="prev", <{page2}>; rel = "next""#);
+        assert_eq!(next_page(Some(&middle)).as_deref(), Some(page2));
+        let last = r#"<https://x/?page=3>; rel="prev", <https://x/?page=1>; rel="first""#;
+        assert_eq!(next_page(Some(last)), None);
+        assert_eq!(next_page(None), None);
+        assert_eq!(next_page(Some("garbage")), None);
+        assert_eq!(next_page(Some(r#"<http://plain/?page=2>; rel="next""#)), None);
+        // releases from several pages are picked from together
+        let mut all = parse(WITH_AFTERGLOW).unwrap();
+        all.extend(parse(RECORDED).unwrap());
+        assert_eq!(pick(&all, &v("0.1.1"), false).unwrap().tag, "v0.2.0");
     }
 
     #[test]

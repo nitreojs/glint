@@ -1,12 +1,14 @@
 //! Full-screen region picker in the style of ShareX: a frozen, dimmed screenshot of the
 //! whole virtual desktop that fades in. Hovering highlights the window under the cursor, or with
 //! Shift (per the settings) the UI element inside it (the wheel walks out to bigger parts), or the
-//! whole monitor over the desktop, and a click
+//! whole monitor over the desktop (big targets once the cursor rests on them), and a click
 //! picks it; Ctrl+click collects several into one pick; dragging selects a region, across
-//! monitors if need be (the selection shows undimmed, its moving edges snap to nearby edges);
-//! Ctrl+A selects every monitor at once. Esc / right-click cancels. For screenshots the picked
-//! region then opens in the markup editor ([`crate::shot::editor`]) on the same frozen screen, or
-//! in draw-first mode the editor opens on the whole screen and the picker returns on request.
+//! monitors if need be (the selection shows undimmed, its moving corner snaps to visible edges
+//! nearby unless Alt is held, Ctrl moves the whole box); Ctrl+A selects every monitor at once.
+//! Esc / right-click cancels. For screenshots the picked region then opens in the markup editor
+//! ([`crate::shot::editor`]) on the same frozen screen. In draw-first mode the editor is up from
+//! the start, toolbar and all, and while its region tool is on (the default) the picker picks over
+//! whatever is drawn: the pick is the finished shot, or with Shift held it opens in the editor.
 //!
 //! The result is posted to the owner as `Box<Option<Picked>>` in LPARAM; the picker keeps
 //! showing until the owner calls [`dismiss`], so the fade-out can overlap other work.
@@ -17,24 +19,30 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use glint_core::config::UiElements;
-use glint_core::geom::fit::{Fit, fit_drag, fit_rect, multi_pick, output_at, overlapped, toggle, window_pick};
+use glint_core::geom::dwell::{Dwell, Kind, Target};
+use glint_core::geom::fit::{
+    Fit, fit_drag, fit_rect, multi_pick, output_at, overlapped, shift_drag, toggle, window_pick,
+};
 use glint_core::geom::monitor::Output as Monitor;
 use glint_core::geom::rect::Rect;
 use glint_core::geom::snap::{self, Edges, snap_edge};
 use glint_core::log::log;
+use glint_core::naming::Source;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
+    GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT, VK_SPACE,
+    VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
 use crate::platform::elements::Elements;
 use crate::platform::gfx::{Painter, animate};
+use crate::platform::identity::identify;
 use crate::platform::windows::{client_rect, visible_windows};
 use crate::shot::Shot;
 use crate::shot::editor::{self, Editor};
@@ -56,6 +64,8 @@ pub(crate) struct Selection {
     pub rect: Rect,
     /// Every output `rect` overlaps, in enumeration order; never empty.
     pub outputs: Vec<Monitor>,
+    /// The app window picked, when one app's window (or a part of it) was.
+    pub source: Option<Source>,
 }
 
 /// What the picker is for.
@@ -64,7 +74,7 @@ pub(crate) enum Purpose {
     /// Selections are sized for the encoder: its smallest frame (`min`), even sides.
     Record { min: (i32, i32) },
     /// The picked region opens in the markup editor; `draw_first` opens the editor on the whole
-    /// screen straight away (ShareX style), with region picking as one of its tools.
+    /// screen straight away (ShareX style), where a picked region is the finished shot.
     Shot { draw_first: bool },
 }
 
@@ -73,7 +83,12 @@ pub(crate) enum Picked {
     Shot(Shot),
 }
 
-/// Selection outline: 1 px white inside 1 px black, both outside the selected pixels.
+/// What a pick takes (desktop coordinates): the rect, the parts of it kept for a multi-window
+/// screenshot, and the windows picked (None for a monitor; empty for a drag).
+type Pick = (Rect, Option<Vec<Rect>>, Vec<Option<HWND>>);
+
+/// Selection outline: 1 px white inside 1 px black, both outside the selected pixels (inside on
+/// sides at the edge of its monitors).
 const RING: i32 = 2;
 const CLICK_SLOP: i32 = 4;
 /// Brightness kept outside the selection, out of 256.
@@ -81,6 +96,8 @@ pub(crate) const DIM: u32 = 150;
 const FADE_IN_MS: f32 = 140.0;
 const FADE_OUT_MS: f32 = 110.0;
 const EDITOR_TIMER: usize = 0x6E01;
+/// Fires when the cursor has rested on a big target long enough for the highlight to go there.
+const DWELL_TIMER: usize = 0x6E02;
 /// Posted by [`Elements`] when its results change.
 const WM_ELEMENTS: u32 = WM_APP + 41;
 
@@ -104,8 +121,6 @@ struct State {
     /// Visible top-level windows when the picker opened, topmost first (desktop coordinates).
     windows: Vec<(HWND, Rect)>,
     clients: Vec<Option<Rect>>,
-    /// The windows' and their client areas' rects, for snapping.
-    frames: Vec<Rect>,
     ui: UiElements,
     /// Shift is held, as of the last key or mouse message.
     shift: bool,
@@ -122,11 +137,19 @@ struct State {
     lit: Vec<Rect>,
     /// Edges a drag snaps to while the button is down (desktop coordinates).
     snap: Option<Edges>,
-    /// Draw-first mode while picking a region: the editor and its screen, back after the pick.
-    parked: Option<(Editor, Screen)>,
+    /// Draw-first with the editor's region tool on: picking, over `flat` when something is drawn.
+    region: bool,
+    /// The frozen screen with the editor's marks drawn in.
+    flat: Option<Frozen>,
+    /// Holds the hover highlight back from big targets for a moment.
+    dwell: Dwell,
     /// Last mouse position (client coordinates).
     cursor: (i32, i32),
     drag_start: Option<(i32, i32)>,
+    /// Added to the cursor for the drag's free corner: Ctrl slides the whole box.
+    slide: (i32, i32),
+    /// Ctrl was down when the button went down (Ctrl+click); it slides the box only once pressed again.
+    ctrl_at_press: bool,
     /// The mouse moved past [`CLICK_SLOP`] since the button went down.
     dragging: bool,
     /// Which side of the drag start the cursor is on (left, above); a change flips the box.
@@ -137,8 +160,10 @@ struct State {
     /// Current (fitted) selection or hover highlight in client coordinates, as displayed.
     sel: Option<Rect>,
     label: Option<Pill>,
-    /// Markup editor, once a screenshot region is picked.
+    /// Markup editor: once a screenshot region is picked, or from the start in draw-first mode.
     edit: Option<Editor>,
+    /// The app window the screenshot shows, from the last pick.
+    source: Option<Source>,
     /// What the highlight shows or glides to (client coordinates).
     target: Option<Rect>,
     /// Ctrl+A pinned the highlight to every monitor (until a drag starts).
@@ -190,6 +215,10 @@ fn fade_window(hwnd: HWND, t: f32) {
     }
 }
 
+fn held(vk: u16) -> bool {
+    unsafe { GetKeyState(vk as i32) < 0 }
+}
+
 /// Fades the picker in. `msg` is posted to `owner` with the result. `elements` says when hovering
 /// highlights UI elements inside windows instead of the windows.
 pub(crate) fn open(
@@ -212,8 +241,6 @@ pub(crate) fn open(
         };
         let windows = visible_windows();
         let clients: Vec<Option<Rect>> = windows.iter().map(|w| client_rect(w.0)).collect();
-        let mut frames: Vec<Rect> = windows.iter().map(|w| w.1).collect();
-        frames.extend(clients.iter().flatten());
         let painter = Painter::new()?;
         let font = painter.font(13.0)?;
         let hint = hint_text(purpose, outputs.len(), elements);
@@ -277,7 +304,6 @@ pub(crate) fn open(
                 outputs,
                 windows,
                 clients,
-                frames,
                 ui: elements,
                 shift: false,
                 elements: None,
@@ -287,9 +313,13 @@ pub(crate) fn open(
                 chosen: Vec::new(),
                 lit: Vec::new(),
                 snap: None,
-                parked: None,
+                region: false,
+                flat: None,
+                dwell: Dwell::default(),
                 cursor: (0, 0),
                 drag_start: None,
+                slide: (0, 0),
+                ctrl_at_press: false,
                 dragging: false,
                 side: None,
                 purpose,
@@ -300,6 +330,7 @@ pub(crate) fn open(
                 sel: None,
                 label: None,
                 edit: None,
+                source: None,
                 target: None,
                 whole: false,
                 glide: None,
@@ -318,11 +349,11 @@ pub(crate) fn open(
             }
             if draw_first {
                 let screen = Rect { x: 0, y: 0, w: area.w, h: area.h };
-                let monitors = st.outputs.iter().map(|o| st.to_client(o.rect)).collect();
-                let mut ed = Editor::canvas(screen, monitors, st.painter.scale, st.cursor);
+                let mut ed = Editor::canvas(screen, st.monitors(), st.painter.scale, st.cursor);
                 st.equip(&mut ed);
                 schedule_tick(hwnd, &ed);
                 st.edit = Some(ed);
+                st.sync_mode();
             } else {
                 st.track(st.cursor);
                 st.update_selection(st.cursor);
@@ -381,23 +412,53 @@ impl State {
         r.offset(-self.origin.0, -self.origin.1)
     }
 
+    fn to_desktop(&self, p: (i32, i32)) -> (i32, i32) {
+        (p.0 + self.origin.0, p.1 + self.origin.1)
+    }
+
     /// The virtual screen (desktop coordinates).
     fn area(&self) -> Rect {
         Rect { x: self.origin.0, y: self.origin.1, w: self.size.0, h: self.size.1 }
     }
 
-    /// The selection (desktop coords) that would be recorded for a drag from `a` to `b` (client coords).
-    /// The cursor's edges snap to nearby edges unless Ctrl is held.
+    /// The monitors in client coordinates.
+    fn monitors(&self) -> Vec<Rect> {
+        self.outputs.iter().map(|o| self.to_client(o.rect)).collect()
+    }
+
+    /// Ctrl (pressed since the button went down) slides the dragged box instead of resizing it.
+    fn sliding(&self) -> bool {
+        self.dragging && !self.ctrl_at_press && held(VK_CONTROL.0)
+    }
+
+    /// The drag's free corner for the cursor at `cur` (client coords).
+    fn corner(&self, cur: (i32, i32)) -> (i32, i32) {
+        (cur.0 + self.slide.0, cur.1 + self.slide.1)
+    }
+
+    /// The selection (desktop coords) for a drag from `a` to its free corner `b` (client coords).
+    /// The corner snaps to visible edges nearby unless Alt is held or Ctrl is sliding the box.
     fn fitted(&self, a: (i32, i32), b: (i32, i32)) -> Rect {
-        let (ox, oy) = self.origin;
-        let mut c = (b.0 + ox, b.1 + oy);
+        let mut c = self.to_desktop(b);
         if let Some(e) = &self.snap
-            && unsafe { GetKeyState(VK_CONTROL.0 as i32) } >= 0
+            && !held(VK_MENU.0)
+            && !self.sliding()
         {
             let t = snap::threshold(self.painter.scale);
-            c = (snap_edge(c.0, &e.xs, t), snap_edge(c.1, &e.ys, t));
+            c = (snap_edge(c.0, (c.1, c.1), &e.xs, t), snap_edge(c.1, (c.0, c.0), &e.ys, t));
         }
-        fit_drag((a.0 + ox, a.1 + oy), c, self.area(), self.fit)
+        fit_drag(self.to_desktop(a), c, self.area(), self.fit)
+    }
+
+    /// The cursor moved from `last` to `p` with Ctrl sliding the box: the drag start and the free
+    /// corner both move, as far as the screen allows.
+    fn slide_drag(&mut self, last: (i32, i32), p: (i32, i32)) {
+        let Some(start) = self.drag_start else { return };
+        let d = (p.0 - last.0, p.1 - last.1);
+        let client = Rect { x: 0, y: 0, w: self.size.0, h: self.size.1 };
+        let moved = shift_drag(start, self.corner(last), d, client);
+        self.drag_start = Some((start.0 + moved.0, start.1 + moved.1));
+        self.slide = (self.slide.0 + moved.0 - d.0, self.slide.1 + moved.1 - d.1);
     }
 
     /// Whether hovering shows UI elements now (the setting and Shift).
@@ -408,7 +469,7 @@ impl State {
     /// What hovering `p` (client coords) highlights, in desktop coords: the UI element the wheel
     /// chose, else the topmost window under it, else its monitor.
     fn hovered(&self, p: (i32, i32)) -> Option<Rect> {
-        let d = (p.0 + self.origin.0, p.1 + self.origin.1);
+        let d = self.to_desktop(p);
         if self.parts()
             && self.chain_at == d
             && let Some(&r) = self.chain.get(self.depth)
@@ -416,29 +477,59 @@ impl State {
             return Some(r);
         }
         let mon = self.outputs[output_at(&self.outputs, d.0, d.1)?].rect;
-        let win = self
-            .windows
-            .iter()
-            .filter(|w| w.1.contains(d.0, d.1))
-            .find_map(|w| window_pick(w.1, &self.outputs).filter(|r| r.contains(d.0, d.1)));
+        let win = self.window_at(d).and_then(|i| window_pick(self.windows[i].1, &self.outputs));
         Some(win.unwrap_or(mon))
     }
 
-    /// What the highlight shows for `p` (client coords), in desktop coords: every monitor after Ctrl+A,
-    /// else what's hovered.
-    fn target_at(&self, p: (i32, i32)) -> Option<Rect> {
-        let area = self.area();
-        if self.whole {
-            return Some(fit_rect(area, area, self.fit));
+    /// The topmost window whose pick contains desktop point `d`.
+    fn window_at(&self, d: (i32, i32)) -> Option<usize> {
+        self.windows.iter().position(|w| {
+            w.1.contains(d.0, d.1) && window_pick(w.1, &self.outputs).is_some_and(|r| r.contains(d.0, d.1))
+        })
+    }
+
+    /// Whether desktop rect `r` is a monitor (or all of them), a window, or a part of one.
+    fn kind(&self, r: Rect) -> Kind {
+        if r == self.area() || self.outputs.iter().any(|o| o.rect == r) {
+            Kind::Monitor
+        } else if self.windows.iter().any(|w| window_pick(w.1, &self.outputs) == Some(r)) {
+            Kind::Window
+        } else {
+            Kind::Element
         }
-        self.hovered(p).map(|r| fit_rect(r, area, self.fit))
+    }
+
+    /// The window picking desktop rect `r` takes: None for a monitor, else the window it is (or
+    /// is part of, the topmost over its centre).
+    fn owner(&self, r: Rect) -> Option<HWND> {
+        if self.kind(r) == Kind::Monitor {
+            return None;
+        }
+        let exact = self.windows.iter().find(|w| window_pick(w.1, &self.outputs) == Some(r));
+        let centre = || self.window_at((r.x + r.w / 2, r.y + r.h / 2)).map(|i| &self.windows[i]);
+        exact.or_else(centre).map(|w| w.0)
+    }
+
+    /// What the highlight shows for `p` (client coords), in desktop coords and unfitted: every
+    /// monitor after Ctrl+A, else what's hovered.
+    fn hover_target(&self, p: (i32, i32)) -> Option<Target> {
+        if self.whole {
+            return Some((self.area(), Kind::Monitor));
+        }
+        self.hovered(p).map(|r| (r, self.kind(r)))
+    }
+
+    /// What the highlight shows for `p` (client coords), in desktop coords.
+    fn target_at(&self, p: (i32, i32)) -> Option<Rect> {
+        self.hover_target(p).map(|(r, _)| fit_rect(r, self.area(), self.fit))
     }
 
     /// What a click at `p` (client coords) picks: the target, or with Ctrl+clicked rects those and the
     /// hovered one together.
-    fn click_pick(&self, p: (i32, i32)) -> Option<(Rect, Option<Vec<Rect>>)> {
+    fn click_pick(&self, p: (i32, i32)) -> Option<Pick> {
         if self.chosen.is_empty() {
-            return self.target_at(p).map(|r| (r, None));
+            let owner = if self.whole { None } else { self.hovered(p).and_then(|r| self.owner(r)) };
+            return self.target_at(p).map(|r| (r, None, vec![owner]));
         }
         let mut set = self.chosen.clone();
         set.extend(self.hovered(p).filter(|h| !self.chosen.contains(h)));
@@ -446,8 +537,16 @@ impl State {
     }
 
     /// The pick for several rects (desktop coords): their bounding box, cut out for screenshots.
-    fn multi(&self, set: &[Rect]) -> Option<(Rect, Option<Vec<Rect>>)> {
-        multi_pick(set, self.area(), self.fit, matches!(self.purpose, Purpose::Shot { .. }))
+    fn multi(&self, set: &[Rect]) -> Option<Pick> {
+        let (rect, cut) = multi_pick(set, self.area(), self.fit, matches!(self.purpose, Purpose::Shot { .. }))?;
+        Some((rect, cut, set.iter().map(|&r| self.owner(r)).collect()))
+    }
+
+    /// The app behind the picked `windows`: there's one when every pick is a window of the same app.
+    fn source_of(windows: &[Option<HWND>]) -> Option<Source> {
+        let mut apps = windows.iter().map(|w| w.and_then(identify));
+        let first = apps.next()??;
+        apps.all(|a| a.is_some_and(|a| a.exe == first.exe)).then_some(first)
     }
 
     /// Ctrl+click at `p` (client coords): the hovered rect joins the chosen ones or leaves them.
@@ -480,7 +579,7 @@ impl State {
             self.start_elements();
         }
         if let Some(el) = &self.elements {
-            el.request((p.0 + self.origin.0, p.1 + self.origin.1));
+            el.request(self.to_desktop(p));
             self.refresh_chain();
         }
     }
@@ -499,7 +598,7 @@ impl State {
     /// the new chain; otherwise the innermost element is.
     fn refresh_chain(&mut self) {
         let Some((at, found)) = self.elements.as_ref().and_then(Elements::latest) else { return };
-        if at != (self.cursor.0 + self.origin.0, self.cursor.1 + self.origin.1) {
+        if at != self.to_desktop(self.cursor) {
             return;
         }
         let area = self.area();
@@ -518,21 +617,19 @@ impl State {
         self.chain_at = at;
     }
 
-    /// Everything a selection's edges snap to (desktop coords): windows, their client areas, the UI
-    /// elements found so far, monitors.
-    fn snap_rects(&self) -> Vec<Rect> {
-        let mut v = self.frames.clone();
-        v.extend(self.outputs.iter().map(|o| o.rect));
-        v.extend(self.elements.iter().flat_map(Elements::known));
-        v
-    }
-
-    fn snap_rects_client(&self) -> Vec<Rect> {
-        self.snap_rects().into_iter().map(|r| self.to_client(r)).collect()
+    /// The visible edges a selection snaps to (desktop coords): of windows, their client areas and
+    /// the UI elements found so far where no window above covers them, and of monitors.
+    fn snap_edges(&self) -> Edges {
+        let frames: Vec<Rect> = self.windows.iter().map(|w| w.1).collect();
+        let mut parts: Vec<(usize, Rect)> =
+            self.clients.iter().enumerate().filter_map(|(i, c)| c.map(|c| (i, c))).collect();
+        parts.extend(self.elements.iter().flat_map(Elements::known));
+        let monitors: Vec<Rect> = self.outputs.iter().map(|o| o.rect).collect();
+        snap::visible(&frames, &parts, &monitors)
     }
 
     fn equip(&self, ed: &mut Editor) {
-        ed.set_snap(self.snap_rects_client());
+        ed.set_snap(self.snap_edges().offset(-self.origin.0, -self.origin.1));
         let windows = self.windows.iter().zip(&self.clients).filter_map(|(w, c)| {
             window_pick(w.1, &self.outputs).map(|r| (self.to_client(r), c.map(|c| self.to_client(c))))
         });
@@ -540,11 +637,9 @@ impl State {
     }
 
     fn element_at(&self, p: (i32, i32)) -> Option<Rect> {
-        let d = (p.0 + self.origin.0, p.1 + self.origin.1);
+        let d = self.to_desktop(p);
         let first = *self.chain.first().filter(|_| self.parts() && self.chain_at == d)?;
-        let window = self.windows.iter().any(|w| window_pick(w.1, &self.outputs) == Some(first));
-        let monitor = self.outputs.iter().any(|o| o.rect == first);
-        (!window && !monitor).then(|| self.to_client(first))
+        (self.kind(first) == Kind::Element).then(|| self.to_client(first))
     }
 
     fn edit_element(&mut self, p: (i32, i32)) -> Option<Rect> {
@@ -562,55 +657,73 @@ impl State {
         }
     }
 
+    /// What picking shows: the screen with draw-first's marks drawn in, or the frozen screen.
+    fn pick_frozen(&self) -> Option<&Frozen> {
+        match (&self.flat, &self.screen) {
+            (Some(flat), _) => Some(flat),
+            (None, Screen::Frozen(f)) => Some(f),
+            (None, Screen::Live(_)) => None,
+        }
+    }
+
     /// Forgets the pick in progress and everything it shows.
     fn reset_pick(&mut self) {
         self.set_gliding(false);
         self.glide = None;
         self.drag_start = None;
+        self.slide = (0, 0);
         self.dragging = false;
         self.snap = None;
         self.whole = false;
         self.chosen.clear();
         self.lit.clear();
         self.target = None;
+        self.dwell.set(None);
         self.sel = None;
         self.label = None;
         unsafe {
+            let _ = KillTimer(Some(self.hwnd), DWELL_TIMER);
             let _ = InvalidateRect(Some(self.hwnd), None, false);
         }
     }
 
-    /// Draw-first mode: the editor's Region tool shows the picker over the marked-up screen.
-    fn pick_region(&mut self) -> Action {
-        let (Some(ed), Screen::Frozen(f)) = (self.edit.as_ref(), &self.screen) else { return Action::Handled };
-        let flat = match ed.flattened(&f.bright, &self.painter).and_then(Frozen::new) {
-            Ok(flat) => flat,
-            Err(e) => {
-                log(&format!("can't pick a region: {e}"));
-                return Action::Handled;
-            }
-        };
-        let screen = std::mem::replace(&mut self.screen, Screen::Frozen(flat));
-        self.parked = self.edit.take().map(|ed| (ed, screen));
+    /// Draw-first: follows the editor between its region tool (the picker picks, over the marks)
+    /// and drawing.
+    fn sync_mode(&mut self) {
+        let region = self.edit.as_ref().is_some_and(Editor::picks_region);
+        if region == self.region {
+            return;
+        }
+        self.region = region;
         self.reset_pick();
-        self.shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-        self.track(self.cursor);
-        self.update_selection(self.cursor);
-        Action::Handled
+        if region {
+            self.flatten();
+            self.shift = held(VK_SHIFT.0);
+            self.track(self.cursor);
+            self.update_selection(self.cursor);
+        } else {
+            self.flat = None;
+        }
     }
 
-    /// Back to the parked editor, unchanged; without one the picker is cancelled.
-    fn unpark(&mut self) -> Action {
-        let Some((ed, screen)) = self.parked.take() else { return Action::Finish(None) };
-        self.reset_pick();
-        self.screen = screen;
-        let sel = ed.has_selection().then_some(ed.sel);
-        self.edit = Some(ed);
-        if let Some(sel) = sel {
-            self.target = Some(sel);
-            self.show(Some(sel));
+    /// Draws the editor's marks into the screen picking shows.
+    fn flatten(&mut self) {
+        self.flat = None;
+        if let (Some(ed), Screen::Frozen(f)) = (&self.edit, &self.screen)
+            && ed.has_marks()
+        {
+            match ed.flattened(&f.bright, &self.painter).and_then(Frozen::new) {
+                Ok(flat) => self.flat = Some(flat),
+                Err(e) => log(&format!("can't show the marks: {e}")),
+            }
         }
-        Action::Release
+        if self.target.is_some() {
+            self.label = None;
+            self.show(self.sel);
+        }
+        unsafe {
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+        }
     }
 
     /// The monitor (client coords) a label for `r` (client coords) goes on: the one under its
@@ -653,15 +766,34 @@ impl State {
         Ok(())
     }
 
+    /// The hover highlight follows the cursor at `cur`, except onto big targets: those wait until
+    /// the cursor has rested on them. Drags update right away.
+    fn update_hover(&mut self, cur: (i32, i32)) {
+        if self.drag_start.is_some_and(|_| self.dragging) {
+            return self.update_selection(cur);
+        }
+        let to = self.hover_target(cur);
+        match self.dwell.hover(to, Instant::now()) {
+            Some(left) => unsafe {
+                SetTimer(Some(self.hwnd), DWELL_TIMER, left.as_millis() as u32 + 1, None);
+            },
+            None => self.update_selection(cur),
+        }
+    }
+
     /// Shows what the mouse at `cur` would pick: the drag selection while dragging, otherwise
     /// the window (or monitor) under the cursor, gliding there from the last one. A drag
     /// follows the cursor instantly, except for jumps (the drag starting, the box flipping
     /// across its start point), which glide.
     fn update_selection(&mut self, cur: (i32, i32)) {
         let drag = self.drag_start.filter(|_| self.dragging);
+        let corner = self.corner(cur);
         let target = match drag {
-            Some(start) => Some(self.fitted(start, cur)),
-            None => self.target_at(cur),
+            Some(start) => Some(self.fitted(start, corner)),
+            None => {
+                self.dwell.set(self.hover_target(cur));
+                self.target_at(cur)
+            }
         }
         .map(|r| self.to_client(r));
         if target == self.target {
@@ -670,7 +802,7 @@ impl State {
         self.target = target;
         let glide = match (drag, self.sel, target) {
             (Some(start), Some(from), Some(_)) => {
-                let side = (cur.0 < start.0, cur.1 < start.1);
+                let side = (corner.0 < start.0, corner.1 < start.1);
                 // The first drag frame turns the hover highlight into the drag box; a flip moves
                 // the box to the other side of its start. Both glide, following the cursor.
                 let jumped = self.side.replace(side).is_none_or(|s| s != side);
@@ -701,7 +833,7 @@ impl State {
         };
         let multi = self.click_pick(self.cursor).filter(|_| !self.chosen.is_empty());
         let (near, target) = match multi {
-            Some((r, _)) => (self.to_client(r), self.to_client(r)),
+            Some((r, ..)) => (self.to_client(r), self.to_client(r)),
             None => (sel, target),
         };
         let text = match self.purpose {
@@ -722,7 +854,7 @@ impl State {
         let gap = self.painter.px(6.0) as i32;
         let above = near.y - RING - gap - lh;
         // In the editor the toolbar may sit above the shot; the label then goes inside.
-        let bar_above = self.edit.as_ref().is_some_and(|e| e.bar.bottom() <= near.y);
+        let bar_above = !self.region && self.edit.as_ref().is_some_and(|e| e.bar.bottom() <= near.y);
         let (x, y) = if part.y == near.y && above >= mon.y && !bar_above {
             (near.x - RING, above)
         } else {
@@ -734,18 +866,20 @@ impl State {
             return self.set_selection(Some(sel), None); // label unchanged
         }
         let on_bright = self.chosen.iter().map(|&c| self.to_client(c)).chain([sel]).any(|r| r.contains(x, y));
-        let label = match &self.screen {
-            Screen::Frozen(f) => render_pill(&self.painter, &self.font, &text, if on_bright { &f.bright } else { &f.dim }, x, y).ok(),
-            Screen::Live(_) => Some(Pill { rect: Rect { x, y, w: lw, h: lh }, dib: None, text }),
+        let label = match self.pick_frozen() {
+            Some(f) => render_pill(&self.painter, &self.font, &text, if on_bright { &f.bright } else { &f.dim }, x, y).ok(),
+            None => Some(Pill { rect: Rect { x, y, w: lw, h: lh }, dib: None, text }),
         };
         self.set_selection(Some(sel), Some(label));
     }
 
     /// What a release at `end` picks (desktop coords): the drag, or what a click picks.
-    fn finish_drag(&mut self, end: (i32, i32)) -> Option<(Rect, Option<Vec<Rect>>)> {
+    fn finish_drag(&mut self, end: (i32, i32)) -> Option<Pick> {
         let start = self.drag_start.take()?;
+        let corner = self.corner(end);
+        self.slide = (0, 0);
         let pick = if std::mem::take(&mut self.dragging) {
-            Some((self.fitted(start, end), None))
+            Some((self.fitted(start, corner), None, Vec::new()))
         } else {
             self.click_pick(end)
         };
@@ -754,16 +888,18 @@ impl State {
     }
 
     /// Recording: done. Screenshot: the region opens in the editor, `cutout` (desktop coords) the
-    /// only parts of it kept.
-    fn picked(&mut self, rect: Rect, cutout: Option<Vec<Rect>>) -> Action {
+    /// only parts of it kept; in draw-first mode it's the finished shot unless `edit` (Shift held).
+    fn picked(&mut self, (rect, cutout, windows): Pick, edit: bool) -> Action {
+        let source = State::source_of(&windows);
         match self.purpose {
             Purpose::Record { .. } => {
                 let outputs = overlapped(rect, &self.outputs).cloned().collect();
-                Action::Finish(Some(Picked::Region(Selection { rect, outputs })))
+                Action::Finish(Some(Picked::Region(Selection { rect, outputs, source })))
             }
             Purpose::Shot { .. } => {
                 self.set_gliding(false);
                 self.glide = None;
+                self.source = source;
                 let was_live = matches!(self.screen, Screen::Live(_));
                 if let Err(e) = self.freeze() {
                     log(&format!("screenshot failed: {e}"));
@@ -771,19 +907,19 @@ impl State {
                 }
                 let sel = self.to_client(rect);
                 let cutout = cutout.map(|c| c.into_iter().map(|r| self.to_client(r)).collect());
-                let mut ed = match self.parked.take() {
-                    Some((mut ed, screen)) => {
-                        self.reset_pick();
-                        self.screen = screen;
-                        ed.set_selection(sel, cutout);
-                        ed
+                if let Some(mut ed) = self.edit.take() {
+                    self.equip(&mut ed);
+                    self.edit = Some(ed);
+                    let action = self.edit_event(|e| e.region_picked(sel, cutout, edit));
+                    if let Action::Finish(r) = action {
+                        return Action::Finish(r);
                     }
-                    None => {
-                        self.chosen.clear();
-                        let monitors = self.outputs.iter().map(|o| self.to_client(o.rect)).collect();
-                        Editor::new(sel, cutout, monitors, self.painter.scale)
-                    }
-                };
+                    self.target = Some(sel);
+                    self.show(Some(sel));
+                    return Action::Release;
+                }
+                self.chosen.clear();
+                let mut ed = Editor::new(sel, cutout, self.monitors(), self.painter.scale);
                 self.equip(&mut ed);
                 self.invalidate(&ed.extent());
                 self.edit = Some(ed);
@@ -803,22 +939,26 @@ impl State {
         match event {
             editor::Event::None => Action::Handled,
             editor::Event::Repaint => {
-                let (damage, sel) = (ed.damage(&before), ed.sel);
+                let (damage, sel, changed) = (ed.damage(&before), ed.sel, ed.marks_changed(&before));
+                let was = self.region;
+                self.sync_mode();
                 self.invalidate(&damage);
-                if self.target.is_some() {
+                if self.region && was && changed {
+                    self.flatten();
+                } else if !self.region && self.target.is_some() {
                     self.target = Some(sel);
                     self.show(Some(sel));
                 }
                 if self.last_paint.get().elapsed() >= self.frame { Action::Paint } else { Action::Handled }
             }
             editor::Event::Cancel => Action::Finish(None),
-            editor::Event::PickRegion => self.pick_region(),
             editor::Event::Finish(output) => {
                 let Screen::Frozen(f) = &self.screen else { return Action::Finish(None) };
                 match ed.pixels(&f.bright, &self.painter) {
                     Ok((pixels, rect, alpha)) => {
                         let (w, h, at) = (rect.w as u32, rect.h as u32, rect.offset(self.origin.0, self.origin.1));
-                        Action::Finish(Some(Picked::Shot(Shot { pixels, w, h, alpha, at, output })))
+                        let source = self.source.clone();
+                        Action::Finish(Some(Picked::Shot(Shot { pixels, w, h, alpha, at, output, source })))
                     }
                     Err(e) => {
                         log(&format!("screenshot failed: {e}"));
@@ -829,7 +969,16 @@ impl State {
         }
     }
 
-    /// Input while the markup editor is open.
+    /// Ctrl or Alt went down or up: the editor's drag moves or snaps accordingly.
+    fn edit_mods(&mut self) -> Action {
+        let (ctrl, alt, at) = (held(VK_CONTROL.0), held(VK_MENU.0), self.cursor);
+        self.edit_event(|e| {
+            e.set_mods(ctrl, alt);
+            e.mouse_move(at)
+        })
+    }
+
+    /// Input while the markup editor is open (and not picking).
     fn handle_edit(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Action {
         match msg {
             WM_LBUTTONDOWN => {
@@ -843,10 +992,12 @@ impl State {
             WM_MOUSEMOVE => {
                 let p = point(lp);
                 self.cursor = p;
-                self.shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                self.shift = held(VK_SHIFT.0);
                 let element = self.edit_element(p);
+                let (ctrl, alt) = (held(VK_CONTROL.0), held(VK_MENU.0));
                 self.edit_event(|e| {
                     e.set_element(element);
+                    e.set_mods(ctrl, alt);
                     e.mouse_move(p)
                 })
             }
@@ -872,8 +1023,12 @@ impl State {
                     e.refresh_pick()
                 })
             }
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+                if wp.0 == VK_CONTROL.0 as usize || wp.0 == VK_MENU.0 as usize =>
+            {
+                self.edit_mods()
+            }
             WM_KEYDOWN => {
-                let held = |vk: u16| unsafe { GetKeyState(vk as i32) } < 0;
                 let (ctrl, shift) = (held(VK_CONTROL.0), held(VK_SHIFT.0));
                 self.edit_event(|e| e.key(wp.0 as u32, ctrl, shift))
             }
@@ -883,14 +1038,8 @@ impl State {
                 let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
                 self.edit_event(|e| e.wheel(delta))
             }
-            WM_TIMER if wp.0 == EDITOR_TIMER => {
-                let _ = unsafe { KillTimer(Some(self.hwnd), EDITOR_TIMER) };
-                self.edit_event(|e| e.tick())
-            }
             WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
-                let mut p = POINT::default();
-                let _ = unsafe { GetCursorPos(&mut p) };
-                let at = (p.x - self.origin.0, p.y - self.origin.1);
+                let at = self.cursor_at();
                 self.edit.as_ref().map_or(Action::Default, |e| Action::Cursor(e.cursor(at)))
             }
             WM_RBUTTONDOWN => {
@@ -902,6 +1051,18 @@ impl State {
             WM_CLOSE => Action::Finish(None),
             _ => Action::Default,
         }
+    }
+
+    /// The mouse position now (client coordinates).
+    fn cursor_at(&self) -> (i32, i32) {
+        let mut p = POINT::default();
+        let _ = unsafe { GetCursorPos(&mut p) };
+        (p.x - self.origin.0, p.y - self.origin.1)
+    }
+
+    /// Draw-first's region tool: whether `p` (client coords) is on the editor's toolbar.
+    fn on_bar(&self, p: (i32, i32)) -> bool {
+        self.region && self.edit.as_ref().is_some_and(|e| e.bar.contains(p.0, p.1))
     }
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Action {
@@ -918,6 +1079,10 @@ impl State {
             }
             return Action::Paint;
         }
+        // Alt alone would enter menu mode, Alt+key would beep.
+        if msg == WM_SYSCHAR || (msg == WM_SYSCOMMAND && (wp.0 & 0xFFF0) as u32 == SC_KEYMENU) {
+            return Action::Handled;
+        }
         if self.done {
             return match msg {
                 WM_CLOSE | WM_KEYDOWN | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP | WM_MOUSEMOVE => Action::Handled,
@@ -926,7 +1091,7 @@ impl State {
         }
         if msg == WM_ELEMENTS {
             self.refresh_chain();
-            if self.edit.is_some() {
+            if self.edit.is_some() && !self.region {
                 let element = self.element_at(self.cursor);
                 return self.edit_event(|e| {
                     e.set_element(element);
@@ -934,27 +1099,61 @@ impl State {
                 });
             }
             if self.dragging {
-                self.snap = Some(snap::edges(&self.snap_rects()));
+                self.snap = Some(self.snap_edges());
             }
-            self.update_selection(self.cursor);
+            self.update_hover(self.cursor);
             return Action::Handled;
         }
-        if self.edit.is_some() {
+        if msg == WM_TIMER && wp.0 == EDITOR_TIMER {
+            let _ = unsafe { KillTimer(Some(self.hwnd), EDITOR_TIMER) };
+            return self.edit_event(|e| e.tick());
+        }
+        if msg == WM_TIMER && wp.0 == DWELL_TIMER {
+            let _ = unsafe { KillTimer(Some(self.hwnd), DWELL_TIMER) };
+            if self.edit.is_none() || self.region {
+                self.update_hover(self.cursor);
+            }
+            return Action::Paint;
+        }
+        if self.edit.is_some() && !self.region {
             return self.handle_edit(msg, wp, lp);
         }
-        let ctrl = || unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+        self.handle_pick(msg, wp, lp)
+    }
+
+    /// Input while picking: select-first before the editor opens, or draw-first's region tool,
+    /// where the editor keeps its toolbar, keys and right-clicks.
+    fn handle_pick(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Action {
+        let ctrl = || held(VK_CONTROL.0);
+        let pressing_bar = self.region && self.edit.as_ref().is_some_and(Editor::dragging);
         match msg {
+            WM_LBUTTONDOWN if self.on_bar(point(lp)) => {
+                let p = point(lp);
+                match self.edit_event(|e| e.mouse_down(p, 0)) {
+                    Action::Finish(r) => Action::Finish(r),
+                    _ => Action::Capture,
+                }
+            }
             WM_LBUTTONDOWN => {
                 self.drag_start = Some(point(lp));
+                self.slide = (0, 0);
+                self.ctrl_at_press = ctrl();
                 self.dragging = false;
                 self.side = None;
-                self.snap = Some(snap::edges(&self.snap_rects()));
+                self.snap = Some(self.snap_edges());
                 Action::Capture
             }
             WM_MOUSEMOVE => {
                 let p = point(lp);
-                self.cursor = p;
-                self.shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                let last = std::mem::replace(&mut self.cursor, p);
+                self.shift = held(VK_SHIFT.0);
+                let mut paint = false;
+                if self.region && self.drag_start.is_none() {
+                    paint = matches!(self.edit_event(|e| e.mouse_move(p)), Action::Paint);
+                }
+                if self.sliding() {
+                    self.slide_drag(last, p);
+                }
                 self.track(p);
                 let mut cleared = false;
                 if let Some(s) = self.drag_start
@@ -967,11 +1166,18 @@ impl State {
                         self.chosen.clear();
                     }
                 }
-                self.update_selection(p);
+                self.update_hover(p);
                 if cleared {
                     self.set_selection(self.sel, None);
                 }
-                if self.last_paint.get().elapsed() >= self.frame { Action::Paint } else { Action::Handled }
+                if paint || self.last_paint.get().elapsed() >= self.frame { Action::Paint } else { Action::Handled }
+            }
+            WM_LBUTTONUP if pressing_bar => {
+                let p = point(lp);
+                match self.edit_event(|e| e.mouse_up(p)) {
+                    Action::Finish(r) => Action::Finish(r),
+                    _ => Action::Release,
+                }
             }
             WM_LBUTTONUP if !self.dragging && self.drag_start.is_some() && ctrl() => {
                 self.drag_start = None;
@@ -980,7 +1186,7 @@ impl State {
                 Action::Release
             }
             WM_LBUTTONUP => match self.finish_drag(point(lp)) {
-                Some((rect, cutout)) => self.picked(rect, cutout),
+                Some(pick) => self.picked(pick, held(VK_SHIFT.0)),
                 None => {
                     self.update_selection(point(lp));
                     Action::Release
@@ -989,24 +1195,35 @@ impl State {
             WM_RBUTTONUP => {
                 if self.drag_start.take().is_some() {
                     self.dragging = false;
+                    self.slide = (0, 0);
                     self.snap = None;
                     self.update_selection(point(lp));
                     Action::Release
+                } else if self.region {
+                    let p = point(lp);
+                    self.edit_event(|e| e.right_click(p))
                 } else {
-                    self.unpark()
+                    Action::Finish(None)
                 }
             }
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP if wp.0 == VK_SHIFT.0 as usize => {
                 self.set_shift(matches!(msg, WM_KEYDOWN | WM_SYSKEYDOWN));
                 Action::Handled
             }
-            WM_KEYDOWN | WM_KEYUP if wp.0 == VK_CONTROL.0 as usize && self.dragging => {
-                self.update_selection(self.cursor);
+            WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
+                if wp.0 == VK_CONTROL.0 as usize || wp.0 == VK_MENU.0 as usize =>
+            {
+                if matches!(msg, WM_KEYUP | WM_SYSKEYUP) && wp.0 == VK_CONTROL.0 as usize {
+                    self.ctrl_at_press = false;
+                }
+                if self.dragging {
+                    self.update_selection(self.cursor);
+                }
                 Action::Handled
             }
             WM_MOUSEWHEEL if self.drag_start.is_none() => {
                 let up = ((wp.0 >> 16) & 0xFFFF) as i16 > 0;
-                let here = self.chain_at == (self.cursor.0 + self.origin.0, self.cursor.1 + self.origin.1);
+                let here = self.chain_at == self.to_desktop(self.cursor);
                 if here && self.parts() && !self.whole {
                     let last = self.chain.len().saturating_sub(1);
                     self.depth = if up { (self.depth + 1).min(last) } else { self.depth.saturating_sub(1) };
@@ -1014,7 +1231,10 @@ impl State {
                 }
                 Action::Handled
             }
-            WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => self.unpark(),
+            WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize && self.region => {
+                self.edit_event(|e| e.key(VK_ESCAPE.0 as u32, false, false))
+            }
+            WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => Action::Finish(None),
             WM_KEYDOWN if wp.0 == VK_A.0 as usize && ctrl() => {
                 if self.drag_start.is_none() {
                     self.whole = true;
@@ -1026,6 +1246,9 @@ impl State {
             }
             // Enter confirms the drag in progress or the Ctrl+clicked set, or picks what's highlighted.
             WM_KEYDOWN if wp.0 == VK_RETURN.0 as usize || wp.0 == VK_SPACE.0 as usize => {
+                if lp.0 & (1 << 30) != 0 {
+                    return Action::Handled; // auto-repeat
+                }
                 let pick = if self.drag_start.is_none() && !self.chosen.is_empty() {
                     self.multi(&self.chosen)
                 } else {
@@ -1033,9 +1256,20 @@ impl State {
                     self.finish_drag(self.cursor)
                 };
                 match pick {
-                    Some((rect, cutout)) => self.picked(rect, cutout),
+                    Some(pick) => self.picked(pick, held(VK_SHIFT.0)),
                     None => Action::Handled,
                 }
+            }
+            WM_KEYDOWN if self.region && self.drag_start.is_none() => {
+                if lp.0 & (1 << 30) != 0 && wp.0 == VK_TAB.0 as usize {
+                    return Action::Handled;
+                }
+                let shift = held(VK_SHIFT.0);
+                self.edit_event(|e| e.key(wp.0 as u32, ctrl(), shift))
+            }
+            WM_KEYUP if self.region => self.edit_event(|e| e.key_up(wp.0 as u32)),
+            WM_SETCURSOR if self.region && (lp.0 & 0xFFFF) as u32 == HTCLIENT && self.on_bar(self.cursor_at()) => {
+                Action::Cursor(IDC_HAND)
             }
             WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => Action::Finish(None),
             WM_CLOSE => Action::Finish(None),
