@@ -6,7 +6,9 @@ use windows::Win32::Devices::FunctionDiscovery::{PKEY_Device_FriendlyName, PKEY_
 use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
-use windows::Win32::System::Com::{BLOB, CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
+use windows::Win32::System::Com::{
+    BLOB, CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, STGM_READ,
+};
 use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
 use windows::core::{HSTRING, Interface, Ref, implement};
 
@@ -438,8 +440,17 @@ pub(crate) struct Microphone {
     pub label: String,
 }
 
-// needs com on the calling thread. the friendly name is "<endpoint> (<device>)", e.g. "Microphone (Shure MV7)".
+// the friendly name is "<endpoint> (<device>)", e.g. "Microphone (Shure MV7)".
 pub(crate) fn microphones() -> (Vec<Microphone>, Option<String>) {
+    let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+    let found = capture_devices();
+    if com {
+        unsafe { CoUninitialize() };
+    }
+    found
+}
+
+fn capture_devices() -> (Vec<Microphone>, Option<String>) {
     unsafe {
         let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
             return (Vec::new(), None);
