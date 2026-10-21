@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 pub(super) const SECOND: i64 = 10_000_000;
 
 pub(super) const GIF_FPS: [u32; 4] = [10, 15, 24, 30];
-pub(super) const GIF_WIDTHS: [u32; 4] = [1280, 960, 640, 480];
 pub(super) const GIF_WARN_BYTES: u64 = 50 * 1024 * 1024;
 // measured with this exporter at 15 fps: 0.031 bytes per pixel per frame on a glint screen recording, 0.063 on ffmpeg's testsrc.
 const GIF_BYTES_PER_PIXEL: f64 = 0.06;
@@ -35,10 +34,6 @@ impl Range {
         self.end - self.start
     }
 
-    pub(super) fn is_full(self, duration: i64) -> bool {
-        self.start <= 0 && self.end >= duration
-    }
-
     pub(super) fn set_start(&mut self, t: i64, min_len: i64) {
         self.start = t.clamp(0, (self.end - min_len).max(0));
     }
@@ -54,6 +49,20 @@ pub(super) fn fmt_time(hns: i64) -> String {
     if h > 0 { format!("{h}:{m:02}:{s:02}.{ms:03}") } else { format!("{m}:{s:02}.{ms:03}") }
 }
 
+/// `0:42.17`: the transport's centiseconds.
+pub(super) fn fmt_clock(hns: i64) -> String {
+    let cs = hns.max(0) / 100_000;
+    let (h, m, s, cs) = (cs / 360_000, cs / 6000 % 60, cs / 100 % 60, cs % 100);
+    if h > 0 { format!("{h}:{m:02}:{s:02}.{cs:02}") } else { format!("{m}:{s:02}.{cs:02}") }
+}
+
+/// `0:42`, rounded to the second.
+pub(super) fn fmt_short(hns: i64) -> String {
+    let s = (hns.max(0) + SECOND / 2) / SECOND;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
 pub(super) fn unique_sibling(src: &Path, suffix: &str, ext: &str) -> PathBuf {
     let stem = src.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "clip".into());
     let dir = src.parent().unwrap_or(Path::new("."));
@@ -65,13 +74,6 @@ pub(super) fn unique_sibling(src: &Path, suffix: &str, ext: &str) -> PathBuf {
         path = dir.join(format!("{stem}{suffix}_{n}.{ext}"));
     }
     path
-}
-
-pub(super) fn gif_size(src: (u32, u32), width: Option<u32>) -> (u32, u32) {
-    match width {
-        Some(w) if w < src.0 && src.0 > 0 => (w, ((src.1 as f64 * w as f64 / src.0 as f64).round() as u32).max(1)),
-        _ => src,
-    }
 }
 
 pub(super) fn gif_frames(len: i64, fps: u32) -> u64 {
@@ -126,8 +128,6 @@ mod tests {
         r.set_start(dur, f);
         assert_eq!(r.start, dur - f);
         assert_eq!(r.len(), f);
-        assert!(!r.is_full(dur));
-        assert!(Range::full(dur).is_full(dur));
 
         let mut tiny = Range::full(f / 2);
         tiny.set_end(0, f / 2, f);
@@ -141,6 +141,11 @@ mod tests {
         assert_eq!(fmt_time(61 * SECOND + 50_000), "1:01.005");
         assert_eq!(fmt_time(3_725 * SECOND), "1:02:05.000");
         assert_eq!(fmt_time(-1), "0:00.000");
+        assert_eq!(fmt_clock(42 * SECOND + 1_799_999), "0:42.17");
+        assert_eq!(fmt_clock(3_725 * SECOND), "1:02:05.00");
+        assert_eq!(fmt_short(24 * SECOND + SECOND / 2), "0:25");
+        assert_eq!(fmt_short(24 * SECOND + SECOND / 2 - 1), "0:24");
+        assert_eq!(fmt_short(3_725 * SECOND), "1:02:05");
     }
 
     #[test]
@@ -167,14 +172,6 @@ mod tests {
             assert_eq!(total, 400, "fps {fps}");
         }
         assert_eq!((0..3).map(|k| gif_delay(k, 30)).collect::<Vec<_>>(), [3, 4, 3]);
-    }
-
-    #[test]
-    fn gif_size_keeps_the_aspect_and_never_upscales() {
-        assert_eq!(gif_size((3440, 1440), Some(640)), (640, 268));
-        assert_eq!(gif_size((1920, 1080), Some(480)), (480, 270));
-        assert_eq!(gif_size((400, 300), Some(640)), (400, 300));
-        assert_eq!(gif_size((1920, 1080), None), (1920, 1080));
     }
 
     #[test]

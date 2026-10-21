@@ -16,20 +16,23 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-use super::trim::AudioExport;
+use super::export::Settings;
 use crate::platform::paths::app_dir;
 
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
 pub(super) struct Saved {
     pub rect: Option<[i32; 4]>,
     pub volume: f32,
-    pub audio: AudioExport,
+    pub export: Settings,
+    /// The retired all / unmuted / mix audio choice: muted lanes now decide, and "mix" became `combine`.
+    #[serde(rename = "audio", skip_serializing)]
+    legacy_audio: Option<String>,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { rect: None, volume: 1.0, audio: AudioExport::All }
+        Saved { rect: None, volume: 1.0, export: Settings::default(), legacy_audio: None }
     }
 }
 
@@ -38,10 +41,17 @@ fn saved_path() -> PathBuf {
 }
 
 impl Saved {
+    fn parse(text: &str) -> Saved {
+        let mut s: Saved = serde_json::from_str(text).unwrap_or_default();
+        if s.legacy_audio.take().as_deref() == Some("mix") {
+            s.export.combine = true;
+        }
+        s.volume = s.volume.clamp(0.0, 1.0);
+        s
+    }
+
     pub(super) fn load() -> Saved {
-        let text = std::fs::read_to_string(saved_path()).unwrap_or_default();
-        let s: Saved = serde_json::from_str(&text).unwrap_or_default();
-        Saved { volume: s.volume.clamp(0.0, 1.0), ..s }
+        Saved::parse(&std::fs::read_to_string(saved_path()).unwrap_or_default())
     }
 
     pub(super) fn store(&self) {
@@ -125,12 +135,19 @@ pub(super) fn save_dialog(owner: HWND, suggested: &Path, ext: &str) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clip::export::Format;
 
     #[test]
     fn saved_state_tolerates_missing_and_old_fields() {
-        let s: Saved = serde_json::from_str(r#"{"rect":[10,20,800,600]}"#).unwrap();
+        let s = Saved::parse(r#"{"rect":[10,20,800,600]}"#);
         assert_eq!(s, Saved { rect: Some([10, 20, 800, 600]), ..Saved::default() });
-        let s: Saved = serde_json::from_str(r#"{"volume":0.5,"audio":"mix","old":1}"#).unwrap();
-        assert_eq!((s.volume, s.audio, s.rect), (0.5, AudioExport::Mix, None));
+        let s = Saved::parse(r#"{"volume":0.5,"audio":"mix","old":1}"#);
+        assert_eq!((s.volume, s.export.combine, s.rect), (0.5, true, None));
+        assert_eq!(s.legacy_audio, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("audio"));
+        assert!(!Saved::parse(r#"{"audio":"unmuted"}"#).export.combine);
+        let s = Saved::parse(r#"{"export":{"format":"gif","target_mb":10,"gif_fps":24}}"#);
+        assert_eq!((s.export.format, s.export.target_mb, s.export.gif_fps), (Format::Gif, Some(10), 24));
+        assert_eq!(Saved::parse("garbage"), Saved::default());
     }
 }

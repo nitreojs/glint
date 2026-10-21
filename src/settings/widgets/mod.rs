@@ -11,12 +11,12 @@ mod tokens;
 pub(crate) use color::{custom_swatch, hue_strip, sv_square};
 pub(crate) use chrome::{TitleAction, nav_item, title_bar};
 pub(crate) use controls::{
-    HotkeyState, Kind, button, checkbox, dropdown, dropdown_detail, hint, hotkey_field, link, row, segmented, slider,
-    swatch, text_field, toggle,
+    HotkeyState, Kind, button, checkbox, dropdown, dropdown_detail, hint, hotkey_field, keycaps, link, row, segmented,
+    slider, swatch, text_field, toggle,
 };
 #[cfg(test)]
 pub(crate) use controls::ROWS;
-pub(crate) use motion::{anim, glide};
+pub(crate) use motion::{anim, anim_ctx, ease, glide, mix, motion};
 pub(crate) use tokens::{
     BAR_H, CONTENT_X, FOOTER_H, Look, MEDIUM, MONO_MEDIUM, Palette, SEMIBOLD, SIDEBAR_W, WINDOW, medium, mono,
     mono_medium, palette, sans, semibold,

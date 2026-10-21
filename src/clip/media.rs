@@ -185,7 +185,8 @@ pub(super) fn audio_rate(reader: &IMFSourceReader, stream: u32) -> u32 {
     }
 }
 
-pub(super) fn float_output(reader: &IMFSourceReader, stream: u32, rate: u32) -> Result<usize, String> {
+/// Float output at the track's own rate: (rate, channels).
+pub(super) fn float_native(reader: &IMFSourceReader, stream: u32) -> Result<(u32, usize), String> {
     unsafe {
         let t = MFCreateMediaType().ctx("MFCreateMediaType")?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
@@ -194,13 +195,21 @@ pub(super) fn float_output(reader: &IMFSourceReader, stream: u32, rate: u32) -> 
             return Err("the audio can't be decoded".into());
         }
         let cur = reader.GetCurrentMediaType(stream).ctx("GetCurrentMediaType")?;
-        let got = cur.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(0);
+        let rate = cur.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(0);
         let channels = cur.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(0) as usize;
-        if got != rate || channels == 0 {
-            return Err(format!("audio tracks at {got} Hz and {rate} Hz can't be mixed"));
+        if rate == 0 || channels == 0 {
+            return Err("the audio has no format".into());
         }
-        Ok(channels)
+        Ok((rate, channels))
     }
+}
+
+pub(super) fn float_output(reader: &IMFSourceReader, stream: u32, rate: u32) -> Result<usize, String> {
+    let (got, channels) = float_native(reader, stream)?;
+    if got != rate {
+        return Err(format!("audio tracks at {got} Hz and {rate} Hz can't be mixed"));
+    }
+    Ok(channels)
 }
 
 pub(super) fn floats(sample: &IMFSample, out: &mut Vec<f32>) -> Result<(), String> {

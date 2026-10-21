@@ -1,49 +1,18 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use serde::{Deserialize, Serialize};
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::HSTRING;
 
+use super::crop::Crop;
+use super::export::{AAC_BYTES_PER_SECOND, Job, Video, VideoJob};
+use super::gif;
 use super::math::Range;
 use super::media::{self, ANY, Got, Gpu, Info, Track, attributes, pack};
 use super::pcm::{self, Lane};
+use super::process::Processor;
 use crate::platform::log::log;
 use crate::record::{Codec, Ctx};
-
-const AAC_BYTES_PER_SECOND: u32 = 24_000;
-
-#[derive(Clone, Copy)]
-pub(super) struct Quality {
-    pub qp: u32,
-    pub effort: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(super) enum AudioExport {
-    #[default]
-    All,
-    Unmuted,
-    Mix,
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct Plan {
-    pub kept: Vec<Range>,
-    pub unmuted: Vec<bool>,
-    pub audio: AudioExport,
-}
-
-impl Plan {
-    fn len(&self) -> i64 {
-        self.kept.iter().map(|r| r.len()).sum()
-    }
-
-    fn keeps(&self, track: usize) -> bool {
-        self.audio == AudioExport::All || self.unmuted.get(track).copied().unwrap_or(true)
-    }
-}
 
 pub(super) struct Progress<'a> {
     pub permille: &'a AtomicU32,
@@ -61,19 +30,71 @@ impl Progress<'_> {
     }
 }
 
-pub(super) fn trim(src: &Path, info: &Info, plan: &Plan, out: &Path, q: Quality, p: &Progress) -> Result<bool, String> {
-    let res = match Gpu::new() {
-        Ok(gpu) => match run(src, info, plan, out, q, p, Some(&gpu)) {
-            Err(e) if !p.cancelled() => {
-                log(&format!("trim on the gpu failed, retrying in software: {e}"));
-                let _ = std::fs::remove_file(out);
-                run(src, info, plan, out, q, p, None)
+fn target(job: &Job) -> Option<u64> {
+    match job {
+        Job::Video(v) => v.target,
+        Job::Gif(g) => g.target,
+    }
+}
+
+/// Writes `job` to `out`. When a size target was missed, one more pass runs with the bitrate (or the gif's
+/// size) cut by the overshoot.
+pub(super) fn export(src: &Path, info: &Info, job: &Job, out: &Path, effort: u32, p: &Progress) -> Result<bool, String> {
+    passes(src, info, job, out, effort, p, true)
+}
+
+#[cfg(test)]
+pub(super) fn export_in_software(src: &Path, info: &Info, job: &Job, out: &Path, p: &Progress) -> Result<bool, String> {
+    passes(src, info, job, out, 60, p, false)
+}
+
+fn passes(src: &Path, info: &Info, job: &Job, out: &Path, effort: u32, p: &Progress, gpu: bool) -> Result<bool, String> {
+    let mut job = job.clone();
+    let mut pass = 0;
+    loop {
+        let res = match &job {
+            Job::Video(v) => video(src, info, v, out, effort, p, gpu),
+            Job::Gif(g) => gif::export(src, info, g, out, p),
+        };
+        let (Ok(true), Some(limit)) = (&res, target(&job)) else { return res };
+        let size = std::fs::metadata(out).map_or(0, |m| m.len());
+        if size <= limit || pass > 0 {
+            return res;
+        }
+        let k = limit as f64 / size as f64 * 0.95;
+        log(&format!("clip: {size} bytes missed the {limit} byte target, another pass at {k:.2}×"));
+        match &mut job {
+            Job::Video(VideoJob { video: Video::Encode { bitrate, .. }, .. }) => {
+                *bitrate = ((*bitrate as f64 * k) as u32).max(100_000);
             }
-            r => r,
-        },
-        Err(e) => {
-            log(&format!("no gpu for trimming: {e}"));
-            run(src, info, plan, out, q, p, None)
+            Job::Gif(g) => {
+                let s = k.sqrt();
+                g.size = ((((g.size.0 as f64 * s) as u32) & !1).max(64), (((g.size.1 as f64 * s) as u32) & !1).max(64));
+            }
+            Job::Video(_) => return res,
+        }
+        pass += 1;
+        p.set(0, 1);
+    }
+}
+
+fn video(src: &Path, info: &Info, job: &VideoJob, out: &Path, effort: u32, p: &Progress, gpu: bool) -> Result<bool, String> {
+    let res = if job.video == Video::Copy || !gpu {
+        run(src, info, job, out, effort, p, None)
+    } else {
+        match Gpu::new() {
+            Ok(gpu) => match run(src, info, job, out, effort, p, Some(&gpu)) {
+                Err(e) if !p.cancelled() => {
+                    log(&format!("export on the gpu failed, retrying in software: {e}"));
+                    let _ = std::fs::remove_file(out);
+                    run(src, info, job, out, effort, p, None)
+                }
+                r => r,
+            },
+            Err(e) => {
+                log(&format!("no gpu for exporting: {e}"));
+                run(src, info, job, out, effort, p, None)
+            }
         }
     };
     if !matches!(res, Ok(true)) {
@@ -89,7 +110,8 @@ struct Held {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
-    Video(u32),
+    Encode(u32),
+    Remux(u32),
     Copy(u32),
     Mix(usize),
 }
@@ -115,7 +137,7 @@ impl Mixdown {
             out_t.SetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE, 16).ctx("mt")?;
             out_t.SetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND, rate).ctx("mt")?;
             out_t.SetUINT32(&MF_MT_AUDIO_NUM_CHANNELS, 2).ctx("mt")?;
-            out_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AAC_BYTES_PER_SECOND).ctx("mt")?;
+            out_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, AAC_BYTES_PER_SECOND as u32).ctx("mt")?;
             out_t.SetUINT32(&MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29).ctx("mt")?;
             let stream = writer.AddStream(&out_t).ctx("IMFSinkWriter::AddStream (audio)")?;
             let in_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
@@ -174,12 +196,25 @@ impl Mixdown {
     }
 }
 
+/// Where a copied piece really starts: the keyframe media foundation lands on when seeking to `start`.
+fn keyframe(reader: &IMFSourceReader, video: u32, start: i64) -> Result<Option<i64>, String> {
+    unsafe {
+        reader.SetStreamSelection(media::ALL, false).ctx("SetStreamSelection")?;
+        reader.SetStreamSelection(video, true).ctx("SetStreamSelection")?;
+    }
+    media::seek(reader, start)?;
+    match media::read(reader, video)? {
+        Got::Sample { ts, .. } => Ok(Some(ts)),
+        Got::End(_) => Ok(None),
+    }
+}
+
 fn run(
     src: &Path,
     info: &Info,
-    plan: &Plan,
+    job: &VideoJob,
     out: &Path,
-    q: Quality,
+    effort: u32,
     p: &Progress,
     gpu: Option<&Gpu>,
 ) -> Result<bool, String> {
@@ -194,18 +229,31 @@ fn run(
         let writer = MFCreateSinkWriterFromURL(&HSTRING::from(out.as_os_str()), None, &attrs)
             .ctx("MFCreateSinkWriterFromURL")?;
 
-        let kept: Vec<&Track> = info.tracks.iter().enumerate().filter(|(k, _)| plan.keeps(*k)).map(|(_, t)| t).collect();
+        let kept: Vec<&Track> = job.tracks.iter().filter_map(|&k| info.tracks.get(k)).collect();
         let mut targets: Vec<Option<Target>> = vec![None; streams.len()];
-        for (i, ..) in &streams {
-            reader.SetStreamSelection(*i, false).ctx("SetStreamSelection")?;
-        }
+        reader.SetStreamSelection(media::ALL, false).ctx("SetStreamSelection")?;
         let Some(&(video, ..)) = streams.iter().find(|s| s.1 == MFMediaType_Video) else {
             return Err("the file has no video".into());
         };
         reader.SetStreamSelection(video, true).ctx("SetStreamSelection")?;
-        media::set_video_output(&reader, MFVideoFormat_NV12, info.size)?;
-        targets[video as usize] = Some(Target::Video(video_stream(&writer, info, q)?));
-        let mut mix = if plan.audio == AudioExport::Mix && kept.len() > 1 {
+        let mut processor = None;
+        targets[video as usize] = Some(match job.video {
+            Video::Copy => {
+                let native = &streams[video as usize].2;
+                let w = writer.AddStream(native).ctx("can't copy the video")?;
+                writer.SetInputMediaType(w, native, None).ctx("can't copy the video")?;
+                Target::Remux(w)
+            }
+            Video::Encode { crop, size, bitrate } => {
+                media::set_video_output(&reader, MFVideoFormat_NV12, info.size)?;
+                if crop.is_some() || size != info.size {
+                    let area = crop.unwrap_or(Crop::full(info.size));
+                    processor = Some(Processor::new(gpu, info.size, area, size, info.fps)?);
+                }
+                Target::Encode(video_stream(&writer, info, size, bitrate, effort)?)
+            }
+        });
+        let mut mix = if job.combine && kept.len() > 1 {
             Some(Mixdown::new(&writer, media::audio_rate(&reader, kept[0].stream))?)
         } else {
             None
@@ -236,16 +284,30 @@ fn run(
             }
             writer.WriteSample(stream, sample).ctx("WriteSample")
         };
-        let total = plan.len();
+        let frame = |s: &IMFSample| -> Result<IMFSample, String> {
+            match &processor {
+                Some(proc) => proc.run(s),
+                None => Ok(s.clone()),
+            }
+        };
+        let total: i64 = job.pieces.iter().map(|pc| pc.end - pc.lead).sum();
         let mut copied_to = vec![0i64; streams.len()];
         let mut any_video = false;
         let mut base = 0;
-        for &seg in &plan.kept {
+        for piece in &job.pieces {
+            let lead = match job.video {
+                Video::Copy => match keyframe(&reader, video, piece.start)? {
+                    Some(k) if k < piece.end => k,
+                    _ => continue,
+                },
+                Video::Encode { .. } => piece.start,
+            };
+            let seg = Range { start: lead, end: piece.end };
             let mut active: Vec<u32> = (0..streams.len() as u32).filter(|&i| targets[i as usize].is_some()).collect();
             for &i in &active {
                 reader.SetStreamSelection(i, true).ctx("SetStreamSelection")?;
             }
-            media::seek(&reader, seg.start)?;
+            media::seek(&reader, lead)?;
             let mut open: Vec<bool> = mix.as_ref().map_or(Vec::new(), |m| vec![true; m.lanes.len()]);
             let mut held: Option<Held> = None;
             let mut started = false;
@@ -258,11 +320,11 @@ fn run(
                     Got::Sample { stream, ts, sample } => (stream, ts, sample),
                     Got::End(i) => {
                         match targets.get(i as usize).copied().flatten() {
-                            Some(Target::Video(w)) => {
+                            Some(Target::Encode(w)) => {
                                 if let Some(h) = held.take() {
                                     let d = media::duration(&h.sample);
                                     let stop = if d > 0 { (h.ts + d).min(seg.end) } else { seg.end };
-                                    write(w, &h.sample, base, Some((stop - seg.start).max(1)))?;
+                                    write(w, &frame(&h.sample)?, base, Some((stop - seg.start).max(1)))?;
                                     started = true;
                                 }
                             }
@@ -300,7 +362,18 @@ fn run(
                             .unwrap_or(pcm::frames(base + seg.len(), m.rate));
                         m.flush(&writer, ready.min(pcm::frames(base + seg.len(), m.rate)))?;
                     }
-                    Target::Video(w) => {
+                    Target::Remux(w) => {
+                        if !done && ts >= seg.start {
+                            if let Ok(dts) = sample.GetUINT64(&MFSampleExtension_DecodeTimestamp) {
+                                let shifted = dts as i64 - seg.start + base;
+                                sample.SetUINT64(&MFSampleExtension_DecodeTimestamp, shifted as u64).ctx("dts")?;
+                            }
+                            write(w, &sample, out_ts(ts), None)?;
+                            started = true;
+                            p.set(out_ts(ts), total);
+                        }
+                    }
+                    Target::Encode(w) => {
                         if !started {
                             if ts <= seg.start {
                                 held = Some(Held { ts, sample });
@@ -308,13 +381,13 @@ fn run(
                             }
                             started = true;
                             if let Some(h) = held.take() {
-                                write(w, &h.sample, base, Some(ts.min(seg.end) - seg.start))?;
+                                write(w, &frame(&h.sample)?, base, Some(ts.min(seg.end) - seg.start))?;
                             }
                         }
                         let dur = media::duration(&sample);
                         done |= seg.end - ts < dur / 2;
                         if !done {
-                            write(w, &sample, out_ts(ts), (dur > 0).then(|| dur.min(seg.end - ts)))?;
+                            write(w, &frame(&sample)?, out_ts(ts), (dur > 0).then(|| dur.min(seg.end - ts)))?;
                             p.set(out_ts(ts), total);
                         }
                     }
@@ -338,6 +411,7 @@ fn run(
             return Err("the selection has no frames".into());
         }
         writer.Finalize().ctx("IMFSinkWriter::Finalize")?;
+        drop(processor);
         let names: Vec<String> = kept.iter().map(|t| t.name.clone()).collect();
         let names = if mix.is_some() { vec![names.join(" + ")] } else { names };
         if !names.is_empty()
@@ -350,19 +424,18 @@ fn run(
     }
 }
 
-unsafe fn video_stream(writer: &IMFSinkWriter, info: &Info, q: Quality) -> Result<u32, String> {
+unsafe fn video_stream(writer: &IMFSinkWriter, info: &Info, size: (u32, u32), bitrate: u32, effort: u32) -> Result<u32, String> {
     unsafe {
-        let (w, h) = info.size;
+        let (w, h) = size;
         let (subtype, profile) = match info.codec.unwrap_or(Codec::H264) {
             Codec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_High.0 as u32),
             Codec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
         };
-        let nominal_bps = ((w as f64 * h as f64 * info.fps) / 10.0).clamp(2e6, 400e6) as u32;
         let fps_milli = (info.fps * 1000.0).round() as u32;
         let out_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
         out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
         out_t.SetGUID(&MF_MT_SUBTYPE, &subtype).ctx("mt")?;
-        out_t.SetUINT32(&MF_MT_AVG_BITRATE, nominal_bps).ctx("mt")?;
+        out_t.SetUINT32(&MF_MT_AVG_BITRATE, bitrate).ctx("mt")?;
         out_t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).ctx("mt")?;
         out_t.SetUINT64(&MF_MT_FRAME_SIZE, pack(w, h)).ctx("mt")?;
         out_t.SetUINT64(&MF_MT_FRAME_RATE, pack(fps_milli, 1000)).ctx("mt")?;
@@ -378,10 +451,12 @@ unsafe fn video_stream(writer: &IMFSinkWriter, info: &Info, q: Quality) -> Resul
         in_t.SetUINT64(&MF_MT_FRAME_RATE, pack(fps_milli, 1000)).ctx("mt")?;
         in_t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).ctx("mt")?;
 
-        let enc = attributes(4)?;
-        enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_Quality.0 as u32).ctx("enc")?;
-        enc.SetUINT64(&CODECAPI_AVEncVideoEncodeQP, q.qp.min(51) as u64).ctx("enc")?;
-        enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, q.effort.min(100)).ctx("enc")?;
+        let enc = attributes(5)?;
+        let mode = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
+        enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode).ctx("enc")?;
+        enc.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, bitrate).ctx("enc")?;
+        enc.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, bitrate.saturating_mul(3) / 2).ctx("enc")?;
+        enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, effort.min(100)).ctx("enc")?;
         enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (info.fps * 2.0).round() as u32).ctx("enc")?;
         writer.SetInputMediaType(stream, &in_t, &enc).ctx("IMFSinkWriter::SetInputMediaType")?;
         Ok(stream)

@@ -1,3 +1,4 @@
+use super::crop::Crop;
 use super::math::Range;
 
 const UNDO_LIMIT: usize = 200;
@@ -9,29 +10,26 @@ pub(super) struct Segment {
     pub removed: bool,
 }
 
+/// The timeline: the trimmed range, its pieces, markers, which sound lanes are muted, and the crop.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct Edit {
     pub range: Range,
     pub segments: Vec<Segment>,
     pub markers: Vec<i64>,
+    pub muted: Vec<bool>,
+    pub crop: Option<Crop>,
 }
 
 impl Edit {
-    pub(super) fn new(duration: i64) -> Self {
+    pub(super) fn new(duration: i64, tracks: usize) -> Self {
         let duration = duration.max(0);
         Edit {
             range: Range::full(duration),
             segments: vec![Segment { start: 0, end: duration, removed: false }],
             markers: Vec::new(),
+            muted: vec![false; tracks],
+            crop: None,
         }
-    }
-
-    pub(super) fn duration(&self) -> i64 {
-        self.segments.last().map_or(0, |s| s.end)
-    }
-
-    pub(super) fn is_edited(&self) -> bool {
-        !self.range.is_full(self.duration()) || self.segments.iter().any(|s| s.removed)
     }
 
     pub(super) fn splits(&self) -> impl Iterator<Item = i64> + '_ {
@@ -170,7 +168,7 @@ mod tests {
 
     #[test]
     fn splitting_needs_room_on_both_sides() {
-        let mut e = Edit::new(10 * S);
+        let mut e = Edit::new(10 * S, 0);
         assert!(e.split(4 * S, S / 10));
         assert!(e.split(7 * S, S / 10));
         assert!(!e.split(7 * S, S / 10));
@@ -182,17 +180,15 @@ mod tests {
         assert_eq!(e.segment_at(4 * S - 1), 0);
         assert_eq!(e.segment_at(4 * S), 1);
         assert_eq!(e.segment_at(10 * S), 2);
-        assert!(!e.is_edited());
     }
 
     #[test]
     fn deleted_segments_are_skipped_and_the_rest_joins() {
-        let mut e = Edit::new(10 * S);
+        let mut e = Edit::new(10 * S, 0);
         e.split(2 * S, 1);
         e.split(5 * S, 1);
         e.split(8 * S, 1);
         assert!(e.toggle_removed(1));
-        assert!(e.is_edited());
         assert_eq!(e.kept(), [r(0, 2 * S), r(5 * S, 10 * S)]);
         assert!(e.toggle_removed(2));
         assert_eq!(e.kept(), [r(0, 2 * S), r(8 * S, 10 * S)]);
@@ -209,7 +205,7 @@ mod tests {
 
     #[test]
     fn the_last_kept_piece_cant_be_deleted() {
-        let mut e = Edit::new(10 * S);
+        let mut e = Edit::new(10 * S, 0);
         assert!(!e.toggle_removed(0));
         e.split(5 * S, 1);
         e.range = r(0, 5 * S);
@@ -241,7 +237,7 @@ mod tests {
 
     #[test]
     fn markers_stay_sorted_unique_and_navigate_past_the_playhead() {
-        let mut e = Edit::new(10 * S);
+        let mut e = Edit::new(10 * S, 0);
         let half = S / 120;
         assert!(e.add_marker(5 * S, half));
         assert!(e.add_marker(2 * S, half));
@@ -258,13 +254,12 @@ mod tests {
         assert_eq!(e.prev_marker(10 * S, half), Some(8 * S));
         assert_eq!(e.marker_near(5 * S + 3, half), Some(1));
         assert_eq!(e.marker_near(6 * S, half), None);
-        assert!(!e.is_edited());
     }
 
     #[test]
     fn undo_and_redo_walk_the_history() {
         let mut u = Undo::new();
-        let mut e = Edit::new(10 * S);
+        let mut e = Edit::new(10 * S, 0);
         let before = e.clone();
         e.split(5 * S, 1);
         u.record(before, &e);
@@ -277,7 +272,7 @@ mod tests {
         assert!(e.markers.is_empty());
         assert_eq!(e.segments.len(), 2);
         assert!(u.undo(&mut e));
-        assert_eq!(e, Edit::new(10 * S));
+        assert_eq!(e, Edit::new(10 * S, 0));
         assert!(!u.undo(&mut e));
         assert!(u.redo(&mut e));
         assert_eq!(e.segments.len(), 2);

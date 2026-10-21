@@ -6,8 +6,10 @@ use std::path::Path;
 use color_quant::NeuQuant;
 use gif::{DisposalMethod, Encoder, Frame, Repeat};
 
+use super::crop::Crop;
 use super::edit::source_time;
-use super::math::{Range, gif_delay, gif_frames, gif_size, gif_tick};
+use super::export::GifJob;
+use super::math::{gif_delay, gif_frames, gif_tick};
 use super::media::{self, Decoded, Info};
 use super::trim::Progress;
 
@@ -16,44 +18,50 @@ const TRANSPARENT: u8 = 255;
 const PALETTE_FRAMES: u64 = 16;
 const SAME: i32 = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct GifOptions {
-    pub fps: u32,
-    pub width: Option<u32>,
-}
-
-pub(super) fn export(
-    src: &Path,
-    info: &Info,
-    kept: &[Range],
-    opts: GifOptions,
-    out: &Path,
-    p: &Progress,
-) -> Result<bool, String> {
-    let res = run(src, info, kept, opts, out, p);
+pub(super) fn export(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Result<bool, String> {
+    let res = run(src, info, job, out, p);
     if !matches!(res, Ok(true)) {
         let _ = std::fs::remove_file(out);
     }
     res
 }
 
-fn bgrx(f: &Decoded, size: (u32, u32), out: &mut Vec<u8>) -> Result<(), String> {
+/// What the reader decodes and where the gif sits in it: the whole frame scaled so the crop comes out at the gif's size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Area {
+    full: (u32, u32),
+    x: u32,
+    y: u32,
+    size: (u32, u32),
+}
+
+fn area(src: (u32, u32), crop: Option<Crop>, size: (u32, u32)) -> Area {
+    let c = crop.unwrap_or(Crop::full(src));
+    let (fx, fy) = (size.0 as f64 / c.w.max(1) as f64, size.1 as f64 / c.h.max(1) as f64);
+    let full = (((src.0 as f64 * fx).round() as u32).max(size.0), ((src.1 as f64 * fy).round() as u32).max(size.1));
+    let x = ((c.x as f64 * fx).round() as u32).min(full.0 - size.0);
+    let y = ((c.y as f64 * fy).round() as u32).min(full.1 - size.1);
+    Area { full, x, y, size }
+}
+
+fn bgrx(f: &Decoded, a: Area, out: &mut Vec<u8>) -> Result<(), String> {
     out.clear();
-    media::with_pixels(&f.sample, size.0, |rows| {
-        for y in 0..size.1 as usize {
-            out.extend_from_slice(rows.row(y));
+    media::with_pixels(&f.sample, a.full.0, |rows| {
+        for y in 0..a.size.1 as usize {
+            out.extend_from_slice(&rows.row(a.y as usize + y)[a.x as usize * 4..(a.x + a.size.0) as usize * 4]);
         }
     })
 }
 
-fn run(src: &Path, info: &Info, kept: &[Range], opts: GifOptions, out: &Path, p: &Progress) -> Result<bool, String> {
-    let size = gif_size(info.size, opts.width);
+fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Result<bool, String> {
+    let (kept, size, fps) = (&job.kept[..], job.size, job.fps);
+    let area = area(info.size, job.crop, size);
     let (w, h) = (u16::try_from(size.0).map_err(|_| "too wide")?, u16::try_from(size.1).map_err(|_| "too tall")?);
-    let frames = gif_frames(kept.iter().map(|r| r.len()).sum(), opts.fps);
+    let frames = gif_frames(kept.iter().map(|r| r.len()).sum(), fps);
     if frames == 0 {
         return Err("the selection is empty".into());
     }
-    let reader = media::rgb_reader(src, size)?;
+    let reader = media::rgb_reader(src, area.full)?;
 
     let picks = frames.min(PALETTE_FRAMES);
     let mut sample = Vec::with_capacity(picks as usize * size.0 as usize * size.1 as usize * 4);
@@ -62,10 +70,10 @@ fn run(src: &Path, info: &Info, kept: &[Range], opts: GifOptions, out: &Path, p:
         if p.cancelled() {
             return Ok(false);
         }
-        let Some((_, t)) = source_time(kept, gif_tick(0, j * frames / picks, opts.fps)) else { continue };
+        let Some((_, t)) = source_time(kept, gif_tick(0, j * frames / picks, fps)) else { continue };
         media::seek(&reader, t)?;
         if let (Some(f), _) = media::decode_until(&reader, t, None)? {
-            bgrx(&f, size, &mut px)?;
+            bgrx(&f, area, &mut px)?;
             sample.extend(px.chunks_exact(4).flat_map(|c| [c[2], c[1], c[0], 255]));
         }
         p.set(j as i64 + 1, picks as i64 * 10);
@@ -92,7 +100,7 @@ fn run(src: &Path, info: &Info, kept: &[Range], opts: GifOptions, out: &Path, p:
         if p.cancelled() {
             return Ok(false);
         }
-        let Some((s, t)) = source_time(kept, gif_tick(0, k, opts.fps)) else { break };
+        let Some((s, t)) = source_time(kept, gif_tick(0, k, fps)) else { break };
         if segment != Some(s) {
             segment = Some(s);
             media::seek(&reader, kept[s].start)?;
@@ -112,12 +120,12 @@ fn run(src: &Path, info: &Info, kept: &[Range], opts: GifOptions, out: &Path, p:
             }
         }
         let Some(f) = &cur else { break };
-        let delay = gif_delay(k, opts.fps);
+        let delay = gif_delay(k, fps);
         let changed = if shown_ts == Some(f.ts) {
             None
         } else {
             shown_ts = Some(f.ts);
-            bgrx(f, size, &mut px)?;
+            bgrx(f, area, &mut px)?;
             dither.frame(&mut q, &px)
         };
         if changed.is_none()
@@ -259,6 +267,16 @@ mod tests {
         let (x, y, w, h, buf) = d.frame(&mut q, &px).unwrap();
         assert_eq!((x, y, w, h), (5, 2, 1, 1));
         assert!(buf[0] != TRANSPARENT && buf[0].abs_diff(200) <= 3);
+    }
+
+    #[test]
+    fn crops_are_cut_from_the_frame_scaled_to_the_gif() {
+        let crop = Crop { x: 960, y: 540, w: 960, h: 540 };
+        assert_eq!(area((1920, 1080), Some(crop), (480, 270)), Area { full: (960, 540), x: 480, y: 270, size: (480, 270) });
+        assert_eq!(area((1920, 1080), None, (640, 360)), Area { full: (640, 360), x: 0, y: 0, size: (640, 360) });
+        let edge = Crop { x: 1001, y: 0, w: 919, h: 1080 };
+        let a = area((1920, 1080), Some(edge), (306, 360));
+        assert!(a.x + a.size.0 <= a.full.0 && a.full.1 == 360);
     }
 
     #[test]

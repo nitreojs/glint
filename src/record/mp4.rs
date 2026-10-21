@@ -44,9 +44,22 @@ fn atom(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn child<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+pub(crate) fn child<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
     let found = atoms(data).ok()?.into_iter().find(|a| &a.kind == kind)?;
     Some(&data[found.body..found.end])
+}
+
+pub(crate) type Boxes<'a> = Vec<([u8; 4], &'a [u8])>;
+
+pub(crate) fn boxes(data: &[u8]) -> Result<Boxes<'_>, String> {
+    Ok(atoms(data)?.into_iter().map(|a| (a.kind, &data[a.body..a.end])).collect())
+}
+
+/// The body of the file's moov box.
+pub(crate) fn moov(path: &Path) -> Result<Vec<u8>, String> {
+    let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let (_, _, data) = read_moov(&mut f)?;
+    child(&data, b"moov").map(<[u8]>::to_vec).ok_or_else(|| "broken moov box".into())
 }
 
 // hdlr: version/flags, pre_defined, handler_type, 3 reserved words, then the name.

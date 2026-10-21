@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use eframe::egui::{Color32, Id, Ui};
+use eframe::egui::{Color32, Context, Id, Ui};
 use windows::Win32::UI::WindowsAndMessaging::{
     SPI_GETCLIENTAREAANIMATION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
 };
@@ -20,10 +20,19 @@ static MOTION: LazyLock<bool> = LazyLock::new(|| {
     ok.is_err() || on.as_bool()
 });
 
+/// Whether transitions animate at all.
+pub(crate) fn motion() -> bool {
+    *MOTION
+}
+
 /// Linear 0..=1 progress toward `on`, over `secs`.
 pub(crate) fn anim(ui: &Ui, id: Id, on: bool, secs: f32) -> f32 {
+    anim_ctx(ui.ctx(), id, on, secs)
+}
+
+pub(crate) fn anim_ctx(ctx: &Context, id: Id, on: bool, secs: f32) -> f32 {
     if *MOTION {
-        ui.ctx().animate_bool_with_time(id, on, secs)
+        ctx.animate_bool_with_time(id, on, secs)
     } else if on {
         1.0
     } else {
@@ -32,7 +41,7 @@ pub(crate) fn anim(ui: &Ui, id: Id, on: bool, secs: f32) -> f32 {
 }
 
 /// The design's ease-out, cubic-bezier(0.2, 0, 0, 1).
-pub(super) fn ease(t: f32) -> f32 {
+pub(crate) fn ease(t: f32) -> f32 {
     let bez = |s: f32, a: f32, b: f32| 3.0 * (1.0 - s).powi(2) * s * a + 3.0 * (1.0 - s) * s * s * b + s * s * s;
     let (mut lo, mut hi) = (0.0, 1.0);
     for _ in 0..20 {
@@ -42,7 +51,7 @@ pub(super) fn ease(t: f32) -> f32 {
     bez((lo + hi) / 2.0, 0.0, 1.0)
 }
 
-pub(super) fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+pub(crate) fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
     a.lerp_to_gamma(b, t.clamp(0.0, 1.0))
 }
 

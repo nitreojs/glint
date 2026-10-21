@@ -154,7 +154,7 @@ pub(crate) fn link(ui: &mut Ui, look: &Look, text: &str) -> Response {
 }
 
 /// Draws keycaps from `x`, centred on `y`; returns where the next element starts.
-fn keycaps(painter: &Painter, ui: &Ui, p: &Palette, mut x: f32, y: f32, keys: &[String], warn: bool) -> f32 {
+pub(crate) fn keycaps(painter: &Painter, ui: &Ui, p: &Palette, mut x: f32, y: f32, keys: &[String], warn: bool) -> f32 {
     let color = if warn { p.warn } else { p.t1 };
     for (i, key) in keys.iter().enumerate() {
         if i > 0 {

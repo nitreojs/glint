@@ -358,7 +358,7 @@ countdown = {countdown}
 # capture apps pause while they're visible.
 indicator_inside = "{indicator_inside}"
 
-# Open the trimmer (trim, export a gif) after every recording is saved.
+# Open the trimmer (trim, cut, crop, mute tracks, save a smaller video or a gif) after every recording is saved.
 open_trimmer = {open_trimmer}
 
 # Screenshots: "select" picks a region first, then opens the editor; "sharex" opens the
