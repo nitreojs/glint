@@ -12,6 +12,7 @@ use crate::app::ipc;
 use crate::config::{Config, Expiry};
 use crate::settings::SettingsApp;
 use crate::settings::widgets::{self, Kind, Look, hint, row};
+use crate::upload::proxy::{self, Setting};
 use crate::upload::{BUILT_IN, custom};
 
 fn pick_sxcu() -> Vec<PathBuf> {
@@ -56,14 +57,23 @@ enum Pick {
     Custom,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ProxyPick {
+    System,
+    Direct,
+    Custom,
+}
+
 pub(in crate::settings) struct Uploaders {
     names: Vec<String>,
     note: Option<(String, bool)>,
+    system_proxy: String,
+    custom_proxy: bool,
 }
 
 impl Uploaders {
     pub(in crate::settings) fn load() -> Uploaders {
-        Uploaders { names: custom::names(), note: None }
+        Uploaders { names: custom::names(), note: None, system_proxy: proxy::describe_system(), custom_proxy: false }
     }
 
     fn refresh(&mut self, note: String, warn: bool) {
@@ -113,6 +123,41 @@ impl SettingsApp {
             widgets::toggle(ui, look, &mut self.cfg.upload_copy_link, "copy the link");
             widgets::toggle(ui, look, &mut self.cfg.recording_upload, "upload every recording once it's saved");
         });
+        row(ui, look, "proxy", 7.0, |ui| self.proxy_row(ui, look));
+    }
+
+    fn proxy_row(&mut self, ui: &mut Ui, look: &Look) {
+        let p = look.p;
+        let parsed = proxy::parse(&self.cfg.upload_proxy);
+        let typing = self.uploaders.custom_proxy && self.cfg.upload_proxy.trim().is_empty();
+        let mut pick = match parsed {
+            Ok(Setting::System) if !typing => ProxyPick::System,
+            Ok(Setting::None) => ProxyPick::Direct,
+            _ => ProxyPick::Custom,
+        };
+        let options = [(ProxyPick::System, "system"), (ProxyPick::Direct, "none"), (ProxyPick::Custom, "custom")];
+        if widgets::segmented(ui, look, &mut pick, &options, None).changed() {
+            self.uploaders.custom_proxy = pick == ProxyPick::Custom;
+            self.cfg.upload_proxy = match pick {
+                ProxyPick::System => "system".into(),
+                ProxyPick::Direct => "none".into(),
+                ProxyPick::Custom => String::new(),
+            };
+        }
+        match pick {
+            ProxyPick::System => hint(ui, self.uploaders.system_proxy.clone(), p.t3),
+            ProxyPick::Direct => hint(ui, "uploads connect straight to the host", p.t3),
+            ProxyPick::Custom => {
+                let problem = proxy::parse(&self.cfg.upload_proxy).err();
+                widgets::text_field(ui, look, &mut self.cfg.upload_proxy, "http://host:port", problem.is_some());
+                let (text, color) = match problem {
+                    Some(e) => (e, p.warn),
+                    None if self.cfg.upload_proxy.trim().is_empty() => ("empty uses the system proxy".into(), p.t3),
+                    None => ("http proxies only: socks can't carry uploads".into(), p.t3),
+                };
+                hint(ui, text, color);
+            }
+        }
     }
 
     fn custom_list(&mut self, ui: &mut Ui, look: &Look) {

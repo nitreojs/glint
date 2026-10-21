@@ -2,30 +2,29 @@
 //! winit allows only one event loop per process and the window can be opened many times.
 //! It edits config.toml and asks the tray app to apply it.
 //!
-//! The window draws its own title bar (egui-winit keeps the DWM shadow for undecorated
-//! windows) and follows the Windows light / dark app setting.
+//! The window draws its own title bar (see [`frameless`]) and follows the Windows light / dark
+//! app setting.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Id, Key, Layout, Rect, RichText,
-    Stroke, TextStyle, Ui, UiBuilder, pos2, vec2,
+    self, Align, Align2, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, Id, Key, Layout, Margin, Rect,
+    RichText, Stroke, TextStyle, Ui, UiBuilder, pos2, vec2,
 };
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
-use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
-use windows::core::w;
 
 use crate::app::ipc::{self, SETTINGS_TITLE, WM_RELOAD};
-use crate::app::tray::icon_pixels;
+use crate::app::tray::icon_rgba;
 use crate::config::{Config, file_name_problem};
-use crate::platform::wide::from_wstr;
+use crate::platform::paths::app_dir;
 
 mod hotkey_capture;
 mod sections;
 pub(crate) mod widgets;
+mod window;
 
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, Listener};
@@ -34,6 +33,7 @@ use sections::{SECTIONS, Section};
 use widgets::{
     BAR_H, CONTENT_X, FOOTER_H, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, medium, mono, sans, semibold,
 };
+pub(crate) use window::frameless;
 
 /// IBM Plex Sans and Mono, unmodified (SIL Open Font License, see assets/fonts/OFL.txt).
 const FONTS: [(&str, &[u8]); 5] = [
@@ -44,6 +44,17 @@ const FONTS: [(&str, &[u8]); 5] = [
     ("mono-medium", include_bytes!("../../assets/fonts/IBMPlexMono-Medium.ttf")),
 ];
 const FONT_LICENSE: &str = include_str!("../../assets/fonts/OFL.txt");
+
+/// Where the settings window's last size is kept, in points: `[width, height]` as JSON.
+fn size_path() -> PathBuf {
+    app_dir().join("settings-window.json")
+}
+
+fn saved_size() -> [f32; 2] {
+    let read = std::fs::read_to_string(size_path()).ok().and_then(|t| serde_json::from_str::<[f32; 2]>(&t).ok());
+    let [w, h] = read.unwrap_or(WINDOW);
+    [w.clamp(WINDOW[0], 8000.0), h.clamp(WINDOW[1], 8000.0)]
+}
 
 pub fn run() {
     if let Some(h) = ipc::find_settings() {
@@ -56,23 +67,21 @@ pub fn run() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(format!("couldn't read the settings, showing defaults: {e}"))),
     };
-    let size = 64;
-    let rgba = icon_pixels(size, true)
-        .into_iter()
-        .flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8])
-        .collect();
+    let size = saved_size();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(SETTINGS_TITLE)
-            .with_inner_size(WINDOW)
-            .with_resizable(false)
+            .with_inner_size(size)
+            .with_min_inner_size(WINDOW)
+            .with_resizable(true)
             .with_decorations(false)
-            .with_icon(egui::IconData { rgba, width: size as u32, height: size as u32 }),
+            .with_icon(egui::IconData { rgba: icon_rgba(64, cfg.accent_rgb()), width: 64, height: 64 }),
         centered: true,
         ..Default::default()
     };
     let app = SettingsApp {
         saved: cfg.clone(),
+        accent_text: cfg.accent.clone(),
         cfg,
         error: load_error,
         listening: None,
@@ -81,12 +90,14 @@ pub fn run() {
         section: Section::General,
         dialog: None,
         keyboard: false,
-        rounded: None,
-        light: None,
+        rounded: false,
+        styled: None,
         closing: false,
         uploaders: Uploaders::load(),
+        audio_devices: None,
         shown: None,
         pinned: false,
+        size: (size, size),
     };
     let _ = eframe::run_native(
         SETTINGS_TITLE,
@@ -94,6 +105,10 @@ pub fn run() {
         Box::new(|cc| {
             fonts(&cc.egui_ctx);
             let _ = CTX.set(cc.egui_ctx.clone());
+            let mut app = app;
+            if let Ok(RawWindowHandle::Win32(h)) = cc.window_handle().map(|h| h.as_raw()) {
+                app.rounded = frameless(HWND(h.hwnd.get() as _), true);
+            }
             Ok(Box::new(app))
         }),
     );
@@ -121,15 +136,20 @@ struct SettingsApp {
     dialog: Option<Dialog>,
     /// The last input was keyboard navigation, so focus rings show.
     keyboard: bool,
-    /// Windows 11 rounds the window corners; None until the window exists.
-    rounded: Option<bool>,
-    /// The theme the egui visuals were set up for.
-    light: Option<bool>,
+    /// Windows 11 rounds the window corners.
+    rounded: bool,
+    /// The theme and accent the egui visuals were set up for.
+    styled: Option<(bool, [u8; 3])>,
     /// Closing was confirmed (or there was nothing to lose): let the close through.
     closing: bool,
     uploaders: Uploaders,
+    audio_devices: Option<sections::audio::Devices>,
     shown: Option<Section>,
     pinned: bool,
+    /// What's typed in the custom accent field; `cfg.accent` follows it while it's a colour.
+    accent_text: String,
+    /// The window's inner size in points when it opened, and now.
+    size: ([f32; 2], [f32; 2]),
 }
 
 static CTX: OnceLock<egui::Context> = OnceLock::new();
@@ -193,55 +213,22 @@ impl SettingsApp {
 impl Drop for SettingsApp {
     fn drop(&mut self) {
         self.stop_listening();
+        let (opened, now) = self.size;
+        if now != opened {
+            let _ = std::fs::write(size_path(), format!("[{}, {}]", now[0].round(), now[1].round()));
+        }
     }
-}
-
-fn windows_build() -> u32 {
-    let mut buf = [0u16; 16];
-    let mut bytes = size_of_val(&buf) as u32;
-    let key = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
-    unsafe {
-        let _ = RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            key,
-            w!("CurrentBuildNumber"),
-            RRF_RT_REG_SZ,
-            None,
-            Some(buf.as_mut_ptr().cast()),
-            Some(&mut bytes),
-        );
-    }
-    from_wstr(&buf).parse().unwrap_or(0)
-}
-
-/// Asks Windows 11 to round the window; returns whether it's rounded (never on Windows 10),
-/// or None while the window doesn't exist yet.
-fn round_corners() -> Option<bool> {
-    Some(round(ipc::find_settings()?))
-}
-
-pub(crate) fn round(hwnd: HWND) -> bool {
-    if windows_build() < 22000 {
-        return false;
-    }
-    let pref = DWMWCP_ROUND;
-    let set = unsafe {
-        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const _ as _, size_of_val(&pref) as u32)
-    };
-    set.is_ok()
 }
 
 impl eframe::App for SettingsApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.poll_capture();
         let ctx = ui.ctx().clone();
-        if self.rounded.is_none() {
-            self.rounded = round_corners();
-        }
         let light = ctx.system_theme() == Some(egui::Theme::Light);
-        let p = if light { widgets::LIGHT } else { widgets::DARK };
-        if self.light != Some(light) {
-            self.light = Some(light);
+        let accent = self.cfg.accent_rgb();
+        let p = widgets::palette(light, accent);
+        if self.styled != Some((light, accent)) {
+            self.styled = Some((light, accent));
             visuals(&ctx, &p, light);
         }
         ctx.input(|i| {
@@ -254,10 +241,17 @@ impl eframe::App for SettingsApp {
                 self.keyboard = true;
             }
         });
+        let viewport = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized, i.viewport().minimized));
+        if let (Some(r), Some(false) | None, Some(false) | None) = viewport
+            && r.width() >= WINDOW[0] - 1.0
+            && r.height() >= WINDOW[1] - 1.0
+        {
+            self.size.1 = [r.width(), r.height()];
+        }
         let look = Look { p, keyboard: self.keyboard };
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let active = widgets::anim(ui, Id::unique("window-active"), focused, 0.15);
-        let radius: u8 = if self.rounded == Some(true) { 8 } else { 0 };
+        let radius: u8 = if self.rounded { 8 } else { 0 };
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
         let had_dialog = self.dialog.is_some();
 
@@ -291,7 +285,8 @@ impl eframe::App for SettingsApp {
             pos2(main.right() - CONTENT_X, main.bottom() - FOOTER_H),
         );
         ui.painter().text(pos2(body.left(), body.top() + 18.0), Align2::LEFT_TOP, self.section.name(), semibold(20.0), p.t1);
-        let rows = Rect::from_min_max(pos2(body.left(), body.top() + 56.0), body.right_bottom());
+        let rows = Rect::from_min_max(pos2(body.left(), body.top() + 56.0), pos2(main.right() - 10.0, body.bottom()));
+        let gutter = (rows.right() - body.right()) as i8;
         let mut content = ui.new_child(UiBuilder::new().max_rect(rows).layout(Layout::top_down(Align::Min)));
         if self.shown != Some(self.section) {
             self.shown = Some(self.section);
@@ -304,7 +299,10 @@ impl eframe::App for SettingsApp {
                 || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
         });
         self.pinned &= !touched;
-        let mut scroll = egui::ScrollArea::vertical().id_salt(self.section.name()).auto_shrink(false);
+        let mut scroll = egui::ScrollArea::vertical()
+            .id_salt(self.section.name())
+            .auto_shrink(false)
+            .content_margin(Margin { right: gutter, ..Margin::ZERO });
         if self.pinned {
             scroll = scroll.vertical_scroll_offset(0.0);
         }
@@ -317,6 +315,7 @@ impl eframe::App for SettingsApp {
             match self.section {
                 Section::General => self.general(content, &look),
                 Section::Recording => self.recording(content, &look),
+                Section::Audio => self.audio(content, &look),
                 Section::Screenshots => self.screenshots(content, &look),
                 Section::Uploads => self.uploads(content, &look),
                 Section::Output => self.output(content, &look),
@@ -469,6 +468,19 @@ pub(crate) fn fonts(ctx: &egui::Context) {
     ctx.all_styles_mut(|s| {
         s.interaction.selectable_labels = false;
         s.spacing.item_spacing = vec2(8.0, 6.0);
+        s.spacing.scroll = egui::style::ScrollStyle {
+            bar_width: 6.0,
+            floating_width: 6.0,
+            handle_min_length: 24.0,
+            foreground_color: false,
+            dormant_background_opacity: 0.0,
+            active_background_opacity: 0.0,
+            interact_background_opacity: 0.0,
+            dormant_handle_opacity: 1.0,
+            active_handle_opacity: 1.0,
+            interact_handle_opacity: 1.0,
+            ..egui::style::ScrollStyle::floating()
+        };
         s.text_styles.insert(TextStyle::Body, sans(13.0));
         s.text_styles.insert(TextStyle::Button, medium(13.0));
         s.text_styles.insert(TextStyle::Small, sans(12.0));
@@ -476,7 +488,7 @@ pub(crate) fn fonts(ctx: &egui::Context) {
     });
 }
 
-/// egui's own widgets (text fields, the licence scroll area) in the palette's colours.
+/// egui's own widgets (text fields, scroll bars) in the palette's colours.
 pub(crate) fn visuals(ctx: &egui::Context, p: &widgets::Palette, light: bool) {
     let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
     v.panel_fill = p.surf;
@@ -487,6 +499,11 @@ pub(crate) fn visuals(ctx: &egui::Context, p: &widgets::Palette, light: bool) {
     v.text_cursor.stroke = Stroke::new(1.5, p.t1);
     for w in [&mut v.widgets.noninteractive, &mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
         w.fg_stroke.color = p.t1;
+    }
+    // scroll handles are painted in these fills
+    for (w, fill) in [(&mut v.widgets.inactive, p.line2), (&mut v.widgets.hovered, p.line3), (&mut v.widgets.active, p.t3)] {
+        w.bg_fill = fill;
+        w.corner_radius = CornerRadius::same(3);
     }
     ctx.set_theme(if light { egui::Theme::Light } else { egui::Theme::Dark });
     ctx.set_visuals(v);
@@ -521,12 +538,15 @@ mod tests {
                 section: Section::General,
                 dialog: None,
                 keyboard: false,
-                rounded: Some(false),
-                light: None,
+                rounded: false,
+                styled: None,
                 closing: false,
                 uploaders: Uploaders::load(),
+                audio_devices: None,
                 shown: None,
                 pinned: false,
+                accent_text: String::new(),
+                size: (WINDOW, WINDOW),
             };
             Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0 }
         }

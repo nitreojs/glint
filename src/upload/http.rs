@@ -3,7 +3,10 @@ use std::io::Read;
 use std::path::PathBuf;
 
 use windows::Win32::Networking::WinHttp::*;
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{HSTRING, PCWSTR, PWSTR};
+
+use super::proxy::{self, Route, Setting};
+use crate::platform::log::log;
 
 pub(crate) enum Part {
     Bytes(Vec<u8>),
@@ -82,22 +85,62 @@ impl Drop for Handle {
 
 fn failure(what: &str, e: windows::core::Error) -> String {
     let code = (e.code().0 as u32) & 0xFFFF;
-    let reason = match code {
-        ERROR_WINHTTP_TIMEOUT => "the server took too long to answer".to_string(),
-        ERROR_WINHTTP_NAME_NOT_RESOLVED => "the server's name couldn't be resolved (offline?)".to_string(),
-        ERROR_WINHTTP_CANNOT_CONNECT => "couldn't connect to the server".to_string(),
-        ERROR_WINHTTP_CONNECTION_ERROR => "the connection was reset".to_string(),
-        ERROR_WINHTTP_SECURE_FAILURE => "the secure connection failed".to_string(),
-        _ if e.message().is_empty() => format!("error {code}"),
-        _ => e.message(),
+    if e.message().is_empty() { format!("{what}: error {code}") } else { format!("{what}: {}", e.message()) }
+}
+
+fn network_failure(stage: &str, host: &str, route: &Route, e: windows::core::Error) -> String {
+    let code = (e.code().0 as u32) & 0xFFFF;
+    let proxy_up = match route {
+        Route::Proxy(p) if code == ERROR_WINHTTP_CANNOT_CONNECT => proxy::listening(p),
+        _ => false,
     };
-    format!("{what}: {reason}")
+    log(&format!("winhttp {stage} to {host} {route}: error {code}{}", if proxy_up { ", proxy is up" } else { "" }));
+    reason(code, host, route, proxy_up).unwrap_or_else(|| failure(host, e))
+}
+
+fn reason(code: u32, host: &str, route: &Route, proxy_up: bool) -> Option<String> {
+    let via = match route {
+        Route::Direct => String::new(),
+        Route::Proxy(p) => format!(" (through the proxy {p})"),
+    };
+    Some(match (code, route) {
+        (ERROR_WINHTTP_CANNOT_CONNECT, Route::Proxy(p)) if proxy_up => format!(
+            "the proxy {p} couldn't reach {host}: the host is down or the proxy's route to it failed; try again or another host"
+        ),
+        (ERROR_WINHTTP_CANNOT_CONNECT, Route::Proxy(p)) => {
+            format!("couldn't connect to the proxy {p} to reach {host}: is it running? (settings → uploads → proxy)")
+        }
+        (ERROR_WINHTTP_CANNOT_CONNECT, Route::Direct) => format!(
+            "couldn't reach {host}: it's down or blocked on this network; set a proxy in settings → uploads, or pick another host"
+        ),
+        (ERROR_WINHTTP_NAME_NOT_RESOLVED, Route::Proxy(p)) => format!("the proxy {p} couldn't be found"),
+        (ERROR_WINHTTP_NAME_NOT_RESOLVED, Route::Direct) => {
+            format!("{host} couldn't be found (offline, or dns blocked?)")
+        }
+        (ERROR_WINHTTP_TIMEOUT, _) => format!("{host} took too long to answer{via}"),
+        (ERROR_WINHTTP_CONNECTION_ERROR, _) => format!("the connection to {host} was cut off{via}"),
+        (ERROR_WINHTTP_INVALID_SERVER_RESPONSE, _) => format!("{host} sent an answer glint couldn't read{via}"),
+        (
+            ERROR_WINHTTP_SECURE_FAILURE
+            | ERROR_WINHTTP_SECURE_CHANNEL_ERROR
+            | ERROR_WINHTTP_SECURE_FAILURE_PROXY
+            | ERROR_WINHTTP_SECURE_CERT_CN_INVALID
+            | ERROR_WINHTTP_SECURE_CERT_DATE_INVALID
+            | ERROR_WINHTTP_SECURE_CERT_REVOKED
+            | ERROR_WINHTTP_SECURE_CERT_REV_FAILED
+            | ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE
+            | ERROR_WINHTTP_SECURE_INVALID_CA
+            | ERROR_WINHTTP_SECURE_INVALID_CERT,
+            _,
+        ) => format!("the secure connection to {host} failed{via}"),
+        _ => return None,
+    })
 }
 
 const CHUNK: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
-pub(crate) fn send(req: &Request) -> Result<Response, String> {
+pub(crate) fn send(req: &Request, proxy: &Setting, progress: &mut dyn FnMut(u64, u64)) -> Result<Response, String> {
     let url = split_url(&req.url)?;
     let mut total = 0u64;
     for part in &req.body {
@@ -115,7 +158,7 @@ pub(crate) fn send(req: &Request) -> Result<Response, String> {
         let session = Handle::new(
             WinHttpOpen(
                 &HSTRING::from(concat!("glint/", env!("CARGO_PKG_VERSION"))),
-                WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+                WINHTTP_ACCESS_TYPE_NO_PROXY,
                 PCWSTR::null(),
                 PCWSTR::null(),
                 0,
@@ -125,6 +168,7 @@ pub(crate) fn send(req: &Request) -> Result<Response, String> {
         WinHttpSetTimeouts(session.0, 0, 30_000, 60_000, 120_000).map_err(|e| failure("WinHttpSetTimeouts", e))?;
         let decompress = WINHTTP_DECOMPRESSION_FLAG_GZIP | WINHTTP_DECOMPRESSION_FLAG_DEFLATE;
         let _ = WinHttpSetOption(Some(session.0), WINHTTP_OPTION_DECOMPRESSION, Some(&decompress.to_ne_bytes()));
+        let route = proxy::route(proxy, session.0, &req.url, &url.host, url.secure)?;
         let connect = Handle::new(WinHttpConnect(session.0, &HSTRING::from(&url.host), url.port, 0), &url.host)?;
         let flags = if url.secure { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
         let request = Handle::new(
@@ -139,12 +183,31 @@ pub(crate) fn send(req: &Request) -> Result<Response, String> {
             ),
             "WinHttpOpenRequest",
         )?;
+        if let Route::Proxy(p) = &route {
+            let mut name: Vec<u16> = p.encode_utf16().chain([0]).collect();
+            let info = WINHTTP_PROXY_INFO {
+                dwAccessType: WINHTTP_ACCESS_TYPE_NAMED_PROXY,
+                lpszProxy: PWSTR(name.as_mut_ptr()),
+                lpszProxyBypass: PWSTR::null(),
+            };
+            let bytes = std::slice::from_raw_parts((&raw const info).cast::<u8>(), size_of::<WINHTTP_PROXY_INFO>());
+            WinHttpSetOption(Some(request.0), WINHTTP_OPTION_PROXY, Some(bytes))
+                .map_err(|e| failure(&format!("proxy {p}"), e))?;
+        }
+        let net = |stage: &str, e| network_failure(stage, &url.host, &route, e);
         let headers: Vec<u16> = headers.encode_utf16().collect();
         WinHttpSendRequest(request.0, (!headers.is_empty()).then_some(&headers[..]), None, 0, total, 0)
-            .map_err(|e| failure(&url.host, e))?;
+            .map_err(|e| net("send", e))?;
+        let mut sent = 0u64;
+        let mut write = |data: &[u8]| -> Result<(), String> {
+            write_all(&request, data).map_err(|e| net("write", e))?;
+            sent += data.len() as u64;
+            progress(sent, u64::from(total));
+            Ok(())
+        };
         for part in &req.body {
             match part {
-                Part::Bytes(b) => write_all(&request, b)?,
+                Part::Bytes(b) => write(b)?,
                 Part::File(p) => {
                     let mut f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
                     let mut buf = vec![0u8; CHUNK];
@@ -153,12 +216,12 @@ pub(crate) fn send(req: &Request) -> Result<Response, String> {
                         if n == 0 {
                             break;
                         }
-                        write_all(&request, &buf[..n])?;
+                        write(&buf[..n])?;
                     }
                 }
             }
         }
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|e| failure(&url.host, e))?;
+        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|e| net("receive", e))?;
         let mut status = 0u32;
         let mut len = size_of::<u32>() as u32;
         WinHttpQueryHeaders(
@@ -185,8 +248,7 @@ pub(crate) fn send(req: &Request) -> Result<Response, String> {
         let mut buf = vec![0u8; CHUNK];
         loop {
             let mut read = 0u32;
-            WinHttpReadData(request.0, buf.as_mut_ptr().cast(), CHUNK as u32, &mut read)
-                .map_err(|e| failure(&url.host, e))?;
+            WinHttpReadData(request.0, buf.as_mut_ptr().cast(), CHUNK as u32, &mut read).map_err(|e| net("read", e))?;
             if read == 0 || body.len() >= MAX_RESPONSE {
                 break;
             }
@@ -201,12 +263,11 @@ pub(crate) fn send(req: &Request) -> Result<Response, String> {
     }
 }
 
-unsafe fn write_all(request: &Handle, mut data: &[u8]) -> Result<(), String> {
+unsafe fn write_all(request: &Handle, mut data: &[u8]) -> windows::core::Result<()> {
     while !data.is_empty() {
         let mut written = 0u32;
         let n = data.len().min(CHUNK) as u32;
-        unsafe { WinHttpWriteData(request.0, Some(data.as_ptr().cast()), n, &mut written) }
-            .map_err(|e| failure("upload", e))?;
+        unsafe { WinHttpWriteData(request.0, Some(data.as_ptr().cast()), n, &mut written) }?;
         data = &data[written as usize..];
     }
     Ok(())
@@ -253,5 +314,25 @@ mod tests {
         let r = Response { headers: h, ..Default::default() };
         assert_eq!(r.header("location"), Some("https://a/b:c"));
         assert_eq!(r.header("content-type"), Some("text/plain"));
+    }
+
+    #[test]
+    fn network_errors_name_the_host_and_route() {
+        let proxy = Route::Proxy("127.0.0.1:10809".into());
+        let r = |code, route: &Route| reason(code, "catbox.moe", route, false).unwrap();
+        assert!(r(ERROR_WINHTTP_CANNOT_CONNECT, &Route::Direct).starts_with("couldn't reach catbox.moe: "));
+        assert!(r(ERROR_WINHTTP_CANNOT_CONNECT, &Route::Direct).contains("set a proxy in settings"));
+        assert!(r(ERROR_WINHTTP_CANNOT_CONNECT, &proxy).starts_with("couldn't connect to the proxy 127.0.0.1:10809"));
+        assert!(r(ERROR_WINHTTP_CANNOT_CONNECT, &proxy).contains("catbox.moe"));
+        let up = reason(ERROR_WINHTTP_CANNOT_CONNECT, "catbox.moe", &proxy, true).unwrap();
+        assert!(up.starts_with("the proxy 127.0.0.1:10809 couldn't reach catbox.moe: "));
+        assert_eq!(r(ERROR_WINHTTP_NAME_NOT_RESOLVED, &proxy), "the proxy 127.0.0.1:10809 couldn't be found");
+        assert_eq!(r(ERROR_WINHTTP_TIMEOUT, &Route::Direct), "catbox.moe took too long to answer");
+        assert_eq!(
+            r(ERROR_WINHTTP_CONNECTION_ERROR, &proxy),
+            "the connection to catbox.moe was cut off (through the proxy 127.0.0.1:10809)"
+        );
+        assert!(r(ERROR_WINHTTP_SECURE_INVALID_CA, &Route::Direct).starts_with("the secure connection to catbox.moe"));
+        assert_eq!(reason(ERROR_WINHTTP_RESEND_REQUEST, "catbox.moe", &Route::Direct, false), None);
     }
 }

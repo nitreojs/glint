@@ -254,6 +254,21 @@ pub(crate) fn checkbox(ui: &mut Ui, look: &Look, on: &mut bool, text: &str) -> R
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
+/// 24 px colour disc; the selected one wears a ring in text colour.
+pub(crate) fn swatch(ui: &mut Ui, look: &Look, color: Color32, selected: bool) -> Response {
+    let p = &look.p;
+    let (rect, resp) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::click());
+    let h = anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
+    let s = ease(anim(ui, resp.id.with("sel"), selected, 0.12));
+    let painter = ui.painter();
+    let c = rect.center();
+    painter.circle_filled(c, 9.0 + h - 2.0 * s, color);
+    painter.circle_stroke(c, 11.0, Stroke::new(1.5, p.t1.gamma_multiply(s)));
+    painter.circle_stroke(c, 9.0 + h - 2.0 * s, Stroke::new(1.0, p.line2));
+    focus_ring(ui, look, &resp, rect, 12.0);
+    resp.on_hover_cursor(CursorIcon::PointingHand)
+}
+
 /// 36 x 20 switch with `text` beside it.
 pub(crate) fn toggle(ui: &mut Ui, look: &Look, on: &mut bool, text: &str) -> Response {
     let p = &look.p;
@@ -374,4 +389,40 @@ pub(crate) fn text_field(ui: &mut Ui, look: &Look, text: &mut String, placeholde
     let shape = egui::epaint::RectShape::new(rect, 5, p.field, Stroke::new(1.0 + f, border), StrokeKind::Inside);
     ui.painter().set(background, shape);
     resp
+}
+
+pub(crate) fn dropdown(ui: &mut Ui, look: &Look, text: &str, items: &[String], width: f32) -> Option<usize> {
+    let p = &look.p;
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+    let h = anim(ui, resp.id.with("hov"), resp.hovered() || open, 0.08);
+    let painter = ui.painter();
+    painter.rect(rect, 5, mix(p.field, p.ctl, h), Stroke::new(1.0, mix(p.line2, p.line3, h)), StrokeKind::Inside);
+    let label = galley(ui, text, sans(13.0));
+    let text_area = Rect::from_min_max(pos2(rect.left() + 10.0, rect.top()), pos2(rect.right() - 28.0, rect.bottom()));
+    let clip = painter.with_clip_rect(text_area.intersect(painter.clip_rect()));
+    clip.galley(pos2(rect.left() + 10.0, rect.center().y - label.size().y / 2.0), label, p.t1);
+    let c = pos2(rect.right() - 16.0, rect.center().y);
+    let chevron = vec![c + vec2(-4.0, -2.0), c + vec2(0.0, 2.0), c + vec2(4.0, -2.0)];
+    painter.add(Shape::line(chevron, Stroke::new(1.5, mix(p.t3, p.t1, h))));
+    focus_ring(ui, look, &resp, rect, 5.0);
+    let frame = egui::Frame::NONE.fill(p.surf).stroke(Stroke::new(1.0, p.line2)).corner_radius(6).inner_margin(4);
+    let mut picked = None;
+    egui::Popup::from_toggle_button_response(&resp).width(width).gap(4.0).frame(frame).show(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        let row_w = width - 8.0;
+        for (i, item) in items.iter().enumerate() {
+            let (r, item_resp) = ui.allocate_exact_size(vec2(row_w, 28.0), Sense::click());
+            let hov = anim(ui, item_resp.id.with("hov"), item_resp.hovered(), 0.06);
+            ui.painter().rect_filled(r, 4, p.hov.gamma_multiply(hov));
+            let g = galley(ui, item, sans(13.0));
+            let clip = ui.painter().with_clip_rect(r.shrink2(vec2(8.0, 0.0)).intersect(ui.clip_rect()));
+            clip.galley(pos2(r.left() + 8.0, r.center().y - g.size().y / 2.0), g, p.t1);
+            if item_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                picked = Some(i);
+            }
+        }
+    });
+    picked
 }

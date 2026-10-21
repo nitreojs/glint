@@ -14,7 +14,7 @@ pub(crate) mod pin;
 
 use editor::Output;
 use output::ImageFormat;
-pub(crate) use output::copy_text;
+pub(crate) use output::{copy_files, copy_text};
 
 /// A finished screenshot as 0xAARRGGBB rows, and what to do with it.
 pub(crate) struct Shot {

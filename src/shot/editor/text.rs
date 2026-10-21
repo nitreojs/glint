@@ -189,11 +189,10 @@ impl Typesetter {
         c.text_layout(&layout, at, color);
     }
 
-    /// One line of `text` centred on `centre`.
     pub(super) fn draw_centred(&self, c: &Canvas, text: &str, px: f32, centre: (f32, f32), color: D2D1_COLOR_F) {
-        let Some(layout) = self.layout(text, px) else { return };
-        let (w, h) = self.extent(text, px);
-        c.text_layout(&layout, (centre.0 - w / 2.0, centre.1 - h / 2.0), color);
+        if let Some(format) = self.format(px) {
+            c.text_centred(text, &format, centre, color);
+        }
     }
 }
 

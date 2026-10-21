@@ -162,14 +162,30 @@ impl Mix {
         self.base
     }
 
-    pub(super) fn take(&mut self, upto: i64) -> Vec<i16> {
+    pub(super) fn take(&mut self, upto: i64) -> Vec<f32> {
         let n = (upto - self.base).max(0) as usize * 2;
         let have = n.min(self.buf.len());
-        let mut out: Vec<i16> = self.buf.drain(..have).map(|v| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16).collect();
-        out.resize(n, 0);
+        let mut out: Vec<f32> = self.buf.drain(..have).collect();
+        out.resize(n, 0.0);
         self.base = self.base.max(upto);
         out
     }
+}
+
+pub(super) fn mix_tracks(sources: &[Vec<f32>], gains: &[f32], tracks: &[Vec<usize>]) -> Vec<Vec<i16>> {
+    let len = sources.iter().map(Vec::len).max().unwrap_or(0);
+    tracks
+        .iter()
+        .map(|members| {
+            let mut sum = vec![0.0f32; len];
+            for &m in members {
+                for (d, s) in sum.iter_mut().zip(&sources[m]) {
+                    *d += s * gains[m];
+                }
+            }
+            sum.into_iter().map(|v| (v.clamp(-1.0, 1.0) * 32767.0).round() as i16).collect()
+        })
+        .collect()
 }
 
 /// loopback delivers no packets while nothing plays, so packets are placed by their timestamps.
@@ -260,10 +276,29 @@ mod tests {
         let mut m = Mix::default();
         m.add(0, &[0.5, -0.5, 0.75, 0.0]);
         m.add(1, &[0.5, -0.75, 0.25, 0.25]);
-        assert_eq!(m.take(3), [16384, -16384, 32767, -24575, 8192, 8192]);
+        let one = |m: &mut Mix, upto| mix_tracks(&[m.take(upto)], &[1.0], &[vec![0]]).remove(0);
+        assert_eq!(one(&mut m, 3), [16384, -16384, 32767, -24575, 8192, 8192]);
         m.add(2, &[1.0, 1.0, 0.5, 0.5]);
-        assert_eq!(m.take(5), [16384, 16384, 0, 0]);
+        assert_eq!(one(&mut m, 5), [16384, 16384, 0, 0]);
         assert_eq!(m.base(), 5);
+    }
+
+    #[test]
+    fn tracks_get_their_sources_at_their_volume() {
+        let desktop = vec![0.25, -0.25, 0.5, 0.5];
+        let app = vec![0.5, 0.5, 0.0, 0.0];
+        let mic = vec![0.1, 0.1, 0.1, 0.1];
+        let gains = [1.0, 2.0, 0.0];
+        let tracks = [vec![0, 1, 2], vec![0], vec![1], vec![2], vec![]];
+        let out = mix_tracks(&[desktop, app, mic], &gains, &tracks);
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0], [32767, 24575, 16384, 16384]);
+        assert_eq!(out[1], [8192, -8192, 16384, 16384]);
+        assert_eq!(out[2], [32767, 32767, 0, 0]);
+        assert_eq!(out[3], [0; 4]);
+        assert_eq!(out[4], [0; 4]);
+        let quiet = mix_tracks(&[vec![0.5, 0.5]], &[0.5], &[vec![0]]);
+        assert_eq!(quiet[0], [8192, 8192]);
     }
 
     #[test]
@@ -276,14 +311,14 @@ mod tests {
         p.push(Some(48_960), &packet, false, &mut m);
         let out = m.take(48_960 + 480);
         let frame = |i: usize| out[2 * i];
-        assert_eq!((frame(0), frame(959)), (16384, 16384));
-        assert_eq!((frame(960), frame(48_959)), (0, 0));
-        assert_eq!((frame(48_960), frame(49_439)), (16384, 16384));
+        assert_eq!((frame(0), frame(959)), (0.5, 0.5));
+        assert_eq!((frame(960), frame(48_959)), (0.0, 0.0));
+        assert_eq!((frame(48_960), frame(49_439)), (0.5, 0.5));
 
         let mut m = Mix::default();
         let mut p = Placement::new(48_000);
         p.push(Some(0), &[0.5; 4], false, &mut m);
         p.push(Some(10), &[0.5; 4], true, &mut m);
-        assert_eq!(m.take(12)[2 * 2..2 * 10], [0; 16]);
+        assert_eq!(m.take(12)[2 * 2..2 * 10], [0.0; 16]);
     }
 }

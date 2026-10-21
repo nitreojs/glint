@@ -12,22 +12,25 @@ pub(super) enum Tool {
     Rectangle,
     Blur,
     Pixelate,
+    Eraser,
     Text,
     Step,
 }
 
-/// Tools with their tooltip and letter key; digits 1-8 follow this order.
-pub(super) const TOOLS: [(Tool, &str, u8); 8] = [
-    (Tool::Pen, "pen  ·  1 / P", b'P'),
-    (Tool::Highlighter, "highlighter  ·  2 / H", b'H'),
-    (Tool::Arrow, "arrow  ·  3 / A", b'A'),
-    (Tool::Rectangle, "rectangle  ·  4 / R", b'R'),
-    (Tool::Blur, "blur  ·  5 / B", b'B'),
-    (Tool::Pixelate, "pixelate  ·  6 / X", b'X'),
-    (Tool::Text, "text  ·  7 / T", b'T'),
-    (Tool::Step, "step  ·  8 / N", b'N'),
+/// Tools in toolbar order with their tooltip, letter key and digit key.
+pub(super) const TOOLS: [(Tool, &str, u8, u32); 9] = [
+    (Tool::Pen, "pen  ·  1 / P", b'P', 1),
+    (Tool::Highlighter, "highlighter  ·  2 / H", b'H', 2),
+    (Tool::Arrow, "arrow  ·  3 / A", b'A', 3),
+    (Tool::Rectangle, "rectangle  ·  4 / R", b'R', 4),
+    (Tool::Blur, "blur  ·  5 / B", b'B', 5),
+    (Tool::Pixelate, "pixelate  ·  6 / X", b'X', 6),
+    (Tool::Eraser, "smart eraser  ·  9 / E", b'E', 9),
+    (Tool::Text, "text  ·  7 / T", b'T', 7),
+    (Tool::Step, "step  ·  8 / N", b'N', 8),
 ];
 
+#[derive(Clone, Copy)]
 pub(super) struct Strength {
     pub(super) presets: [f32; 3],
     pub(super) step: f32,
@@ -37,7 +40,7 @@ pub(super) struct Strength {
 }
 
 impl Tool {
-    pub(super) fn strength(self) -> Strength {
+    pub(super) fn strength(self) -> Option<Strength> {
         let (presets, step, min, max, name) = match self {
             Tool::Pen | Tool::Arrow | Tool::Rectangle => ([2.0, 4.0, 8.0], 1.0, 1.0, 40.0, "width"),
             Tool::Highlighter => ([10.0, 16.0, 28.0], 2.0, 4.0, 80.0, "width"),
@@ -45,8 +48,13 @@ impl Tool {
             Tool::Pixelate => ([6.0, 12.0, 20.0], 2.0, 2.0, 80.0, "block size"),
             Tool::Text => ([16.0, 24.0, 36.0], 2.0, 8.0, 160.0, "size"),
             Tool::Step => ([20.0, 28.0, 40.0], 2.0, 12.0, 120.0, "size"),
+            Tool::Eraser => return None,
         };
-        Strength { presets, step, min, max, name }
+        Some(Strength { presets, step, min, max, name })
+    }
+
+    pub(super) fn picks_rects(self) -> bool {
+        matches!(self, Tool::Rectangle | Tool::Blur | Tool::Pixelate | Tool::Eraser)
     }
 }
 
@@ -61,7 +69,7 @@ pub(super) const COLORS: [D2D1_COLOR_F; 5] = [
 const LIGHT: [bool; 5] = [false, true, false, false, true];
 const STEP_INK: D2D1_COLOR_F = rgba(20, 20, 24, 1.0);
 const HIGHLIGHTER_ALPHA: f32 = 0.4;
-const MIN_SIDE: i32 = 3;
+pub(super) const MIN_SIDE: i32 = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Mark {
@@ -70,6 +78,7 @@ pub(super) enum Mark {
     Rectangle { rect: Rect, color: usize, width: f32 },
     Blur { rect: Rect, radius: f32 },
     Pixelate { rect: Rect, block: f32 },
+    Eraser { rect: Rect, fill: u32 },
     /// `at` is the top-left corner; `extent` is the laid-out size in physical pixels.
     Text { at: (f32, f32), text: String, color: usize, size: f32, extent: (f32, f32) },
     /// A numbered disc of diameter `size` (radius `r` in physical pixels), with an arrow to `tail`.
@@ -94,6 +103,7 @@ impl Mark {
             Tool::Rectangle => Mark::Rectangle { rect, color, width: strength },
             Tool::Blur => Mark::Blur { rect, radius: strength },
             Tool::Pixelate => Mark::Pixelate { rect, block: strength },
+            Tool::Eraser => Mark::Eraser { rect, fill: 0 },
             Tool::Text => Mark::Text { at, text: String::new(), color, size: strength, extent: (0.0, 0.0) },
             Tool::Step => Mark::Step { at, tail: None, color, size: strength, r: 0.0 },
         }
@@ -107,6 +117,7 @@ impl Mark {
             Mark::Rectangle { .. } => Tool::Rectangle,
             Mark::Blur { .. } => Tool::Blur,
             Mark::Pixelate { .. } => Tool::Pixelate,
+            Mark::Eraser { .. } => Tool::Eraser,
             Mark::Text { .. } => Tool::Text,
             Mark::Step { .. } => Tool::Step,
         }
@@ -116,21 +127,23 @@ impl Mark {
         matches!(self, Mark::Blur { .. } | Mark::Pixelate { .. })
     }
 
-    pub(super) fn strength(&self) -> f32 {
+    pub(super) fn strength(&self) -> Option<f32> {
         match self {
-            Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => *width,
-            Mark::Blur { radius, .. } => *radius,
-            Mark::Pixelate { block, .. } => *block,
-            Mark::Text { size, .. } | Mark::Step { size, .. } => *size,
+            Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => Some(*width),
+            Mark::Blur { radius, .. } => Some(*radius),
+            Mark::Pixelate { block, .. } => Some(*block),
+            Mark::Text { size, .. } | Mark::Step { size, .. } => Some(*size),
+            Mark::Eraser { .. } => None,
         }
     }
 
-    pub(super) fn strength_mut(&mut self) -> &mut f32 {
+    pub(super) fn strength_mut(&mut self) -> Option<&mut f32> {
         match self {
-            Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => width,
-            Mark::Blur { radius, .. } => radius,
-            Mark::Pixelate { block, .. } => block,
-            Mark::Text { size, .. } | Mark::Step { size, .. } => size,
+            Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => Some(width),
+            Mark::Blur { radius, .. } => Some(radius),
+            Mark::Pixelate { block, .. } => Some(block),
+            Mark::Text { size, .. } | Mark::Step { size, .. } => Some(size),
+            Mark::Eraser { .. } => None,
         }
     }
 
@@ -141,7 +154,7 @@ impl Mark {
             | Mark::Rectangle { color, .. }
             | Mark::Text { color, .. }
             | Mark::Step { color, .. } => Some(*color),
-            Mark::Blur { .. } | Mark::Pixelate { .. } => None,
+            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } => None,
         }
     }
 
@@ -152,13 +165,16 @@ impl Mark {
             | Mark::Rectangle { color, .. }
             | Mark::Text { color, .. }
             | Mark::Step { color, .. } => Some(color),
-            Mark::Blur { .. } | Mark::Pixelate { .. } => None,
+            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } => None,
         }
     }
 
     pub(super) fn area_mut(&mut self) -> Option<&mut Rect> {
         match self {
-            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => Some(rect),
+            Mark::Rectangle { rect, .. }
+            | Mark::Blur { rect, .. }
+            | Mark::Pixelate { rect, .. }
+            | Mark::Eraser { rect, .. } => Some(rect),
             Mark::Stroke { .. } | Mark::Arrow { .. } | Mark::Text { .. } | Mark::Step { .. } => None,
         }
     }
@@ -169,9 +185,10 @@ impl Mark {
             Mark::Stroke { .. } | Mark::Step { .. } => true,
             Mark::Text { text, .. } => !text.trim().is_empty(),
             Mark::Arrow { from, to, .. } => (from.0 - to.0).abs() >= 3.0 || (from.1 - to.1).abs() >= 3.0,
-            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
-                rect.w >= MIN_SIDE && rect.h >= MIN_SIDE
-            }
+            Mark::Rectangle { rect, .. }
+            | Mark::Blur { rect, .. }
+            | Mark::Pixelate { rect, .. }
+            | Mark::Eraser { rect, .. } => rect.w >= MIN_SIDE && rect.h >= MIN_SIDE,
         }
     }
 
@@ -179,7 +196,10 @@ impl Mark {
         match self {
             Mark::Stroke { points, .. } => span(points),
             Mark::Arrow { from, to, .. } => span(&[*from, *to]),
-            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => *rect,
+            Mark::Rectangle { rect, .. }
+            | Mark::Blur { rect, .. }
+            | Mark::Pixelate { rect, .. }
+            | Mark::Eraser { rect, .. } => *rect,
             Mark::Text { at, extent, .. } => span(&[*at, (at.0 + extent.0.max(1.0), at.1 + extent.1)]),
             Mark::Step { at, tail, r, .. } => {
                 let corners = [(at.0 - r, at.1 - r), (at.0 + r, at.1 + r)];
@@ -198,7 +218,7 @@ impl Mark {
             }
             Mark::Text { size, .. } => outline(size * scale),
             Mark::Step { tail: Some(_), r, .. } => arrow_head(tail_width(*r), f32::MAX) * 0.55,
-            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Step { .. } => 0.0,
+            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } | Mark::Step { .. } => 0.0,
         };
         self.bbox().inflate(reach.ceil() as i32 + 1)
     }
@@ -212,9 +232,10 @@ impl Mark {
                 shift(from);
                 shift(to);
             }
-            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
-                *rect = rect.offset(dx, dy)
-            }
+            Mark::Rectangle { rect, .. }
+            | Mark::Blur { rect, .. }
+            | Mark::Pixelate { rect, .. }
+            | Mark::Eraser { rect, .. } => *rect = rect.offset(dx, dy),
             Mark::Text { at, .. } => shift(at),
             Mark::Step { at, tail, .. } => {
                 shift(at);
@@ -261,7 +282,7 @@ impl Mark {
                 let reach = width * scale / 2.0 + slop;
                 within(*rect, p, reach) && !within(*rect, p, -reach)
             }
-            Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => within(*rect, p, 0.0),
+            Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } | Mark::Eraser { rect, .. } => within(*rect, p, 0.0),
             Mark::Text { .. } => within(self.bbox(), p, slop),
             Mark::Step { at, tail, r, .. } => {
                 dist(p, *at) <= r + slop || tail.is_some_and(|t| seg_dist(p, *at, t) <= tail_width(*r) / 2.0 + slop)
@@ -274,7 +295,10 @@ impl Mark {
             Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { tail: None, .. } => Vec::new(),
             Mark::Step { tail: Some(t), .. } => vec![(Grip::To, *t)],
             Mark::Arrow { from, to, .. } => vec![(Grip::From, *from), (Grip::To, *to)],
-            Mark::Rectangle { rect, .. } | Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } => {
+            Mark::Rectangle { rect, .. }
+            | Mark::Blur { rect, .. }
+            | Mark::Pixelate { rect, .. }
+            | Mark::Eraser { rect, .. } => {
                 GRIPS.iter().map(|&e| (Grip::Edge(e), edge_point(*rect, e))).collect()
             }
         }
@@ -408,6 +432,11 @@ pub(super) fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32), scale: f32, 
         Mark::Rectangle { rect, color, width } => {
             let (x, y) = at((rect.x as f32, rect.y as f32));
             c.rect_outline(x, y, rect.w as f32, rect.h as f32, ink_width(*width, scale), COLORS[*color]);
+        }
+        Mark::Eraser { rect, fill } => {
+            let (x, y) = at((rect.x as f32, rect.y as f32));
+            let rgb = rgba((fill >> 16) as u8, (fill >> 8) as u8, *fill as u8, 1.0);
+            c.fill(x, y, rect.w as f32, rect.h as f32, rgb);
         }
         Mark::Text { at: corner, text, color, size, .. } => {
             let px = size * scale;

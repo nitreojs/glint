@@ -4,7 +4,7 @@ use eframe::egui::{
 
 use super::controls::focus_ring;
 use super::motion::{anim, mix};
-use super::tokens::{CLOSE_HOVER, CLOSE_PRESSED, Look, MARK, medium, mono, mono_medium, sans, semibold};
+use super::tokens::{CLOSE_HOVER, CLOSE_PRESSED, Look, medium, mono, mono_medium, sans, semibold};
 
 pub(crate) enum TitleAction {
     None,
@@ -20,7 +20,7 @@ pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, what: &str, active
 
     // The mark: a 14 px disc whose highlight is cut out (side colour) while inactive.
     let disc = Rect::from_min_size(pos2(rect.left() + 18.0, rect.center().y - 7.0), vec2(14.0, 14.0));
-    painter.circle_filled(disc.center(), 7.0, mix(p.t4, MARK, active));
+    painter.circle_filled(disc.center(), 7.0, mix(p.t4, p.mark, active));
     painter.circle_filled(pos2(disc.right() - 4.0, disc.top() + 4.0), 2.0, mix(p.side, Color32::WHITE, active));
     let name = painter.text(
         pos2(disc.right() + 9.0, rect.center().y),
@@ -31,7 +31,7 @@ pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, what: &str, active
     );
     painter.text(pos2(name.right() + 9.0, rect.center().y), Align2::LEFT_CENTER, what, sans(13.0), mix(p.t4, p.t3, active));
 
-    // Everything but the buttons moves the window; a double-click does nothing (fixed size).
+    // Everything but the buttons moves the window.
     let buttons = 2.0 * 46.0;
     let drag = ui.interact(
         Rect::from_min_max(rect.min, pos2(rect.right() - buttons, rect.bottom())),

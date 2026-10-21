@@ -32,7 +32,7 @@ impl Item {
     pub(super) fn tip(self) -> Option<&'static str> {
         Some(match self {
             Item::Region => "region  ·  Q",
-            Item::Tool(t) => TOOLS.iter().find(|(tool, ..)| *tool == t).map(|(_, tip, _)| *tip)?,
+            Item::Tool(t) => TOOLS.iter().find(|(tool, ..)| *tool == t).map(|(_, tip, ..)| *tip)?,
             Item::Color(i) => COLOR_TIPS[i],
             Item::Size(_) => "size  ·  [ ]",
             Item::Undo => "undo  ·  Ctrl+Z",
@@ -62,7 +62,7 @@ fn groups(region: bool) -> Vec<Vec<Item>> {
 
 impl Editor {
     /// Lays the toolbar out under the selection, or above it, or inside it when neither fits; with
-    /// no selection, at the top of the monitor under the mouse.
+    /// no selection, centred under the mouse.
     pub(super) fn place_bar(&mut self) {
         let (cell, pad, gap) = (self.px(32.0) as i32, self.px(4.0) as i32, self.px(9.0) as i32);
         let groups = groups(self.region);
@@ -73,7 +73,7 @@ impl Editor {
         let (bar, monitor) = if self.selected {
             place(self.sel, (w, h), margin, &self.monitors)
         } else {
-            top(self.mouse, (w, h), margin, &self.monitors)
+            summon(self.mouse, (w, h), margin, &self.monitors)
         };
         self.bar_monitor = monitor;
         let (x, y) = (bar.x, bar.y);
@@ -95,12 +95,16 @@ impl Editor {
         self.pill = None;
     }
 
-    /// Tooltip for the hovered button, on the side of the bar away from the selection.
+    /// Tooltip for the hovered button, on the side of the bar away from the selection; with the
+    /// bar hidden, next to the mouse.
     pub(super) fn place_pill(&self, item: Item, text: &str, painter: &Painter, font: &IDWriteTextFormat) -> Rect {
-        let b = self.bar;
-        let cell = self.cells.iter().find(|(i, _)| *i == item).map(|(_, r)| *r).unwrap_or(b);
         let (tw, _) = painter.measure(text, font);
         let (w, h) = ((tw.ceil() + self.px(20.0)) as i32, self.px(26.0) as i32);
+        if !self.bar_shown() {
+            return beside(self.mouse, (w, h), self.px(16.0) as i32, nearest(&self.monitors, self.mouse));
+        }
+        let b = self.bar;
+        let cell = self.cells.iter().find(|(i, _)| *i == item).map(|(_, r)| *r).unwrap_or(b);
         let gap = self.px(6.0) as i32;
         let below_sel = !self.selected || b.y >= self.sel.bottom();
         let mut y = if below_sel { b.bottom() + gap } else { b.y - gap - h };
@@ -132,7 +136,7 @@ impl Editor {
             let (cw, ch) = (r.w as f32, r.h as f32);
             let active = match item {
                 Item::Tool(t) => self.tool == Some(t),
-                Item::Size(n) => size.is_some_and(|(tool, v)| tool.strength().presets[n] == v),
+                Item::Size(n) => size.is_some_and(|(_, s, v)| s.presets[n] == v),
                 _ => false,
             };
             let bg = if pressed == Some(item) {
@@ -179,11 +183,21 @@ fn place(sel: Rect, (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect
     (on(low, inside), low)
 }
 
-/// At the top centre of the monitor under `mouse`.
-fn top(mouse: (i32, i32), (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect, Rect) {
-    let m = nearest(monitors, mouse);
-    let x = (m.x + (m.w - w) / 2).max(m.x);
-    (Rect { x, y: m.y + margin, w, h }, m)
+fn summon((x, y): (i32, i32), (w, h): (i32, i32), margin: i32, monitors: &[Rect]) -> (Rect, Rect) {
+    let m = nearest(monitors, (x, y));
+    let below = y + margin;
+    let y = if below + h <= m.bottom() - margin { below } else { y - margin - h };
+    let fit = |v: i32, lo: i32, room: i32, len: i32| {
+        let (min, max) = (lo + margin, lo + room - len - margin);
+        v.clamp(min, max.max(min))
+    };
+    (Rect { x: fit(x - w / 2, m.x, m.w, w), y: fit(y, m.y, m.h, h), w, h }, m)
+}
+
+pub(super) fn beside((x, y): (i32, i32), (w, h): (i32, i32), off: i32, monitor: Rect) -> Rect {
+    let m = monitor;
+    let fit = |v: i32, lo: i32, room: i32, len: i32| v.clamp(lo, (lo + room - len).max(lo));
+    Rect { x: fit(x + off, m.x, m.w, w), y: fit(y + off, m.y, m.h, h), w, h }
 }
 
 pub(super) fn nearest(monitors: &[Rect], (x, y): (i32, i32)) -> Rect {
@@ -226,6 +240,11 @@ fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR
                     c.round_rect(qx, qy, q - 0.6 * s, q - 0.6 * s, 0.6 * s, D2D1_COLOR_F { a: a * ink.a, ..ink });
                 }
             }
+        }
+        Item::Tool(Tool::Eraser) => {
+            let body = [p(-6.7, 2.5), p(-2.5, 6.7), p(6.7, -2.5), p(2.5, -6.7)];
+            c.polygon(&[body[0], body[1], p(1.1, 3.2), p(-3.2, -1.1)], ink);
+            c.polyline(&[body[0], body[1], body[2], body[3], body[0]], 1.5 * s, ink);
         }
         Item::Tool(Tool::Text) => {
             c.polyline(&[p(-5.5, -5.5), p(5.5, -5.5)], 2.0 * s, ink);
@@ -324,5 +343,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn summoned_bar_sits_under_the_cursor_on_its_monitor() {
+        let at = |p: (i32, i32)| summon(p, SIZE, MARGIN, &MONITORS);
+        assert_eq!(at((1720, 500)), (Rect { x: 1442, y: 510, w: 556, h: 40 }, MONITORS[0]));
+        assert_eq!(at((3430, 500)).0, Rect { x: 2874, y: 510, w: 556, h: 40 }, "clamped at the right edge");
+        assert_eq!(at((1000, 1420)).0, Rect { x: 722, y: 1370, w: 556, h: 40 }, "above when there's no room below");
+        assert_eq!(at((-1900, 600)), (Rect { x: -1910, y: 610, w: 556, h: 40 }, MONITORS[1]));
+        assert_eq!(at((-100, 200)), (Rect { x: 10, y: 210, w: 556, h: 40 }, MONITORS[0]), "from a gap, the nearest");
+        for x in (-1920..3440).step_by(53) {
+            for y in (-1440..1620).step_by(47) {
+                let (b, m) = at((x, y));
+                assert_eq!(m.intersect(&b), Some(b), "({x}, {y}) put the bar at {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hints_stay_beside_the_cursor_on_screen() {
+        let m = MONITORS[0];
+        assert_eq!(beside((100, 100), (200, 26), 16, m), Rect { x: 116, y: 116, w: 200, h: 26 });
+        assert_eq!(beside((3430, 1430), (200, 26), 16, m), Rect { x: 3240, y: 1414, w: 200, h: 26 });
     }
 }

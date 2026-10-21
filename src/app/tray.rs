@@ -10,27 +10,49 @@ use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, H
 
 use crate::platform::wide::copy_wstr;
 
+/// The recording dot stays red whatever the accent.
+pub(crate) const RECORDING_RED: [u8; 3] = [0xE5, 0x40, 0x2F];
+pub(crate) const IDLE_TIP: &str = "glint\nclick: screenshot · double-click: settings";
+
 pub(crate) struct Tray {
     hwnd: HWND,
     callback: u32,
+    size: i32,
     idle: HICON,
     rec: HICON,
     recording: bool,
 }
 
 impl Tray {
-    pub(crate) fn new(hwnd: HWND, callback: u32) -> Tray {
+    pub(crate) fn new(hwnd: HWND, callback: u32, accent: [u8; 3]) -> Tray {
         // Drawn at the exact small-icon size (16 / 20 / 24 / 32 px), not scaled down.
         let size = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, GetDpiForSystem()) }.max(16);
         let tray = Tray {
             hwnd,
             callback,
-            idle: make_icon(size, true),
-            rec: make_icon(size, false),
+            size,
+            idle: make_icon(size, true, accent),
+            rec: make_icon(size, false, RECORDING_RED),
             recording: false,
         };
         tray.add();
         tray
+    }
+
+    /// Redraws the idle icon in a new accent colour.
+    pub(crate) fn set_accent(&mut self, accent: [u8; 3]) {
+        let old = std::mem::replace(&mut self.idle, make_icon(self.size, true, accent));
+        if !self.recording {
+            let mut d = self.data();
+            d.uFlags = NIF_ICON;
+            d.hIcon = self.idle;
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+            }
+        }
+        unsafe {
+            let _ = DestroyIcon(old);
+        }
     }
 
     fn data(&self) -> NOTIFYICONDATAW {
@@ -48,7 +70,7 @@ impl Tray {
         d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
         d.uCallbackMessage = self.callback;
         d.hIcon = if self.recording { self.rec } else { self.idle };
-        copy_wstr(&mut d.szTip, if self.recording { "glint: recording" } else { "glint" });
+        copy_wstr(&mut d.szTip, if self.recording { "glint: recording" } else { IDLE_TIP });
         d.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         unsafe {
             let _ = Shell_NotifyIconW(NIM_ADD, &d);
@@ -61,6 +83,18 @@ impl Tray {
         let mut d = self.data();
         d.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         d.hIcon = if on { self.rec } else { self.idle };
+        copy_wstr(&mut d.szTip, tip);
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
+        }
+    }
+
+    pub(crate) fn set_idle_tip(&self, tip: &str) {
+        if self.recording {
+            return;
+        }
+        let mut d = self.data();
+        d.uFlags = NIF_TIP | NIF_SHOWTIP;
         copy_wstr(&mut d.szTip, tip);
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
@@ -96,11 +130,10 @@ impl Drop for Tray {
     }
 }
 
-/// The glint mark as straight-alpha ARGB pixels: a red disc with a white highlight in the
-/// upper right ("a glint on a lens"); without the highlight it's the plain recording dot.
+/// The glint mark as straight-alpha ARGB pixels: a disc in `color` with a white highlight in
+/// the upper right ("a glint on a lens"); without the highlight it's the plain recording dot.
 /// Geometry is snapped to whole pixels so it stays crisp at 16 px.
-pub(crate) fn icon_pixels(size: i32, highlight: bool) -> Vec<u32> {
-    const RED: [u8; 3] = [0xE5, 0x40, 0x2F];
+pub(crate) fn icon_pixels(size: i32, highlight: bool, color: [u8; 3]) -> Vec<u32> {
     let s = size as f32;
     let unit = |n: f32| (n * s / 16.0).round();
     let (c, r) = (s / 2.0, s / 2.0 - unit(1.0).max(1.0)); // 14 px disc on a 16 px grid
@@ -119,14 +152,20 @@ pub(crate) fn icon_pixels(size: i32, highlight: bool) -> Vec<u32> {
             let w = if highlight { cover(((fx - hx).powi(2) + (fy - hy).powi(2)).sqrt(), hd / 2.0) } else { 0.0 };
             let ch = |v: u8| (v as f32 + (255.0 - v as f32) * w).round() as u32;
             px[(y * size + x) as usize] =
-                ((a * 255.0).round() as u32) << 24 | ch(RED[0]) << 16 | ch(RED[1]) << 8 | ch(RED[2]);
+                ((a * 255.0).round() as u32) << 24 | ch(color[0]) << 16 | ch(color[1]) << 8 | ch(color[2]);
         }
     }
     px
 }
 
-fn make_icon(size: i32, highlight: bool) -> HICON {
-    let px = icon_pixels(size, highlight);
+/// `icon_pixels` as RGBA bytes, for egui window icons.
+pub(crate) fn icon_rgba(size: i32, color: [u8; 3]) -> Vec<u8> {
+    let px = icon_pixels(size, true, color);
+    px.into_iter().flat_map(|p| [(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8]).collect()
+}
+
+fn make_icon(size: i32, highlight: bool, color: [u8; 3]) -> HICON {
+    let px = icon_pixels(size, highlight, color);
     unsafe {
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -152,5 +191,26 @@ fn make_icon(size: i32, highlight: bool) -> HICON {
         let _ = DeleteObject(color.into());
         let _ = DeleteObject(mask.into());
         icon
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_mark_takes_the_accent_and_the_recording_dot_stays_red() {
+        let size = 16;
+        let at = |px: &[u32], x: i32, y: i32| px[(y * size + x) as usize];
+        let blue = icon_pixels(size, true, [0x2F, 0x7B, 0xE5]);
+        assert_eq!(at(&blue, 8, 8), 0xFF2F_7BE5);
+        assert_eq!(at(&blue, 0, 0) >> 24, 0);
+        let (hx, hy) = (11, 4);
+        assert_eq!(at(&blue, hx, hy) & 0xFF_FFFF, 0xFF_FFFF);
+        let rec = icon_pixels(size, false, RECORDING_RED);
+        assert_eq!(at(&rec, 8, 8), 0xFFE5_402F);
+        assert_eq!(at(&rec, hx, hy), 0xFFE5_402F);
+        let rgba = icon_rgba(size, [0x2F, 0x7B, 0xE5]);
+        assert_eq!(rgba[((8 * size + 8) * 4) as usize..][..4], [0x2F, 0x7B, 0xE5, 0xFF]);
     }
 }

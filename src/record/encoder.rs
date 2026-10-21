@@ -14,6 +14,7 @@ use windows::core::{GUID, HSTRING, Interface, PWSTR};
 use super::capture::Capture;
 use super::cursor::CursorRenderer;
 use super::mix::{RATE, frames_to_hns};
+use super::mp4::name_tracks;
 use super::timeline::{AudioPlacer, Pauses};
 use super::{Codec, Ctx, INFINITE, Msg, Params, RING, create_device, hns, lock, qpc, texture_desc};
 use crate::platform::log::log;
@@ -35,7 +36,8 @@ pub(super) struct Encoder {
     cursor: Option<CursorRenderer>,
     writer: IMFSinkWriter,
     stream: u32,
-    audio: Option<u32>,
+    audio: Vec<u32>,
+    track_names: Vec<String>,
     alloc: IMFVideoSampleAllocatorEx,
     _mgr: IMFDXGIDeviceManager,
 }
@@ -63,7 +65,7 @@ impl Video {
 }
 
 impl Encoder {
-    pub(super) unsafe fn new(p: Params, cap: &Capture, audio: bool) -> Result<Self, String> {
+    pub(super) unsafe fn new(p: Params, cap: &Capture, track_names: Vec<String>) -> Result<Self, String> {
         unsafe {
             let (device, ctx) = create_device(&cap.adapter, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)?;
             // Media Foundation uses this device from its own worker threads.
@@ -152,7 +154,7 @@ impl Encoder {
             enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, p.effort.min(100)).ctx("enc")?;
             enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (p.fps * 2.0).round() as u32).ctx("enc")?;
             writer.SetInputMediaType(stream, &in_t, &enc).ctx("IMFSinkWriter::SetInputMediaType")?;
-            let audio = if audio { Some(add_audio_stream(&writer)?) } else { None };
+            let audio = track_names.iter().map(|_| add_audio_stream(&writer)).collect::<Result<Vec<u32>, String>>()?;
 
             let name = describe_encoder(&writer, stream);
             writer.BeginWriting().ctx("IMFSinkWriter::BeginWriting")?;
@@ -175,7 +177,10 @@ impl Encoder {
                 p.codec,
                 p.qp,
                 p.effort,
-                if audio.is_some() { " + aac audio" } else { "" },
+                match audio.len() {
+                    0 => String::new(),
+                    n => format!(" + {n} aac track(s)"),
+                },
                 p.path.display()
             ));
             Ok(Encoder {
@@ -189,6 +194,7 @@ impl Encoder {
                 writer,
                 stream,
                 audio,
+                track_names,
                 alloc,
                 _mgr: mgr,
             })
@@ -221,8 +227,8 @@ impl Encoder {
                 stale: false,
             };
             let mut placer = AudioPlacer::default();
-            let mut early_audio: Vec<(i64, Vec<i16>)> = Vec::new();
-            let mut audio_open = self.audio.is_some();
+            let mut early_audio: Vec<(i64, Vec<Vec<i16>>)> = Vec::new();
+            let mut audio_open = !self.audio.is_empty();
             let mut end_qpc = None;
 
             loop {
@@ -252,13 +258,13 @@ impl Encoder {
                             break;
                         }
                     }
-                    Some(Msg::Audio { start, data }) => match v.start {
+                    Some(Msg::Audio { start, tracks }) => match v.start {
                         Some(origin) => {
                             let at = placer.next;
-                            let out = placer.place(start, &data, &lock(pauses), origin);
+                            let out = placer.place(start, &tracks, &lock(pauses), origin);
                             self.write_audio(at, &out)?;
                         }
-                        None => early_audio.push((start, data)),
+                        None => early_audio.push((start, tracks)),
                     },
                     Some(Msg::Frame { slot: ring_slot, qpc, cursor }) => {
                         if let Some(i) = ring_slot {
@@ -295,9 +301,9 @@ impl Encoder {
                 if let Some(origin) = v.start
                     && !early_audio.is_empty()
                 {
-                    for (start, data) in std::mem::take(&mut early_audio) {
+                    for (start, tracks) in std::mem::take(&mut early_audio) {
                         let at = placer.next;
-                        let out = placer.place(start, &data, &lock(pauses), origin);
+                        let out = placer.place(start, &tracks, &lock(pauses), origin);
                         self.write_audio(at, &out)?;
                     }
                 }
@@ -315,13 +321,18 @@ impl Encoder {
                 v.frames += 1;
                 duration_s = v.slot_time(end_slot) as f64 / 1e7;
                 let at = placer.next;
-                let pad = placer.pad(v.slot_time(end_slot));
-                self.write_audio(at, &pad)?;
+                let pad = vec![0; 2 * placer.pad(v.slot_time(end_slot))];
+                self.write_audio(at, &vec![pad; self.audio.len()])?;
             }
             if v.frames == 0 {
                 return Err("no frames were captured".into());
             }
             self.writer.Finalize().ctx("IMFSinkWriter::Finalize")?;
+            if !self.track_names.is_empty()
+                && let Err(e) = name_tracks(&self.p.path, &self.track_names)
+            {
+                log(&format!("couldn't name the audio tracks: {e}"));
+            }
             Ok((v.frames, v.dropped, duration_s))
         }
     }
@@ -355,26 +366,11 @@ impl Encoder {
         }
     }
 
-    unsafe fn write_audio(&self, at: i64, data: &[i16]) -> Result<(), String> {
-        let Some(stream) = self.audio else { return Ok(()) };
-        if data.is_empty() {
-            return Ok(());
+    unsafe fn write_audio(&self, at: i64, tracks: &[Vec<i16>]) -> Result<(), String> {
+        for (&stream, data) in self.audio.iter().zip(tracks) {
+            unsafe { write_pcm(&self.writer, stream, at, data)? };
         }
-        unsafe {
-            let bytes = std::mem::size_of_val(data);
-            let buf = MFCreateMemoryBuffer(bytes as u32).ctx("MFCreateMemoryBuffer")?;
-            let mut p = std::ptr::null_mut();
-            buf.Lock(&mut p, None, None).ctx("IMFMediaBuffer::Lock")?;
-            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, p, bytes);
-            let _ = buf.Unlock();
-            buf.SetCurrentLength(bytes as u32).ctx("SetCurrentLength")?;
-            let sample = MFCreateSample().ctx("MFCreateSample")?;
-            sample.AddBuffer(&buf).ctx("AddBuffer")?;
-            let end = at + (data.len() / 2) as i64;
-            sample.SetSampleTime(frames_to_hns(at)).ctx("SetSampleTime")?;
-            sample.SetSampleDuration(frames_to_hns(end) - frames_to_hns(at)).ctx("SetSampleDuration")?;
-            self.writer.WriteSample(stream, &sample).ctx("WriteSample (audio)")
-        }
+        Ok(())
     }
 
     /// Copies the clean region image into a pooled sample texture and draws the cursor on it.
@@ -442,6 +438,27 @@ unsafe fn add_audio_stream(writer: &IMFSinkWriter) -> Result<u32, String> {
         in_t.SetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND, RATE * 4).ctx("mt")?;
         writer.SetInputMediaType(stream, &in_t, None).ctx("IMFSinkWriter::SetInputMediaType (audio)")?;
         Ok(stream)
+    }
+}
+
+unsafe fn write_pcm(writer: &IMFSinkWriter, stream: u32, at: i64, data: &[i16]) -> Result<(), String> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    unsafe {
+        let bytes = std::mem::size_of_val(data);
+        let buf = MFCreateMemoryBuffer(bytes as u32).ctx("MFCreateMemoryBuffer")?;
+        let mut p = std::ptr::null_mut();
+        buf.Lock(&mut p, None, None).ctx("IMFMediaBuffer::Lock")?;
+        std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, p, bytes);
+        let _ = buf.Unlock();
+        buf.SetCurrentLength(bytes as u32).ctx("SetCurrentLength")?;
+        let sample = MFCreateSample().ctx("MFCreateSample")?;
+        sample.AddBuffer(&buf).ctx("AddBuffer")?;
+        let end = at + (data.len() / 2) as i64;
+        sample.SetSampleTime(frames_to_hns(at)).ctx("SetSampleTime")?;
+        sample.SetSampleDuration(frames_to_hns(end) - frames_to_hns(at)).ctx("SetSampleDuration")?;
+        writer.WriteSample(stream, &sample).ctx("WriteSample (audio)")
     }
 }
 

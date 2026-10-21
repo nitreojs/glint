@@ -6,6 +6,7 @@ use std::path::Path;
 use color_quant::NeuQuant;
 use gif::{DisposalMethod, Encoder, Frame, Repeat};
 
+use super::edit::source_time;
 use super::math::{Range, gif_delay, gif_frames, gif_size, gif_tick};
 use super::media::{self, Decoded, Info};
 use super::trim::Progress;
@@ -24,12 +25,12 @@ pub(super) struct GifOptions {
 pub(super) fn export(
     src: &Path,
     info: &Info,
-    range: Range,
+    kept: &[Range],
     opts: GifOptions,
     out: &Path,
     p: &Progress,
 ) -> Result<bool, String> {
-    let res = run(src, info, range, opts, out, p);
+    let res = run(src, info, kept, opts, out, p);
     if !matches!(res, Ok(true)) {
         let _ = std::fs::remove_file(out);
     }
@@ -45,10 +46,10 @@ fn bgrx(f: &Decoded, size: (u32, u32), out: &mut Vec<u8>) -> Result<(), String> 
     })
 }
 
-fn run(src: &Path, info: &Info, range: Range, opts: GifOptions, out: &Path, p: &Progress) -> Result<bool, String> {
+fn run(src: &Path, info: &Info, kept: &[Range], opts: GifOptions, out: &Path, p: &Progress) -> Result<bool, String> {
     let size = gif_size(info.size, opts.width);
     let (w, h) = (u16::try_from(size.0).map_err(|_| "too wide")?, u16::try_from(size.1).map_err(|_| "too tall")?);
-    let frames = gif_frames(range.len(), opts.fps);
+    let frames = gif_frames(kept.iter().map(|r| r.len()).sum(), opts.fps);
     if frames == 0 {
         return Err("the selection is empty".into());
     }
@@ -61,7 +62,7 @@ fn run(src: &Path, info: &Info, range: Range, opts: GifOptions, out: &Path, p: &
         if p.cancelled() {
             return Ok(false);
         }
-        let t = gif_tick(range.start, j * frames / picks, opts.fps);
+        let Some((_, t)) = source_time(kept, gif_tick(0, j * frames / picks, opts.fps)) else { continue };
         media::seek(&reader, t)?;
         if let (Some(f), _) = media::decode_until(&reader, t, None)? {
             bgrx(&f, size, &mut px)?;
@@ -86,12 +87,17 @@ fn run(src: &Path, info: &Info, range: Range, opts: GifOptions, out: &Path, p: &
     let (mut cur, mut next): (Option<Decoded>, Option<Decoded>) = (None, None);
     let mut eof = false;
     let mut shown_ts = None;
-    media::seek(&reader, range.start)?;
+    let mut segment = None;
     for k in 0..frames {
         if p.cancelled() {
             return Ok(false);
         }
-        let t = gif_tick(range.start, k, opts.fps);
+        let Some((s, t)) = source_time(kept, gif_tick(0, k, opts.fps)) else { break };
+        if segment != Some(s) {
+            segment = Some(s);
+            media::seek(&reader, kept[s].start)?;
+            (cur, next, eof) = (None, None, false);
+        }
         loop {
             if next.is_none() && !eof {
                 next = media::next_video(&reader)?;

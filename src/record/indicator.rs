@@ -2,9 +2,12 @@
 //! optional countdown bubble in its centre before the recording starts, and a small floating
 //! pill with a pulsing red dot, the elapsed time and pause / stop / discard buttons.
 //!
-//! Every window here is excluded from screen capture, so none of it appears in the video
-//! even where it overlaps the region (e.g. when recording a whole monitor). On Windows 10
-//! that rules out per-pixel-alpha layered windows (UpdateLayeredWindow), so:
+//! Only windows over the recorded area are excluded from screen capture: NVIDIA Instant
+//! Replay and some other capture apps pause while any window with a display affinity is
+//! visible. The frame sits outside the area unless pushed inside at monitor edges, the pill
+//! looks for a spot outside it, and the countdown bubble closes before capture starts; what
+//! still overlaps the area is left out or excluded per [`IndicatorInside`]. Excluding rules
+//! out per-pixel-alpha layered windows (UpdateLayeredWindow) on Windows 10, so:
 //! * brackets are click-through constant-alpha layered windows shaped by a window region;
 //! * the pill is a DWM glass popup that Direct2D draws into with per-pixel alpha.
 
@@ -15,7 +18,7 @@ use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, TRUE, WPARAM};
 use windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
-use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -24,8 +27,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, Tr
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
+use crate::config::IndicatorInside;
 use crate::platform::gfx::{Dib, Painter, animate, ease_out, make_glass, rgba};
 use crate::platform::log::log;
+use crate::platform::monitors;
 use crate::platform::rect::Rect;
 
 const FADE_IN_MS: f32 = 160.0;
@@ -52,7 +57,8 @@ pub(crate) struct Indicator {
     /// Brackets and dashed sides with their full opacity.
     marks: Vec<(HWND, u8)>,
     pill: Option<HWND>,
-    pill_pos: Rect,
+    /// Where the pill goes once recording, and whether it's excluded from capture; None when hidden.
+    pill_at: Option<(Rect, bool)>,
     count: Option<HWND>,
     owner: HWND,
     msg: u32,
@@ -206,6 +212,90 @@ fn exclude_from_capture(hwnd: HWND) {
     }
 }
 
+/// How an indicator window appears while recording.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shown {
+    /// Clear of the recorded area.
+    Plain,
+    /// Over the recorded area, excluded from capture.
+    Excluded,
+    /// Over the recorded area, left out.
+    Hidden,
+}
+
+/// How a window covering `piece` appears given the recorded `regions` (desktop px).
+fn shown(piece: Rect, regions: &[Rect], inside: IndicatorInside) -> Shown {
+    if !regions.iter().any(|r| r.intersect(&piece).is_some()) {
+        return Shown::Plain;
+    }
+    match inside {
+        IndicatorInside::Show => Shown::Excluded,
+        IndicatorInside::Hide => Shown::Hidden,
+    }
+}
+
+/// The `parts` (relative to `pos`) of a frame piece that are drawn, each with its 1 px rim,
+/// and whether the piece must be excluded from capture.
+fn kept_parts(pos: Rect, parts: &[Rect], regions: &[Rect], inside: IndicatorInside) -> (Vec<Rect>, bool) {
+    let mut kept = Vec::with_capacity(parts.len());
+    let mut exclude = false;
+    for p in parts {
+        match shown(p.inflate(1).offset(pos.x, pos.y), regions, inside) {
+            Shown::Plain => kept.push(*p),
+            Shown::Excluded => {
+                kept.push(*p);
+                exclude = true;
+            }
+            Shown::Hidden => {}
+        }
+    }
+    (kept, exclude)
+}
+
+/// Squared distance between the nearest points of `a` and `b`.
+fn distance_sq(a: &Rect, b: &Rect) -> i64 {
+    let dx = (a.x - b.right()).max(b.x - a.right()).max(0) as i64;
+    let dy = (a.y - b.bottom()).max(b.y - a.bottom()).max(0) as i64;
+    dx * dx + dy * dy
+}
+
+/// Where the `size` pill goes for the frame `outer` around `capture`: `gap` beside the frame
+/// (above, below, left, right) on its monitor `home`, then on the other `screens` nearest
+/// first, at the first spot clear of the frame; failing that, inside the area's top-left
+/// corner, excluded from capture or hidden per `inside`.
+fn pill_spot(
+    capture: Rect,
+    outer: Rect,
+    home: Rect,
+    screens: &[Rect],
+    (w, h): (i32, i32),
+    gap: i32,
+    inside: IndicatorInside,
+) -> (Rect, Shown) {
+    let recorded: Vec<Rect> = std::iter::once(&home).chain(screens).filter(|s| capture.intersect(s).is_some()).copied().collect();
+    let regions: Vec<Rect> = recorded.iter().filter_map(|s| capture.intersect(s)).collect();
+    let framed: Vec<Rect> = recorded.iter().filter_map(|s| outer.intersect(s)).collect();
+    let mut others: Vec<&Rect> = screens.iter().filter(|s| **s != home).collect();
+    others.sort_by_key(|s| distance_sq(s, &capture));
+    for s in std::iter::once(&home).chain(others) {
+        let f = outer.intersect(&s.inflate(-1)).unwrap_or(outer);
+        let beside = [
+            (f.x, f.y - 1 - gap - h),
+            (f.x, f.bottom() + 1 + gap),
+            (f.x - 1 - gap - w, f.y),
+            (f.right() + 1 + gap, f.y),
+        ];
+        for (x, y) in beside {
+            let spot = clamp_into(x, y, w, h, *s);
+            if !framed.iter().any(|r| r.intersect(&spot).is_some()) {
+                return (spot, Shown::Plain);
+            }
+        }
+    }
+    let spot = clamp_into(capture.x + 2 * gap, capture.y + 2 * gap, w, h, home);
+    (spot, shown(spot, &regions, inside))
+}
+
 /// Keeps a `w`x`h` box at (x, y) inside `mon`.
 fn clamp_into(x: i32, y: i32, w: i32, h: i32, mon: Rect) -> Rect {
     Rect { x: x.clamp(mon.x, (mon.right() - w).max(mon.x)), y: y.clamp(mon.y, (mon.bottom() - h).max(mon.y)), w, h }
@@ -232,8 +322,10 @@ fn luminance_under(r: Rect) -> f32 {
 }
 
 /// A frame piece (corner bracket or dashed side): a window shaped to `parts` plus a 1 px rim
-/// around each, at opacity `alpha` once faded in.
-fn mark(pos: Rect, parts: &[Rect], alpha: u8) -> Option<(HWND, u8)> {
+/// around each, at opacity `alpha` once faded in. Parts over the recorded `regions` are left
+/// out or excluded from capture per `inside`.
+fn mark(pos: Rect, parts: &[Rect], alpha: u8, regions: &[Rect], inside: IndicatorInside) -> Option<(HWND, u8)> {
+    let (parts, exclude) = kept_parts(pos, parts, regions, inside);
     if pos.w <= 2 || pos.h <= 2 || parts.is_empty() {
         return None;
     }
@@ -242,7 +334,9 @@ fn mark(pos: Rect, parts: &[Rect], alpha: u8) -> Option<(HWND, u8)> {
     let dib = Dib::new(pos.w, pos.h).ok()?;
     unsafe {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
-        exclude_from_capture(hwnd);
+        if exclude {
+            exclude_from_capture(hwnd);
+        }
         let rgn = CreateRectRgn(0, 0, 0, 0);
         let (rim_brush, fill_brush) = (CreateSolidBrush(rim), CreateSolidBrush(fill));
         let whole = Rect { x: 0, y: 0, w: pos.w, h: pos.h }.to_win();
@@ -267,13 +361,15 @@ impl Indicator {
     /// `capture` and `monitors` (the recorded outputs) are in desktop coordinates. The pill's
     /// buttons post `msg` to `owner` with WPARAM [`STOP`], [`DISCARD`] or [`PAUSE`]. With a
     /// `countdown`, a bubble showing it replaces the pill until [`Indicator::start`]; clicking
-    /// it posts [`DISCARD`]. Fades in before returning.
+    /// it posts [`DISCARD`], and [`Indicator::end_countdown`] must close it before capture
+    /// starts. `inside` decides what overlaps the recorded area. Fades in before returning.
     pub(crate) fn show(
         capture: Rect,
         monitors: &[Rect],
         owner: HWND,
         msg: u32,
         countdown: u32,
+        inside: IndicatorInside,
     ) -> Result<Indicator, String> {
         let painter = Painter::new()?;
         let px = |v: f32| painter.px(v) as i32;
@@ -282,13 +378,14 @@ impl Indicator {
         register(w!("glint_count"), Some(count_proc), IDC_HAND);
 
         // The frame sits just outside the region; where that is off the monitors it is pushed
-        // inside (it is excluded from capture, so it never shows up in the video).
+        // inside, where it is left out or excluded from capture.
         let (arm, th, gap) = (px(20.0), px(3.0), px(4.0));
         let (dash, space, inset) = (px(8.0), px(6.0), arm + px(6.0));
         let outer = capture.inflate(gap + th);
         let (corners, sides) = frame(outer, monitors, inset);
         let Some(&anchor) = corners.first() else { return Err("the recorded region is on no monitor".into()) };
         let size = arm + 2; // + rim on both sides
+        let regions: Vec<Rect> = monitors.iter().filter_map(|m| capture.intersect(m)).collect();
         let mut marks = Vec::with_capacity(corners.len() + sides.len());
         for c in &corners {
             let x = if c.right { c.x + 1 - size } else { c.x - 1 };
@@ -296,7 +393,8 @@ impl Indicator {
             let near = |far: bool, len: i32| if far { size - 1 - len } else { 1 };
             let horizontal = Rect { x: near(c.right, arm), y: near(c.bottom, th), w: arm, h: th };
             let vertical = Rect { x: near(c.right, th), y: near(c.bottom, arm), w: th, h: arm };
-            marks.extend(mark(Rect { x, y, w: size, h: size }, &[horizontal, vertical], CORNER_ALPHA));
+            let pos = Rect { x, y, w: size, h: size };
+            marks.extend(mark(pos, &[horizontal, vertical], CORNER_ALPHA, &regions, inside));
         }
         // Dashed sides between the brackets.
         for s in &sides {
@@ -314,32 +412,35 @@ impl Indicator {
                     Rect { x: 1, y: 1 + off, w: th, h: dash }
                 })
                 .collect();
-            marks.extend(mark(pos, &parts, DASH_ALPHA));
+            marks.extend(mark(pos, &parts, DASH_ALPHA, &regions, inside));
         }
 
-        let monitor = monitors[anchor.monitor];
-        let f = outer.intersect(&monitor.inflate(-1)).unwrap_or(outer);
+        let home = monitors[anchor.monitor];
+        let screens: Vec<Rect> = match monitors::enumerate() {
+            Ok(outputs) if !outputs.is_empty() => outputs.iter().map(|o| o.rect).collect(),
+            _ => monitors.to_vec(),
+        };
 
         let font = painter.font(13.0)?;
         let time_w = painter.measure("88:88", &font).0.ceil();
         let layout = Layout::new(&painter, time_w);
-        let (pw, ph) = (layout.w.ceil() as i32, layout.h as i32);
-        let (mut x, mut y) = (f.x, f.y - 1 - px(6.0) - ph);
-        if y < monitor.y {
-            y = f.bottom() + 1 + px(6.0);
-        }
-        if y + ph > monitor.bottom() {
-            (x, y) = (capture.x + px(12.0), capture.y + px(12.0));
-        }
-        let pill_pos = clamp_into(x, y, pw, ph, monitor);
-        let mut ind = Indicator { marks, pill: None, pill_pos, count: None, owner, msg };
+        let size = (layout.w.ceil() as i32, layout.h as i32);
+        let pill_at = match pill_spot(capture, outer, home, &screens, size, px(6.0), inside) {
+            (pos, Shown::Plain) => Some((pos, false)),
+            (pos, Shown::Excluded) => Some((pos, true)),
+            (_, Shown::Hidden) => {
+                log("indicator: no room for the pill outside the recorded area; hidden");
+                None
+            }
+        };
+        let mut ind = Indicator { marks, pill: None, pill_at, count: None, owner, msg };
         if countdown > 0 {
             let (cx, cy) = (capture.x + capture.w / 2, capture.y + capture.h / 2);
-            let on = monitors.iter().copied().find(|m| m.contains(cx, cy)).unwrap_or(monitor);
+            let on = monitors.iter().copied().find(|m| m.contains(cx, cy)).unwrap_or(home);
             let d = px(104.0);
             ind.count = Some(open_count(clamp_into(cx - d / 2, cy - d / 2, d, d, on), countdown, owner, msg)?);
-        } else {
-            ind.pill = Some(open_pill(painter, font, layout, pill_pos, owner, msg)?);
+        } else if let Some((pos, exclude)) = pill_at {
+            ind.pill = Some(open_pill(painter, font, layout, pos, exclude, owner, msg)?);
         }
         animate(FADE_IN_MS, |t| {
             set_fade(&ind.marks, t);
@@ -361,16 +462,27 @@ impl Indicator {
         render_count();
     }
 
-    pub(crate) fn start(&mut self) -> Result<(), String> {
+    /// Fades out and closes the countdown bubble, and waits until the composed desktop no
+    /// longer shows it, so capture can start without excluding it.
+    pub(crate) fn end_countdown(&mut self) {
         if let Some(count) = self.count.take() {
             animate(FADE_OUT_MS, |t| set_count_fade(1.0 - t));
             close_count(count);
+            unsafe {
+                let _ = DwmFlush();
+            }
         }
-        if self.pill.is_none() {
+    }
+
+    /// Shows the pill after a countdown; call [`Indicator::end_countdown`] first.
+    pub(crate) fn start(&mut self) -> Result<(), String> {
+        if self.pill.is_none()
+            && let Some((pos, exclude)) = self.pill_at
+        {
             let painter = Painter::new()?;
             let font = painter.font(13.0)?;
             let layout = Layout::new(&painter, painter.measure("88:88", &font).0.ceil());
-            self.pill = Some(open_pill(painter, font, layout, self.pill_pos, self.owner, self.msg)?);
+            self.pill = Some(open_pill(painter, font, layout, pos, exclude, self.owner, self.msg)?);
             animate(FADE_IN_MS, set_pill_fade);
         }
         Ok(())
@@ -400,12 +512,15 @@ fn open_pill(
     font: IDWriteTextFormat,
     layout: Layout,
     pos: Rect,
+    exclude: bool,
     owner: HWND,
     msg: u32,
 ) -> Result<HWND, String> {
     let pill = popup(w!("glint_pill"), WINDOW_EX_STYLE(0), pos).ok_or("can't create the indicator window")?;
     make_glass(pill);
-    exclude_from_capture(pill);
+    if exclude {
+        exclude_from_capture(pill);
+    }
     let rt = painter.window_target(pill, pos.w, pos.h)?;
     PILL.with(|p| {
         *p.borrow_mut() = Some(PillState {
@@ -438,7 +553,6 @@ fn open_count(pos: Rect, n: u32, owner: HWND, msg: u32) -> Result<HWND, String> 
     let font = painter.font(46.0)?;
     let hwnd = popup(w!("glint_count"), WINDOW_EX_STYLE(0), pos).ok_or("can't create the countdown window")?;
     make_glass(hwnd);
-    exclude_from_capture(hwnd);
     let rt = match painter.window_target(hwnd, pos.w, pos.h) {
         Ok(rt) => rt,
         Err(e) => {
@@ -719,13 +833,12 @@ fn render_count() {
         let Some(st) = g.as_ref() else { return };
         let pop = ease_out((st.changed.elapsed().as_secs_f32() * 1000.0 / COUNT_POP_MS).min(1.0));
         let text = st.n.to_string();
-        let (tw, _) = st.painter.measure(&text, &st.font);
-        let (s, r) = (st.size, st.size / 2.0);
+        let r = st.size / 2.0;
         let _ = st.painter.render(&st.rt, st.fade, |c| {
             c.circle((r, r), r - 1.0, rgba(16, 16, 20, 0.88));
             c.ring((r, r), r - st.painter.px(5.0), st.painter.px(2.0), rgba(255, 69, 58, 0.35 + 0.5 * pop));
             let dy = st.painter.px(6.0) * (1.0 - pop);
-            c.text(&text, &st.font, [(s - tw) / 2.0, dy, tw + 2.0, s], rgba(255, 255, 255, 0.96 * pop));
+            c.text_centred(&text, &st.font, (r, r + dy), rgba(255, 255, 255, 0.96 * pop));
         });
     });
 }
@@ -955,5 +1068,44 @@ mod tests {
         assert_eq!(subtract(&[(0, 10)], (10, 20)), [(0, 10)]);
         assert_eq!(subtract(&[(0, 4), (6, 10)], (2, 8)), [(0, 2), (8, 10)]);
         assert_eq!(subtract(&[(0, 10)], (0, 10)), []);
+    }
+
+    #[test]
+    fn only_pieces_over_the_region_are_excluded_or_hidden() {
+        let regions = [Rect { x: 100, y: 100, w: 200, h: 100 }];
+        let (hide, show) = (IndicatorInside::Hide, IndicatorInside::Show);
+        for inside in [hide, show] {
+            assert_eq!(shown(Rect { x: 0, y: 0, w: 50, h: 50 }, &regions, inside), Shown::Plain);
+            assert_eq!(shown(Rect { x: 300, y: 100, w: 10, h: 10 }, &regions, inside), Shown::Plain);
+            assert_eq!(shown(Rect { x: 290, y: 190, w: 20, h: 20 }, &[], inside), Shown::Plain);
+        }
+        assert_eq!(shown(Rect { x: 290, y: 190, w: 20, h: 20 }, &regions, hide), Shown::Hidden);
+        assert_eq!(shown(Rect { x: 290, y: 190, w: 20, h: 20 }, &regions, show), Shown::Excluded);
+    }
+
+    #[test]
+    fn a_bracket_pushed_inside_keeps_its_arm_outside() {
+        let regions = [Rect { x: 0, y: 100, w: 400, h: 300 }];
+        let pos = Rect { x: 0, y: 92, w: 22, h: 22 };
+        let (h, v) = (Rect { x: 1, y: 1, w: 20, h: 3 }, Rect { x: 1, y: 1, w: 3, h: 20 });
+        assert_eq!(kept_parts(pos, &[h, v], &regions, IndicatorInside::Hide), (vec![h], false));
+        assert_eq!(kept_parts(pos, &[h, v], &regions, IndicatorInside::Show), (vec![h, v], true));
+        let away = [Rect { x: 100, y: 200, w: 10, h: 10 }];
+        assert_eq!(kept_parts(pos, &[h, v], &away, IndicatorInside::Hide), (vec![h, v], false));
+    }
+
+    #[test]
+    fn the_pill_finds_a_spot_outside_the_region() {
+        let spot = |capture: Rect, screens: &[Rect], inside| pill_spot(capture, capture.inflate(7), MAIN, screens, (150, 32), 6, inside);
+        let hide = IndicatorInside::Hide;
+        let pill = |x, y| Rect { x, y, w: 150, h: 32 };
+        // Above the frame, else below it, else beside it.
+        assert_eq!(spot(Rect { x: 100, y: 200, w: 400, h: 300 }, &[MAIN], hide), (pill(93, 154), Shown::Plain));
+        assert_eq!(spot(Rect { x: 100, y: 0, w: 400, h: 300 }, &[MAIN], hide), (pill(93, 314), Shown::Plain));
+        assert_eq!(spot(Rect { x: 400, y: 0, w: 3040, h: 1440 }, &[MAIN], hide), (pill(236, 1), Shown::Plain));
+        // A whole monitor: on a neighbor, else inside per the setting.
+        assert_eq!(spot(MAIN, &[MAIN, LEFT, TOP], hide), (pill(-150, 540), Shown::Plain));
+        assert_eq!(spot(MAIN, &[MAIN], hide), (pill(12, 12), Shown::Hidden));
+        assert_eq!(spot(MAIN, &[MAIN], IndicatorInside::Show), (pill(12, 12), Shown::Excluded));
     }
 }

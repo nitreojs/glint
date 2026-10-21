@@ -1,6 +1,7 @@
 use crate::config::Config;
 
 mod about;
+pub(super) mod audio;
 mod general;
 mod output;
 mod recording;
@@ -11,20 +12,29 @@ pub(super) mod uploads;
 pub(super) enum Section {
     General,
     Recording,
+    Audio,
     Screenshots,
     Uploads,
     Output,
     About,
 }
 
-pub(super) const SECTIONS: [Section; 6] =
-    [Section::General, Section::Recording, Section::Screenshots, Section::Uploads, Section::Output, Section::About];
+pub(super) const SECTIONS: [Section; 7] = [
+    Section::General,
+    Section::Recording,
+    Section::Audio,
+    Section::Screenshots,
+    Section::Uploads,
+    Section::Output,
+    Section::About,
+];
 
 impl Section {
     pub(super) fn name(self) -> &'static str {
         match self {
             Section::General => "general",
             Section::Recording => "recording",
+            Section::Audio => "audio",
             Section::Screenshots => "screenshots",
             Section::Uploads => "uploads",
             Section::Output => "output",
@@ -45,17 +55,21 @@ impl Section {
                     + n(a.freeze_screen == b.freeze_screen)
                     + n(a.ui_elements == b.ui_elements)
                     + n(a.notify_success == b.notify_success)
+                    + n(a.accent_rgb() == b.accent_rgb())
             }
             Section::Recording => {
                 n(a.fps == b.fps)
                     + n(a.codec == b.codec)
                     + n(a.quality == b.quality)
                     + n(a.effort == b.effort)
-                    + n(a.audio_desktop == b.audio_desktop)
-                    + n(a.audio_mic == b.audio_mic)
                     + n(a.countdown == b.countdown)
+                    + n(a.indicator_inside == b.indicator_inside)
                     + n(a.draw_cursor == b.draw_cursor)
                     + n(a.open_trimmer == b.open_trimmer)
+            }
+            Section::Audio => {
+                let (x, y) = (&a.audio_sources, &b.audio_sources);
+                x.iter().zip(y).filter(|(s, t)| s != t).count() + x.len().abs_diff(y.len())
             }
             Section::Screenshots => {
                 n(a.screenshot_format == b.screenshot_format)
@@ -70,6 +84,7 @@ impl Section {
                     + n(a.litterbox_expiry == b.litterbox_expiry)
                     + n(a.upload_copy_link == b.upload_copy_link)
                     + n(a.recording_upload == b.recording_upload)
+                    + n(a.upload_proxy == b.upload_proxy)
             }
             Section::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
             Section::About => 0,
@@ -89,18 +104,19 @@ impl Section {
                 cfg.freeze_screen = d.freeze_screen;
                 cfg.ui_elements = d.ui_elements;
                 cfg.notify_success = d.notify_success;
+                cfg.accent = d.accent;
             }
             Section::Recording => {
                 cfg.fps = d.fps;
                 cfg.codec = d.codec;
                 cfg.quality = d.quality;
                 cfg.effort = d.effort;
-                cfg.audio_desktop = d.audio_desktop;
-                cfg.audio_mic = d.audio_mic;
                 cfg.countdown = d.countdown;
+                cfg.indicator_inside = d.indicator_inside;
                 cfg.draw_cursor = d.draw_cursor;
                 cfg.open_trimmer = d.open_trimmer;
             }
+            Section::Audio => cfg.audio_sources = d.audio_sources,
             Section::Screenshots => {
                 cfg.screenshot_format = d.screenshot_format;
                 cfg.screenshot_style = d.screenshot_style;
@@ -114,6 +130,7 @@ impl Section {
                 cfg.litterbox_expiry = d.litterbox_expiry;
                 cfg.upload_copy_link = d.upload_copy_link;
                 cfg.recording_upload = d.recording_upload;
+                cfg.upload_proxy = d.upload_proxy;
             }
             Section::Output => {
                 cfg.output_dir = d.output_dir;

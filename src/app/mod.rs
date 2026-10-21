@@ -5,6 +5,7 @@ use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARA
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, NIN_SELECT, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
@@ -19,7 +20,7 @@ use crate::platform::monitors;
 use crate::platform::rect::Rect;
 use crate::platform::wide::wide;
 use crate::record::indicator::{self, Indicator};
-use crate::record::{AudioSource, Outcome, Params, Recorder, Source};
+use crate::record::{Outcome, Params, Recorder, Source};
 use crate::shot::editor::Output;
 use crate::shot::{self, Delivered, Shot};
 use crate::upload::{self, Done};
@@ -32,7 +33,7 @@ pub(crate) mod tray;
 
 use hotkeys::{ESC_HOTKEY_ID, FULL_HOTKEY_ID, HOTKEY_ID, PAUSE_HOTKEY_ID, SHOT_HOTKEY_ID};
 use menu::show_menu;
-use tray::Tray;
+use tray::{IDLE_TIP, Tray};
 
 /// NIN_SELECT | NINF_KEY: the icon was activated with the keyboard.
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -43,6 +44,8 @@ const WM_APP_QUIT: u32 = WM_APP + 4;
 /// Posted by the indicator pill's buttons (see the handler for WPARAM values).
 const WM_APP_STOP: u32 = WM_APP + 5;
 const COUNTDOWN_TIMER_ID: usize = 7;
+/// Runs the tray icon's single-click action once the double-click time has passed.
+const CLICK_TIMER_ID: usize = 8;
 /// A pinned screenshot's copy / save: a `Box<Shot>` in LPARAM.
 const WM_APP_PIN: u32 = WM_APP + 30;
 
@@ -108,12 +111,16 @@ impl App {
                     || self.full_hotkey.as_deref() != Some(cfg.fullscreen_hotkey.as_str())
                     || recording && self.pause_hotkey.as_deref() != Some(cfg.pause_hotkey.as_str());
                 let startup_changed = self.cfg.launch_at_startup != cfg.launch_at_startup;
+                let accent_changed = self.cfg.accent_rgb() != cfg.accent_rgb();
                 let before = std::mem::replace(&mut self.cfg, cfg);
                 if hotkeys_changed {
                     self.register_hotkeys(Some(&before));
                 }
                 if startup_changed {
                     self.sync_autostart();
+                }
+                if accent_changed {
+                    self.tray.set_accent(self.cfg.accent_rgb());
                 }
             }
             Err(e) => self.notify("glint: settings error", &e, true, ClickTarget::None),
@@ -169,17 +176,6 @@ impl App {
             let tip = format!("glint: {what} {}×{} @ {:.0} fps", size.0, size.1, fps);
             self.tray.set_recording(true, &tip);
         }
-    }
-
-    fn audio_sources(&self) -> Vec<AudioSource> {
-        let mut sources = Vec::new();
-        if self.cfg.audio_desktop {
-            sources.push(AudioSource::Desktop);
-        }
-        if self.cfg.audio_mic {
-            sources.push(AudioSource::Mic);
-        }
-        sources
     }
 
     fn start_selection(&mut self, shot: bool) {
@@ -247,7 +243,7 @@ impl App {
             qp: self.cfg.quality,
             effort: self.cfg.effort,
             draw_cursor: self.cfg.draw_cursor,
-            audio: self.audio_sources(),
+            audio: self.cfg.audio_sources.clone(),
             path,
         };
         let monitors: Vec<Rect> = sel.outputs.iter().map(|o| o.rect).collect();
@@ -260,7 +256,8 @@ impl App {
 
     fn start_countdown(&mut self, params: Params, monitors: Vec<Rect>, fps: f64) {
         let left = self.cfg.countdown;
-        match Indicator::show(params.region, &monitors, self.hwnd, WM_APP_STOP, left) {
+        let inside = self.cfg.indicator_inside;
+        match Indicator::show(params.region, &monitors, self.hwnd, WM_APP_STOP, left, inside) {
             Ok(indicator) => {
                 unsafe {
                     SetTimer(Some(self.hwnd), COUNTDOWN_TIMER_ID, 1000, None);
@@ -300,7 +297,7 @@ impl App {
         if matches!(self.state, State::Countdown { .. }) {
             self.end_countdown();
             self.state = State::Idle;
-            self.tray.set_recording(false, "glint");
+            self.tray.set_recording(false, IDLE_TIP);
             log("countdown cancelled");
         }
     }
@@ -310,7 +307,7 @@ impl App {
         params: Params,
         monitors: &[Rect],
         fps: f64,
-        indicator: Option<Indicator>,
+        mut indicator: Option<Indicator>,
         picker: Option<HWND>,
     ) {
         let region = params.region;
@@ -321,16 +318,20 @@ impl App {
                 drop(Box::from_raw(b));
             }
         };
-        // The pipeline initializes while the picker fades out; capture starts once it's gone.
+        // The pipeline initializes while the picker or the countdown bubble fades out; capture
+        // starts once they're gone.
         let started = Recorder::start(params, done);
         if let Some(p) = picker {
             picker::dismiss(p);
+        }
+        if let Some(i) = &mut indicator {
+            i.end_countdown();
         }
         match started.and_then(|s| s.wait()) {
             Ok(rec) => {
                 let indicator = match indicator {
                     Some(mut i) => i.start().map(|_| i),
-                    None => Indicator::show(region, monitors, self.hwnd, WM_APP_STOP, 0),
+                    None => Indicator::show(region, monitors, self.hwnd, WM_APP_STOP, 0, self.cfg.indicator_inside),
                 };
                 let indicator = indicator.map_err(|e| log(&format!("indicator unavailable: {e}"))).ok();
                 self.state = State::Recording { rec, indicator, size: (region.w, region.h), fps };
@@ -339,7 +340,7 @@ impl App {
             }
             Err(e) => {
                 log(&format!("start failed: {e}"));
-                self.tray.set_recording(false, "glint");
+                self.tray.set_recording(false, IDLE_TIP);
                 self.notify("glint: couldn't start recording", &e, true, ClickTarget::Log);
             }
         }
@@ -400,7 +401,7 @@ impl App {
         };
         self.state = State::Idle; // drops the indicator if capture ended on its own
         self.release_pause_hotkey();
-        self.tray.set_recording(false, "glint");
+        self.tray.set_recording(false, IDLE_TIP);
         match res {
             Ok(Outcome::Discarded) => {
                 self.notify_done("Recording discarded", "Nothing was saved.", ClickTarget::None);
@@ -416,9 +417,10 @@ impl App {
                     size.1,
                     fps
                 );
-                let audio: Vec<&str> = s.audio.iter().map(|a| a.short_name()).collect();
-                if !audio.is_empty() {
-                    text += &format!(" · {}", audio.join(" + "));
+                match s.tracks.as_slice() {
+                    [] => {}
+                    [one] => text += &format!(" · {one}"),
+                    all => text += &format!("\n{} audio tracks: {}", all.len(), all.join(", ")),
                 }
                 for issue in &s.audio_issues {
                     text += &format!("\n{issue}");
@@ -459,6 +461,9 @@ impl App {
     }
 
     fn on_uploaded(&mut self, done: Done) {
+        if !upload::active() {
+            self.tray.set_idle_tip(IDLE_TIP);
+        }
         match done.result {
             Ok(url) => {
                 history::add(done.kind, done.path.as_deref(), done.size, Some(&url));
@@ -560,6 +565,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.tick_countdown());
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == CLICK_TIMER_ID => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
+            }
+            with_app(|a| a.toggle(true));
+            return LRESULT(0);
+        }
         WM_APP_STOP => {
             with_app(|a| a.on_indicator(wp.0));
             return LRESULT(0);
@@ -572,9 +584,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| if wp.0 == 1 { a.pause_hotkeys() } else { a.register_hotkeys(Some(&a.cfg.clone())) });
             return LRESULT(0);
         }
+        upload::WM_UPLOAD_PROGRESS => {
+            with_app(|a| a.tray.set_idle_tip(&format!("glint: uploading {} %", wp.0)));
+            return LRESULT(0);
+        }
         WM_APP_TRAY => {
             match (lp.0 & 0xFFFF) as u32 {
-                WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT => show_menu(hwnd),
+                WM_CONTEXTMENU | NIN_KEYSELECT => show_menu(hwnd),
+                WM_LBUTTONDOWN => unsafe {
+                    let _ = SetForegroundWindow(hwnd);
+                    SetTimer(Some(hwnd), CLICK_TIMER_ID, GetDoubleClickTime(), None);
+                },
+                WM_LBUTTONDBLCLK => {
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
+                    }
+                    open_settings();
+                }
                 NIN_BALLOONUSERCLICK => {
                     with_app(|a| a.open_click_target());
                 }
@@ -669,6 +695,7 @@ pub fn run() {
             Ok(c) => (c, None),
             Err(e) => (Config::default(), Some(e)),
         };
+        let tray = Tray::new(hwnd, WM_APP_TRAY, cfg.accent_rgb());
         let mut app = App {
             hwnd,
             cfg,
@@ -677,7 +704,7 @@ pub fn run() {
             full_hotkey: None,
             pause_hotkey: None,
             state: State::Idle,
-            tray: Tray::new(hwnd, WM_APP_TRAY),
+            tray,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             click: ClickTarget::None,
             exiting: false,
@@ -691,7 +718,8 @@ pub fn run() {
                 let all_held = app.hotkey.is_some() && app.shot_hotkey.is_some() && app.full_hotkey.is_some();
                 if all_held && !autostarted {
                     let text = format!(
-                        "{} records a region, {} takes a screenshot, {} captures all screens. Tray icon → settings.",
+                        "{} records a region, {} takes a screenshot, {} captures all screens. \
+                         Double-click the tray icon for settings.",
                         app.cfg.hotkey, app.cfg.screenshot_hotkey, app.cfg.fullscreen_hotkey
                     );
                     app.notify_done("glint is running", &text, ClickTarget::None);

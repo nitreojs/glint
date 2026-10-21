@@ -1,5 +1,6 @@
 use std::hash::{BuildHasher, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -11,16 +12,21 @@ use crate::platform::log::log;
 
 pub(crate) mod custom;
 mod http;
+pub(crate) mod proxy;
 mod syntax;
 
 use custom::Sxcu;
 use http::Part;
+use proxy::Setting;
 
 pub(crate) const BUILT_IN: [&str; 4] = ["catbox", "litterbox", "uguu", "pomf"];
 
 pub(crate) const WM_UPLOADED: u32 = WM_APP + 50;
+pub(crate) const WM_UPLOAD_PROGRESS: u32 = WM_APP + 51;
 
 const MB: u64 = 1024 * 1024;
+
+static ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 struct Limit {
     bytes: u64,
@@ -31,6 +37,7 @@ pub(crate) struct Destination {
     pub name: String,
     sxcu: Sxcu,
     limit: Option<Limit>,
+    proxy: Setting,
 }
 
 pub(crate) struct Payload {
@@ -112,16 +119,17 @@ fn built_in(name: &str, expiry: Expiry) -> Option<Destination> {
         ),
         _ => return None,
     };
-    Some(Destination { name: name.into(), sxcu, limit: Some(Limit { bytes, text }) })
+    Some(Destination { name: name.into(), sxcu, limit: Some(Limit { bytes, text }), proxy: Setting::System })
 }
 
 impl Destination {
     pub(crate) fn from_config(cfg: &Config) -> Result<Destination, String> {
+        let proxy = proxy::parse(&cfg.upload_proxy).map_err(|e| format!("upload proxy: {e}"))?;
         let name = cfg.upload_destination.trim();
         if let Some(d) = built_in(name, cfg.litterbox_expiry) {
-            return Ok(d);
+            return Ok(Destination { proxy, ..d });
         }
-        Ok(Destination { name: name.into(), sxcu: custom::load(name)?, limit: None })
+        Ok(Destination { name: name.into(), sxcu: custom::load(name)?, limit: None, proxy })
     }
 
     fn check_size(&self, file: &Payload) -> Result<(), String> {
@@ -138,13 +146,21 @@ impl Destination {
         }
     }
 
-    fn upload(&self, file: Payload) -> Result<custom::Uploaded, String> {
+    pub(crate) fn upload(&self, file: Payload) -> Result<custom::Uploaded, String> {
+        self.upload_with(file, &mut |_, _| {})
+    }
+
+    fn upload_with(&self, file: Payload, progress: &mut dyn FnMut(u64, u64)) -> Result<custom::Uploaded, String> {
         self.check_size(&file)?;
         let mime = file.mime();
         let request = self.sxcu.request(&file.name, mime, file.part)?;
-        let response = http::send(&request)?;
+        let response = http::send(&request, &self.proxy, progress)?;
         self.sxcu.response(&self.name, &file.name, &response)
     }
+}
+
+pub(crate) fn active() -> bool {
+    ACTIVE.load(Ordering::SeqCst) > 0
 }
 
 pub(crate) fn start(
@@ -157,16 +173,28 @@ pub(crate) fn start(
     let dest = Destination::from_config(cfg)?;
     dest.check_size(&file)?;
     let hwnd = notify.0 as isize;
+    ACTIVE.fetch_add(1, Ordering::SeqCst);
     std::thread::Builder::new()
         .name("upload".into())
         .spawn(move || {
             let size = file.size;
-            let result = dest.upload(file).map(|up| {
+            let mut shown = None;
+            let mut progress = |sent: u64, total: u64| {
+                let percent = (sent * 100).checked_div(total).unwrap_or(100);
+                if shown != Some(percent) {
+                    shown = Some(percent);
+                    let _ = unsafe {
+                        PostMessageW(Some(HWND(hwnd as _)), WM_UPLOAD_PROGRESS, WPARAM(percent as usize), LPARAM(0))
+                    };
+                }
+            };
+            let result = dest.upload_with(file, &mut progress).map(|up| {
                 if let Some(d) = &up.deletion_url {
                     log(&format!("uploaded {} to {}, delete with {d}", up.url, dest.name));
                 }
                 up.url
             });
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
             let done = Box::into_raw(Box::new(Done { kind, path, size, host: dest.name, result }));
             unsafe {
                 if PostMessageW(Some(HWND(hwnd as _)), WM_UPLOADED, WPARAM(0), LPARAM(done as isize)).is_err() {
@@ -175,7 +203,10 @@ pub(crate) fn start(
             }
         })
         .map(|_| ())
-        .map_err(|e| format!("can't start the upload: {e}"))
+        .map_err(|e| {
+            ACTIVE.fetch_sub(1, Ordering::SeqCst);
+            format!("can't start the upload: {e}")
+        })
 }
 
 pub(crate) fn start_file(cfg: &Config, kind: Kind, path: &Path, notify: HWND) -> Result<(), String> {

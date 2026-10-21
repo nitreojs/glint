@@ -58,31 +58,44 @@ pub(super) struct AudioPlacer {
 }
 
 impl AudioPlacer {
-    pub(super) fn place(&mut self, start: i64, data: &[i16], pauses: &Pauses, origin: i64) -> Vec<i16> {
+    pub(super) fn place(&mut self, start: i64, tracks: &[Vec<i16>], pauses: &Pauses, origin: i64) -> Vec<Vec<i16>> {
         let tolerance = RATE as i64 / 50;
-        let mut out = Vec::with_capacity(data.len());
-        for (i, frame) in data.chunks_exact(2).enumerate() {
+        let frames = tracks.first().map_or(0, |t| t.len() / 2);
+        let mut order: Vec<Option<usize>> = Vec::with_capacity(frames);
+        for i in 0..frames {
             let Some(t) = pauses.active(start + frames_to_hns(i as i64)) else { continue };
             if t < origin {
                 continue;
             }
             let target = hns_to_frames(t - origin);
-            let pos = self.next + (out.len() / 2) as i64;
+            let pos = self.next + order.len() as i64;
             if target > pos + tolerance {
-                out.resize(out.len() + 2 * (target - pos) as usize, 0);
+                order.resize(order.len() + (target - pos) as usize, None);
             } else if target < pos - tolerance {
                 continue;
             }
-            out.extend_from_slice(frame);
+            order.push(Some(i));
         }
-        self.next += (out.len() / 2) as i64;
-        out
+        self.next += order.len() as i64;
+        tracks
+            .iter()
+            .map(|data| {
+                let mut out = Vec::with_capacity(2 * order.len());
+                for f in &order {
+                    match f {
+                        Some(i) => out.extend_from_slice(&data[2 * i..2 * i + 2]),
+                        None => out.extend_from_slice(&[0, 0]),
+                    }
+                }
+                out
+            })
+            .collect()
     }
 
-    pub(super) fn pad(&mut self, end: i64) -> Vec<i16> {
+    pub(super) fn pad(&mut self, end: i64) -> usize {
         let n = (hns_to_frames(end) - self.next).max(0);
         self.next += n;
-        vec![0; 2 * n as usize]
+        n as usize
     }
 }
 
@@ -122,9 +135,12 @@ mod tests {
         p.resume(30 * MS);
         let mut a = AudioPlacer::default();
         let data: Vec<i16> = (0..1920i16).flat_map(|i| [i, i]).collect();
-        let out = a.place(0, &data, &p, 0);
-        assert_eq!(out.len() / 2, 960);
-        assert_eq!((out[2 * 479], out[2 * 480]), (479, 1440));
+        let neg: Vec<i16> = data.iter().map(|v| -v).collect();
+        let out = a.place(0, &[data, neg], &p, 0);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].len() / 2, 960);
+        assert_eq!((out[0][2 * 479], out[0][2 * 480]), (479, 1440));
+        assert_eq!((out[1][2 * 479], out[1][2 * 480]), (-479, -1440));
         assert_eq!(a.next, 960);
     }
 
@@ -133,15 +149,15 @@ mod tests {
         let p = Pauses::default();
         let ramp: Vec<i16> = (0..480i16).flat_map(|i| [i, i]).collect();
         let mut a = AudioPlacer::default();
-        let out = a.place(0, &ramp, &p, 5 * MS);
-        assert_eq!((out.len() / 2, out[0]), (240, 240));
+        let out = a.place(0, std::slice::from_ref(&ramp), &p, 5 * MS);
+        assert_eq!((out[0].len() / 2, out[0][0]), (240, 240));
         let mut a = AudioPlacer::default();
-        let out = a.place(55 * MS, &ramp, &p, 5 * MS);
-        assert_eq!(out.len() / 2, 2400 + 480);
-        assert_eq!((out[2 * 2399], out[2 * 2400]), (0, 0));
-        assert_eq!(out[2 * 2401], 1);
-        let out = a.place(65 * MS, &ramp, &p, 5 * MS);
-        assert_eq!((out.len() / 2, a.next), (480, 3360));
-        assert_eq!(a.pad(100 * MS).len() / 2, 4800 - 3360);
+        let out = a.place(55 * MS, &[ramp.clone(), ramp.clone()], &p, 5 * MS);
+        assert!(out.iter().all(|t| t.len() / 2 == 2400 + 480));
+        assert_eq!((out[1][2 * 2399], out[1][2 * 2400]), (0, 0));
+        assert_eq!(out[1][2 * 2401], 1);
+        let out = a.place(65 * MS, std::slice::from_ref(&ramp), &p, 5 * MS);
+        assert_eq!((out[0].len() / 2, a.next), (480, 3360));
+        assert_eq!(a.pad(100 * MS), 4800 - 3360);
     }
 }

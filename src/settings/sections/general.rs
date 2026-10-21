@@ -1,9 +1,20 @@
-use eframe::egui::Ui;
+use eframe::egui::{Color32, Ui, vec2};
 
-use crate::config::UiElements;
+use crate::config::{UiElements, hex, parse_hex};
 use crate::settings::SettingsApp;
 use crate::settings::hotkey_capture::{HotkeyField, held_names, key_names};
 use crate::settings::widgets::{self, HotkeyState, Look, hint, row};
+
+const ACCENTS: [[u8; 3]; 8] = [
+    [0xE5, 0x40, 0x2F],
+    [0xE8, 0x6A, 0x1F],
+    [0xD9, 0x43, 0x7A],
+    [0x8E, 0x5B, 0xD9],
+    [0x2F, 0x7B, 0xE5],
+    [0x1F, 0x9E, 0x8F],
+    [0x3E, 0x9E, 0x4A],
+    [0x7A, 0x77, 0x72],
+];
 
 impl SettingsApp {
     /// One hotkey row: the field, and the reason the last combo can't be used.
@@ -55,6 +66,38 @@ impl SettingsApp {
             let choices = [(true, "all"), (false, "errors only")];
             widgets::segmented(ui, look, &mut self.cfg.notify_success, &choices, Some(200.0));
             hint(ui, "errors only — no popup after every screenshot or recording", look.p.t3);
+        });
+        self.accent_row(ui, look);
+    }
+
+    fn accent_row(&mut self, ui: &mut Ui, look: &Look) {
+        let current = self.cfg.accent_rgb();
+        row(ui, look, "accent", 3.0, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                for rgb in ACCENTS {
+                    let color = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+                    if widgets::swatch(ui, look, color, rgb == current).clicked() {
+                        self.cfg.accent = hex(rgb);
+                        self.accent_text = self.cfg.accent.clone();
+                    }
+                }
+            });
+            let valid = parse_hex(&self.accent_text).is_some();
+            let field = ui.allocate_ui(vec2(120.0, 32.0), |ui| {
+                widgets::text_field(ui, look, &mut self.accent_text, "#E5402F", !valid)
+            });
+            let typed = parse_hex(&self.accent_text);
+            if let Some(rgb) = typed.filter(|_| field.inner.changed()) {
+                self.cfg.accent = hex(rgb);
+            } else if !field.inner.has_focus() && typed != Some(self.cfg.accent_rgb()) {
+                self.accent_text = self.cfg.accent.clone();
+            }
+            if valid {
+                hint(ui, "a preset or any #rrggbb colour, for these windows and the tray icon", look.p.t3);
+            } else {
+                hint(ui, "type a colour as #rrggbb, like #e5402f", look.p.warn);
+            }
         });
     }
 }

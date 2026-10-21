@@ -15,7 +15,7 @@ use crate::record::{Codec, Ctx};
 
 pub(super) const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 pub(super) const ANY: u32 = MF_SOURCE_READER_ANY_STREAM.0 as u32;
-const ALL: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
+pub(super) const ALL: u32 = MF_SOURCE_READER_ALL_STREAMS.0 as u32;
 
 pub(super) struct Com;
 
@@ -39,12 +39,18 @@ impl Drop for Com {
 }
 
 #[derive(Clone, Debug)]
+pub(super) struct Track {
+    pub stream: u32,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
 pub(super) struct Info {
     pub duration: i64,
     pub size: (u32, u32),
     pub fps: f64,
     pub codec: Option<Codec>,
-    pub audio: bool,
+    pub tracks: Vec<Track>,
 }
 
 pub(super) fn pack(hi: u32, lo: u32) -> u64 {
@@ -146,8 +152,67 @@ pub(super) fn probe(path: &Path) -> Result<Info, String> {
             reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION).ctx("duration")?;
         let duration = pv.Anonymous.Anonymous.Anonymous.uhVal as i64;
         let _ = PropVariantClear(&mut pv);
-        let audio = streams(&reader).iter().any(|s| s.1 == MFMediaType_Audio);
-        Ok(Info { duration, size, fps, codec, audio })
+        let tracks = tracks(path, &reader);
+        Ok(Info { duration, size, fps, codec, tracks })
+    }
+}
+
+fn tracks(path: &Path, reader: &IMFSourceReader) -> Vec<Track> {
+    let names = crate::record::mp4::track_names(path);
+    let kinds = crate::record::mp4::trak_kinds(path);
+    let majors: Vec<bool> = streams(reader).iter().map(|s| s.1 == MFMediaType_Audio).collect();
+    let mut audio: Vec<u32> = (0..majors.len() as u32).filter(|&i| majors[i as usize]).collect();
+    if reversed(&kinds, &majors) {
+        audio.reverse();
+    }
+    (audio.into_iter().enumerate())
+        .map(|(n, stream)| {
+            let name = names.get(n).cloned().flatten().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            Track { stream, name: name.unwrap_or_else(|| format!("track {}", n + 1)) }
+        })
+        .collect()
+}
+
+// measured: the mpeg-4 source lists traks in reverse moov order (ffmpeg- and sink-writer-made files alike).
+fn reversed(kinds: &[[u8; 4]], audio: &[bool]) -> bool {
+    let sound: Vec<bool> = kinds.iter().map(|k| k == b"soun").collect();
+    sound != audio || sound.iter().rev().eq(audio)
+}
+
+pub(super) fn audio_rate(reader: &IMFSourceReader, stream: u32) -> u32 {
+    unsafe {
+        reader.GetNativeMediaType(stream, 0).and_then(|t| t.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)).unwrap_or(48_000)
+    }
+}
+
+pub(super) fn float_output(reader: &IMFSourceReader, stream: u32, rate: u32) -> Result<usize, String> {
+    unsafe {
+        let t = MFCreateMediaType().ctx("MFCreateMediaType")?;
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Audio).ctx("mt")?;
+        t.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float).ctx("mt")?;
+        if reader.SetCurrentMediaType(stream, None, &t).is_err() {
+            return Err("the audio can't be decoded".into());
+        }
+        let cur = reader.GetCurrentMediaType(stream).ctx("GetCurrentMediaType")?;
+        let got = cur.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(0);
+        let channels = cur.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(0) as usize;
+        if got != rate || channels == 0 {
+            return Err(format!("audio tracks at {got} Hz and {rate} Hz can't be mixed"));
+        }
+        Ok(channels)
+    }
+}
+
+pub(super) fn floats(sample: &IMFSample, out: &mut Vec<f32>) -> Result<(), String> {
+    unsafe {
+        let buf = sample.ConvertToContiguousBuffer().ctx("ConvertToContiguousBuffer")?;
+        let (mut data, mut len) = (std::ptr::null_mut(), 0u32);
+        buf.Lock(&mut data, None, Some(&mut len)).ctx("Lock")?;
+        let bytes = std::slice::from_raw_parts(data, len as usize);
+        out.clear();
+        out.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+        let _ = buf.Unlock();
+        Ok(())
     }
 }
 
@@ -292,5 +357,19 @@ pub(super) fn with_pixels<R>(sample: &IMFSample, width: u32, f: impl FnOnce(&Row
         let r = f(&Rows { scan0, pitch: width as isize, width });
         let _ = buf.Unlock();
         Ok(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reader_order_is_reversed_unless_the_moov_order_matches() {
+        let (v, a) = (*b"vide", *b"soun");
+        assert!(reversed(&[v, a, a], &[true, true, false]));
+        assert!(!reversed(&[v, a, a], &[false, true, true]));
+        assert!(reversed(&[a, v, a], &[true, false, true]));
+        assert!(reversed(&[], &[true, true, false]));
     }
 }

@@ -153,7 +153,7 @@ impl Painter {
             if clear {
                 rt.Clear(Some(&rgba(0, 0, 0, 0.0)));
             }
-            f(&Canvas { rt, brush, fade, factory: &self.factory, round });
+            f(&Canvas { rt, brush, fade, factory: &self.factory, dwrite: &self.dwrite, round });
             rt.EndDraw(None, None).map_err(|e| format!("EndDraw: {e}"))
         }
     }

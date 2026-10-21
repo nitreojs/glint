@@ -739,6 +739,7 @@ dependencies = [
  "serde_json",
  "toml",
  "windows",
+ "windows-core",
  "windows-numerics",
 ]
 

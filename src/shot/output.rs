@@ -1,5 +1,7 @@
 //! Turns a finished screenshot (raw pixels) into PNG/JPG bytes and puts it on the clipboard.
 
+use std::os::windows::ffi::OsStrExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND, RPC_E_CHANGED_MODE};
@@ -17,8 +19,9 @@ use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_UNICODETEXT};
+use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY};
 use windows::Win32::System::Variant::{VARIANT, VT_R4};
+use windows::Win32::UI::Shell::DROPFILES;
 use windows::core::{Error, PWSTR, w};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -131,6 +134,31 @@ pub(crate) fn copy_text(owner: Option<HWND>, text: &str) -> Result<(), String> {
     let _clipboard = Clipboard::open(owner)?;
     unsafe { EmptyClipboard() }.map_err(|e| format!("EmptyClipboard: {e}"))?;
     mem.give_to_clipboard(u32::from(CF_UNICODETEXT.0))
+}
+
+pub(crate) fn copy_files(owner: Option<HWND>, paths: &[PathBuf]) -> Result<(), String> {
+    let header = size_of::<DROPFILES>();
+    let names: Vec<u8> = paths
+        .iter()
+        .flat_map(|p| p.as_os_str().encode_wide().chain([0]))
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let files = DROPFILES { pFiles: header as u32, fWide: true.into(), ..Default::default() };
+    let list = Global::new(header + names.len(), |buf| {
+        let (head, body) = buf.split_at_mut(header);
+        head.copy_from_slice(unsafe { std::slice::from_raw_parts((&files as *const DROPFILES).cast::<u8>(), header) });
+        body.copy_from_slice(&names);
+    })?;
+    let effect = Global::new(4, |buf| buf.copy_from_slice(&DROPEFFECT_COPY.0.to_le_bytes()))?;
+    let effect_format = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
+    let _clipboard = Clipboard::open(owner)?;
+    unsafe { EmptyClipboard() }.map_err(|e| format!("EmptyClipboard: {e}"))?;
+    list.give_to_clipboard(u32::from(CF_HDROP.0))?;
+    if effect_format != 0 {
+        effect.give_to_clipboard(effect_format)?;
+    }
+    Ok(())
 }
 
 /// A packed bottom-up DIB: `header`, then the rows, each pixel through `px`.

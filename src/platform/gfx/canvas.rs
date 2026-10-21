@@ -3,7 +3,9 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::*;
-use windows::Win32::Graphics::DirectWrite::{DWRITE_MEASURING_MODE_NATURAL, IDWriteTextFormat, IDWriteTextLayout};
+use windows::Win32::Graphics::DirectWrite::{
+    DWRITE_MEASURING_MODE_NATURAL, DWRITE_OVERHANG_METRICS, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
+};
 use windows_numerics::Vector2;
 
 use crate::platform::wide::wide;
@@ -13,12 +15,31 @@ pub(crate) struct Canvas<'a> {
     pub(super) brush: ID2D1SolidColorBrush,
     pub(super) fade: f32,
     pub(super) factory: &'a ID2D1Factory,
+    pub(super) dwrite: &'a IDWriteFactory,
     /// Round caps and joins, for strokes drawn by hand.
     pub(super) round: ID2D1StrokeStyle,
 }
 
 fn rect_f(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
     D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h }
+}
+
+const LAYOUT_BOX: f32 = 1024.0;
+
+// overhang metrics are distances from the layout box (max width × max height) to the ink
+fn ink_from_overhang(o: &DWRITE_OVERHANG_METRICS, (w, h): (f32, f32)) -> [f32; 4] {
+    [-o.left, -o.top, w + o.right, h + o.bottom]
+}
+
+fn centred_origin((cx, cy): (f32, f32), [l, t, r, b]: [f32; 4]) -> (f32, f32) {
+    (cx - (l + r) / 2.0, cy - (t + b) / 2.0)
+}
+
+fn ink_box(layout: &IDWriteTextLayout) -> Option<[f32; 4]> {
+    unsafe {
+        let o = layout.GetOverhangMetrics().ok()?;
+        Some(ink_from_overhang(&o, (layout.GetMaxWidth(), layout.GetMaxHeight())))
+    }
 }
 
 impl Canvas<'_> {
@@ -32,6 +53,11 @@ impl Canvas<'_> {
             let rr = D2D1_ROUNDED_RECT { rect: rect_f(x, y, w, h), radiusX: radius, radiusY: radius };
             self.rt.FillRoundedRectangle(&rr, &self.brush);
         }
+    }
+
+    pub(crate) fn fill(&self, x: f32, y: f32, w: f32, h: f32, color: D2D1_COLOR_F) {
+        self.color(color);
+        unsafe { self.rt.FillRectangle(&rect_f(x, y, w, h), &self.brush) };
     }
 
     pub(crate) fn line(&self, (x0, y0): (f32, f32), (x1, y1): (f32, f32), width: f32, color: D2D1_COLOR_F) {
@@ -114,5 +140,56 @@ impl Canvas<'_> {
     pub(crate) fn text_layout(&self, layout: &IDWriteTextLayout, (x, y): (f32, f32), color: D2D1_COLOR_F) {
         self.color(color);
         unsafe { self.rt.DrawTextLayout(Vector2 { X: x, Y: y }, layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE) };
+    }
+
+    pub(crate) fn text_centred(&self, text: &str, font: &IDWriteTextFormat, centre: (f32, f32), color: D2D1_COLOR_F) {
+        let s: Vec<u16> = text.encode_utf16().collect();
+        let Ok(layout) = (unsafe { self.dwrite.CreateTextLayout(&s, font, LAYOUT_BOX, LAYOUT_BOX) }) else { return };
+        if let Some(ink) = ink_box(&layout) {
+            self.text_layout(&layout, centred_origin(centre, ink), color);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::Graphics::DirectWrite::*;
+    use windows::core::w;
+
+    use super::*;
+
+    #[test]
+    fn ink_box_is_centred_on_the_point() {
+        let o = DWRITE_OVERHANG_METRICS { left: -10.0, top: -40.0, right: -900.0, bottom: -914.0 };
+        let ink = ink_from_overhang(&o, (LAYOUT_BOX, LAYOUT_BOX));
+        assert_eq!(ink, [10.0, 40.0, 124.0, 110.0]);
+        assert_eq!(centred_origin((50.0, 50.0), ink), (-17.0, -25.0));
+        let (x, y) = centred_origin((50.0, 50.0), ink);
+        assert_eq!(((ink[0] + ink[2]) / 2.0 + x, (ink[1] + ink[3]) / 2.0 + y), (50.0, 50.0));
+    }
+
+    #[test]
+    fn digit_ink_is_found_inside_the_line() {
+        let dwrite: IDWriteFactory = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.unwrap();
+        let font = unsafe {
+            dwrite.CreateTextFormat(
+                w!("Segoe UI"),
+                None,
+                DWRITE_FONT_WEIGHT_SEMI_BOLD,
+                DWRITE_FONT_STYLE_NORMAL,
+                DWRITE_FONT_STRETCH_NORMAL,
+                100.0,
+                w!("en-us"),
+            )
+        }
+        .unwrap();
+        let s: Vec<u16> = "8".encode_utf16().collect();
+        let layout = unsafe { dwrite.CreateTextLayout(&s, &font, LAYOUT_BOX, LAYOUT_BOX) }.unwrap();
+        let [l, t, r, b] = ink_box(&layout).unwrap();
+        let mut m = DWRITE_TEXT_METRICS::default();
+        unsafe { layout.GetMetrics(&mut m) }.unwrap();
+        assert!(t > 10.0 && b < m.height, "the digit's ink sits inside its line box: {t} {b} {}", m.height);
+        assert!((60.0..80.0).contains(&(b - t)), "a lining digit is about cap height: {}", b - t);
+        assert!(l >= 0.0 && r <= m.width + 1.0 && r - l > 30.0, "{l} {r} {}", m.width);
     }
 }

@@ -1,6 +1,6 @@
 use eframe::egui::Ui;
 
-use crate::config::CodecName;
+use crate::config::{CodecName, IndicatorInside};
 use crate::settings::SettingsApp;
 use crate::settings::widgets::{self, Look, hint, row};
 
@@ -64,16 +64,6 @@ impl SettingsApp {
             let word = effort_word(self.cfg.effort);
             widgets::slider(ui, look, &mut self.cfg.effort, 0..=100, word, "0 ← faster", "smaller files → 100");
         });
-        row(ui, look, "desktop audio", 1.0, |ui| {
-            let text = if self.cfg.audio_desktop { "on" } else { "off" };
-            widgets::toggle(ui, look, &mut self.cfg.audio_desktop, text);
-            hint(ui, "what your default output device plays", t3);
-        });
-        row(ui, look, "microphone", 1.0, |ui| {
-            let text = if self.cfg.audio_mic { "on" } else { "off" };
-            widgets::toggle(ui, look, &mut self.cfg.audio_mic, text);
-            hint(ui, "your default recording device; with desktop audio, both go into one track", t3);
-        });
         let mut counts = COUNTDOWN_PRESETS.to_vec();
         if !counts.contains(&self.cfg.countdown) {
             counts.push(self.cfg.countdown);
@@ -84,6 +74,11 @@ impl SettingsApp {
         row(ui, look, "countdown", 7.0, |ui| {
             widgets::segmented(ui, look, &mut self.cfg.countdown, &choices, Some(200.0));
             hint(ui, "esc or the record hotkey cancels it", t3);
+        });
+        row(ui, look, "overlay on the recorded area", 7.0, |ui| {
+            let choices = [(IndicatorInside::Hide, "hide"), (IndicatorInside::Show, "show")];
+            widgets::segmented(ui, look, &mut self.cfg.indicator_inside, &choices, Some(168.0));
+            hint(ui, "show keeps it out of the video, but nvidia instant replay and some capture apps pause while it's visible", t3);
         });
         row(ui, look, "mouse cursor", 1.0, |ui| {
             let text = if self.cfg.draw_cursor { "shown in captures" } else { "hidden" };

@@ -22,7 +22,7 @@ use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, D
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE,
+    GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_CONTROL, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_SPACE, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
@@ -81,7 +81,7 @@ const CLICK_SLOP: i32 = 4;
 pub(crate) const DIM: u32 = 150;
 const FADE_IN_MS: f32 = 140.0;
 const FADE_OUT_MS: f32 = 110.0;
-const NOTICE_TIMER: usize = 0x6E01;
+const EDITOR_TIMER: usize = 0x6E01;
 /// Posted by [`Elements`] when its results change.
 const WM_ELEMENTS: u32 = WM_APP + 41;
 
@@ -104,6 +104,7 @@ struct State {
     outputs: Vec<Monitor>,
     /// Visible top-level windows when the picker opened, topmost first (desktop coordinates).
     windows: Vec<(HWND, Rect)>,
+    clients: Vec<Option<Rect>>,
     /// The windows' and their client areas' rects, for snapping.
     frames: Vec<Rect>,
     ui: UiElements,
@@ -211,8 +212,9 @@ pub(crate) fn open(
             h: GetSystemMetrics(SM_CYVIRTUALSCREEN),
         };
         let windows = visible_windows();
+        let clients: Vec<Option<Rect>> = windows.iter().map(|w| client_rect(w.0)).collect();
         let mut frames: Vec<Rect> = windows.iter().map(|w| w.1).collect();
-        frames.extend(windows.iter().filter_map(|w| client_rect(w.0)));
+        frames.extend(clients.iter().flatten());
         let painter = Painter::new()?;
         let font = painter.font(13.0)?;
         let hint = hint_text(purpose, outputs.len(), elements);
@@ -275,6 +277,7 @@ pub(crate) fn open(
                 black: CreateSolidBrush(COLORREF(0)),
                 outputs,
                 windows,
+                clients,
                 frames,
                 ui: elements,
                 shift: false,
@@ -318,7 +321,8 @@ pub(crate) fn open(
                 let screen = Rect { x: 0, y: 0, w: area.w, h: area.h };
                 let monitors = st.outputs.iter().map(|o| st.to_client(o.rect)).collect();
                 let mut ed = Editor::canvas(screen, monitors, st.painter.scale, st.cursor);
-                ed.set_snap(st.snap_rects_client());
+                st.equip(&mut ed);
+                schedule_tick(hwnd, &ed);
                 st.edit = Some(ed);
             } else {
                 st.track(st.cursor);
@@ -526,6 +530,37 @@ impl State {
 
     fn snap_rects_client(&self) -> Vec<Rect> {
         self.snap_rects().into_iter().map(|r| self.to_client(r)).collect()
+    }
+
+    fn equip(&self, ed: &mut Editor) {
+        ed.set_snap(self.snap_rects_client());
+        let windows = self.windows.iter().zip(&self.clients).filter_map(|(w, c)| {
+            window_pick(w.1, &self.outputs).map(|r| (self.to_client(r), c.map(|c| self.to_client(c))))
+        });
+        ed.set_windows(windows.collect());
+    }
+
+    fn element_at(&self, p: (i32, i32)) -> Option<Rect> {
+        let d = (p.0 + self.origin.0, p.1 + self.origin.1);
+        let first = *self.chain.first().filter(|_| self.parts() && self.chain_at == d)?;
+        let window = self.windows.iter().any(|w| window_pick(w.1, &self.outputs) == Some(first));
+        let monitor = self.outputs.iter().any(|o| o.rect == first);
+        (!window && !monitor).then(|| self.to_client(first))
+    }
+
+    fn edit_element(&mut self, p: (i32, i32)) -> Option<Rect> {
+        if !self.edit.as_ref().is_some_and(Editor::wants_elements) {
+            return None;
+        }
+        self.track(p);
+        self.element_at(p)
+    }
+
+    fn under(&self, (x, y): (i32, i32)) -> u32 {
+        match &self.screen {
+            Screen::Frozen(f) => f.bright.pixel(x, y).unwrap_or(0),
+            Screen::Live(_) => 0,
+        }
     }
 
     /// Forgets the pick in progress and everything it shows.
@@ -750,7 +785,7 @@ impl State {
                         Editor::new(sel, cutout, monitors, self.painter.scale)
                     }
                 };
-                ed.set_snap(self.snap_rects_client());
+                self.equip(&mut ed);
                 self.invalidate(&ed.extent());
                 self.edit = Some(ed);
                 self.target = Some(sel);
@@ -765,9 +800,7 @@ impl State {
         let Some(ed) = self.edit.as_mut() else { return Action::Handled };
         let before = ed.frame();
         let event = call(ed);
-        if let Some(left) = ed.notice_left() {
-            unsafe { SetTimer(Some(self.hwnd), NOTICE_TIMER, left.as_millis() as u32 + 1, None) };
-        }
+        schedule_tick(self.hwnd, ed);
         match event {
             editor::Event::None => Action::Handled,
             editor::Event::Repaint => {
@@ -802,7 +835,8 @@ impl State {
         match msg {
             WM_LBUTTONDOWN => {
                 let p = point(lp);
-                match self.edit_event(|e| e.mouse_down(p)) {
+                let under = self.under(p);
+                match self.edit_event(|e| e.mouse_down(p, under)) {
                     Action::Finish(r) => Action::Finish(r),
                     _ => Action::Capture,
                 }
@@ -810,7 +844,12 @@ impl State {
             WM_MOUSEMOVE => {
                 let p = point(lp);
                 self.cursor = p;
-                self.edit_event(|e| e.mouse_move(p))
+                self.shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+                let element = self.edit_element(p);
+                self.edit_event(|e| {
+                    e.set_element(element);
+                    e.mouse_move(p)
+                })
             }
             WM_LBUTTONUP => {
                 let p = point(lp);
@@ -820,21 +859,33 @@ impl State {
                 }
             }
             // bit 30 of lparam: the key was already down (auto-repeat)
-            WM_KEYDOWN if lp.0 & (1 << 30) != 0 && (wp.0 == VK_RETURN.0 as usize || wp.0 == VK_SPACE.0 as usize) => {
+            WM_KEYDOWN
+                if lp.0 & (1 << 30) != 0
+                    && [VK_RETURN, VK_SPACE, VK_TAB].iter().any(|vk| wp.0 == vk.0 as usize) =>
+            {
                 Action::Handled
+            }
+            WM_KEYDOWN | WM_KEYUP if wp.0 == VK_SHIFT.0 as usize => {
+                self.shift = msg == WM_KEYDOWN;
+                let element = self.edit_element(self.cursor);
+                self.edit_event(|e| {
+                    e.set_element(element);
+                    e.refresh_pick()
+                })
             }
             WM_KEYDOWN => {
                 let held = |vk: u16| unsafe { GetKeyState(vk as i32) } < 0;
                 let (ctrl, shift) = (held(VK_CONTROL.0), held(VK_SHIFT.0));
                 self.edit_event(|e| e.key(wp.0 as u32, ctrl, shift))
             }
+            WM_KEYUP => self.edit_event(|e| e.key_up(wp.0 as u32)),
             WM_CHAR => self.edit_event(|e| e.char(wp.0 as u16)),
             WM_MOUSEWHEEL => {
                 let delta = ((wp.0 >> 16) & 0xFFFF) as i16 as i32;
                 self.edit_event(|e| e.wheel(delta))
             }
-            WM_TIMER if wp.0 == NOTICE_TIMER => {
-                let _ = unsafe { KillTimer(Some(self.hwnd), NOTICE_TIMER) };
+            WM_TIMER if wp.0 == EDITOR_TIMER => {
+                let _ = unsafe { KillTimer(Some(self.hwnd), EDITOR_TIMER) };
                 self.edit_event(|e| e.tick())
             }
             WM_SETCURSOR if (lp.0 & 0xFFFF) as u32 == HTCLIENT => {
@@ -842,6 +893,10 @@ impl State {
                 let _ = unsafe { GetCursorPos(&mut p) };
                 let at = (p.x - self.origin.0, p.y - self.origin.1);
                 self.edit.as_ref().map_or(Action::Default, |e| Action::Cursor(e.cursor(at)))
+            }
+            WM_RBUTTONDOWN => {
+                let p = point(lp);
+                self.edit_event(|e| e.right_click(p))
             }
             WM_RBUTTONUP => Action::Handled,
             WM_ACTIVATE if (wp.0 & 0xFFFF) as u32 == WA_INACTIVE => Action::Finish(None),
@@ -871,13 +926,18 @@ impl State {
             };
         }
         if msg == WM_ELEMENTS {
-            if self.edit.is_none() {
-                self.refresh_chain();
-                if self.dragging {
-                    self.snap = Some(snap::edges(&self.snap_rects()));
-                }
-                self.update_selection(self.cursor);
+            self.refresh_chain();
+            if self.edit.is_some() {
+                let element = self.element_at(self.cursor);
+                return self.edit_event(|e| {
+                    e.set_element(element);
+                    e.refresh_pick()
+                });
             }
+            if self.dragging {
+                self.snap = Some(snap::edges(&self.snap_rects()));
+            }
+            self.update_selection(self.cursor);
             return Action::Handled;
         }
         if self.edit.is_some() {
@@ -999,6 +1059,12 @@ fn finish(result: Option<Picked>) {
         if PostMessageW(Some(owner), msg, WPARAM(0), LPARAM(boxed as isize)).is_err() {
             drop(Box::from_raw(boxed));
         }
+    }
+}
+
+fn schedule_tick(hwnd: HWND, ed: &Editor) {
+    if let Some(left) = ed.next_tick() {
+        unsafe { SetTimer(Some(hwnd), EDITOR_TIMER, left.as_millis() as u32 + 1, None) };
     }
 }
 

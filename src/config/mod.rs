@@ -6,8 +6,10 @@ use crate::platform::format::date_time;
 use crate::platform::paths::{app_dir, videos_dir};
 use crate::record::Codec;
 
+pub(crate) mod audio;
 pub(crate) mod hotkeys;
 
+use audio::AudioSource;
 use hotkeys::parse_hotkey;
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -29,9 +31,9 @@ pub(crate) struct Config {
     pub quality: u32,
     pub effort: u32,
     pub draw_cursor: bool,
-    pub audio_desktop: bool,
-    pub audio_mic: bool,
+    pub audio_sources: Vec<AudioSource>,
     pub countdown: u32,
+    pub indicator_inside: IndicatorInside,
     pub open_trimmer: bool,
     pub screenshot_style: ShotStyle,
     pub screenshot_format: ShotFormat,
@@ -44,9 +46,13 @@ pub(crate) struct Config {
     pub litterbox_expiry: Expiry,
     pub upload_copy_link: bool,
     pub recording_upload: bool,
+    pub upload_proxy: String,
+    /// `#RRGGBB`, see [`parse_hex`].
+    pub accent: String,
 }
 
 pub(crate) const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
+pub(crate) const DEFAULT_ACCENT: &str = "#E5402F";
 /// Characters Windows doesn't allow in file names.
 pub(crate) const BAD_NAME_CHARS: &[char] = &['\\', '/', ':', '*', '?', '"', '<', '>', '|'];
 
@@ -88,6 +94,16 @@ impl UiElements {
             UiElements::Off => false,
         }
     }
+}
+
+/// The recording frame and pill where they would overlap the recorded area.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum IndicatorInside {
+    /// Left out while recording.
+    Hide,
+    /// Shown but excluded from capture, which pauses NVIDIA Instant Replay and similar apps.
+    Show,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,9 +156,9 @@ impl Default for Config {
             quality: 22,
             effort: 50,
             draw_cursor: true,
-            audio_desktop: false,
-            audio_mic: false,
+            audio_sources: audio::default_sources(),
             countdown: 0,
+            indicator_inside: IndicatorInside::Hide,
             open_trimmer: false,
             screenshot_style: ShotStyle::Select,
             screenshot_format: ShotFormat::Png,
@@ -154,6 +170,8 @@ impl Default for Config {
             litterbox_expiry: Expiry::Day,
             upload_copy_link: true,
             recording_upload: false,
+            upload_proxy: "system".into(),
+            accent: DEFAULT_ACCENT.into(),
         }
     }
 }
@@ -163,6 +181,16 @@ impl Config {
         app_dir().join("config.toml")
     }
 
+    fn parse(text: &str) -> Result<Config, toml::de::Error> {
+        let table: toml::Table = toml::from_str(text)?;
+        if !audio::is_legacy(&table) {
+            return toml::from_str(text);
+        }
+        let mut table = table;
+        audio::migrate(&mut table);
+        toml::Value::Table(table).try_into()
+    }
+
     /// Loads the settings file, creating it with defaults on first run.
     pub(crate) fn load() -> Result<Config, String> {
         let path = Self::path();
@@ -170,7 +198,7 @@ impl Config {
             Config::default().save()?;
         }
         let text = std::fs::read_to_string(&path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let cfg = Config::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let hotkeys = [
             ("hotkey", &cfg.hotkey),
             ("screenshot_hotkey", &cfg.screenshot_hotkey),
@@ -196,6 +224,14 @@ impl Config {
         }
         if let Some(problem) = file_name_problem(&cfg.file_name) {
             return Err(format!("file_name {}: {problem}", toml::Value::String(cfg.file_name.clone())));
+        }
+        if parse_hex(&cfg.accent).is_none() {
+            return Err(format!("accent must be a colour like \"#E5402F\", got {}", toml::Value::String(cfg.accent.clone())));
+        }
+        for (i, s) in cfg.audio_sources.iter().enumerate() {
+            if let Some(problem) = s.problem() {
+                return Err(format!("audio source {}: {problem}", i + 1));
+            }
         }
         Ok(cfg)
     }
@@ -227,6 +263,10 @@ impl Config {
             UiElements::Shift => "shift",
             UiElements::Always => "always",
             UiElements::Off => "off",
+        };
+        let indicator_inside = match self.indicator_inside {
+            IndicatorInside::Hide => "hide",
+            IndicatorInside::Show => "show",
         };
         format!(
             r#"# glint settings. "Settings…" in the tray menu edits this file; hand edits apply the
@@ -287,13 +327,21 @@ effort = {effort}
 
 draw_cursor = {draw_cursor}
 
-# Record the sound playing on the default output device, and/or the default microphone.
-# Both on = mixed into one track.
-audio_desktop = {audio_desktop}
-audio_mic = {audio_mic}
+# Sound to record. Each source has a kind: "desktop" (what the default output device plays;
+# exclude = "name.exe" leaves one app out of it), "app" (app = "name.exe": only that app and
+# the processes it starts), or "mic" (device = an endpoint id, or none for the default
+# microphone). volume is 0-200 (%); tracks lists which of the video's audio tracks (1-6) it
+# goes to, and a track that gets several sources holds their mix.
+{audio_sources}
 
 # Seconds to count down after selecting a region before recording starts (0 = none).
 countdown = {countdown}
+
+# The recording frame and pill where they'd overlap the recorded area (e.g. a whole monitor
+# on a single-monitor setup): "hide" leaves them out (the tray icon and hotkeys still control
+# the recording), "show" keeps them out of the video, but NVIDIA Instant Replay and some
+# capture apps pause while they're visible.
+indicator_inside = "{indicator_inside}"
 
 # Open the trimmer (trim, export a gif) after every recording is saved.
 open_trimmer = {open_trimmer}
@@ -321,6 +369,12 @@ litterbox_expiry = "{expiry}"
 upload_copy_link = {upload_copy_link}
 # Upload every recording after it's saved.
 recording_upload = {recording_upload}
+# Proxy for uploads: "system" (Windows' proxy settings, the ones browsers use), "none", or
+# "http://host:port". SOCKS proxies can't be used: Windows' HTTP stack only speaks HTTP proxies.
+upload_proxy = {upload_proxy}
+
+# Accent colour of the tray icon and the settings / trimmer windows: a #RRGGBB hex colour.
+accent = {accent}
 "#,
             hotkey = q(&self.hotkey),
             screenshot_hotkey = q(&self.screenshot_hotkey),
@@ -335,8 +389,7 @@ recording_upload = {recording_upload}
             quality = self.quality,
             effort = self.effort,
             draw_cursor = self.draw_cursor,
-            audio_desktop = self.audio_desktop,
-            audio_mic = self.audio_mic,
+            audio_sources = audio::render_sources(&self.audio_sources),
             countdown = self.countdown,
             open_trimmer = self.open_trimmer,
             screenshot_quality = self.screenshot_quality,
@@ -347,6 +400,8 @@ recording_upload = {recording_upload}
             expiry = self.litterbox_expiry.name(),
             upload_copy_link = self.upload_copy_link,
             recording_upload = self.recording_upload,
+            upload_proxy = q(&self.upload_proxy),
+            accent = q(&self.accent),
         )
     }
 
@@ -381,11 +436,36 @@ recording_upload = {recording_upload}
         }
         path
     }
+
+    /// The accent as RGB; the default red if the setting isn't a valid colour.
+    pub(crate) fn accent_rgb(&self) -> [u8; 3] {
+        parse_hex(&self.accent).or_else(|| parse_hex(DEFAULT_ACCENT)).unwrap_or_default()
+    }
 }
 
 /// Why `pattern` can't name files, if it can't.
 pub(crate) fn file_name_problem(pattern: &str) -> Option<&'static str> {
     pattern.contains(BAD_NAME_CHARS).then_some("file names can't contain \\ / : * ? \" < > |")
+}
+
+/// `#RRGGBB` or `#RGB`, the `#` optional, surrounding spaces ignored.
+pub(crate) fn parse_hex(text: &str) -> Option<[u8; 3]> {
+    let hex = text.trim();
+    let hex = hex.strip_prefix('#').unwrap_or(hex);
+    if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let v = u32::from_str_radix(hex, 16).ok()?;
+    match hex.len() {
+        6 => Some([(v >> 16) as u8, (v >> 8) as u8, v as u8]),
+        3 => Some([(v >> 8) as u8 * 17, (v >> 4 & 15) as u8 * 17, (v & 15) as u8 * 17]),
+        _ => None,
+    }
+}
+
+/// The canonical `#RRGGBB` spelling.
+pub(crate) fn hex(rgb: [u8; 3]) -> String {
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
 }
 
 #[cfg(test)]
@@ -410,9 +490,13 @@ mod tests {
             quality: 18,
             effort: 75,
             draw_cursor: false,
-            audio_desktop: true,
-            audio_mic: true,
+            audio_sources: vec![
+                AudioSource { exclude: "game.exe".into(), ..AudioSource::new(audio::SourceKind::Desktop, 0) },
+                AudioSource { app: "discord.exe".into(), volume: 80, ..AudioSource::new(audio::SourceKind::App, 1) },
+                AudioSource { enabled: false, tracks: vec![4], ..AudioSource::new(audio::SourceKind::Mic, 2) },
+            ],
             countdown: 5,
+            indicator_inside: IndicatorInside::Show,
             open_trimmer: true,
             screenshot_style: ShotStyle::Sharex,
             screenshot_format: ShotFormat::Jpg,
@@ -424,6 +508,8 @@ mod tests {
             litterbox_expiry: Expiry::Hour,
             upload_copy_link: false,
             recording_upload: true,
+            upload_proxy: "http://127.0.0.1:10809".into(),
+            accent: "#2F7BE5".into(),
         };
         let back: Config = toml::from_str(&cfg.render()).unwrap();
         assert_eq!(back, cfg);
@@ -442,6 +528,18 @@ mod tests {
     }
 
     #[test]
+    fn old_audio_keys_still_load() {
+        let old = Config::parse("fps = 60\naudio_desktop = true\naudio_mic = true\ncountdown = 3").unwrap();
+        assert_eq!((old.fps, old.countdown), (60, 3));
+        let kinds: Vec<_> = old.audio_sources.iter().map(|s| (s.kind, s.enabled)).collect();
+        assert_eq!(kinds, [(audio::SourceKind::Desktop, true), (audio::SourceKind::Mic, true)]);
+        let off = Config::parse("audio_desktop = false").unwrap();
+        assert_eq!(off.audio_sources, Config::default().audio_sources);
+        assert!(Config::parse("audio_desktop = true\nnope = 1").is_err());
+        assert_eq!(Config::parse(&Config::default().render()).unwrap(), Config::default());
+    }
+
+    #[test]
     fn ui_elements_follow_the_mode_and_shift() {
         let used = |mode: UiElements| [mode.used(false), mode.used(true)];
         assert_eq!(used(UiElements::Shift), [false, true]);
@@ -452,5 +550,32 @@ mod tests {
         assert_eq!(parsed("off").unwrap(), UiElements::Off);
         assert!(parsed("ctrl").is_err());
         assert_eq!(Config::default().ui_elements, UiElements::Shift);
+    }
+
+    #[test]
+    fn indicator_inside_round_trips() {
+        for inside in [IndicatorInside::Hide, IndicatorInside::Show] {
+            let cfg = Config { indicator_inside: inside, ..Config::default() };
+            assert_eq!(toml::from_str::<Config>(&cfg.render()).unwrap().indicator_inside, inside);
+        }
+        let parsed = |v: &str| toml::from_str::<Config>(&format!("indicator_inside = \"{v}\"")).map(|c| c.indicator_inside);
+        assert_eq!(parsed("show").unwrap(), IndicatorInside::Show);
+        assert!(parsed("excluded").is_err());
+        assert_eq!(Config::default().indicator_inside, IndicatorInside::Hide);
+    }
+
+    #[test]
+    fn accent_colours_parse_and_are_validated() {
+        assert_eq!(parse_hex("#E5402F"), Some([0xE5, 0x40, 0x2F]));
+        assert_eq!(parse_hex(" e5402f "), Some([0xE5, 0x40, 0x2F]));
+        assert_eq!(parse_hex("#f0a"), Some([0xFF, 0x00, 0xAA]));
+        for bad in ["", "#", "#E5402", "#E5402F0", "#GG0000", "E5 40 2F", "#+5402F", "#ё00"] {
+            assert_eq!(parse_hex(bad), None, "{bad:?}");
+        }
+        assert_eq!(hex([0xE5, 0x40, 0x2F]), DEFAULT_ACCENT);
+        assert_eq!(hex(parse_hex("#abc").unwrap()), "#AABBCC");
+        assert_eq!(Config { accent: "nope".into(), ..Config::default() }.accent_rgb(), [0xE5, 0x40, 0x2F]);
+        let parsed = |v: &str| toml::from_str::<Config>(&format!("accent = \"{v}\"")).map(|c| c.accent_rgb());
+        assert_eq!(parsed("#1F9E8F").unwrap(), [0x1F, 0x9E, 0x8F]);
     }
 }
