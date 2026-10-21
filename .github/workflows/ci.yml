@@ -22,4 +22,4 @@ jobs:
       - name: clippy
         run: cargo clippy --release --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --release --lib --locked -- --test-threads=1
+        run: cargo test --release --lib --locked
