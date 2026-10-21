@@ -56,13 +56,13 @@ pub(super) struct Opened {
     pub issues: Vec<String>,
 }
 
-pub(super) unsafe fn open_all(cfg: &[AudioSource]) -> Opened {
-    let (mut sources, mut routes, mut issues) = (Vec::new(), Vec::new(), Vec::new());
+pub(super) unsafe fn open_all(cfg: &[AudioSource], track_names: &[String]) -> Opened {
+    let (mut sources, mut opened, mut issues) = (Vec::new(), Vec::new(), Vec::new());
     for c in cfg.iter().filter(|c| c.enabled && c.records()) {
         match unsafe { open(c) } {
             Ok(s) => {
                 sources.push(s);
-                routes.push(c.tracks.as_slice());
+                opened.push(c);
             }
             Err(e) => {
                 log(&format!("audio: {e}"));
@@ -71,7 +71,7 @@ pub(super) unsafe fn open_all(cfg: &[AudioSource]) -> Opened {
         }
     }
     let names: Vec<String> = sources.iter().map(|s| s.name.clone()).collect();
-    Opened { tracks: plan(&names, &routes), sources, issues }
+    Opened { tracks: plan(&names, &opened, track_names), sources, issues }
 }
 
 unsafe fn open(cfg: &AudioSource) -> Result<Source, String> {

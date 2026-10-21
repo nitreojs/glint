@@ -7,6 +7,7 @@ use crate::platform::paths::{app_dir, videos_dir};
 use crate::record::Codec;
 
 pub(crate) mod audio;
+pub(crate) mod color;
 pub(crate) mod hotkeys;
 
 use audio::AudioSource;
@@ -32,6 +33,7 @@ pub(crate) struct Config {
     pub effort: u32,
     pub draw_cursor: bool,
     pub audio_sources: Vec<AudioSource>,
+    pub audio_track_names: Vec<String>,
     pub countdown: u32,
     pub indicator_inside: IndicatorInside,
     pub open_trimmer: bool,
@@ -49,6 +51,7 @@ pub(crate) struct Config {
     pub upload_proxy: String,
     /// `#RRGGBB`, see [`parse_hex`].
     pub accent: String,
+    pub accent_custom: Option<String>,
 }
 
 pub(crate) const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
@@ -157,6 +160,7 @@ impl Default for Config {
             effort: 50,
             draw_cursor: true,
             audio_sources: audio::default_sources(),
+            audio_track_names: vec![String::new(); audio::MAX_TRACKS as usize],
             countdown: 0,
             indicator_inside: IndicatorInside::Hide,
             open_trimmer: false,
@@ -172,6 +176,7 @@ impl Default for Config {
             recording_upload: false,
             upload_proxy: "system".into(),
             accent: DEFAULT_ACCENT.into(),
+            accent_custom: None,
         }
     }
 }
@@ -233,6 +238,9 @@ impl Config {
                 return Err(format!("audio source {}: {problem}", i + 1));
             }
         }
+        if cfg.audio_track_names.len() > audio::MAX_TRACKS as usize {
+            return Err(format!("audio_track_names has {} names, at most {} fit", cfg.audio_track_names.len(), audio::MAX_TRACKS));
+        }
         Ok(cfg)
     }
 
@@ -247,6 +255,10 @@ impl Config {
 
     fn render(&self) -> String {
         let q = |s: &str| toml::Value::String(s.to_string()).to_string();
+        let accent_custom = match &self.accent_custom {
+            Some(c) => format!("accent_custom = {}", q(c)),
+            None => "# accent_custom = \"#RRGGBB\"".into(),
+        };
         let codec = match self.codec {
             CodecName::H264 => "h264",
             CodecName::Hevc => "hevc",
@@ -331,8 +343,11 @@ draw_cursor = {draw_cursor}
 # exclude = "name.exe" leaves one app out of it), "app" (app = "name.exe": only that app and
 # the processes it starts), or "mic" (device = an endpoint id, or none for the default
 # microphone). volume is 0-200 (%); tracks lists which of the video's audio tracks (1-6) it
-# goes to, and a track that gets several sources holds their mix.
+# goes to, and a track that gets several sources holds their mix. An app on a track that also
+# has a desktop source (not excluding it) isn't added again: desktop already holds it.
 {audio_sources}
+# Names players show for tracks 1-6; "" names a track after its sources ("mix", "desktop", ...).
+{audio_track_names}
 
 # Seconds to count down after selecting a region before recording starts (0 = none).
 countdown = {countdown}
@@ -375,6 +390,8 @@ upload_proxy = {upload_proxy}
 
 # Accent colour of the tray icon and the settings / trimmer windows: a #RRGGBB hex colour.
 accent = {accent}
+# The colour last picked with the custom swatch, remembered while a preset is in use.
+{accent_custom}
 "#,
             hotkey = q(&self.hotkey),
             screenshot_hotkey = q(&self.screenshot_hotkey),
@@ -390,6 +407,7 @@ accent = {accent}
             effort = self.effort,
             draw_cursor = self.draw_cursor,
             audio_sources = audio::render_sources(&self.audio_sources),
+            audio_track_names = audio::render_track_names(&self.audio_track_names),
             countdown = self.countdown,
             open_trimmer = self.open_trimmer,
             screenshot_quality = self.screenshot_quality,
@@ -440,6 +458,10 @@ accent = {accent}
     /// The accent as RGB; the default red if the setting isn't a valid colour.
     pub(crate) fn accent_rgb(&self) -> [u8; 3] {
         parse_hex(&self.accent).or_else(|| parse_hex(DEFAULT_ACCENT)).unwrap_or_default()
+    }
+
+    pub(crate) fn accent_custom_rgb(&self) -> Option<[u8; 3]> {
+        self.accent_custom.as_deref().and_then(parse_hex)
     }
 }
 
@@ -495,6 +517,7 @@ mod tests {
                 AudioSource { app: "discord.exe".into(), volume: 80, ..AudioSource::new(audio::SourceKind::App, 1) },
                 AudioSource { enabled: false, tracks: vec![4], ..AudioSource::new(audio::SourceKind::Mic, 2) },
             ],
+            audio_track_names: ["all", "", "", "voice", "", ""].map(String::from).to_vec(),
             countdown: 5,
             indicator_inside: IndicatorInside::Show,
             open_trimmer: true,
@@ -510,6 +533,7 @@ mod tests {
             recording_upload: true,
             upload_proxy: "http://127.0.0.1:10809".into(),
             accent: "#2F7BE5".into(),
+            accent_custom: Some("#7FE0C0".into()),
         };
         let back: Config = toml::from_str(&cfg.render()).unwrap();
         assert_eq!(back, cfg);

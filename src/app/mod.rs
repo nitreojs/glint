@@ -244,6 +244,7 @@ impl App {
             effort: self.cfg.effort,
             draw_cursor: self.cfg.draw_cursor,
             audio: self.cfg.audio_sources.clone(),
+            track_names: self.cfg.audio_track_names.clone(),
             path,
         };
         let monitors: Vec<Rect> = sel.outputs.iter().map(|o| o.rect).collect();

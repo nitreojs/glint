@@ -2,6 +2,8 @@ use std::sync::LazyLock;
 
 use eframe::egui::{Color32, FontFamily, FontId};
 
+use crate::config::color::{contrast, text_on};
+
 pub(crate) const WINDOW: [f32; 2] = [680.0, 600.0];
 pub(crate) const BAR_H: f32 = 40.0;
 pub(crate) const SIDEBAR_W: f32 = 168.0;
@@ -40,6 +42,8 @@ pub(crate) struct Palette {
     pub accp: Color32,
     /// Accent for text (the selected section number).
     pub acct: Color32,
+    pub on_acc: Color32,
+    pub mark_ring: Color32,
     pub warn: Color32,
     pub focus: Color32,
 }
@@ -60,11 +64,25 @@ fn tone(rgb: [u8; 3], permille: i32) -> Color32 {
     Color32::from_rgb(ch(rgb[0]), ch(rgb[1]), ch(rgb[2]))
 }
 
+fn rgb3(c: Color32) -> [u8; 3] {
+    [c.r(), c.g(), c.b()]
+}
+
+fn readable(accent: [u8; 3], permille: i32, on: Color32) -> Color32 {
+    let mut p = permille;
+    let mut c = tone(accent, p);
+    while contrast(rgb3(c), rgb3(on)) < 3.0 && p.abs() < 1000 {
+        p = (p + 50 * p.signum()).clamp(-1000, 1000);
+        c = tone(accent, p);
+    }
+    c
+}
+
 /// The theme's colours with accent shades made from `accent`; the offsets keep the default red
 /// within a few levels of its hand-tuned shades.
 pub(crate) fn palette(light: bool, accent: [u8; 3]) -> Palette {
     let mark = Color32::from_rgb(accent[0], accent[1], accent[2]);
-    if light {
+    let mut p = if light {
         Palette {
             side: rgb(0xF1F0ED),
             surf: rgb(0xFAF9F7),
@@ -86,7 +104,9 @@ pub(crate) fn palette(light: bool, accent: [u8; 3]) -> Palette {
             acc: tone(accent, -145),
             acch: tone(accent, -220),
             accp: tone(accent, -310),
-            acct: tone(accent, -145),
+            acct: readable(accent, -145, rgb(0xE5E3DF)),
+            on_acc: Color32::WHITE,
+            mark_ring: Color32::TRANSPARENT,
             warn: rgb(0x9A5F06),
             focus: rgb(0x1C1B19),
         }
@@ -112,11 +132,19 @@ pub(crate) fn palette(light: bool, accent: [u8; 3]) -> Palette {
             acc: tone(accent, -90),
             acch: tone(accent, -40),
             accp: tone(accent, -210),
-            acct: tone(accent, 200),
+            acct: readable(accent, 200, rgb(0x2C2C2B)),
+            on_acc: Color32::WHITE,
+            mark_ring: Color32::TRANSPARENT,
             warn: rgb(0xE3A33C),
             focus: rgb(0xEDEBE7),
         }
+    };
+    let [r, g, b] = text_on(rgb3(p.acc));
+    p.on_acc = Color32::from_rgb(r, g, b);
+    if contrast(accent, rgb3(p.side)) < 1.6 {
+        p.mark_ring = p.line3;
     }
+    p
 }
 
 /// What every control needs to draw itself this frame.
@@ -166,5 +194,22 @@ mod tests {
         assert_eq!(blue.mark, rgb(0x2F7BE5));
         assert!(blue.acc.b() > blue.acc.r() && blue.acct.b() > blue.acc.b());
         assert_eq!(blue.surf, dark.surf);
+    }
+
+    #[test]
+    fn extreme_accents_keep_text_and_the_mark_readable() {
+        for light in [false, true] {
+            let red = palette(light, [0xE5, 0x40, 0x2F]);
+            assert_eq!((red.on_acc, red.acct, red.mark_ring), (Color32::WHITE, tone([0xE5, 0x40, 0x2F], if light { -145 } else { 200 }), Color32::TRANSPARENT));
+            for accent in [[0xFF, 0xFF, 0xFF], [0xFF, 0xF2, 0x40], [0, 0, 0], [0x10, 0x10, 0x30]] {
+                let p = palette(light, accent);
+                assert!(contrast(rgb3(p.acct), rgb3(p.sel)) >= 3.0, "{accent:?} light {light}");
+                assert!(contrast(rgb3(p.on_acc), rgb3(p.acc)) >= 3.0, "{accent:?} light {light}");
+            }
+        }
+        assert_eq!(palette(false, [0x10, 0x10, 0x10]).mark_ring, palette(false, [0; 3]).line3);
+        assert_eq!(palette(true, [0xF8, 0xF8, 0xF8]).mark_ring, palette(true, [0; 3]).line3);
+        assert_eq!(palette(true, [0x10, 0x10, 0x10]).mark_ring, Color32::TRANSPARENT);
+        assert_eq!(palette(true, [0xFF, 0xF2, 0x40]).on_acc, Color32::from_rgb(0x1C, 0x1B, 0x19));
     }
 }

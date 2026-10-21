@@ -1,8 +1,9 @@
 use std::ops::RangeInclusive;
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, EventFilter, FontId, Galley, Key, Layout, Margin, Painter, Rect,
-    Response, RichText, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2,
+    self, Align, Align2, Color32, CursorIcon, EventFilter, FontId, Galley, Id, Key, Layout, Margin, Painter, Rect,
+    Response, RichText, Role, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, UiStackInfo, WidgetInfo, accesskit,
+    pos2, vec2,
 };
 
 use super::motion::{anim, ease, glide, mix};
@@ -12,6 +13,34 @@ use super::tokens::{LABEL_GAP, LABEL_W, Look, Palette, medium, mono, mono_medium
 pub(super) fn focus_ring(ui: &Ui, look: &Look, resp: &Response, rect: Rect, radius: f32) {
     if look.keyboard && resp.has_focus() {
         ui.painter().rect_stroke(rect.expand(2.0), radius + 2.0, Stroke::new(2.0, look.p.focus), StrokeKind::Middle);
+    }
+}
+
+pub(super) fn bounds(r: Rect) -> accesskit::Rect {
+    accesskit::Rect { x0: r.min.x.into(), y0: r.min.y.into(), x1: r.max.x.into(), y1: r.max.y.into() }
+}
+
+const ROW_TAG: &str = "glint-row";
+
+pub(super) fn in_row(ui: &Ui, id: Id) {
+    let Some(row) = ui.stack().iter().find_map(|s| s.tags().get_downcast::<Id>(ROW_TAG).copied()) else { return };
+    if ui.ctx().accesskit_node_builder(id, |_| ()).is_some() {
+        ui.data_mut(|d| d.get_temp_mut_or_default::<Vec<Id>>(row).push(id));
+    }
+}
+
+fn name_inputs(ui: &Ui, row: Id, label: &str) {
+    let inputs = ui.data_mut(|d| d.remove_temp::<Vec<Id>>(row)).unwrap_or_default();
+    let only = inputs.len() == 1;
+    for id in inputs {
+        ui.ctx().accesskit_node_builder(id, |n| match n.label().filter(|l| !l.trim().is_empty()).map(str::to_owned) {
+            Some(own) if only => {
+                n.set_description(own);
+                n.set_label(label);
+            }
+            Some(_) => {}
+            None => n.set_label(label),
+        });
     }
 }
 
@@ -29,17 +58,29 @@ pub(crate) fn row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: imp
     let full = ui.available_rect_before_wrap();
     let top = full.top();
     ui.painter().hline(full.x_range(), top + 0.5, Stroke::new(1.0, look.p.line));
-    let column = Rect::from_min_max(pos2(full.left() + LABEL_W + LABEL_GAP, top + 15.0), full.right_bottom());
-    let mut child = ui.new_child(UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)));
-    child.spacing_mut().item_spacing = vec2(8.0, 6.0);
-    add(&mut child);
     let text = ui.painter().layout(label.to_owned(), medium(13.0), look.p.t1, LABEL_W);
     let label_rect = Rect::from_min_size(pos2(full.left(), top + 15.0 + label_dy), text.size());
+    let column = Rect::from_min_max(pos2(full.left() + LABEL_W + LABEL_GAP, top + 15.0), full.right_bottom());
+    let id = ui.next_auto_id();
+    let mut child = ui.new_child(
+        UiBuilder::new()
+            .max_rect(column)
+            .layout(Layout::top_down(Align::Min))
+            .ui_stack_info(UiStackInfo::default().with_tag_value(ROW_TAG, id))
+            .accessibility_role(Role::Group)
+            .accessibility_label(label),
+    );
+    child.interact(label_rect, id.with("label"), Sense::hover()).widget_info(|| WidgetInfo::labeled(Role::Label, true, label));
+    child.spacing_mut().item_spacing = vec2(8.0, 6.0);
+    add(&mut child);
+    name_inputs(ui, id, label);
     let bottom = child.min_rect().bottom().max(label_rect.bottom()).max(top + 15.0) + 14.0;
+    let rect = Rect::from_min_max(full.left_top(), pos2(full.right(), bottom));
+    ui.ctx().accesskit_node_builder(child.unique_id(), |n| n.set_bounds(bounds(rect)));
     #[cfg(test)]
     ROWS.with_borrow_mut(|rows| rows.push((label.to_owned(), label_rect, child.min_rect())));
     ui.painter().galley(label_rect.min, text, look.p.t1);
-    ui.advance_cursor_after_rect(Rect::from_min_max(full.left_top(), pos2(full.right(), bottom)));
+    ui.advance_cursor_after_rect(rect);
 }
 
 /// 12 px hint text under a control, wrapping.
@@ -83,7 +124,7 @@ pub(crate) fn button(ui: &mut Ui, look: &Look, text: &str, kind: Kind, height: f
         }
         Kind::Primary => {
             let fill = mix(mix(p.acc, p.acch, h), p.accp, d);
-            (mix(Color32::TRANSPARENT, fill, on), p.line2.gamma_multiply(1.0 - on), mix(p.t4, Color32::WHITE, on))
+            (mix(Color32::TRANSPARENT, fill, on), p.line2.gamma_multiply(1.0 - on), mix(p.t4, p.on_acc, on))
         }
         Kind::Text => {
             let fill = mix(mix(Color32::TRANSPARENT, p.hov, h), p.prs, d);
@@ -94,6 +135,7 @@ pub(crate) fn button(ui: &mut Ui, look: &Look, text: &str, kind: Kind, height: f
     painter.rect(rect, 5, fill, Stroke::new(1.0, ring), StrokeKind::Inside);
     painter.galley(rect.center() - g.size() / 2.0, g, color);
     focus_ring(ui, look, &resp, rect, 5.0);
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, enabled, text));
     if enabled { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp }
 }
 
@@ -107,6 +149,7 @@ pub(crate) fn link(ui: &mut Ui, look: &Look, text: &str) -> Response {
     painter.hline(rect.x_range(), (top + g.size().y).round() + 1.5, Stroke::new(1.0, mix(look.p.line3, look.p.t1, h)));
     painter.galley(pos2(rect.left(), top), g, look.p.t1);
     focus_ring(ui, look, &resp, rect.expand2(vec2(2.0, 0.0)), 3.0);
+    resp.widget_info(|| WidgetInfo::labeled(Role::Link, true, text));
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -130,6 +173,7 @@ fn keycaps(painter: &Painter, ui: &Ui, p: &Palette, mut x: f32, y: f32, keys: &[
     x
 }
 
+#[derive(Clone, Copy)]
 pub(crate) enum HotkeyState<'a> {
     Idle,
     /// Recording a new combo; `held` are the modifiers down right now.
@@ -174,6 +218,16 @@ pub(crate) fn hotkey_field(ui: &mut Ui, look: &Look, keys: &[String], state: Hot
         }
     }
     focus_ring(ui, look, &resp, rect, 5.0);
+    resp.widget_info(|| {
+        let value = match state {
+            HotkeyState::Idle => keys.join("+"),
+            HotkeyState::Listening { held: [] } => "press a shortcut…".to_owned(),
+            HotkeyState::Listening { held } => format!("{} + …", held.join("+")),
+            HotkeyState::Error { keys } => keys.join("+"),
+        };
+        WidgetInfo { current_text_value: Some(value), ..WidgetInfo::new(Role::Button) }
+    });
+    in_row(ui, resp.id);
     resp
 }
 
@@ -188,6 +242,9 @@ pub(crate) fn segmented<T: Copy + PartialEq>(
     let p = &look.p;
     let w = width.unwrap_or_else(|| ui.available_width());
     let (rect, mut resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::hover());
+    let group = ui.new_child(UiBuilder::new().max_rect(rect).accessibility_role(Role::RadioGroup));
+    ui.ctx().accesskit_node_builder(group.unique_id(), |n| n.set_bounds(bounds(rect)));
+    in_row(ui, group.unique_id());
     ui.painter().rect(rect, 6, p.field, Stroke::new(1.0, p.line2), StrokeKind::Inside);
     let inner = rect.shrink(3.0);
     let n = options.len();
@@ -196,7 +253,7 @@ pub(crate) fn segmented<T: Copy + PartialEq>(
     let mut cells = Vec::with_capacity(n);
     for (i, (v, _)) in options.iter().enumerate() {
         let r = Rect::from_min_size(pos2(inner.left() + i as f32 * (seg_w + 2.0), inner.top()), vec2(seg_w, 26.0));
-        let cell = ui.interact(r, resp.id.with(i), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+        let cell = group.interact(r, resp.id.with(i), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
         if cell.clicked() && *value != *v {
             *value = *v;
             resp.mark_changed();
@@ -224,11 +281,12 @@ pub(crate) fn segmented<T: Copy + PartialEq>(
     let painter = ui.painter();
     let highlight = Rect::from_min_size(pos2(inner.left() + pos * (seg_w + 2.0), inner.top()), vec2(seg_w, 26.0));
     painter.rect(highlight, 4, p.ctlh, Stroke::new(1.0, p.line2), StrokeKind::Inside);
-    for (i, ((_, label), (r, cell))) in options.iter().zip(&cells).enumerate() {
+    for (i, ((v, label), (r, cell))) in options.iter().zip(&cells).enumerate() {
         let near = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
         let h = anim(ui, cell.id.with("hov"), cell.hovered(), 0.08);
         let font = if i == selected { medium(13.0) } else { sans(13.0) };
         painter.text(r.center(), Align2::CENTER_CENTER, *label, font, mix(p.t2, p.t1, near.max(h)));
+        cell.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, *v == *value, *label));
     }
     if look.keyboard && focused.is_some() {
         painter.rect_stroke(rect.expand(2.0), 8.0, Stroke::new(2.0, p.focus), StrokeKind::Middle);
@@ -257,10 +315,11 @@ pub(crate) fn checkbox(ui: &mut Ui, look: &Look, on: &mut bool, text: &str) -> R
             pos2(bx.left() + 7.0, bx.bottom() - 4.5),
             pos2(bx.right() - 3.5, bx.top() + 4.5),
         ];
-        painter.add(Shape::line(check, Stroke::new(2.0, Color32::WHITE.gamma_multiply(t))));
+        painter.add(Shape::line(check, Stroke::new(2.0, p.on_acc.gamma_multiply(t))));
     }
     painter.galley(pos2(bx.right() + 10.0, rect.center().y - g.size().y / 2.0), g, p.t1);
     focus_ring(ui, look, &resp, bx, 3.0);
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, *on, text));
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -276,6 +335,9 @@ pub(crate) fn swatch(ui: &mut Ui, look: &Look, color: Color32, selected: bool) -
     painter.circle_stroke(c, 11.0, Stroke::new(1.5, p.t1.gamma_multiply(s)));
     painter.circle_stroke(c, 9.0 + h - 2.0 * s, Stroke::new(1.0, p.line2));
     focus_ring(ui, look, &resp, rect, 12.0);
+    resp.widget_info(|| {
+        WidgetInfo::selected(Role::RadioButton, true, selected, format!("#{:02X}{:02X}{:02X}", color.r(), color.g(), color.b()))
+    });
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -299,9 +361,11 @@ pub(crate) fn toggle(ui: &mut Ui, look: &Look, on: &mut bool, text: &str) -> Res
     let w = 14.0 + 4.0 * d;
     let x = track.left() + 3.0 + (16.0 - 4.0 * d) * t;
     let knob = Rect::from_min_size(pos2(x, track.top() + 3.0), vec2(w, 14.0));
-    painter.rect_filled(knob, 7, mix(p.t2, Color32::WHITE, t));
+    painter.rect_filled(knob, 7, mix(p.t2, p.on_acc, t));
     painter.galley(pos2(track.right() + 10.0, rect.center().y - g.size().y / 2.0), g, p.t2);
     focus_ring(ui, look, &resp, track, 10.0);
+    resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, *on, text));
+    in_row(ui, resp.id);
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
 
@@ -373,6 +437,14 @@ pub(crate) fn slider(
         painter.text(scale.left_center(), Align2::LEFT_CENTER, lo, mono(11.0), p.t3);
         painter.text(scale.right_center(), Align2::RIGHT_CENTER, hi, mono(11.0), p.t3);
         focus_ring(ui, look, &resp, track, 3.0);
+        resp.widget_info(|| WidgetInfo::slider(true, *value as f64, ""));
+        ui.ctx().accesskit_node_builder(resp.id, |n| {
+            n.set_min_numeric_value(min as f64);
+            n.set_max_numeric_value(max as f64);
+            n.set_numeric_value_step(1.0);
+            n.set_value(format!("{value} {word}").trim_end());
+        });
+        in_row(ui, resp.id);
         resp.on_hover_cursor(CursorIcon::PointingHand)
     })
     .inner
@@ -398,6 +470,7 @@ pub(crate) fn text_field(ui: &mut Ui, look: &Look, text: &mut String, placeholde
     let border = if warn { p.warn } else { mix(mix(p.line2, p.line3, h), p.t2, f) };
     let shape = egui::epaint::RectShape::new(rect, 5, p.field, Stroke::new(1.0 + f, border), StrokeKind::Inside);
     ui.painter().set(background, shape);
+    in_row(ui, resp.id);
     resp
 }
 
@@ -435,6 +508,9 @@ pub(crate) fn dropdown_detail(
     let chevron = vec![c + vec2(-4.0, -2.0), c + vec2(0.0, 2.0), c + vec2(4.0, -2.0)];
     painter.add(Shape::line(chevron, Stroke::new(1.5, mix(p.t3, p.t1, h))));
     focus_ring(ui, look, &resp, rect, 5.0);
+    resp.widget_info(|| WidgetInfo { current_text_value: Some(text.to_owned()), ..WidgetInfo::new(Role::ComboBox) });
+    ui.ctx().accesskit_node_builder(resp.id, |n| n.set_expanded(open));
+    in_row(ui, resp.id);
     let frame = egui::Frame::NONE.fill(p.surf).stroke(Stroke::new(1.0, p.line2)).corner_radius(6).inner_margin(4);
     let align = if list_width > width { egui::RectAlign::BOTTOM_END } else { egui::RectAlign::BOTTOM_START };
     let popup = egui::Popup::from_toggle_button_response(&resp).width(list_width).align(align).gap(4.0).frame(frame);
@@ -455,6 +531,7 @@ pub(crate) fn dropdown_detail(
                     let d = galley(ui, detail, sans(12.0));
                     clip.galley(pos2(after, r.center().y - d.size().y / 2.0), d, p.t3);
                 }
+                item_resp.widget_info(|| WidgetInfo::labeled(Role::ListBoxOption, true, name));
                 if item_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
                     picked = Some(i);
                 }

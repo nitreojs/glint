@@ -1,8 +1,9 @@
 use crate::config::Config;
+use crate::config::audio::{MAX_TRACKS, track_name};
 
 mod about;
 pub(super) mod audio;
-mod general;
+pub(super) mod general;
 mod output;
 mod recording;
 mod screenshots;
@@ -55,7 +56,7 @@ impl Section {
                     + n(a.freeze_screen == b.freeze_screen)
                     + n(a.ui_elements == b.ui_elements)
                     + n(a.notify_success == b.notify_success)
-                    + n(a.accent_rgb() == b.accent_rgb())
+                    + n(a.accent_rgb() == b.accent_rgb() && a.accent_custom_rgb() == b.accent_custom_rgb())
             }
             Section::Recording => {
                 n(a.fps == b.fps)
@@ -69,7 +70,8 @@ impl Section {
             }
             Section::Audio => {
                 let (x, y) = (&a.audio_sources, &b.audio_sources);
-                x.iter().zip(y).filter(|(s, t)| s != t).count() + x.len().abs_diff(y.len())
+                let named = |n| track_name(&a.audio_track_names, n) != track_name(&b.audio_track_names, n);
+                x.iter().zip(y).filter(|(s, t)| s != t).count() + x.len().abs_diff(y.len()) + (1..=MAX_TRACKS).filter(|&n| named(n)).count()
             }
             Section::Screenshots => {
                 n(a.screenshot_format == b.screenshot_format)
@@ -105,6 +107,7 @@ impl Section {
                 cfg.ui_elements = d.ui_elements;
                 cfg.notify_success = d.notify_success;
                 cfg.accent = d.accent;
+                cfg.accent_custom = d.accent_custom;
             }
             Section::Recording => {
                 cfg.fps = d.fps;
@@ -116,7 +119,10 @@ impl Section {
                 cfg.draw_cursor = d.draw_cursor;
                 cfg.open_trimmer = d.open_trimmer;
             }
-            Section::Audio => cfg.audio_sources = d.audio_sources,
+            Section::Audio => {
+                cfg.audio_sources = d.audio_sources;
+                cfg.audio_track_names = d.audio_track_names;
+            }
             Section::Screenshots => {
                 cfg.screenshot_format = d.screenshot_format;
                 cfg.screenshot_style = d.screenshot_style;

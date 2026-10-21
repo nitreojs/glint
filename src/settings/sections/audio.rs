@@ -173,21 +173,32 @@ impl SettingsApp {
         let devices = self.audio_devices.get_or_insert_with(|| Devices::load(&ctx));
         let live: Vec<&AudioSource> = self.cfg.audio_sources.iter().filter(|s| s.enabled && s.records()).collect();
         let names: Vec<String> = live.iter().map(|s| devices.label(s)).collect();
-        let routes: Vec<&[u32]> = live.iter().map(|s| s.tracks.as_slice()).collect();
-        let tracks = plan(&names, &routes);
+        let tracks = plan(&names, &live, &self.cfg.audio_track_names);
+        let custom = &mut self.cfg.audio_track_names;
         row(ui, look, "tracks", 1.0, |ui| {
             if tracks.is_empty() {
                 hint(ui, "no audio: turn a source on and give it a track", p.t3);
                 return;
             }
-            for (n, t) in tracks.iter().enumerate() {
-                let mut line = format!("{} · {}", n + 1, t.name);
-                if t.name == "mix" {
-                    let parts: Vec<&str> = t.sources.iter().map(|&i| names[i].as_str()).collect();
-                    line += &format!(" ({})", parts.join(" + "));
-                }
-                hint(ui, line, p.t1);
+            custom.resize(MAX_TRACKS as usize, String::new());
+            for t in &tracks {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    hint(ui, t.number.to_string(), p.t2);
+                    let field = (ui.available_width() * 0.4).min(220.0);
+                    let name = &mut custom[t.number as usize - 1];
+                    ui.allocate_ui(vec2(field, 32.0), |ui| widgets::text_field(ui, look, name, &t.auto, false));
+                    let mut about = Vec::new();
+                    if t.sources.len() > 1 {
+                        about.push(t.sources.iter().map(|&i| names[i].as_str()).collect::<Vec<_>>().join(" + "));
+                    }
+                    about.extend(t.note(&names));
+                    if !about.is_empty() {
+                        hint(ui, about.join(" · "), p.t3);
+                    }
+                });
             }
+            hint(ui, "names are what players list; leave one empty to name it after its sources", p.t3);
             hint(ui, "empty tracks and tracks that repeat an earlier one are left out of the file", p.t3);
         });
     }

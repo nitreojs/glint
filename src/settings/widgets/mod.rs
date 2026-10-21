@@ -3,10 +3,12 @@
 //! toggles and save.
 
 mod chrome;
+mod color;
 mod controls;
 mod motion;
 mod tokens;
 
+pub(crate) use color::{custom_swatch, hue_strip, sv_square};
 pub(crate) use chrome::{TitleAction, nav_item, title_bar};
 pub(crate) use controls::{
     HotkeyState, Kind, button, checkbox, dropdown, dropdown_detail, hint, hotkey_field, link, row, segmented, slider,

@@ -8,6 +8,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForSystem, GetSystemMetricsForDpi};
 use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO, SM_CXSMICON};
 
+use crate::config::color::contrast;
 use crate::platform::wide::copy_wstr;
 
 /// The recording dot stays red whatever the accent.
@@ -141,6 +142,8 @@ pub(crate) fn icon_pixels(size: i32, highlight: bool, color: [u8; 3]) -> Vec<u32
     let hd = unit(3.0);
     let (hx, hy) = (s - unit(3.0) - hd / 2.0, unit(3.0) + hd / 2.0);
     let cover = |d: f32, r: f32| (r - d + 0.5).clamp(0.0, 1.0);
+    let rim = rim_for(color);
+    let rim_w = unit(1.0).max(1.0);
     let mut px = vec![0u32; (size * size) as usize];
     for y in 0..size {
         for x in 0..size {
@@ -150,12 +153,29 @@ pub(crate) fn icon_pixels(size: i32, highlight: bool, color: [u8; 3]) -> Vec<u32
                 continue;
             }
             let w = if highlight { cover(((fx - hx).powi(2) + (fy - hy).powi(2)).sqrt(), hd / 2.0) } else { 0.0 };
-            let ch = |v: u8| (v as f32 + (255.0 - v as f32) * w).round() as u32;
+            let inside = rim.map_or(1.0, |_| cover(((fx - c).powi(2) + (fy - c).powi(2)).sqrt(), r - rim_w));
+            let base = |i: usize| {
+                let edge = rim.map_or(color[i], |rim| rim[i]) as f32;
+                edge + (color[i] as f32 - edge) * inside
+            };
+            let ch = |i: usize| (base(i) + (255.0 - base(i)) * w).round() as u32;
             px[(y * size + x) as usize] =
-                ((a * 255.0).round() as u32) << 24 | ch(color[0]) << 16 | ch(color[1]) << 8 | ch(color[2]);
+                ((a * 255.0).round() as u32) << 24 | ch(0) << 16 | ch(1) << 8 | ch(2);
         }
     }
     px
+}
+
+fn rim_for(color: [u8; 3]) -> Option<[u8; 3]> {
+    // windows 11 taskbars are roughly #eeeeee (light) and #1c1c1c (dark)
+    let toward = |to: f32| color.map(|c| (c as f32 + (to - c as f32) * 0.55).round() as u8);
+    if contrast(color, [0xEE; 3]) < 1.6 {
+        Some(toward(0.0))
+    } else if contrast(color, [0x1C; 3]) < 1.6 {
+        Some(toward(255.0))
+    } else {
+        None
+    }
 }
 
 /// `icon_pixels` as RGBA bytes, for egui window icons.
@@ -212,5 +232,19 @@ mod tests {
         assert_eq!(at(&rec, hx, hy), 0xFFE5_402F);
         let rgba = icon_rgba(size, [0x2F, 0x7B, 0xE5]);
         assert_eq!(rgba[((8 * size + 8) * 4) as usize..][..4], [0x2F, 0x7B, 0xE5, 0xFF]);
+    }
+
+    #[test]
+    fn too_light_or_dark_marks_get_a_rim() {
+        let size = 16;
+        let at = |px: &[u32], x: i32, y: i32| px[(y * size + x) as usize] & 0xFF_FFFF;
+        let white = icon_pixels(size, true, [0xFF; 3]);
+        assert_eq!(at(&white, 8, 8), 0xFF_FFFF);
+        assert!(at(&white, 8, 1) & 0xFF < 0xC0);
+        let black = icon_pixels(size, true, [0; 3]);
+        assert_eq!(at(&black, 8, 8), 0);
+        assert!(at(&black, 8, 1) & 0xFF > 0x40);
+        let blue = icon_pixels(size, true, [0x2F, 0x7B, 0xE5]);
+        assert_eq!(at(&blue, 8, 1), 0x2F_7BE5);
     }
 }

@@ -6,8 +6,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, Id, Key, Layout, Modifiers, Rect, RichText, Sense, Stroke, TextureHandle,
-    TextureOptions, Ui, UiBuilder, pos2, vec2,
+    self, Align, Align2, Color32, Id, Key, Layout, Modifiers, Rect, RichText, Role, Sense, Stroke, TextureHandle,
+    TextureOptions, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
@@ -846,6 +846,8 @@ impl eframe::App for ClipApp {
 impl ClipApp {
     fn preview(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
         let resp = ui.interact(rect, Id::unique("clip-preview"), Sense::click());
+        let playable = self.info.is_ok() && self.player_error.is_none();
+        resp.widget_info(|| WidgetInfo::labeled(Role::Button, playable, if self.play == Play::Paused { "play" } else { "pause" }));
         let painter = ui.painter();
         painter.rect_filled(rect, 6, LETTERBOX);
         let problem = self.info.as_ref().err().or(self.player_error.as_ref());
@@ -921,6 +923,7 @@ impl ClipApp {
             self.saved.volume = v;
             self.sync_gains();
         }
+        resp.widget_info(|| WidgetInfo::slider(true, (v * 100.0).round() as f64, "volume"));
         let painter = ui.painter();
         let y = rect.center().y;
         let track = Rect::from_min_max(pos2(rect.left(), y - 2.0), pos2(rect.right(), y + 2.0));
@@ -951,6 +954,7 @@ impl ClipApp {
                 self.muted[k] = !self.muted[k];
                 changed = true;
             }
+            resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, !self.muted[k], name));
             let h = widgets::anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
             let painter = ui.painter();
             let fill = if audible { p.ctl } else { p.field };
@@ -975,10 +979,11 @@ impl ClipApp {
                     self.solo[k] = !self.solo[k];
                     changed = true;
                 }
+                resp.widget_info(|| WidgetInfo::selected(Role::Button, true, self.solo[k], format!("solo {name}")));
                 let h = widgets::anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
                 let painter = ui.painter();
                 let (fill, fg) = if self.solo[k] {
-                    (p.acc, Color32::WHITE)
+                    (p.acc, p.on_acc)
                 } else {
                     (p.ctl.lerp_to_gamma(p.ctlh, h), p.t2)
                 };

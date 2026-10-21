@@ -59,26 +59,44 @@ fn is_sound(trak: &[u8]) -> bool {
     hdlr.is_some_and(|h| h.len() >= HDLR_NAME && &h[8..12] == b"soun")
 }
 
+// ffmpeg writes a track title as trak/udta/name holding the bare utf-8 text; vlc and quicktime read it.
+fn udta_with_name(udta: &[u8], name: &str) -> Result<Vec<u8>, String> {
+    let mut body = atom(b"name", name.as_bytes());
+    for a in atoms(udta)?.iter().filter(|a| &a.kind != b"name") {
+        body.extend_from_slice(&udta[a.start..a.end]);
+    }
+    Ok(atom(b"udta", &body))
+}
+
 fn rename_trak(trak: &[u8], name: &str) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(trak.len() + name.len());
+    let mut out = Vec::with_capacity(trak.len() + 2 * name.len() + 24);
+    let mut named = false;
     for a in atoms(trak)? {
         let body = &trak[a.body..a.end];
-        if &a.kind != b"mdia" {
-            out.extend_from_slice(&trak[a.start..a.end]);
-            continue;
-        }
-        let mut mdia = Vec::with_capacity(body.len() + name.len());
-        for m in atoms(body)? {
-            if &m.kind == b"hdlr" {
-                let mut hdlr = body[m.body..m.body + HDLR_NAME].to_vec();
-                hdlr.extend_from_slice(name.as_bytes());
-                hdlr.push(0);
-                mdia.extend(atom(b"hdlr", &hdlr));
-            } else {
-                mdia.extend_from_slice(&body[m.start..m.end]);
+        match &a.kind {
+            b"mdia" => {
+                let mut mdia = Vec::with_capacity(body.len() + name.len());
+                for m in atoms(body)? {
+                    if &m.kind == b"hdlr" {
+                        let mut hdlr = body[m.body..m.body + HDLR_NAME].to_vec();
+                        hdlr.extend_from_slice(name.as_bytes());
+                        hdlr.push(0);
+                        mdia.extend(atom(b"hdlr", &hdlr));
+                    } else {
+                        mdia.extend_from_slice(&body[m.start..m.end]);
+                    }
+                }
+                out.extend(atom(b"mdia", &mdia));
             }
+            b"udta" if !named => {
+                out.extend(udta_with_name(body, name)?);
+                named = true;
+            }
+            _ => out.extend_from_slice(&trak[a.start..a.end]),
         }
-        out.extend(atom(b"mdia", &mdia));
+    }
+    if !named {
+        out.extend(udta_with_name(&[], name)?);
     }
     Ok(out)
 }
@@ -154,8 +172,11 @@ pub(crate) fn track_names(path: &Path) -> Vec<Option<String>> {
         .iter()
         .filter(|a| &a.kind == b"trak" && is_sound(&moov[a.body..a.end]))
         .map(|a| {
-            let h = child(child(&moov[a.body..a.end], b"mdia")?, b"hdlr")?;
-            let name = String::from_utf8_lossy(&h[HDLR_NAME..]).trim_end_matches('\0').to_string();
+            let trak = &moov[a.body..a.end];
+            let titled = child(trak, b"udta").and_then(|u| child(u, b"name")).map(|n| String::from_utf8_lossy(n));
+            let hdlr = child(child(trak, b"mdia")?, b"hdlr").map(|h| String::from_utf8_lossy(&h[HDLR_NAME..]));
+            let name = titled.filter(|n| !n.trim_end_matches('\0').is_empty()).or(hdlr)?;
+            let name = name.trim_end_matches('\0').to_string();
             (!name.is_empty() && name != UNNAMED).then_some(name)
         })
         .collect()
@@ -247,8 +268,28 @@ mod tests {
         let kinds: Vec<[u8; 4]> = atoms(moov).unwrap().iter().map(|a| a.kind).collect();
         assert_eq!(kinds, [*b"mvhd", *b"trak", *b"trak", *b"trak", *b"udta"]);
         assert_eq!(child(moov, b"udta").unwrap(), atom(b"meta", &[3; 20]));
-        let last = atoms(moov).unwrap().into_iter().nth(3).unwrap();
-        assert_eq!(child(&moov[last.body..last.end], b"udta").unwrap(), atom(b"cprt", b"x"));
+        let traks: Vec<&[u8]> =
+            atoms(moov).unwrap().into_iter().filter(|a| &a.kind == b"trak").map(|a| &moov[a.body..a.end]).collect();
+        assert_eq!(child(traks[0], b"udta"), None);
+        let inner = |t: &[u8]| atoms(t).unwrap().iter().map(|a| a.kind).collect::<Vec<_>>();
+        assert_eq!(inner(traks[1]), [*b"tkhd", *b"mdia", *b"udta"]);
+        let mut name = atom(b"name", b"mic: Shure MV7");
+        name.extend(atom(b"cprt", b"x"));
+        assert_eq!(child(traks[2], b"udta").unwrap(), name);
+    }
+
+    #[test]
+    fn track_titles_match_what_ffmpeg_writes() {
+        // trak/udta of `ffmpeg -metadata:s:a:0 title=mixname -f mp4` (ffmpeg 6.1.1).
+        let ffmpeg = b"\x00\x00\x00\x17udta\x00\x00\x00\x0fnamemixname";
+        let mut body = atom(b"tkhd", &[1; 84]);
+        let mut mdia = atom(b"mdhd", &[7; 24]);
+        mdia.extend(hdlr(b"soun", UNNAMED));
+        body.extend(atom(b"mdia", &mdia));
+        let renamed = rename_trak(&body, "mixname").unwrap();
+        assert!(renamed.ends_with(ffmpeg));
+        let again = rename_trak(&renamed, "mixname").unwrap();
+        assert_eq!(again, renamed);
     }
 
     #[test]

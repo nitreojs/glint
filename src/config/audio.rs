@@ -121,6 +121,15 @@ pub(crate) fn render_sources(sources: &[AudioSource]) -> String {
     format!("audio_sources = [\n{}]", lines.concat())
 }
 
+pub(crate) fn track_name(names: &[String], n: u32) -> &str {
+    names.get(n as usize - 1).map_or("", |s| s.trim())
+}
+
+pub(crate) fn render_track_names(names: &[String]) -> String {
+    let all: Vec<String> = (1..=MAX_TRACKS).map(|n| toml::Value::String(track_name(names, n).into()).to_string()).collect();
+    format!("audio_track_names = [{}]", all.join(", "))
+}
+
 const LEGACY: [&str; 2] = ["audio_desktop", "audio_mic"];
 
 pub(crate) fn is_legacy(table: &toml::Table) -> bool {
@@ -163,6 +172,21 @@ mod tests {
         assert_eq!(sources[2].tracks, [1]);
         let empty: Wrap = toml::from_str(&render_sources(&[])).unwrap();
         assert!(empty.audio_sources.is_empty());
+    }
+
+    #[test]
+    fn track_names_render_and_parse_back() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        struct Wrap {
+            audio_track_names: Vec<String>,
+        }
+        let names: Vec<String> = ["all", "", "game \"x\"", "", "", "voice"].iter().map(|s| s.to_string()).collect();
+        let back: Wrap = toml::from_str(&render_track_names(&names)).unwrap();
+        assert_eq!(back.audio_track_names, names);
+        let short: Wrap = toml::from_str(&render_track_names(&[" all ".into()])).unwrap();
+        assert_eq!(short.audio_track_names, ["all", "", "", "", "", ""]);
+        assert_eq!(track_name(&[], 6), "");
+        assert_eq!(track_name(&names, 3), "game \"x\"");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use eframe::egui::{
-    self, Color32, CornerRadius, CursorIcon, Id, Painter, Rect, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
+    self, Color32, CornerRadius, CursorIcon, Id, Painter, Rect, Role, Sense, Shape, Stroke, StrokeKind, Ui, WidgetInfo,
+    pos2, vec2,
 };
 
 use super::edit::snap_to;
@@ -234,6 +235,26 @@ impl ClipApp {
             }
             self.drag = None;
         }
+        let timed = |role: Role, label: &str, t: i64| WidgetInfo {
+            current_text_value: Some(math::fmt_time(t)),
+            value: Some(t as f64 / SECOND as f64),
+            ..WidgetInfo::labeled(role, true, label)
+        };
+        body.widget_info(|| timed(Role::Slider, "playhead", self.pos));
+        if let Some(r) = &start {
+            r.widget_info(|| timed(Role::Slider, "trim start", self.edit.range.start));
+        }
+        if let Some(r) = &end {
+            r.widget_info(|| timed(Role::Slider, "trim end", self.edit.range.end));
+        }
+        for (i, r) in &markers {
+            if let Some(&t) = self.edit.markers.get(*i) {
+                r.widget_info(|| timed(Role::Button, "marker", t));
+            }
+        }
+        if let Some(s) = &scroll {
+            s.widget_info(|| WidgetInfo::slider(true, self.view.start as f64 / SECOND as f64, "timeline scroll"));
+        }
 
         let painter = ui.painter().clone();
         painter.rect(track, 6, p.field, Stroke::new(1.0, p.line2), StrokeKind::Inside);
@@ -305,7 +326,7 @@ impl ClipApp {
             let knob = r.shrink2(vec2(2.0 - h, 0.0));
             painter.rect_filled(knob, 3, if h > 0.0 { p.acch } else { p.acc });
             let c = knob.center();
-            painter.vline(c.x, c.y - 6.0..=c.y + 6.0, Stroke::new(1.5, Color32::WHITE.gamma_multiply(0.85)));
+            painter.vline(c.x, c.y - 6.0..=c.y + 6.0, Stroke::new(1.5, p.on_acc.gamma_multiply(0.85)));
         }
         let x = x_of(self.pos);
         if visible(x) {

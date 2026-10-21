@@ -89,6 +89,7 @@ pub(crate) struct Params {
     pub effort: u32,
     pub draw_cursor: bool,
     pub audio: Vec<AudioSource>,
+    pub track_names: Vec<String>,
     pub path: PathBuf,
 }
 
@@ -174,7 +175,7 @@ impl Recorder {
                 let mf = MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok();
                 let path = p.path.clone();
                 let setup = Capture::new(&p).and_then(|cap| {
-                    let opened = audio::open_all(&p.audio);
+                    let opened = audio::open_all(&p.audio, &p.track_names);
                     let names: Vec<String> = opened.tracks.iter().map(|t| t.name.clone()).collect();
                     let routes = opened.tracks.into_iter().map(|t| t.sources).collect();
                     Encoder::new(p, &cap, names.clone())

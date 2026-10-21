@@ -6,7 +6,7 @@ repository = "https://github.com/nitreojs/glint"
 
 [dependencies]
 color_quant = "1.1.0"
-eframe = { version = "0.37.0", default-features = false, features = ["clipboard", "default_fonts", "glow"] }
+eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow"] }
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 raw-window-handle = "0.6.2"
 regex-lite = "0.1.9"

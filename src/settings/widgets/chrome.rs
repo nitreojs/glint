@@ -1,5 +1,6 @@
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, CursorIcon, Id, PointerButton, Rect, Response, Sense, Stroke, Ui, pos2, vec2,
+    self, Align2, Color32, CornerRadius, CursorIcon, Id, PointerButton, Rect, Response, Role, Sense, Stroke, Ui,
+    WidgetInfo, pos2, vec2,
 };
 
 use super::controls::focus_ring;
@@ -21,6 +22,7 @@ pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, what: &str, active
     // The mark: a 14 px disc whose highlight is cut out (side colour) while inactive.
     let disc = Rect::from_min_size(pos2(rect.left() + 18.0, rect.center().y - 7.0), vec2(14.0, 14.0));
     painter.circle_filled(disc.center(), 7.0, mix(p.t4, p.mark, active));
+    painter.circle_stroke(disc.center(), 7.0, Stroke::new(1.0, p.mark_ring.gamma_multiply(active)));
     painter.circle_filled(pos2(disc.right() - 4.0, disc.top() + 4.0), 2.0, mix(p.side, Color32::WHITE, active));
     let name = painter.text(
         pos2(disc.right() + 9.0, rect.center().y),
@@ -45,6 +47,7 @@ pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, what: &str, active
     let fg = mix(p.t4, p.t1, active);
     let min_rect = Rect::from_min_max(pos2(rect.right() - buttons, rect.top()), pos2(rect.right() - 46.0, rect.bottom()));
     let min = ui.interact(min_rect, Id::unique("title-min"), Sense::CLICK);
+    min.widget_info(|| WidgetInfo::labeled(Role::Button, true, "minimize window"));
     let (h, d) = (anim(ui, min.id, min.hovered(), 0.08), anim(ui, min.id.with("p"), min.is_pointer_button_down_on(), 0.08));
     let painter = ui.painter();
     painter.rect_filled(min_rect, 0, p.hov.gamma_multiply(h * (1.0 - d)));
@@ -54,6 +57,7 @@ pub(crate) fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, what: &str, active
 
     let close_rect = Rect::from_min_max(pos2(rect.right() - 46.0, rect.top()), rect.right_bottom());
     let close = ui.interact(close_rect, Id::unique("title-close"), Sense::CLICK);
+    close.widget_info(|| WidgetInfo::labeled(Role::Button, true, "close window"));
     let (h, d) =
         (anim(ui, close.id, close.hovered(), 0.08), anim(ui, close.id.with("p"), close.is_pointer_button_down_on(), 0.08));
     let painter = ui.painter();
@@ -100,5 +104,6 @@ pub(crate) fn nav_item(
         painter.circle_filled(pos2(rect.right() - 12.5, y), 2.5, p.t2.gamma_multiply(dot));
     }
     focus_ring(ui, look, &resp, rect, 5.0);
+    resp.widget_info(|| WidgetInfo::selected(Role::Tab, true, selected, label));
     resp
 }

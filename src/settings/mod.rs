@@ -253,7 +253,7 @@ impl eframe::App for SettingsApp {
         let active = widgets::anim(ui, Id::unique("window-active"), focused, 0.15);
         let radius: u8 = if self.rounded { 8 } else { 0 };
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
-        let had_dialog = self.dialog.is_some();
+        let had_overlay = self.dialog.is_some() || egui::Popup::is_any_open(&ctx);
 
         let full = ui.max_rect();
         ui.painter().rect_filled(full, radius, p.surf);
@@ -296,7 +296,9 @@ impl eframe::App for SettingsApp {
         let touched = ctx.input(|i| {
             i.pointer.any_pressed()
                 || i.pointer.delta() != egui::Vec2::ZERO
-                || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+                || i.events.iter().any(|e| {
+                    matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::AccessKitActionRequest(_))
+                })
         });
         self.pinned &= !touched;
         let mut scroll = egui::ScrollArea::vertical()
@@ -330,7 +332,7 @@ impl eframe::App for SettingsApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.dialog = Some(Dialog::SaveChanges);
         }
-        if esc && !had_dialog && self.listening.is_none() {
+        if esc && !had_overlay && self.listening.is_none() {
             self.request_close(&ctx);
         }
     }
@@ -522,6 +524,7 @@ mod tests {
         frame: eframe::Frame,
         time: f64,
         screen: egui::Vec2,
+        tree: Vec<(egui::accesskit::NodeId, egui::accesskit::Node)>,
     }
 
     impl Harness {
@@ -549,7 +552,8 @@ mod tests {
                 accent_text: String::new(),
                 size: (WINDOW, WINDOW),
             };
-            Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0, screen: vec2(WINDOW[0], WINDOW[1]) }
+            let screen = vec2(WINDOW[0], WINDOW[1]);
+            Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0, screen, tree: Vec::new() }
         }
 
         fn frame(&mut self, events: Vec<egui::Event>, label: &str) -> Option<f32> {
@@ -561,12 +565,44 @@ mod tests {
                 ..Default::default()
             };
             let (app, frame) = (&mut self.app, &mut self.frame);
-            let out = self.ctx.run_ui(input, |ui| app.ui(ui, frame));
+            let mut out = self.ctx.run_ui(input, |ui| app.ui(ui, frame));
+            self.tree = out.platform_output.accesskit_update.take().map(|u| u.nodes).unwrap_or_default();
             out.shapes.iter().find_map(|c| match &c.shape {
                 egui::epaint::Shape::Text(t) if t.galley.text() == label => Some(t.pos.y),
                 _ => None,
             })
         }
+
+        fn settle(&mut self) {
+            for _ in 0..12 {
+                self.frame(Vec::new(), "");
+            }
+        }
+
+        fn click(&mut self, pos: egui::Pos2) {
+            self.frame(vec![egui::Event::PointerMoved(pos), button(pos, true)], "");
+            self.frame(vec![button(pos, false)], "");
+            self.settle();
+        }
+
+        fn drag(&mut self, from: egui::Pos2, to: egui::Pos2) {
+            self.frame(vec![egui::Event::PointerMoved(from), button(from, true)], "");
+            for t in [0.25, 0.5, 0.75, 1.0] {
+                self.frame(vec![egui::Event::PointerMoved(from.lerp(to, t))], "");
+            }
+            self.frame(vec![button(to, false)], "");
+            self.settle();
+        }
+
+        fn control(&mut self, label: &str) -> Rect {
+            widgets::ROWS.with_borrow_mut(Vec::clear);
+            self.frame(Vec::new(), "");
+            widgets::ROWS.take().into_iter().find(|(l, ..)| l == label).map(|(.., c)| c).expect(label)
+        }
+    }
+
+    fn button(pos: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() }
     }
 
     fn wheel() -> egui::Event {
@@ -625,6 +661,136 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn accent_presets_keep_white_button_text() {
+        for light in [false, true] {
+            for rgb in sections::general::ACCENTS {
+                assert_eq!(widgets::palette(light, rgb).on_acc, Color32::WHITE, "{rgb:?} light {light}");
+            }
+        }
+    }
+
+    #[test]
+    fn custom_accent_picker_drags_live_and_esc_only_closes_it() {
+        use crate::config::color::rgb_to_hsv;
+        use sections::general::{ACCENTS, accent_popup_id};
+        let mut h = Harness::new();
+        h.frame(vec![egui::Event::PointerMoved(pos2(400.0, 300.0))], "");
+        h.frame(vec![egui::Event::PointerMoved(pos2(420.0, 320.0))], "");
+        for _ in 0..20 {
+            h.frame(vec![wheel()], "");
+        }
+        let swatches = h.control("accent");
+        let custom = pos2(swatches.left() + 8.0 * 30.0 + 12.0, swatches.top() + 12.0);
+        h.click(custom);
+        let popup = h.ctx.memory(|m| m.area_rect(accent_popup_id())).expect("the picker opens");
+        assert!(Rect::from_min_size(pos2(0.0, 0.0), h.screen).contains_rect(popup), "{popup:?}");
+        assert!(!popup.expand(4.0).contains(custom), "{popup:?}");
+
+        let square = Rect::from_min_size(popup.min + vec2(13.0, 13.0), vec2(232.0, 148.0));
+        h.click(square.lerp_inside(vec2(0.75, 0.25)));
+        let [hue, s, v] = rgb_to_hsv(h.app.cfg.accent_rgb());
+        let red = rgb_to_hsv(ACCENTS[0])[0];
+        assert!((s - 0.75).abs() < 0.02 && (v - 0.75).abs() < 0.02 && (hue - red).abs() < 0.01, "{hue} {s} {v}");
+        assert_eq!(h.app.cfg.accent_custom.as_deref(), Some(h.app.cfg.accent.as_str()));
+
+        let strip = square.bottom() + 10.0 + 6.0;
+        h.drag(pos2(square.left() + 10.0, strip), pos2(square.center().x, strip));
+        let picked = h.app.cfg.accent_rgb();
+        assert!((rgb_to_hsv(picked)[0] - 0.5).abs() < 0.01, "{picked:?}");
+        assert_eq!(h.app.styled.map(|s| s.1), Some(picked));
+
+        let esc = egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        };
+        h.frame(vec![esc], "");
+        h.settle();
+        assert!(!egui::Popup::is_id_open(&h.ctx, accent_popup_id()));
+        assert!(h.app.dialog.is_none() && !h.app.closing);
+        assert_eq!(h.app.cfg.accent_rgb(), picked);
+
+        h.click(pos2(swatches.left() + 12.0, swatches.top() + 12.0));
+        assert_eq!((h.app.cfg.accent_rgb(), h.app.cfg.accent_custom_rgb()), (ACCENTS[0], Some(picked)));
+        h.click(custom);
+        assert_eq!(h.app.cfg.accent_rgb(), picked);
+        assert!(egui::Popup::is_id_open(&h.ctx, accent_popup_id()));
+        h.click(pos2(600.0, 70.0));
+        assert!(!egui::Popup::is_id_open(&h.ctx, accent_popup_id()));
+        assert_eq!(h.app.cfg.accent_rgb(), picked);
+    }
+
+    #[test]
+    fn every_section_reports_its_controls_to_accessibility_tools() {
+        use egui::accesskit::{Node, Role, Toggled};
+        use sections::general::ACCENTS;
+        let mut h = Harness::new();
+        h.ctx.enable_accesskit();
+        h.app.cfg.upload_destination = "litterbox".into();
+        let named = |tree: &[(egui::accesskit::NodeId, Node)], role: Role, name: &str| {
+            tree.iter().filter(|(_, n)| n.role() == role && n.label() == Some(name)).map(|(_, n)| n.clone()).collect::<Vec<_>>()
+        };
+        let mut counts = Vec::new();
+        for section in SECTIONS {
+            h.app.go(section);
+            h.settle();
+            let tree = std::mem::take(&mut h.tree);
+            for (_, n) in &tree {
+                let input = matches!(
+                    n.role(),
+                    Role::Button | Role::CheckBox | Role::RadioButton | Role::Slider | Role::ComboBox | Role::TextInput | Role::Tab | Role::Link
+                );
+                let name = n.label().or(n.placeholder()).unwrap_or("");
+                assert!(!input || !name.trim().is_empty(), "{}: unnamed {:?} {n:?}", section.name(), n.role());
+            }
+            for name in ["minimize window", "close window", "save"] {
+                assert_eq!(named(&tree, Role::Button, name).len(), 1, "{} › {name}", section.name());
+            }
+            let tabs = named(&tree, Role::Tab, section.name());
+            assert!(tabs.len() == 1 && tabs[0].toggled() == Some(Toggled::True), "{}", section.name());
+            let groups = tree.iter().filter(|(_, n)| n.role() == Role::Group && n.bounds().is_some()).count();
+            assert!(groups >= 2, "{} has {groups} rows", section.name());
+            counts.push(format!("{} {} nodes, {groups} rows", section.name(), tree.len()));
+
+            if section == Section::General {
+                let hotkey = named(&tree, Role::Button, "record hotkey");
+                assert_eq!(hotkey.len(), 1);
+                assert_eq!(hotkey[0].value(), Some("ctrl+alt+printscreen"));
+                let labels = tree.iter().filter(|(_, n)| n.role() == Role::Label && n.value() == Some("record hotkey"));
+                assert_eq!(labels.count(), 1);
+                let startup = named(&tree, Role::CheckBox, "launch at startup");
+                assert!(startup.len() == 1 && startup[0].toggled() == Some(Toggled::False), "{startup:?}");
+                assert_eq!(startup[0].description(), Some("off"));
+                let notifications = named(&tree, Role::RadioGroup, "notifications");
+                assert_eq!(notifications.len(), 1);
+                let options: Vec<_> = notifications[0]
+                    .children()
+                    .iter()
+                    .filter_map(|id| tree.iter().find(|(i, _)| i == id))
+                    .map(|(_, n)| (n.role(), n.label().unwrap_or("").to_owned(), n.toggled()))
+                    .collect();
+                assert_eq!(
+                    options,
+                    [
+                        (Role::RadioButton, "all".to_owned(), Some(Toggled::True)),
+                        (Role::RadioButton, "errors only".to_owned(), Some(Toggled::False)),
+                    ]
+                );
+                let swatches = tree.iter().filter(|(_, n)| n.role() == Role::RadioButton && n.label().is_some_and(|l| l.starts_with('#')));
+                assert_eq!(swatches.count(), ACCENTS.len());
+                assert_eq!(named(&tree, Role::RadioButton, "custom colour").len(), 1);
+            }
+            if section == Section::Recording {
+                let quality = named(&tree, Role::Slider, "quality");
+                assert!(quality.len() == 1 && quality[0].numeric_value() == Some(h.app.cfg.quality as f64), "{quality:?}");
+            }
+        }
+        eprintln!("{}", counts.join("\n"));
     }
 }
 
