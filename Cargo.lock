@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "glint"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "color_quant",
  "eframe",
