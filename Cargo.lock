@@ -1126,18 +1126,48 @@ dependencies = [
 name = "glint"
 version = "0.1.1"
 dependencies = [
- "color_quant",
  "eframe",
- "gif",
- "minisign-verify",
+ "glint-core",
+ "glint-media",
+ "glint-ui",
  "raw-window-handle",
- "regex-lite",
  "serde",
  "serde_json",
  "toml",
  "windows",
- "windows-core",
  "windows-numerics",
+]
+
+[[package]]
+name = "glint-core"
+version = "0.1.1"
+dependencies = [
+ "emath",
+ "minisign-verify",
+ "regex-lite",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
+name = "glint-media"
+version = "0.1.1"
+dependencies = [
+ "color_quant",
+ "gif",
+ "glint-core",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "glint-ui"
+version = "0.1.1"
+dependencies = [
+ "eframe",
+ "glint-core",
+ "windows",
 ]
 
 [[package]]

@@ -1,0 +1,218 @@
+[
+  {
+    "url": "https://api.github.com/repos/nitreojs/glint/releases/270000004",
+    "html_url": "https://github.com/nitreojs/glint/releases/tag/afterglow-v0.2.0-beta.1",
+    "id": 270000004,
+    "tag_name": "afterglow-v0.2.0-beta.1",
+    "target_commitish": "lord",
+    "name": "afterglow v0.2.0-beta.1",
+    "draft": false,
+    "immutable": false,
+    "prerelease": true,
+    "created_at": "2026-12-02T18:20:11Z",
+    "published_at": "2026-12-02T18:20:11Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000040",
+        "id": 2700000040,
+        "name": "afterglow-v0.2.0-beta.1-windows-x64.exe",
+        "label": "",
+        "content_type": "application/octet-stream",
+        "state": "uploaded",
+        "size": 4210688,
+        "download_count": 0,
+        "created_at": "2026-12-02T18:20:11Z",
+        "updated_at": "2026-12-02T18:20:11Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/afterglow-v0.2.0-beta.1/afterglow-v0.2.0-beta.1-windows-x64.exe"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000041",
+        "id": 2700000041,
+        "name": "afterglow-v0.2.0-beta.1-windows-x64.exe.minisig",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 340,
+        "download_count": 0,
+        "created_at": "2026-12-02T18:20:11Z",
+        "updated_at": "2026-12-02T18:20:11Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/afterglow-v0.2.0-beta.1/afterglow-v0.2.0-beta.1-windows-x64.exe.minisig"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000042",
+        "id": 2700000042,
+        "name": "SHA256SUMS",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 97,
+        "download_count": 0,
+        "created_at": "2026-12-02T18:20:11Z",
+        "updated_at": "2026-12-02T18:20:11Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/afterglow-v0.2.0-beta.1/SHA256SUMS"
+      }
+    ]
+  },
+  {
+    "url": "https://api.github.com/repos/nitreojs/glint/releases/270000003",
+    "html_url": "https://github.com/nitreojs/glint/releases/tag/afterglow-v0.1.0",
+    "id": 270000003,
+    "tag_name": "afterglow-v0.1.0",
+    "target_commitish": "lord",
+    "name": "afterglow v0.1.0",
+    "draft": false,
+    "immutable": false,
+    "prerelease": false,
+    "created_at": "2026-11-20T10:05:42Z",
+    "published_at": "2026-11-20T10:05:42Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000030",
+        "id": 2700000030,
+        "name": "afterglow-v0.1.0-windows-x64.exe",
+        "label": "",
+        "content_type": "application/octet-stream",
+        "state": "uploaded",
+        "size": 4102144,
+        "download_count": 0,
+        "created_at": "2026-11-20T10:05:42Z",
+        "updated_at": "2026-11-20T10:05:42Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/afterglow-v0.1.0/afterglow-v0.1.0-windows-x64.exe"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000031",
+        "id": 2700000031,
+        "name": "afterglow-v0.1.0-windows-x64.exe.minisig",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 340,
+        "download_count": 0,
+        "created_at": "2026-11-20T10:05:42Z",
+        "updated_at": "2026-11-20T10:05:42Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/afterglow-v0.1.0/afterglow-v0.1.0-windows-x64.exe.minisig"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000032",
+        "id": 2700000032,
+        "name": "SHA256SUMS",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 97,
+        "download_count": 0,
+        "created_at": "2026-11-20T10:05:42Z",
+        "updated_at": "2026-11-20T10:05:42Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/afterglow-v0.1.0/SHA256SUMS"
+      }
+    ]
+  },
+  {
+    "url": "https://api.github.com/repos/nitreojs/glint/releases/270000002",
+    "html_url": "https://github.com/nitreojs/glint/releases/tag/v0.1.2",
+    "id": 270000002,
+    "tag_name": "v0.1.2",
+    "target_commitish": "lord",
+    "name": "glint v0.1.2",
+    "draft": false,
+    "immutable": false,
+    "prerelease": false,
+    "created_at": "2026-11-12T09:41:03Z",
+    "published_at": "2026-11-12T09:41:03Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000020",
+        "id": 2700000020,
+        "name": "glint-v0.1.2-windows-x64.exe",
+        "label": "",
+        "content_type": "application/octet-stream",
+        "state": "uploaded",
+        "size": 10584064,
+        "download_count": 0,
+        "created_at": "2026-11-12T09:41:03Z",
+        "updated_at": "2026-11-12T09:41:03Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/v0.1.2/glint-v0.1.2-windows-x64.exe"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000021",
+        "id": 2700000021,
+        "name": "glint-v0.1.2-windows-x64.exe.minisig",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 340,
+        "download_count": 0,
+        "created_at": "2026-11-12T09:41:03Z",
+        "updated_at": "2026-11-12T09:41:03Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/v0.1.2/glint-v0.1.2-windows-x64.exe.minisig"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000022",
+        "id": 2700000022,
+        "name": "SHA256SUMS",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 97,
+        "download_count": 0,
+        "created_at": "2026-11-12T09:41:03Z",
+        "updated_at": "2026-11-12T09:41:03Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/v0.1.2/SHA256SUMS"
+      }
+    ]
+  },
+  {
+    "url": "https://api.github.com/repos/nitreojs/glint/releases/270000001",
+    "html_url": "https://github.com/nitreojs/glint/releases/tag/v0.1.1",
+    "id": 270000001,
+    "tag_name": "v0.1.1",
+    "target_commitish": "lord",
+    "name": "glint v0.1.1",
+    "draft": false,
+    "immutable": false,
+    "prerelease": false,
+    "created_at": "2026-10-21T21:40:57Z",
+    "published_at": "2026-10-21T21:40:57Z",
+    "assets": [
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000010",
+        "id": 2700000010,
+        "name": "glint-v0.1.1-windows-x64.exe",
+        "label": "",
+        "content_type": "application/octet-stream",
+        "state": "uploaded",
+        "size": 10551296,
+        "download_count": 0,
+        "created_at": "2026-10-21T21:40:57Z",
+        "updated_at": "2026-10-21T21:40:57Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/v0.1.1/glint-v0.1.1-windows-x64.exe"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000011",
+        "id": 2700000011,
+        "name": "glint-v0.1.1-windows-x64.exe.minisig",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 340,
+        "download_count": 0,
+        "created_at": "2026-10-21T21:40:57Z",
+        "updated_at": "2026-10-21T21:40:57Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/v0.1.1/glint-v0.1.1-windows-x64.exe.minisig"
+      },
+      {
+        "url": "https://api.github.com/repos/nitreojs/glint/releases/assets/2700000012",
+        "id": 2700000012,
+        "name": "SHA256SUMS",
+        "label": "",
+        "content_type": "text/plain",
+        "state": "uploaded",
+        "size": 97,
+        "download_count": 0,
+        "created_at": "2026-10-21T21:40:57Z",
+        "updated_at": "2026-10-21T21:40:57Z",
+        "browser_download_url": "https://github.com/nitreojs/glint/releases/download/v0.1.1/SHA256SUMS"
+      }
+    ]
+  }
+]

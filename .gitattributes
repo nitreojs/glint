@@ -1,1 +1,2 @@
-src/update/fixtures/* -text
+apps/glint/src/update/fixtures/* -text
+crates/core/src/update/fixtures/* -text

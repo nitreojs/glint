@@ -1,12 +1,19 @@
-[package]
-name = "glint"
+[workspace]
+members = ["apps/glint", "crates/core", "crates/media", "crates/ui"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.1"
 edition = "2024"
 repository = "https://github.com/nitreojs/glint"
 
-[dependencies]
+[workspace.dependencies]
+glint-core = { path = "crates/core" }
+glint-media = { path = "crates/media" }
+glint-ui = { path = "crates/ui" }
 color_quant = "1.1.0"
 eframe = { version = "0.37.0", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow"] }
+emath = "0.37.0"
 gif = { version = "0.14.2", default-features = false, features = ["std"] }
 minisign-verify = "0.3.0"
 raw-window-handle = "0.6.2"

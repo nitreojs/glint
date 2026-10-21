@@ -1,0 +1,13 @@
+[package]
+name = "glint-ui"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+eframe.workspace = true
+glint-core.workspace = true
+windows.workspace = true
+
+[features]
+test-rows = []

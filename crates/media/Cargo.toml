@@ -1,0 +1,12 @@
+[package]
+name = "glint-media"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+color_quant.workspace = true
+gif.workspace = true
+glint-core.workspace = true
+windows.workspace = true
+windows-core.workspace = true

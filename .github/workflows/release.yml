@@ -27,9 +27,9 @@ jobs:
             exit 1
           fi
       - name: test
-        run: cargo test --release --lib --locked
+        run: cargo test --workspace --release --lib --locked
       - name: build
-        run: cargo build --release --locked
+        run: cargo build --release --locked -p glint
       - name: package
         shell: bash
         run: |
@@ -55,7 +55,7 @@ jobs:
           printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
           "$minisign" -S -s "$key" -m "dist/$ASSET" -t "glint $GITHUB_REF_NAME $ASSET" < /dev/null
           rm -f "$key"
-          public=$(sed -n 's/.*PUBLIC_KEY: &str = "\(.*\)";/\1/p' src/update/mod.rs)
+          public=$(sed -n 's/.*PUBLIC_KEY: &str = "\(.*\)";/\1/p' apps/glint/src/update/mod.rs)
           "$minisign" -V -P "$public" -m "dist/$ASSET"
           cat "dist/$ASSET.minisig"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
