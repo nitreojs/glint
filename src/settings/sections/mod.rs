@@ -7,6 +7,7 @@ pub(super) mod general;
 mod output;
 mod recording;
 mod screenshots;
+pub(super) mod updates;
 pub(super) mod uploads;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -17,16 +18,18 @@ pub(super) enum Section {
     Screenshots,
     Uploads,
     Output,
+    Updates,
     About,
 }
 
-pub(super) const SECTIONS: [Section; 7] = [
+pub(super) const SECTIONS: [Section; 8] = [
     Section::General,
     Section::Recording,
     Section::Audio,
     Section::Screenshots,
     Section::Uploads,
     Section::Output,
+    Section::Updates,
     Section::About,
 ];
 
@@ -39,6 +42,7 @@ impl Section {
             Section::Screenshots => "screenshots",
             Section::Uploads => "uploads",
             Section::Output => "output",
+            Section::Updates => "updates",
             Section::About => "about",
         }
     }
@@ -89,6 +93,7 @@ impl Section {
                     + n(a.upload_proxy == b.upload_proxy)
             }
             Section::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
+            Section::Updates => n(a.update_mode == b.update_mode) + n(a.update_beta == b.update_beta),
             Section::About => 0,
         }
     }
@@ -141,6 +146,10 @@ impl Section {
             Section::Output => {
                 cfg.output_dir = d.output_dir;
                 cfg.file_name = d.file_name;
+            }
+            Section::Updates => {
+                cfg.update_mode = d.update_mode;
+                cfg.update_beta = d.update_beta;
             }
             Section::About => {}
         }

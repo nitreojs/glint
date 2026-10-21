@@ -9,7 +9,7 @@ use crate::settings::{Dialog, SettingsApp};
 
 const REPO_URL: &str = "https://github.com/nitreojs/glint";
 
-fn open_url(url: &str) {
+pub(super) fn open_url(url: &str) {
     unsafe {
         ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
     }

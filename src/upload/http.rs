@@ -1,6 +1,6 @@
 use std::ffi::c_void;
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use windows::Win32::Networking::WinHttp::*;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
@@ -141,6 +141,45 @@ const CHUNK: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
 pub(crate) fn send(req: &Request, proxy: &Setting, progress: &mut dyn FnMut(u64, u64)) -> Result<Response, String> {
+    let mut body = Vec::new();
+    let mut response = exchange(req, proxy, progress, &mut |data| {
+        body.extend_from_slice(data);
+        Ok(body.len() < MAX_RESPONSE)
+    })?;
+    response.text = String::from_utf8_lossy(&body).into_owned();
+    Ok(response)
+}
+
+/// Streams the response body into `path`, refusing more than `max` bytes; the returned
+/// response has no text. The file is removed unless the server answered 2xx.
+pub(crate) fn download(req: &Request, proxy: &Setting, path: &Path, max: u64) -> Result<Response, String> {
+    let shown = path.display();
+    let mut file = std::fs::File::create(path).map_err(|e| format!("{shown}: {e}"))?;
+    let mut written = 0u64;
+    let result = exchange(req, proxy, &mut |_, _| {}, &mut |data| {
+        written += data.len() as u64;
+        if written > max {
+            return Err(format!("{} is bigger than the {max} bytes expected", req.url));
+        }
+        file.write_all(data).map_err(|e| format!("{shown}: {e}"))?;
+        Ok(true)
+    });
+    let flushed = file.sync_all().map_err(|e| format!("{shown}: {e}"));
+    drop(file);
+    let result = result.and_then(|r| flushed.map(|_| r));
+    if !result.as_ref().is_ok_and(Response::ok) {
+        let _ = std::fs::remove_file(path);
+    }
+    result
+}
+
+/// Sends `req`; `sink` gets the response body in chunks and returns false to stop reading.
+fn exchange(
+    req: &Request,
+    proxy: &Setting,
+    progress: &mut dyn FnMut(u64, u64),
+    sink: &mut dyn FnMut(&[u8]) -> Result<bool, String>,
+) -> Result<Response, String> {
     let url = split_url(&req.url)?;
     let mut total = 0u64;
     for part in &req.body {
@@ -244,19 +283,17 @@ pub(crate) fn send(req: &Request, proxy: &Setting, progress: &mut dyn FnMut(u64,
             )
         });
         let final_url = query_string(|buf, len| WinHttpQueryOption(request.0, WINHTTP_OPTION_URL, buf, len));
-        let mut body = Vec::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
             let mut read = 0u32;
             WinHttpReadData(request.0, buf.as_mut_ptr().cast(), CHUNK as u32, &mut read).map_err(|e| net("read", e))?;
-            if read == 0 || body.len() >= MAX_RESPONSE {
+            if read == 0 || !sink(&buf[..read as usize])? {
                 break;
             }
-            body.extend_from_slice(&buf[..read as usize]);
         }
         Ok(Response {
             status,
-            text: String::from_utf8_lossy(&body).into_owned(),
+            text: String::new(),
             headers: parse_headers(&raw),
             url: if final_url.is_empty() { req.url.clone() } else { final_url },
         })

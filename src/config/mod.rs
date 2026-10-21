@@ -52,6 +52,8 @@ pub(crate) struct Config {
     /// `#RRGGBB`, see [`parse_hex`].
     pub accent: String,
     pub accent_custom: Option<String>,
+    pub update_mode: UpdateMode,
+    pub update_beta: bool,
 }
 
 pub(crate) const DEFAULT_FILE_NAME: &str = "glint_{date}_{time}";
@@ -107,6 +109,17 @@ pub(crate) enum IndicatorInside {
     Hide,
     /// Shown but excluded from capture, which pauses NVIDIA Instant Replay and similar apps.
     Show,
+}
+
+/// What glint does about new releases on GitHub.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum UpdateMode {
+    /// Downloads in the background, installs when glint restarts.
+    Auto,
+    /// Only tells you; clicking the notification installs.
+    Notify,
+    Off,
 }
 
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,6 +190,8 @@ impl Default for Config {
             upload_proxy: "system".into(),
             accent: DEFAULT_ACCENT.into(),
             accent_custom: None,
+            update_mode: UpdateMode::Auto,
+            update_beta: false,
         }
     }
 }
@@ -279,6 +294,11 @@ impl Config {
         let indicator_inside = match self.indicator_inside {
             IndicatorInside::Hide => "hide",
             IndicatorInside::Show => "show",
+        };
+        let update_mode = match self.update_mode {
+            UpdateMode::Auto => "auto",
+            UpdateMode::Notify => "notify",
+            UpdateMode::Off => "off",
         };
         format!(
             r#"# glint settings. "Settings…" in the tray menu edits this file; hand edits apply the
@@ -392,6 +412,13 @@ upload_proxy = {upload_proxy}
 accent = {accent}
 # The colour last picked with the custom swatch, remembered while a preset is in use.
 {accent_custom}
+
+# Updates from github.com/nitreojs/glint, checked at start and every 6 hours, signature-checked
+# before they're used: "auto" downloads them in the background and installs on the next start
+# (or when you click the notification), "notify" only tells you, "off" never checks.
+update_mode = "{update_mode}"
+# Also take beta versions (GitHub pre-releases).
+update_beta = {update_beta}
 "#,
             hotkey = q(&self.hotkey),
             screenshot_hotkey = q(&self.screenshot_hotkey),
@@ -420,6 +447,7 @@ accent = {accent}
             recording_upload = self.recording_upload,
             upload_proxy = q(&self.upload_proxy),
             accent = q(&self.accent),
+            update_beta = self.update_beta,
         )
     }
 
@@ -534,6 +562,8 @@ mod tests {
             upload_proxy: "http://127.0.0.1:10809".into(),
             accent: "#2F7BE5".into(),
             accent_custom: Some("#7FE0C0".into()),
+            update_mode: UpdateMode::Notify,
+            update_beta: true,
         };
         let back: Config = toml::from_str(&cfg.render()).unwrap();
         assert_eq!(back, cfg);
@@ -586,6 +616,24 @@ mod tests {
         assert_eq!(parsed("show").unwrap(), IndicatorInside::Show);
         assert!(parsed("excluded").is_err());
         assert_eq!(Config::default().indicator_inside, IndicatorInside::Hide);
+    }
+
+    #[test]
+    fn update_settings_round_trip_with_their_comments() {
+        for mode in [UpdateMode::Auto, UpdateMode::Notify, UpdateMode::Off] {
+            for beta in [false, true] {
+                let cfg = Config { update_mode: mode, update_beta: beta, ..Config::default() };
+                let back = Config::parse(&cfg.render()).unwrap();
+                assert_eq!((back.update_mode, back.update_beta), (mode, beta));
+            }
+        }
+        let text = Config::default().render();
+        assert!(text.contains("\n# (or when you click the notification), \"notify\" only tells you, \"off\" never checks.\nupdate_mode = \"auto\"\n"));
+        assert!(text.contains("\n# Also take beta versions (GitHub pre-releases).\nupdate_beta = false\n"));
+        let parsed = |v: &str| Config::parse(&format!("update_mode = \"{v}\"")).map(|c| c.update_mode);
+        assert_eq!(parsed("notify").unwrap(), UpdateMode::Notify);
+        assert!(parsed("manual").is_err());
+        assert_eq!((Config::default().update_mode, Config::default().update_beta), (UpdateMode::Auto, false));
     }
 
     #[test]

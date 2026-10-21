@@ -18,6 +18,7 @@ const ID_LOG: usize = 103;
 const ID_EXIT: usize = 104;
 const ID_PAUSE: usize = 107;
 const ID_TRIM: usize = 108;
+const ID_UPDATE: usize = 109;
 const ID_RECENT: usize = 1000;
 const ID_CLEAR_HISTORY: usize = 1199;
 const RECENT: usize = 10;
@@ -116,6 +117,7 @@ pub(super) fn show_menu(hwnd: HWND) {
     let full_label = with_key("Screenshot all screens", full_hotkey);
     let last = history::last_recording();
     let recent = history::recent(RECENT);
+    let update_label = with_app(|a| a.ready_version()).flatten().map(|v| wide(&format!("Restart to update to {v}")));
     let cmd = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let (label, shot_label, full_label) = (wide(&label), wide(&shot_label), wide(&full_label));
@@ -136,6 +138,9 @@ pub(super) fn show_menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings…"));
         let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        if let Some(label) = &update_label {
+            let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, PCWSTR(label.as_ptr()));
+        }
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
@@ -179,6 +184,9 @@ pub(super) fn show_menu(hwnd: HWND) {
             if let Some(e) = recent.get(i) {
                 recent_action(hwnd, e, (c - ID_RECENT) % ACTIONS);
             }
+        }
+        ID_UPDATE => {
+            with_app(|a| a.install_update());
         }
         ID_EXIT => {
             with_app(|a| a.exit());

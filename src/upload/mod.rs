@@ -11,7 +11,7 @@ use crate::platform::format::human_size;
 use crate::platform::log::log;
 
 pub(crate) mod custom;
-mod http;
+pub(crate) mod http;
 pub(crate) mod proxy;
 mod syntax;
 

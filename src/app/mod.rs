@@ -1,7 +1,8 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::time::Duration;
 
-use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
@@ -10,7 +11,7 @@ use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, NIN_SELECT, ShellExecuteW}
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-use crate::config::{Config, ShotStyle};
+use crate::config::{Config, ShotStyle, UpdateMode};
 use crate::history::{self, Kind};
 use crate::picker::{self, Picked, Purpose};
 use crate::platform::capture;
@@ -23,6 +24,7 @@ use crate::record::indicator::{self, Indicator};
 use crate::record::{Outcome, Params, Recorder, Source};
 use crate::shot::editor::Output;
 use crate::shot::{self, Delivered, Shot};
+use crate::update::{self, Checked, UPDATED_ARG, Version};
 use crate::upload::{self, Done};
 
 mod autostart;
@@ -30,6 +32,7 @@ mod hotkeys;
 pub(crate) mod ipc;
 mod menu;
 pub(crate) mod tray;
+pub(crate) mod updates;
 
 use hotkeys::{ESC_HOTKEY_ID, FULL_HOTKEY_ID, HOTKEY_ID, PAUSE_HOTKEY_ID, SHOT_HOTKEY_ID};
 use menu::show_menu;
@@ -63,6 +66,8 @@ enum ClickTarget {
     File(PathBuf),
     Link(String),
     Log,
+    /// Restart into the update, or download and install it.
+    Update,
 }
 
 struct App {
@@ -78,6 +83,7 @@ struct App {
     taskbar_created: u32,
     click: ClickTarget,
     exiting: bool,
+    update: updates::Updates,
 }
 
 thread_local! {
@@ -112,6 +118,8 @@ impl App {
                     || recording && self.pause_hotkey.as_deref() != Some(cfg.pause_hotkey.as_str());
                 let startup_changed = self.cfg.launch_at_startup != cfg.launch_at_startup;
                 let accent_changed = self.cfg.accent_rgb() != cfg.accent_rgb();
+                let updates_changed =
+                    self.cfg.update_mode != cfg.update_mode || self.cfg.update_beta != cfg.update_beta;
                 let before = std::mem::replace(&mut self.cfg, cfg);
                 if hotkeys_changed {
                     self.register_hotkeys(Some(&before));
@@ -121,6 +129,9 @@ impl App {
                 }
                 if accent_changed {
                     self.tray.set_accent(self.cfg.accent_rgb());
+                }
+                if updates_changed {
+                    self.updates_reconfigured();
                 }
             }
             Err(e) => self.notify("glint: settings error", &e, true, ClickTarget::None),
@@ -512,12 +523,15 @@ impl App {
         }
     }
 
-    fn open_click_target(&self) {
+    fn open_click_target(&mut self) {
+        if matches!(self.click, ClickTarget::Update) {
+            return self.install_update();
+        }
         match &self.click {
             ClickTarget::File(p) => shell("explorer.exe", &format!("/select,\"{}\"", p.display())),
             ClickTarget::Link(url) => shell(url, ""),
             ClickTarget::Log => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
-            ClickTarget::None => {}
+            ClickTarget::Update | ClickTarget::None => {}
         }
     }
 }
@@ -566,6 +580,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.tick_countdown());
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == updates::CHECK_TIMER_ID => {
+            with_app(|a| a.on_check_timer());
+            return LRESULT(0);
+        }
+        WM_TIMER if wp.0 == updates::IDLE_TIMER_ID => {
+            with_app(|a| a.when_idle());
+            return LRESULT(0);
+        }
         WM_TIMER if wp.0 == CLICK_TIMER_ID => {
             unsafe {
                 let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
@@ -575,6 +597,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_STOP => {
             with_app(|a| a.on_indicator(wp.0));
+            return LRESULT(0);
+        }
+        ipc::WM_UPDATE_CHECK => {
+            with_app(|a| a.check_now(wp.0));
+            return LRESULT(0);
+        }
+        ipc::WM_UPDATE_INSTALL => {
+            with_app(|a| a.install_update());
             return LRESULT(0);
         }
         ipc::WM_RELOAD => {
@@ -611,12 +641,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         // Results posted from the overlay / encoder thread own a Box in LPARAM. If the state
         // is busy (re-entrant dispatch), re-post instead of dropping the result.
-        WM_APP_SELECTION | WM_APP_DONE | WM_APP_PIN | upload::WM_UPLOADED => {
+        WM_APP_SELECTION | WM_APP_DONE | WM_APP_PIN | upload::WM_UPLOADED | update::WM_UPDATE_DONE => {
             let handled = with_app(|a| unsafe {
                 match msg {
                     WM_APP_SELECTION => a.on_selection(*Box::from_raw(lp.0 as *mut Option<Picked>)),
                     WM_APP_PIN => a.finish_shot(*Box::from_raw(lp.0 as *mut Shot)),
                     upload::WM_UPLOADED => a.on_uploaded(*Box::from_raw(lp.0 as *mut Done)),
+                    update::WM_UPDATE_DONE => a.on_checked(*Box::from_raw(lp.0 as *mut Checked)),
                     _ => a.on_done(*Box::from_raw(lp.0 as *mut Result<Outcome, String>)),
                 }
             });
@@ -656,15 +687,64 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
+/// Takes the single-instance mutex for the life of the process. Right after an update the
+/// previous process is still exiting, so `wait` keeps trying for a while.
+fn single_instance(wait: bool) -> bool {
+    for _ in 0..200 {
+        unsafe {
+            let mutex = CreateMutexW(None, false, w!("Local\\glint-single-instance"));
+            if GetLastError() != ERROR_ALREADY_EXISTS {
+                return true;
+            }
+            if let Ok(h) = mutex {
+                let _ = CloseHandle(h);
+            }
+        }
+        if !wait {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
 pub fn run() {
+    let args: Vec<String> = std::env::args().collect();
+    let updated_from = args.iter().position(|a| a == UPDATED_ARG).and_then(|i| args.get(i + 1)).cloned();
+    let autostarted = args.iter().any(|a| a == autostart::ARG);
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        let _mutex = CreateMutexW(None, false, w!("Local\\glint-single-instance"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        if !single_instance(updated_from.is_some()) {
             MessageBoxW(None, w!("glint is already running (see the tray icon)."), w!("glint"), MB_ICONINFORMATION);
             return;
         }
-        let _ = std::fs::write(log_path(), ""); // fresh log per run
+        // a fresh log per run; after an update it goes on from the run that installed it
+        if updated_from.is_none() {
+            let _ = std::fs::write(log_path(), "");
+        }
+        update::tidy(updated_from.is_some());
+        let (cfg, cfg_err) = match Config::load() {
+            Ok(c) => (c, None),
+            Err(e) => (Config::default(), Some(e)),
+        };
+        let mut update_error = None;
+        if cfg_err.is_none()
+            && cfg.update_mode != UpdateMode::Off
+            && let Some(staged) = update::staged()
+        {
+            let mut args = vec![UPDATED_ARG.to_string(), Version::current().to_string()];
+            if autostarted {
+                args.push(autostart::ARG.into());
+            }
+            log(&format!("installing the downloaded {} at start", staged.tag));
+            match update::install(&staged, &args) {
+                Ok(()) => return,
+                Err(e) => {
+                    log(&format!("update to {} failed: {e}", staged.tag));
+                    update_error = Some(e);
+                }
+            }
+        }
 
         let hinst = GetModuleHandleW(None).expect("module handle");
         let class = ipc::MAIN_CLASS;
@@ -692,10 +772,6 @@ pub fn run() {
         )
         .expect("main window");
 
-        let (cfg, cfg_err) = match Config::load() {
-            Ok(c) => (c, None),
-            Err(e) => (Config::default(), Some(e)),
-        };
         let tray = Tray::new(hwnd, WM_APP_TRAY, cfg.accent_rgb());
         let mut app = App {
             hwnd,
@@ -709,15 +785,24 @@ pub fn run() {
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             click: ClickTarget::None,
             exiting: false,
+            update: updates::Updates::default(),
         };
         app.register_hotkeys(None);
-        let autostarted = std::env::args().any(|a| a == autostart::ARG);
+        if let Some(old) = &updated_from {
+            log(&format!("updated from {old} to {}", Version::current()));
+        }
         match cfg_err {
             Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
             None => {
                 app.sync_autostart(); // keeps the entry pointing at this exe
                 let all_held = app.hotkey.is_some() && app.shot_hotkey.is_some() && app.full_hotkey.is_some();
-                if all_held && !autostarted {
+                if let Some(e) = &update_error {
+                    app.notify("glint: couldn't update", e, true, ClickTarget::Log);
+                } else if let Some(old) = &updated_from {
+                    let now = Version::current();
+                    let notes = ClickTarget::Link(update::notes_url(&format!("v{now}")));
+                    app.notify_done(&format!("updated to {now}"), &format!("from {old} · click for what's new"), notes);
+                } else if all_held && !autostarted {
                     let text = format!(
                         "{} records a region, {} takes a screenshot, {} captures all screens. \
                          Double-click the tray icon for settings.",
@@ -727,6 +812,7 @@ pub fn run() {
                 }
             }
         }
+        app.schedule_update_check(updates::FIRST_CHECK_MS);
         log(&format!(
             "started, hotkeys record {:?}, screenshot {:?}, all screens {:?}",
             app.hotkey, app.shot_hotkey, app.full_hotkey

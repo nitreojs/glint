@@ -28,6 +28,7 @@ mod window;
 
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, Listener};
+use sections::updates::Updater;
 use sections::uploads::Uploaders;
 use sections::{SECTIONS, Section};
 use widgets::{
@@ -94,6 +95,7 @@ pub fn run() {
         styled: None,
         closing: false,
         uploaders: Uploaders::load(),
+        updater: Updater::load(),
         audio_devices: None,
         shown: None,
         pinned: false,
@@ -143,6 +145,7 @@ struct SettingsApp {
     /// Closing was confirmed (or there was nothing to lose): let the close through.
     closing: bool,
     uploaders: Uploaders,
+    updater: Updater,
     audio_devices: Option<sections::audio::Devices>,
     shown: Option<Section>,
     pinned: bool,
@@ -321,6 +324,7 @@ impl eframe::App for SettingsApp {
                 Section::Screenshots => self.screenshots(content, &look),
                 Section::Uploads => self.uploads(content, &look),
                 Section::Output => self.output(content, &look),
+                Section::Updates => self.updates(content, &look),
                 Section::About => self.about(content, &look),
             }
         });
@@ -422,7 +426,7 @@ impl SettingsApp {
                     });
                     body(
                         ui,
-                        "rust crates (egui, eframe, winit, windows-rs, serde, toml, gif, color_quant and their dependencies), \
+                        "rust crates (egui, eframe, winit, windows-rs, serde, toml, gif, color_quant, minisign-verify and their dependencies), \
                          by their authors, under permissive licences, mostly mit or apache-2.0.",
                     );
                     ui.add_space(4.0);
@@ -546,6 +550,7 @@ mod tests {
                 styled: None,
                 closing: false,
                 uploaders: Uploaders::load(),
+                updater: Updater::at(std::env::temp_dir().join("glint-tests-no-update-status.json")),
                 audio_devices: None,
                 shown: None,
                 pinned: false,
@@ -791,6 +796,61 @@ mod tests {
             }
         }
         eprintln!("{}", counts.join("\n"));
+    }
+
+    #[test]
+    fn updates_section_shows_the_tray_apps_status() {
+        use crate::config::UpdateMode;
+        use crate::update::{State, Status};
+        use egui::accesskit::{Node, Role, Toggled};
+        fn find(tree: &[(egui::accesskit::NodeId, Node)], role: Role, text: &str) -> Option<Node> {
+            let named = |n: &Node| n.label() == Some(text) || n.value() == Some(text);
+            tree.iter().find(|(_, n)| n.role() == role && named(n)).map(|(_, n)| n.clone())
+        }
+        let mut h = Harness::new();
+        h.ctx.enable_accesskit();
+        h.app.go(Section::Updates);
+        let ready = State::Ready { version: "0.2.0".into() };
+        h.app.updater.status = Status { checked: Some("2026-10-21 14:32".into()), state: ready };
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        assert!(find(&tree, Role::Label, concat!("v", env!("CARGO_PKG_VERSION"))).is_some());
+        let check = find(&tree, Role::Button, "check now").expect("check now");
+        assert!(!check.is_disabled());
+        assert!(find(&tree, Role::Label, "0.2.0 ready ·").is_some() && find(&tree, Role::Link, "restart").is_some());
+        assert!(find(&tree, Role::Label, "last checked 2026-10-21 14:32").is_some());
+        assert!(find(&tree, Role::Link, "what's new in 0.2.0 ↗").is_some());
+        let modes = find(&tree, Role::RadioGroup, "updates").expect("the mode picker");
+        let options: Vec<_> = modes
+            .children()
+            .iter()
+            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
+            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
+            .collect();
+        let on = |name: &str, yes: bool| (name.to_owned(), Some(if yes { Toggled::True } else { Toggled::False }));
+        assert_eq!(options, [on("auto", true), on("notify only", false), on("off", false)]);
+        let beta = find(&tree, Role::CheckBox, "beta updates").expect("the beta toggle");
+        assert_eq!(beta.toggled(), Some(Toggled::False));
+
+        let picker = h.control("updates");
+        h.click(pos2(picker.left() + 150.0, picker.top() + 16.0));
+        assert_eq!(h.app.cfg.update_mode, UpdateMode::Notify);
+        assert_eq!(Section::Updates.changes(&h.app.cfg, &h.app.saved), 1);
+        Section::Updates.reset(&mut h.app.cfg);
+        assert_eq!(h.app.cfg, h.app.saved);
+
+        h.app.updater.status.state = State::Failed { error: "github answered 500 for the release list".into() };
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        assert!(find(&tree, Role::Label, "github answered 500 for the release list").is_some());
+        assert!(find(&tree, Role::Link, "restart").is_none());
+        assert!(find(&tree, Role::Link, "github.com/nitreojs/glint/releases ↗").is_some());
+
+        h.app.updater.status = Status { checked: None, state: State::Checking };
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        assert!(find(&tree, Role::Button, "check now").expect("check now").is_disabled());
+        assert!(find(&tree, Role::Label, "checking…").is_some() && find(&tree, Role::Label, "not checked yet").is_some());
     }
 }
 

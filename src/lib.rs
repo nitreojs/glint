@@ -7,4 +7,5 @@ mod platform;
 mod record;
 pub mod settings;
 mod shot;
+mod update;
 mod upload;
