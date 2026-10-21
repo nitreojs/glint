@@ -25,6 +25,8 @@ pub(super) struct Saved {
     pub rect: Option<[i32; 4]>,
     pub volume: f32,
     pub export: Settings,
+    /// The export panel's "more options" are open.
+    pub more: bool,
     /// The retired all / unmuted / mix audio choice: muted lanes now decide, and "mix" became `combine`.
     #[serde(rename = "audio", skip_serializing)]
     legacy_audio: Option<String>,
@@ -32,7 +34,7 @@ pub(super) struct Saved {
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { rect: None, volume: 1.0, export: Settings::default(), legacy_audio: None }
+        Saved { rect: None, volume: 1.0, export: Settings::default(), more: false, legacy_audio: None }
     }
 }
 
@@ -135,7 +137,7 @@ pub(super) fn save_dialog(owner: HWND, suggested: &Path, ext: &str) -> Option<Pa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clip::export::Format;
+    use crate::clip::export::{CodecChoice, Format};
 
     #[test]
     fn saved_state_tolerates_missing_and_old_fields() {
@@ -149,5 +151,8 @@ mod tests {
         let s = Saved::parse(r#"{"export":{"format":"gif","target_mb":10,"gif_fps":24}}"#);
         assert_eq!((s.export.format, s.export.target_mb, s.export.gif_fps), (Format::Gif, Some(10), 24));
         assert_eq!(Saved::parse("garbage"), Saved::default());
+        let s = Saved::parse(r#"{"more":true,"export":{"fps":30,"kbps":3000,"codec":"hevc"}}"#);
+        assert!(s.more && !Saved::default().more);
+        assert_eq!((s.export.fps, s.export.kbps, s.export.codec), (Some(30), Some(3000), CodecChoice::Hevc));
     }
 }

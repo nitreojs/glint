@@ -42,6 +42,9 @@ pub(crate) fn anim_ctx(ctx: &Context, id: Id, on: bool, secs: f32) -> f32 {
 
 /// The design's ease-out, cubic-bezier(0.2, 0, 0, 1).
 pub(crate) fn ease(t: f32) -> f32 {
+    if t <= 0.0 || t >= 1.0 {
+        return t.clamp(0.0, 1.0);
+    }
     let bez = |s: f32, a: f32, b: f32| 3.0 * (1.0 - s).powi(2) * s * a + 3.0 * (1.0 - s) * s * s * b + s * s * s;
     let (mut lo, mut hi) = (0.0, 1.0);
     for _ in 0..20 {

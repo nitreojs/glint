@@ -112,6 +112,25 @@ pub(super) fn open(path: &Path, gpu: Option<&Gpu>) -> Result<IMFSourceReader, St
     }
 }
 
+/// Whether windows has an encoder (hardware or software) that writes `subtype`.
+pub(super) fn has_encoder(subtype: GUID) -> bool {
+    unsafe {
+        let out = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype };
+        let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
+        let (mut list, mut count) = (std::ptr::null_mut(), 0u32);
+        if MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, None, Some(&out), &mut list, &mut count).is_err() {
+            return false;
+        }
+        if !list.is_null() {
+            for i in 0..count as usize {
+                drop(std::ptr::read(list.add(i)));
+            }
+            windows::Win32::System::Com::CoTaskMemFree(Some(list as _));
+        }
+        count > 0
+    }
+}
+
 pub(super) fn rgb_reader(src: &Path, size: (u32, u32)) -> Result<IMFSourceReader, String> {
     let gpu = Gpu::new().and_then(|g| {
         let r = open(src, Some(&g))?;

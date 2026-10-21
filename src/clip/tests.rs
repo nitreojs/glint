@@ -31,6 +31,7 @@ impl Harness {
         let path = PathBuf::from("C:/nowhere/glint_2026-10-21_04-36.mp4");
         let app = ClipApp::new(path, Ok(info), None, &Config::default(), Saved::default(), [0xE5, 0x40, 0x2F]);
         let mut h = Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0, texts: Vec::new() };
+        h.app.hevc = true;
         h.settle();
         h
     }
@@ -92,7 +93,8 @@ fn the_export_panel_shows_only_the_rows_that_apply() {
         assert!(h.has(row), "{row}");
     }
     assert!(h.has("combine sound into one track"));
-    assert!(!h.has("frame rate") && !h.has("reset"));
+    assert!(h.has("frame rate") && h.has("60 fps (original)") && !h.has("reset"));
+    assert!(h.has("more options") && !h.has("bitrate") && !h.has("codec"));
     assert!(h.has("1920×1080 · 60 fps · 0:42 · 3 sound tracks"));
     assert!(h.has("drag the red edges to trim · ") && h.has("all keys"));
     assert!(h.starts("≈ ").is_some());
@@ -117,6 +119,7 @@ fn the_export_panel_shows_only_the_rows_that_apply() {
     h.click(h.at("gif"));
     assert_eq!(h.app.saved.export.format, Format::Gif);
     assert!(h.has("frame rate") && h.has("15 fps") && h.has("save gif"));
+    assert!(!h.has("more options") && !h.has("60 fps (original)"));
     assert!(!h.has("combine sound into one track"));
     assert_eq!(h.starts("0:42 of").as_deref(), Some("0:42 of 0:42 · no sound (gif)"));
 
@@ -129,6 +132,42 @@ fn the_export_panel_shows_only_the_rows_that_apply() {
 
     h.click(h.at("≤ 25 MB"));
     assert_eq!(h.app.saved.export.target_mb, Some(25));
+}
+
+#[test]
+fn more_options_hold_bitrate_and_codec_and_a_bitrate_replaces_the_size_limit() {
+    let mut h = Harness::new(2);
+    h.click(h.at("more options"));
+    assert!(h.app.saved.more);
+    assert!(h.has("bitrate") && h.has("auto") && h.has("codec") && h.has("same as source (h.264)"));
+
+    h.click(h.at("≤ 10 MB"));
+    assert_eq!(h.app.saved.export.target_mb, Some(10));
+    assert!(h.starts("· ").is_some_and(|t| t.ends_with(" Mbps")), "the size limit's bitrate shows next to auto");
+
+    h.click(h.at("… Mbps"));
+    h.frame(vec![Event::Text("3".into())]);
+    h.settle();
+    assert_eq!((h.app.saved.export.kbps, h.app.saved.export.target_mb), (Some(3000), None));
+    assert!(h.starts("· ").is_none());
+    assert_eq!(h.starts("≈ ").as_deref(), Some("≈ 18 MB"));
+
+    h.click(h.at("≤ 25 MB"));
+    assert_eq!((h.app.saved.export.kbps, h.app.saved.export.target_mb), (None, Some(25)));
+    assert!(h.app.custom_mbps.is_empty());
+
+    h.click(h.at("… Mbps"));
+    h.frame(vec![Event::Text("999".into())]);
+    h.settle();
+    assert_eq!((h.app.saved.export.kbps, h.app.saved.export.target_mb), (None, Some(25)), "out of range stays auto");
+
+    h.click(h.at("same as source (h.264)"));
+    h.click(h.at("hevc"));
+    assert_eq!(h.app.saved.export.codec, export::CodecChoice::Hevc);
+
+    h.click(h.at("more options"));
+    assert!(!h.app.saved.more);
+    assert!(!h.has("bitrate"));
 }
 
 #[test]
@@ -344,4 +383,67 @@ fn a_cropped_gif_comes_out_at_the_scaled_crop() {
     assert!(matches!(&job, Job::Gif(g) if g.size == (320, 360)), "{job:?}");
     assert_eq!(streams, ["gif,320,360"]);
     assert!((duration - 1.0).abs() < 0.05, "{duration}");
+}
+
+fn video_stream_facts(path: &Path) -> Vec<String> {
+    let p = path.to_string_lossy();
+    let entries = "stream=codec_name,width,height,r_frame_rate,nb_frames,bit_rate";
+    tool("ffprobe", &["-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "csv=p=0", &p])
+        .trim()
+        .split(',')
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn thirty_fps_at_3_mbps_drops_frames_on_the_grid() {
+    let noisy = ["-vf", "noise=alls=25:allf=t+u", "-g", "60", "-b:v", "20M"];
+    let src = fixture("rate", "1280x720", "60", &noisy);
+    let out = src.with_file_name(format!("glint-clip-rate-out-{}.mp4", std::process::id()));
+    let edit = Edit::new(3 * SECOND, 2);
+    let settings = export::Settings { fps: Some(30), kbps: Some(3000), ..export::Settings::default() };
+    let (job, estimate) = export_to(&src, &edit, &settings, &out);
+    let facts = video_stream_facts(&out);
+    let audio = probe(&out, "stream=codec_type,duration");
+    let size = std::fs::metadata(&out).unwrap().len();
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+
+    assert!(matches!(&job, Job::Video(VideoJob { video: Video::Encode { fps: Some(30), bitrate: 3_000_000, .. }, .. })));
+    assert_eq!(facts[..4], ["h264", "1280", "720", "30/1"], "{facts:?}");
+    assert_eq!(facts[5], "90", "{facts:?}");
+    let bps: f64 = facts[4].parse().unwrap();
+    assert!((bps / 3e6 - 1.0).abs() < 0.15, "{bps}");
+    assert_eq!(audio.iter().filter(|a| a.starts_with("audio")).count(), 2, "{audio:?}");
+    for a in audio.iter().filter(|a| a.starts_with("audio")) {
+        let d: f64 = a.split(',').nth(1).unwrap().parse().unwrap();
+        assert!((d - 3.0).abs() < 0.06, "{a}");
+    }
+    let off = (estimate as f64 - size as f64).abs() / size as f64;
+    assert!(off < 0.15, "estimate {estimate} vs {size}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH and an hevc encoder; writes and deletes temp files"]
+fn switching_to_hevc_reencodes_with_it() {
+    let has = {
+        let _com = Com::init();
+        media::has_encoder(windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC)
+    };
+    assert!(has, "this pc has no hevc encoder");
+    let src = fixture("hevc", "1280x720", "30", &["-g", "30"]);
+    let out = src.with_file_name(format!("glint-clip-hevc-out-{}.mp4", std::process::id()));
+    let mut edit = Edit::new(3 * SECOND, 2);
+    edit.range = Range { start: SECOND / 2, end: 5 * SECOND / 2 };
+    let settings = export::Settings { codec: export::CodecChoice::Hevc, ..export::Settings::default() };
+    let (job, _) = export_to(&src, &edit, &settings, &out);
+    let facts = video_stream_facts(&out);
+    let duration: f64 = probe(&out, "format=duration")[0].parse().unwrap();
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+
+    assert!(matches!(&job, Job::Video(VideoJob { video: Video::Encode { codec: crate::record::Codec::Hevc, fps: None, .. }, .. })));
+    assert_eq!(facts[..4], ["hevc", "1280", "720", "30/1"], "{facts:?}");
+    assert!((duration - 2.0).abs() < 0.08, "{duration}");
 }

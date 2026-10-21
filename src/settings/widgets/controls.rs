@@ -482,6 +482,7 @@ pub(crate) fn dropdown(ui: &mut Ui, look: &Look, text: &str, items: &[String], w
 pub(crate) struct Dropped {
     pub picked: Option<usize>,
     pub opened: bool,
+    pub response: Response,
 }
 
 pub(crate) fn dropdown_detail(
@@ -538,5 +539,5 @@ pub(crate) fn dropdown_detail(
             }
         });
     });
-    Dropped { picked, opened }
+    Dropped { picked, opened, response: resp }
 }

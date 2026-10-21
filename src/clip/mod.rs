@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Color32, ColorImage, Event, Id, Key, Modifiers, Rect, TextureHandle, TextureOptions, Ui, pos2, vec2};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
 
 use crate::app::tray::icon_rgba;
 use crate::config::Config;
@@ -70,12 +71,12 @@ pub(crate) fn spawn(path: &Path) -> std::io::Result<()> {
 
 pub fn run(path: PathBuf) {
     let probe = path.clone();
-    let info = std::thread::spawn(move || {
+    let (info, hevc) = std::thread::spawn(move || {
         let _com = Com::init();
-        media::probe(&probe)
+        (media::probe(&probe), media::has_encoder(MFVideoFormat_HEVC))
     })
     .join()
-    .unwrap_or_else(|_| Err("the video couldn't be read".into()));
+    .unwrap_or_else(|_| (Err("the video couldn't be read".into()), false));
     if let Err(e) = &info {
         log(&format!("clip: {}: {e}", path.display()));
     }
@@ -110,7 +111,7 @@ pub fn run(path: PathBuf) {
                 actions::place(h, r);
             }
             let mut app = ClipApp::new(path, info, index, &cfg, saved, accent);
-            (app.hwnd, app.rounded, app.live) = (hwnd, rounded, true);
+            (app.hwnd, app.rounded, app.live, app.hevc) = (hwnd, rounded, true, hevc);
             Ok(Box::new(app))
         }),
     );
@@ -219,6 +220,9 @@ struct ClipApp {
     cropping: Option<Cropping>,
     saved: Saved,
     custom_mb: String,
+    custom_mbps: String,
+    /// Windows can encode hevc.
+    hevc: bool,
     task: Option<Task>,
     upload: Option<Upload>,
     toast: Option<Toast>,
@@ -267,6 +271,7 @@ impl ClipApp {
             Some(mb) if !export::TARGETS_MB.contains(&mb) => mb.to_string(),
             _ => String::new(),
         };
+        let custom_mbps = saved.export.kbps.map_or(String::new(), |k| format!("{}", k as f64 / 1000.0));
         ClipApp {
             path,
             name,
@@ -305,6 +310,8 @@ impl ClipApp {
             cropping: None,
             saved,
             custom_mb,
+            custom_mbps,
+            hevc: false,
             task: None,
             upload: None,
             toast: None,
