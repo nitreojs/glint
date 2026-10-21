@@ -521,6 +521,7 @@ mod tests {
         app: SettingsApp,
         frame: eframe::Frame,
         time: f64,
+        screen: egui::Vec2,
     }
 
     impl Harness {
@@ -548,13 +549,13 @@ mod tests {
                 accent_text: String::new(),
                 size: (WINDOW, WINDOW),
             };
-            Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0 }
+            Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0, screen: vec2(WINDOW[0], WINDOW[1]) }
         }
 
         fn frame(&mut self, events: Vec<egui::Event>, label: &str) -> Option<f32> {
             self.time += 0.016;
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WINDOW[0], WINDOW[1]))),
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), self.screen)),
                 time: Some(self.time),
                 events,
                 ..Default::default()
@@ -597,6 +598,33 @@ mod tests {
         assert_eq!(h.frame(Vec::new(), "frame rate"), Some(TOP));
         h.app.go(Section::General);
         assert_eq!(h.frame(Vec::new(), "record hotkey"), Some(TOP));
+    }
+
+    #[test]
+    fn row_labels_clear_their_controls() {
+        use crate::config::audio::{AudioSource, SourceKind};
+        for width in [WINDOW[0], 760.0, 1200.0] {
+            let mut h = Harness::new();
+            h.screen = vec2(width, WINDOW[1]);
+            h.app.cfg.upload_destination = "litterbox".into();
+            h.app.cfg.audio_sources =
+                [SourceKind::Desktop, SourceKind::App, SourceKind::Mic].iter().enumerate().map(|(i, &k)| AudioSource::new(k, i)).collect();
+            for section in SECTIONS {
+                h.app.go(section);
+                for _ in 0..40 {
+                    h.frame(Vec::new(), "");
+                }
+                widgets::ROWS.with_borrow_mut(Vec::clear);
+                h.frame(Vec::new(), "");
+                let rows = widgets::ROWS.take();
+                assert!(!rows.is_empty(), "{} has no rows", section.name());
+                for (label, l, c) in rows {
+                    let at = format!("{} › {label} at {width}: label {l:?}, control {c:?}", section.name());
+                    assert!(l.right() < c.left(), "{at}");
+                    assert!(c.right() <= width - CONTENT_X + 0.5, "{at}");
+                }
+            }
+        }
     }
 }
 

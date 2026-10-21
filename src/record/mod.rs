@@ -33,6 +33,7 @@ use crate::config::audio::AudioSource;
 use crate::platform::log::log;
 use crate::platform::rect::Rect;
 
+mod apps;
 mod audio;
 mod capture;
 mod cursor;
@@ -44,7 +45,8 @@ mod rotate;
 mod timeline;
 pub(crate) mod tracks;
 
-pub(crate) use audio::{Microphone, microphones, session_apps};
+pub(crate) use apps::{App, running_apps};
+pub(crate) use audio::{Microphone, microphones};
 use capture::Capture;
 use encoder::Encoder;
 use timeline::Pauses;

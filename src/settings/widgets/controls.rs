@@ -17,8 +17,14 @@ pub(super) fn focus_ring(ui: &Ui, look: &Look, resp: &Response, rect: Rect, radi
 
 // ---- layout -----------------------------------------------------------------------------------
 
-/// One settings row: a divider, the label in its fixed column, the control column. `label_dy`
-/// lines the label up with the control (7 for 32 px controls, 1 for toggles, 0 for sliders).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ROWS: std::cell::RefCell<Vec<(String, Rect, Rect)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One settings row: a divider, the label wrapping in its fixed column, the control column.
+/// `label_dy` lines the label's first line up with the control (7 for 32 px controls, 1 for
+/// toggles, 0 for sliders).
 pub(crate) fn row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: impl FnOnce(&mut Ui)) {
     let full = ui.available_rect_before_wrap();
     let top = full.top();
@@ -27,8 +33,12 @@ pub(crate) fn row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: imp
     let mut child = ui.new_child(UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Min)));
     child.spacing_mut().item_spacing = vec2(8.0, 6.0);
     add(&mut child);
-    let bottom = child.min_rect().bottom().max(top + 15.0) + 14.0;
-    ui.painter().text(pos2(full.left(), top + 15.0 + label_dy), Align2::LEFT_TOP, label, medium(13.0), look.p.t1);
+    let text = ui.painter().layout(label.to_owned(), medium(13.0), look.p.t1, LABEL_W);
+    let label_rect = Rect::from_min_size(pos2(full.left(), top + 15.0 + label_dy), text.size());
+    let bottom = child.min_rect().bottom().max(label_rect.bottom()).max(top + 15.0) + 14.0;
+    #[cfg(test)]
+    ROWS.with_borrow_mut(|rows| rows.push((label.to_owned(), label_rect, child.min_rect())));
+    ui.painter().galley(label_rect.min, text, look.p.t1);
     ui.advance_cursor_after_rect(Rect::from_min_max(full.left_top(), pos2(full.right(), bottom)));
 }
 
@@ -392,10 +402,28 @@ pub(crate) fn text_field(ui: &mut Ui, look: &Look, text: &mut String, placeholde
 }
 
 pub(crate) fn dropdown(ui: &mut Ui, look: &Look, text: &str, items: &[String], width: f32) -> Option<usize> {
+    let rows: Vec<(&str, &str)> = items.iter().map(|i| (i.as_str(), "")).collect();
+    dropdown_detail(ui, look, text, &rows, width, width).picked
+}
+
+pub(crate) struct Dropped {
+    pub picked: Option<usize>,
+    pub opened: bool,
+}
+
+pub(crate) fn dropdown_detail(
+    ui: &mut Ui,
+    look: &Look,
+    text: &str,
+    rows: &[(&str, &str)],
+    width: f32,
+    list_width: f32,
+) -> Dropped {
     let p = &look.p;
     let (rect, resp) = ui.allocate_exact_size(vec2(width, 32.0), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+    let opened = resp.clicked() && !open;
     let h = anim(ui, resp.id.with("hov"), resp.hovered() || open, 0.08);
     let painter = ui.painter();
     painter.rect(rect, 5, mix(p.field, p.ctl, h), Stroke::new(1.0, mix(p.line2, p.line3, h)), StrokeKind::Inside);
@@ -408,21 +436,30 @@ pub(crate) fn dropdown(ui: &mut Ui, look: &Look, text: &str, items: &[String], w
     painter.add(Shape::line(chevron, Stroke::new(1.5, mix(p.t3, p.t1, h))));
     focus_ring(ui, look, &resp, rect, 5.0);
     let frame = egui::Frame::NONE.fill(p.surf).stroke(Stroke::new(1.0, p.line2)).corner_radius(6).inner_margin(4);
+    let align = if list_width > width { egui::RectAlign::BOTTOM_END } else { egui::RectAlign::BOTTOM_START };
+    let popup = egui::Popup::from_toggle_button_response(&resp).width(list_width).align(align).gap(4.0).frame(frame);
     let mut picked = None;
-    egui::Popup::from_toggle_button_response(&resp).width(width).gap(4.0).frame(frame).show(|ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        let row_w = width - 8.0;
-        for (i, item) in items.iter().enumerate() {
-            let (r, item_resp) = ui.allocate_exact_size(vec2(row_w, 28.0), Sense::click());
-            let hov = anim(ui, item_resp.id.with("hov"), item_resp.hovered(), 0.06);
-            ui.painter().rect_filled(r, 4, p.hov.gamma_multiply(hov));
-            let g = galley(ui, item, sans(13.0));
-            let clip = ui.painter().with_clip_rect(r.shrink2(vec2(8.0, 0.0)).intersect(ui.clip_rect()));
-            clip.galley(pos2(r.left() + 8.0, r.center().y - g.size().y / 2.0), g, p.t1);
-            if item_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
-                picked = Some(i);
+    popup.show(|ui| {
+        egui::ScrollArea::vertical().max_height(336.0).auto_shrink([false, true]).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let row_w = list_width - 8.0;
+            for (i, (name, detail)) in rows.iter().enumerate() {
+                let (r, item_resp) = ui.allocate_exact_size(vec2(row_w, 28.0), Sense::click());
+                let hov = anim(ui, item_resp.id.with("hov"), item_resp.hovered(), 0.06);
+                ui.painter().rect_filled(r, 4, p.hov.gamma_multiply(hov));
+                let clip = ui.painter().with_clip_rect(r.shrink2(vec2(8.0, 0.0)).intersect(ui.clip_rect()));
+                let g = galley(ui, name, sans(13.0));
+                let after = r.left() + 8.0 + g.size().x + 10.0;
+                clip.galley(pos2(r.left() + 8.0, r.center().y - g.size().y / 2.0), g, p.t1);
+                if !detail.is_empty() {
+                    let d = galley(ui, detail, sans(12.0));
+                    clip.galley(pos2(after, r.center().y - d.size().y / 2.0), d, p.t3);
+                }
+                if item_resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    picked = Some(i);
+                }
             }
-        }
+        });
     });
-    picked
+    Dropped { picked, opened }
 }

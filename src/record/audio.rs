@@ -3,16 +3,14 @@ use std::sync::mpsc::{self, Sender};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Devices::FunctionDiscovery::{PKEY_Device_FriendlyName, PKEY_DeviceInterface_FriendlyName};
-use windows::Win32::Foundation::{CloseHandle, PROPERTYKEY};
+use windows::Win32::Foundation::PROPERTYKEY;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
 use windows::Win32::System::Com::{BLOB, CLSCTX_ALL, CoCreateInstance, CoTaskMemFree, STGM_READ};
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
 use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
 use windows::core::{HSTRING, Interface, Ref, implement};
 
+use super::apps::{Proc, processes, roots};
 use super::mix::{Format, HNS, Mix, Placement, RATE, Sample, frames_to_hns, hns_to_frames, mix_tracks};
 use super::tracks::{Track, plan};
 use super::{Ctx, Msg, hns, qpc};
@@ -188,7 +186,8 @@ unsafe fn process_loopback(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Result<Clie
                 },
             },
         };
-        let mut pv = PROPVARIANT::default();
+        // the windows crate drops PROPVARIANT with PropVariantClear, which would CoTaskMemFree the stack blob.
+        let mut pv = std::mem::ManuallyDrop::new(PROPVARIANT::default());
         let v = &mut pv.Anonymous.Anonymous;
         v.vt = VT_BLOB;
         v.Anonymous.blob = BLOB {
@@ -197,7 +196,7 @@ unsafe fn process_loopback(pid: u32, mode: PROCESS_LOOPBACK_MODE) -> Result<Clie
         };
         let (tx, rx) = mpsc::sync_channel(1);
         let handler: IActivateAudioInterfaceCompletionHandler = Activated(tx).into();
-        let op = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&pv), &handler)
+        let op = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(&*pv), &handler)
             .ctx("ActivateAudioInterfaceAsync")?;
         rx.recv_timeout(ACTIVATE_TIMEOUT).map_err(|_| "process loopback activation timed out".to_string())?;
         let mut hr = windows::core::HRESULT(0);
@@ -413,46 +412,6 @@ pub(super) unsafe fn run(mut sources: Vec<Source>, tracks: &[Vec<usize>], stop: 
     }
 }
 
-pub(super) struct Proc {
-    pid: u32,
-    parent: u32,
-    exe: String,
-}
-
-fn processes() -> Vec<Proc> {
-    let mut out = Vec::new();
-    unsafe {
-        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else { return out };
-        let mut e = PROCESSENTRY32W { dwSize: size_of::<PROCESSENTRY32W>() as u32, ..Default::default() };
-        let mut ok = Process32FirstW(snap, &mut e).is_ok();
-        while ok {
-            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
-            let exe = String::from_utf16_lossy(&e.szExeFile[..len]).to_lowercase();
-            out.push(Proc { pid: e.th32ProcessID, parent: e.th32ParentProcessID, exe });
-            ok = Process32NextW(snap, &mut e).is_ok();
-        }
-        let _ = CloseHandle(snap);
-    }
-    out
-}
-
-// process loopback captures a whole process tree from its root pid.
-fn roots(procs: &[Proc], exe: &str) -> Vec<u32> {
-    let find = |pid: u32| procs.iter().find(|p| p.pid == pid && pid != 0);
-    let inside = |p: &Proc| {
-        let mut at = find(p.parent);
-        for _ in 0..64 {
-            match at {
-                Some(a) if a.exe == exe => return true,
-                Some(a) if a.pid != p.pid => at = find(a.parent),
-                _ => return false,
-            }
-        }
-        false
-    };
-    procs.iter().filter(|p| p.exe == exe && !inside(p)).map(|p| p.pid).collect()
-}
-
 unsafe fn property(dev: &IMMDevice, key: &PROPERTYKEY) -> Option<String> {
     unsafe {
         let store = dev.OpenPropertyStore(STGM_READ).ok()?;
@@ -502,57 +461,5 @@ pub(crate) fn microphones() -> (Vec<Microphone>, Option<String>) {
         }
         let default = en.GetDefaultAudioEndpoint(eCapture, eConsole).ok().and_then(|d| device_id(&d));
         (mics, default)
-    }
-}
-
-// needs com on the calling thread.
-pub(crate) fn session_apps() -> Vec<String> {
-    let procs = processes();
-    let mut apps = Vec::new();
-    unsafe {
-        let Ok(en) = CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL) else {
-            return apps;
-        };
-        let Ok(all) = en.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) else { return apps };
-        for i in 0..all.GetCount().unwrap_or(0) {
-            let Ok(mgr) = all.Item(i).and_then(|d| d.Activate::<IAudioSessionManager2>(CLSCTX_ALL, None)) else {
-                continue;
-            };
-            let Ok(sessions) = mgr.GetSessionEnumerator() else { continue };
-            for j in 0..sessions.GetCount().unwrap_or(0) {
-                let Ok(s) = sessions.GetSession(j).and_then(|s| s.cast::<IAudioSessionControl2>()) else { continue };
-                if s.IsSystemSoundsSession() == windows::Win32::Foundation::S_OK {
-                    continue;
-                }
-                let Ok(pid) = s.GetProcessId() else { continue };
-                if let Some(p) = procs.iter().find(|p| p.pid == pid && pid != 0) {
-                    apps.push(p.exe.clone());
-                }
-            }
-        }
-    }
-    apps.sort();
-    apps.dedup();
-    apps
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn roots_are_the_top_of_each_tree() {
-        let p = |pid, parent, exe: &str| Proc { pid, parent, exe: exe.into() };
-        let procs = [
-            p(1, 0, "explorer.exe"),
-            p(10, 1, "discord.exe"),
-            p(11, 10, "discord.exe"),
-            p(12, 11, "discord.exe"),
-            p(20, 1, "discord.exe"),
-            p(30, 10, "helper.exe"),
-            p(31, 30, "discord.exe"),
-        ];
-        assert_eq!(roots(&procs, "discord.exe"), [10, 20]);
-        assert_eq!(roots(&procs, "obs64.exe"), [0u32; 0]);
     }
 }
