@@ -31,11 +31,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "nitreojs"
+            VALUE "CompanyName", "starkow"
             VALUE "FileDescription", "glint"
             VALUE "FileVersion", "{version}"
             VALUE "InternalName", "glint"
-            VALUE "LegalCopyright", "Copyright (C) nitreojs"
+            VALUE "LegalCopyright", "Copyright (C) starkow"
             VALUE "OriginalFilename", "glint.exe"
             VALUE "ProductName", "glint"
             VALUE "ProductVersion", "{version}"
