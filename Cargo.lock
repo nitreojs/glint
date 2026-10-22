@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "glint"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "embed-resource",
@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "glint-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "emath",
  "minisign-verify",
@@ -1167,7 +1167,7 @@ dependencies = [
 
 [[package]]
 name = "glint-media"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "color_quant",
  "gif",
@@ -1178,7 +1178,7 @@ dependencies = [
 
 [[package]]
 name = "glint-ui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "eframe",
  "glint-core",
