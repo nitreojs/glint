@@ -1,7 +1,8 @@
 use std::sync::LazyLock;
 
 use glint_core::geom::rect::Rect;
-use glint_core::record::pipeline::{Backend, Parts, Role, open_audio};
+use glint_core::record::clicks::Style;
+use glint_core::record::pipeline::{Backend, ClickCapture, Parts, Role, open_audio};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -16,6 +17,7 @@ use windows::Win32::System::Threading::{
 
 use super::capture::Capture;
 use super::encoder::{self, Composer, SinkWriter};
+use super::mouse::{self, Hook};
 use super::{Ctx, Params, audio};
 
 /// Shared textures between capture and encoder; capture drops frames only if all are busy.
@@ -47,6 +49,7 @@ impl Backend for Windows {
     type Frames = Composer;
     type Output = SinkWriter;
     type Audio = audio::Source;
+    type Mouse = Hook;
     type Guard = Thread;
 
     fn enter(role: Role) -> Thread {
@@ -54,6 +57,7 @@ impl Backend for Windows {
             Role::Encode => (THREAD_PRIORITY_ABOVE_NORMAL, true, true),
             Role::Capture => (THREAD_PRIORITY_HIGHEST, false, false),
             Role::Audio => (THREAD_PRIORITY_HIGHEST, true, false),
+            Role::Mouse => (THREAD_PRIORITY_HIGHEST, false, false),
         };
         set_priority(priority);
         unsafe {
@@ -83,7 +87,11 @@ unsafe fn open(p: &Params) -> Result<Parts<Windows>, String> {
         let audio = open_audio::<audio::Source>(&p.audio, &p.track_names);
         let names = audio.tracks.iter().map(|t| t.name.clone()).collect();
         let (frames, output) = encoder::open(p, &capture, names)?;
-        Ok(Parts { capture, frames, output, audio, fps: p.fps, path: p.path.clone() })
+        let clicks = p.clicks.map(|c| {
+            let scale = mouse::scale(p.region);
+            ClickCapture { mouse: Hook { region: p.region }, style: Style::new(c.accent, scale), scale, burn_in: c.burn_in }
+        });
+        Ok(Parts { capture, frames, output, audio, fps: p.fps, path: p.path.clone(), clicks })
     }
 }
 

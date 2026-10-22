@@ -3,9 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use super::video::{self, Control, Stats};
+use super::video::{self, Clicks, Control, Stats};
 use super::*;
 use crate::config::audio::SourceKind;
+use crate::record::clicks::{Button, Click};
 use crate::record::pointer::PointerKind;
 
 const MS: i64 = 10_000;
@@ -17,6 +18,7 @@ struct Log {
     latched: Vec<usize>,
     pointers: Vec<(i32, i32)>,
     contents: Vec<Content>,
+    drawn: Vec<Vec<Shape>>,
     video: Vec<(u32, i64, i64)>,
     audio: Vec<(usize, i64, usize)>,
     finished: bool,
@@ -62,11 +64,14 @@ impl Frames for FakeFrames {
         }
         let mut log = get(&self.log);
         log.contents.push((None, None));
+        log.drawn.push(Vec::new());
         Ok(Some(log.contents.len() as u32 - 1))
     }
 
-    fn compose(&mut self, frame: &u32, cursor: Option<(i32, i32)>) -> Result<(), String> {
-        get(&self.log).contents[*frame as usize] = (self.image, cursor);
+    fn compose(&mut self, frame: &u32, cursor: Option<(i32, i32)>, clicks: &[Shape]) -> Result<(), String> {
+        let mut log = get(&self.log);
+        log.contents[*frame as usize] = (self.image, cursor);
+        log.drawn[*frame as usize] = clicks.to_vec();
         Ok(())
     }
 }
@@ -128,7 +133,7 @@ fn encode<O: Output<Frame = u32>>(
     let (free_tx, free_rx) = mpsc::channel();
     let abort = AtomicBool::new(abort);
     let pauses = Mutex::new(pauses);
-    let ctl = Control { abort: &abort, pauses: &pauses, now };
+    let ctl = Control { abort: &abort, pauses: &pauses, now, clicks: Clicks::Off };
     let stats = video::run(frames, output, &rx, &free_tx, &ctl, 10.0, tracks);
     Run { stats, freed: free_rx.try_iter().collect() }
 }
@@ -141,7 +146,7 @@ fn run_video(events: Vec<Event<usize>>, pauses: Pauses, now: fn() -> i64, fail: 
 }
 
 fn stats(frames: u64, dropped: u64, duration_s: f64) -> Result<Stats, String> {
-    Ok(Stats { frames, dropped, duration_s })
+    Ok(Stats { frames, dropped, duration_s, clicks: None })
 }
 
 #[test]
@@ -254,6 +259,89 @@ fn no_frames_is_an_error() {
     assert!(!get(&log).finished);
 }
 
+fn press(button: Button, down: bool, at: i64) -> Event<usize> {
+    Event::Click(Press { button, down, at, x: 1.5, y: 2.5 })
+}
+
+fn run_clicks(events: Vec<Event<usize>>, pauses: Pauses, now: fn() -> i64, clicks: Clicks) -> (Run, Shared) {
+    let log = Shared::default();
+    let (tx, rx) = mpsc::channel();
+    for e in events {
+        tx.send(e).unwrap();
+    }
+    drop(tx);
+    let (free_tx, free_rx) = mpsc::channel();
+    let (abort, pauses) = (AtomicBool::new(false), Mutex::new(pauses));
+    let ctl = Control { abort: &abort, pauses: &pauses, now, clicks };
+    let stats = video::run(&mut FakeFrames::new(&log), &mut FakeOutput { log: log.clone() }, &rx, &free_tx, &ctl, 10.0, 0);
+    (Run { stats, freed: free_rx.try_iter().collect() }, log)
+}
+
+#[test]
+fn clicks_land_on_the_video_timeline_without_the_paused_time() {
+    let mut pauses = Pauses::default();
+    pauses.pause(300 * MS);
+    pauses.resume(500 * MS);
+    let events = vec![
+        press(Button::Left, true, 50 * MS),
+        press(Button::Left, false, 60 * MS),
+        frame(Some(0), 100 * MS, None),
+        press(Button::Left, true, 150 * MS),
+        press(Button::Left, false, 200 * MS),
+        press(Button::Right, true, 280 * MS),
+        press(Button::Middle, true, 350 * MS),
+        press(Button::Middle, false, 360 * MS),
+        press(Button::Right, false, 400 * MS),
+        frame(Some(1), 600 * MS, None),
+        press(Button::Left, true, 650 * MS),
+        press(Button::Right, true, 720 * MS),
+        Event::End { at: 700 * MS },
+    ];
+    let (run, log) = run_clicks(events, pauses, mid_pause, Clicks::Keep);
+    let click = |button, down, up: Option<i64>| Click { button, down: down * MS, up: up.map(|u| u * MS), x: 1.5, y: 2.5 };
+    let clicks = vec![click(Button::Left, 50, Some(100)), click(Button::Right, 180, Some(200)), click(Button::Left, 350, None)];
+    assert_eq!(run.stats, Ok(Stats { frames: 2, dropped: 0, duration_s: 0.4, clicks: Some(clicks) }));
+    assert!(get(&log).drawn.iter().all(Vec::is_empty));
+}
+
+#[test]
+fn burnt_in_clicks_are_drawn_at_each_frames_time() {
+    let style = Style::new([255, 0, 0], 1.0);
+    let events = vec![
+        frame(Some(0), 0, None),
+        frame(Some(1), 100 * MS, None),
+        press(Button::Left, true, 120 * MS),
+        press(Button::Left, false, 150 * MS),
+        frame(Some(0), 200 * MS, None),
+        frame(Some(1), 300 * MS, None),
+        Event::End { at: 400 * MS },
+    ];
+    let (run, log) = run_clicks(events, Pauses::default(), || 0, Clicks::Burn(style));
+    assert_eq!(run.stats, stats(4, 0, 0.4));
+    let log = get(&log);
+    assert_eq!(log.drawn.iter().map(Vec::len).collect::<Vec<_>>(), [0, 0, 2, 1]);
+    assert_eq!(log.drawn[2], clicks::state_at(&[Click { button: Button::Left, down: 0, up: Some(30 * MS), x: 1.5, y: 2.5 }], 80 * MS, &style));
+    let ring = log.drawn[3][0];
+    assert!((ring.radius - 28.0 * (1.0 - (1.0 - 180.0f32 / 450.0).powi(3))).abs() < 1e-3, "{ring:?}");
+}
+
+#[test]
+fn burnt_in_ripples_get_frames_on_a_still_screen() {
+    let events = vec![
+        frame(Some(0), 0, None),
+        frame(Some(1), 100 * MS, None),
+        press(Button::Right, true, 150 * MS),
+        Event::End { at: 400 * MS },
+    ];
+    let (run, log) = run_clicks(events, Pauses::default(), || 260 * MS, Clicks::Burn(Style::new([255, 0, 0], 1.0)));
+    assert_eq!(run.stats, stats(3, 0, 0.4));
+    let log = get(&log);
+    assert_eq!(log.latched, [0, 1]);
+    assert_eq!(log.video, [(0, 0, 100 * MS), (1, 100 * MS, 200 * MS), (2, 300 * MS, 100 * MS)]);
+    assert_eq!(log.contents[2], (Some(1), None));
+    assert_eq!(log.drawn[2].len(), 2);
+}
+
 struct FakeAudio {
     name: String,
     gain: f32,
@@ -341,6 +429,7 @@ fn audio_sources_open_into_planned_tracks() {
 struct FakeCapture {
     frames: i64,
     images: Vec<usize>,
+    mouse_done: Option<Arc<AtomicBool>>,
 }
 
 impl Capture for FakeCapture {
@@ -356,7 +445,28 @@ impl Capture for FakeCapture {
             };
             out.send(frame(Some(image), k * 100 * MS, Some((k as i32, 0)))).unwrap();
         }
+        while self.mouse_done.as_ref().is_some_and(|d| !d.load(Ordering::SeqCst)) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         Ok(CaptureStats { dropped: 1, coalesced: 2 })
+    }
+}
+
+struct FakeMouse {
+    done: Arc<AtomicBool>,
+}
+
+impl Mouse for FakeMouse {
+    fn run(&mut self, stop: &AtomicBool, listening: &dyn Fn() -> bool, out: &mut dyn FnMut(Press)) {
+        if listening() {
+            out(Press { button: Button::Left, down: true, at: 150 * MS, x: 4.5, y: 5.5 });
+            out(Press { button: Button::Left, down: false, at: 250 * MS, x: 0.0, y: 0.0 });
+            out(Press { button: Button::Right, down: true, at: 380 * MS, x: 6.5, y: 7.5 });
+        }
+        self.done.store(true, Ordering::SeqCst);
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -364,6 +474,7 @@ struct Fake {
     log: Shared,
     path: PathBuf,
     fail: bool,
+    mouse: bool,
 }
 
 impl Backend for Fake {
@@ -371,6 +482,7 @@ impl Backend for Fake {
     type Frames = FakeFrames;
     type Output = FakeOutput;
     type Audio = FakeAudio;
+    type Mouse = FakeMouse;
     type Guard = ();
 
     fn enter(_: Role) {}
@@ -386,13 +498,17 @@ impl Backend for Fake {
         let mut app = AudioSource::new(SourceKind::App, 2);
         app.app = "x.exe".into();
         let config = [AudioSource::new(SourceKind::Mic, 0), AudioSource::new(SourceKind::Desktop, 1), app];
+        let done = Arc::new(AtomicBool::new(false));
+        let style = Style::new([255, 0, 0], 1.25);
+        let clicks = ClickCapture { mouse: FakeMouse { done: done.clone() }, style, scale: 1.25, burn_in: false };
         Ok(Parts {
-            capture: FakeCapture { frames: 5, images: vec![0, 1] },
+            capture: FakeCapture { frames: 5, images: vec![0, 1], mouse_done: self.mouse.then_some(done) },
             frames: FakeFrames::new(&self.log),
             output: FakeOutput { log: self.log },
             audio: open_audio(&config, &[]),
             fps: 10.0,
             path: self.path,
+            clicks: self.mouse.then_some(clicks),
         })
     }
 }
@@ -405,13 +521,34 @@ struct Recording {
 }
 
 fn record(name: &str, fail: bool) -> Recording {
+    record_with(name, fail, false, b"partial")
+}
+
+fn record_with(name: &str, fail: bool, mouse: bool, file: &[u8]) -> Recording {
     let path = std::env::temp_dir().join(format!("glint-pipeline-{name}-{}.mp4", std::process::id()));
-    std::fs::write(&path, b"partial").unwrap();
+    std::fs::write(&path, file).unwrap();
     let log = Shared::default();
     let (tx, done) = mpsc::channel();
-    let backend = Fake { log: log.clone(), path: path.clone(), fail };
+    let backend = Fake { log: log.clone(), path: path.clone(), fail, mouse };
     let started = start(backend, move |res| tx.send(res).unwrap()).and_then(Starting::wait);
     Recording { started, done, log, path }
+}
+
+#[test]
+fn clicks_from_the_mouse_thread_are_saved_in_the_file() {
+    let atom = |kind: &[u8], body: &[u8]| [&((body.len() + 8) as u32).to_be_bytes()[..], kind, body].concat();
+    let mp4 = [atom(b"ftyp", b"isom"), atom(b"mdat", &[7; 64]), atom(b"moov", &atom(b"mvhd", &[0; 100]))].concat();
+    let Recording { started, done, path, .. } = record_with("clicks", false, true, &mp4);
+    let _rec = started.unwrap();
+    let Ok(Outcome::Saved(s)) = done.recv().unwrap() else { panic!("not saved") };
+    let saved = clicks::load(&path);
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(s.duration_s, 0.5);
+    let clicks = vec![
+        Click { button: Button::Left, down: 150 * MS, up: Some(250 * MS), x: 4.5, y: 5.5 },
+        Click { button: Button::Right, down: 380 * MS, up: None, x: 6.5, y: 7.5 },
+    ];
+    assert_eq!(saved, Ok(Some(Payload { version: 1, scale: 1.25, clicks })));
 }
 
 #[test]

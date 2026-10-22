@@ -22,9 +22,11 @@ mod audio;
 #[cfg(windows)]
 mod capture;
 #[cfg(windows)]
-mod cursor;
+pub(crate) mod cursor;
 #[cfg(windows)]
 mod encoder;
+#[cfg(windows)]
+mod mouse;
 #[cfg(windows)]
 mod rotate;
 #[cfg(windows)]
@@ -51,9 +53,18 @@ pub struct Params {
     /// Encoder quality-vs-speed knob, 0 (fastest) ..= 100 (best).
     pub effort: u32,
     pub draw_cursor: bool,
+    /// Click highlights; `None` = off (no mouse hook).
+    pub clicks: Option<ClickHighlights>,
     pub audio: Vec<AudioSource>,
     pub track_names: Vec<String>,
     pub path: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ClickHighlights {
+    /// Drawn into the video; otherwise saved in the file for the trimmer.
+    pub burn_in: bool,
+    pub accent: [u8; 3],
 }
 
 #[derive(Clone, Copy, Debug)]

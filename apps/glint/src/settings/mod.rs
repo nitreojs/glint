@@ -840,5 +840,49 @@ mod tests {
         assert!(find(&tree, Role::Button, "check now").expect("check now").is_disabled());
         assert!(find(&tree, Role::Label, "checking…").is_some() && find(&tree, Role::Label, "not checked yet").is_some());
     }
+
+    #[test]
+    fn click_highlights_reveal_their_mode_and_count_as_changes() {
+        use egui::accesskit::{Node, Role, Toggled};
+        use glint_core::config::ClickMode;
+        fn find(tree: &[(egui::accesskit::NodeId, Node)], role: Role, text: &str) -> Option<Node> {
+            let named = |n: &Node| n.label() == Some(text) || n.value() == Some(text);
+            tree.iter().find(|(_, n)| n.role() == role && named(n)).map(|(_, n)| n.clone())
+        }
+        let mut h = Harness::new();
+        h.ctx.enable_accesskit();
+        h.screen = vec2(WINDOW[0], 1400.0);
+        h.app.go(Section::Recording);
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        assert!(find(&tree, Role::Heading, "overlays").is_some());
+        let toggle = find(&tree, Role::CheckBox, "click highlights").expect("the toggle");
+        assert_eq!((toggle.toggled(), toggle.description()), (Some(Toggled::False), Some("off")));
+        assert!(find(&tree, Role::RadioGroup, "clicks").is_none());
+
+        let c = h.control("click highlights");
+        h.click(pos2(c.left() + 18.0, c.top() + 10.0));
+        assert!(h.app.cfg.click_highlights);
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        let toggle = find(&tree, Role::CheckBox, "click highlights").expect("the toggle");
+        assert_eq!((toggle.toggled(), toggle.description()), (Some(Toggled::True), Some("a ripple on every click")));
+        let modes = find(&tree, Role::RadioGroup, "clicks").expect("the mode picker");
+        let options: Vec<_> = modes
+            .children()
+            .iter()
+            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
+            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
+            .collect();
+        assert_eq!(options, [("editable".to_owned(), Some(Toggled::True)), ("burn in".to_owned(), Some(Toggled::False))]);
+        assert!(find(&tree, Role::Label, "editable clicks can be moved or removed in the trimmer").is_some());
+
+        let picker = h.control("clicks");
+        h.click(pos2(picker.left() + 126.0, picker.top() + 16.0));
+        assert_eq!(h.app.cfg.clicks, ClickMode::BurnIn);
+        assert_eq!(Section::Recording.changes(&h.app.cfg, &h.app.saved), 2);
+        Section::Recording.reset(&mut h.app.cfg);
+        assert_eq!(h.app.cfg, h.app.saved);
+    }
 }
 

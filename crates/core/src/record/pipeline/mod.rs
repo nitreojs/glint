@@ -7,6 +7,8 @@
 //!   cuts paused time and hands frames and placed audio to the [`Output`].
 //! * Audio thread (when enabled): [`AudioInput`]s placed on the capture clock and mixed into
 //!   up to six 48 kHz stereo tracks.
+//! * Mouse thread (with click highlights on): the [`Mouse`] hook's presses, placed on the video
+//!   timeline by the encoder thread, drawn into frames or saved in the file.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use super::Codec;
+use super::clicks::{self, Payload, Press, Shape, Style};
 use super::pointer::PointerShape;
 use super::timeline::Pauses;
 use crate::config::audio::AudioSource;
@@ -39,6 +42,7 @@ pub enum Event<I> {
     /// `start`: capture time of the first frame in 100 ns units.
     Audio { start: i64, tracks: Vec<Vec<i16>> },
     AudioEnd,
+    Click(Press),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,7 +65,24 @@ pub trait Frames {
     fn latch(&mut self, image: &Self::Image) -> Result<(), String>;
     fn set_pointer(&mut self, shape: &PointerShape);
     fn alloc(&mut self) -> Result<Option<Self::Frame>, String>;
-    fn compose(&mut self, frame: &Self::Frame, cursor: Option<(i32, i32)>) -> Result<(), String>;
+    /// `clicks`: highlights to draw over the image, under the cursor.
+    fn compose(&mut self, frame: &Self::Frame, cursor: Option<(i32, i32)>, clicks: &[Shape]) -> Result<(), String>;
+}
+
+/// Mouse buttons on a global hook: presses inside the region and every release, positions in
+/// region pixels, times on the capture clock.
+pub trait Mouse: Send + 'static {
+    /// Reports buttons until `stop`, listening only while `listening()` holds (not paused).
+    fn run(&mut self, stop: &AtomicBool, listening: &dyn Fn() -> bool, out: &mut dyn FnMut(Press));
+}
+
+pub struct ClickCapture<M> {
+    pub mouse: M,
+    pub style: Style,
+    /// DPI / 96 of the region's monitor, saved with the clicks.
+    pub scale: f32,
+    /// Drawn into the video; otherwise the clicks are saved in the file for the trimmer.
+    pub burn_in: bool,
 }
 
 pub trait Output {
@@ -136,6 +157,7 @@ pub enum Role {
     Encode,
     Capture,
     Audio,
+    Mouse,
 }
 
 pub trait Backend: Send + Sized + 'static {
@@ -143,6 +165,7 @@ pub trait Backend: Send + Sized + 'static {
     type Frames: Frames<Image = <Self::Capture as Capture>::Image>;
     type Output: Output<Frame = <Self::Frames as Frames>::Frame>;
     type Audio: AudioInput;
+    type Mouse: Mouse;
     type Guard;
 
     fn enter(role: Role) -> Self::Guard;
@@ -157,6 +180,7 @@ pub struct Parts<B: Backend> {
     pub audio: OpenedAudio<B::Audio>,
     pub fps: f64,
     pub path: PathBuf,
+    pub clicks: Option<ClickCapture<B::Mouse>>,
 }
 
 #[derive(Clone, Debug)]
@@ -281,9 +305,9 @@ fn run_session<B: Backend>(
     parts: Parts<B>,
     stop: &Arc<AtomicBool>,
     abort: &AtomicBool,
-    pauses: &Mutex<Pauses>,
+    pauses: &Arc<Mutex<Pauses>>,
 ) -> Result<Summary, String> {
-    let Parts { capture, mut frames, mut output, audio, fps, path } = parts;
+    let Parts { capture, mut frames, mut output, audio, fps, path, clicks } = parts;
     let OpenedAudio { sources, tracks, issues: mut audio_issues } = audio;
     let names: Vec<String> = tracks.iter().map(|t| t.name.clone()).collect();
     let routes: Vec<Vec<usize>> = tracks.into_iter().map(|t| t.sources).collect();
@@ -298,6 +322,27 @@ fn run_session<B: Backend>(
             audio::run(sources, &routes, &st, &tx, B::now)
         });
         Some(spawned.map_err(|e| format!("failed to spawn audio thread: {e}"))?)
+    };
+    let (mode, scale) = match &clicks {
+        None => (video::Clicks::Off, 1.0),
+        Some(c) if c.burn_in => (video::Clicks::Burn(c.style), c.scale),
+        Some(c) => (video::Clicks::Keep, c.scale),
+    };
+    let mouse = match clicks {
+        None => None,
+        Some(ClickCapture { mut mouse, .. }) => {
+            let (st, ps, tx) = (stop.clone(), pauses.clone(), tx.clone());
+            let spawned = thread::Builder::new().name("glint-mouse".into()).spawn(move || {
+                let _thread = B::enter(Role::Mouse);
+                mouse.run(&st, &|| !lock(&ps).paused(), &mut |p| {
+                    let _ = tx.send(Event::Click(p));
+                });
+            });
+            Some(spawned.map_err(|e| {
+                stop.store(true, Ordering::SeqCst);
+                format!("failed to spawn mouse thread: {e}")
+            })?)
+        }
     };
     let st = stop.clone();
     let capture = thread::Builder::new()
@@ -314,7 +359,7 @@ fn run_session<B: Backend>(
             stop.store(true, Ordering::SeqCst);
             format!("failed to spawn capture thread: {e}")
         })?;
-    let control = video::Control { abort, pauses, now: B::now };
+    let control = video::Control { abort, pauses, now: B::now, clicks: mode };
     let enc_res = video::run(&mut frames, &mut output, &rx, &free_tx, &control, fps, names.len());
     if enc_res.is_err() {
         stop.store(true, Ordering::SeqCst);
@@ -324,7 +369,19 @@ fn run_session<B: Backend>(
     if let Some(m) = mixer {
         audio_issues.extend(m.join().unwrap_or_else(|_| vec!["audio thread panicked".into()]));
     }
-    let video::Stats { frames: written, dropped: enc_dropped, duration_s } = enc_res?;
+    if let Some(m) = mouse
+        && m.join().is_err()
+    {
+        log("mouse thread panicked");
+    }
+    let video::Stats { frames: written, dropped: enc_dropped, duration_s, clicks } = enc_res?;
+    if let Some(clicks) = clicks {
+        let n = clicks.len();
+        match clicks::save(&path, &Payload { version: clicks::VERSION, scale, clicks }) {
+            Ok(()) => log(&format!("saved {n} click(s) for the trimmer")),
+            Err(e) => log(&format!("couldn't save the clicks: {e}")),
+        }
+    }
     let (cap_dropped, coalesced, stopped_early) = match cap_res {
         Ok(s) => (s.dropped, s.coalesced, None),
         Err(e) => (0, 0, Some(e)),

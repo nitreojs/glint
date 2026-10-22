@@ -43,7 +43,7 @@ pub(crate) struct CursorRenderer {
     shape: Option<Shape>,
 }
 
-pub(super) fn compile(source: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
+pub(crate) fn compile(source: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DBlob> {
     let mut code = None;
     let mut errors = None;
     let r = unsafe {
@@ -73,7 +73,7 @@ pub(super) fn compile(source: &str, entry: PCSTR, target: PCSTR) -> Result<ID3DB
     code.ok_or_else(|| Error::from_hresult(windows::Win32::Foundation::E_FAIL))
 }
 
-pub(super) fn blob_bytes(b: &ID3DBlob) -> &[u8] {
+pub(crate) fn blob_bytes(b: &ID3DBlob) -> &[u8] {
     unsafe { std::slice::from_raw_parts(b.GetBufferPointer() as *const u8, b.GetBufferSize()) }
 }
 

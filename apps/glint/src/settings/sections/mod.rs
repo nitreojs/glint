@@ -72,6 +72,8 @@ impl Section {
                     + n(a.indicator_inside == b.indicator_inside)
                     + n(a.draw_cursor == b.draw_cursor)
                     + n(a.open_trimmer == b.open_trimmer)
+                    + n(a.click_highlights == b.click_highlights)
+                    + n(a.clicks == b.clicks)
             }
             Section::Audio => {
                 let (x, y) = (&a.audio_sources, &b.audio_sources);
@@ -125,6 +127,8 @@ impl Section {
                 cfg.indicator_inside = d.indicator_inside;
                 cfg.draw_cursor = d.draw_cursor;
                 cfg.open_trimmer = d.open_trimmer;
+                cfg.click_highlights = d.click_highlights;
+                cfg.clicks = d.clicks;
             }
             Section::Audio => {
                 cfg.audio_sources = d.audio_sources;

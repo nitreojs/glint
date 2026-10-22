@@ -1,5 +1,5 @@
-use eframe::egui::Ui;
-use glint_core::config::{CodecName, IndicatorInside};
+use eframe::egui::{Id, Ui};
+use glint_core::config::{ClickMode, CodecName, IndicatorInside};
 use glint_ui::widgets::{self, Look, hint, row};
 
 use crate::settings::SettingsApp;
@@ -87,5 +87,21 @@ impl SettingsApp {
         row(ui, look, "trimmer", 1.0, |ui| {
             widgets::toggle(ui, look, &mut self.cfg.open_trimmer, "open trimmer after recording");
         });
+        widgets::group(ui, look, "overlays");
+        row(ui, look, "click highlights", 1.0, |ui| {
+            let text = if self.cfg.click_highlights { "a ripple on every click" } else { "off" };
+            widgets::toggle(ui, look, &mut self.cfg.click_highlights, text);
+        });
+        let shown = widgets::glide(ui, Id::unique("click-mode"), if self.cfg.click_highlights { 1.0 } else { 0.0 }, 0.12);
+        if shown > 0.0 {
+            ui.scope(|ui| {
+                ui.multiply_opacity(shown);
+                row(ui, look, "clicks", 7.0, |ui| {
+                    let modes = [(ClickMode::Editable, "editable"), (ClickMode::BurnIn, "burn in")];
+                    widgets::segmented(ui, look, &mut self.cfg.clicks, &modes, Some(168.0));
+                    hint(ui, "editable clicks can be moved or removed in the trimmer", t3);
+                });
+            });
+        }
     }
 }

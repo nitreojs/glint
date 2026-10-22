@@ -4,12 +4,23 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::Duration;
 
 use super::{Event, Frames, Output, lock};
+use crate::record::clicks::{self, Click, Log, Shape, Style};
 use crate::record::timeline::{AudioPlacer, Pauses};
+
+const IDLE: Duration = Duration::from_millis(50);
+
+pub(super) enum Clicks {
+    Off,
+    /// Collected and returned in [`Stats::clicks`].
+    Keep,
+    Burn(Style),
+}
 
 pub(super) struct Control<'a> {
     pub abort: &'a AtomicBool,
     pub pauses: &'a Mutex<Pauses>,
     pub now: fn() -> i64,
+    pub clicks: Clicks,
 }
 
 #[derive(Debug, PartialEq)]
@@ -17,6 +28,8 @@ pub(super) struct Stats {
     pub frames: u64,
     pub dropped: u64,
     pub duration_s: f64,
+    /// With [`Clicks::Keep`]: the clicks on the video timeline.
+    pub clicks: Option<Vec<Click>>,
 }
 
 struct Video<T> {
@@ -29,6 +42,16 @@ struct Video<T> {
     dropped: u64,
     cursor: Option<(i32, i32)>,
     stale: bool,
+    /// Clicks with active capture-clock times.
+    clicks: Log,
+    burn: Option<Style>,
+    shapes: Vec<Shape>,
+}
+
+fn paint(burn: Option<&Style>, clicks: &Log, shapes: &mut Vec<Shape>, t: i64) {
+    if let Some(style) = burn {
+        clicks::shapes_at(clicks.clicks(), t, style, shapes);
+    }
 }
 
 impl<T> Video<T> {
@@ -40,21 +63,37 @@ impl<T> Video<T> {
         self.start.map_or(0, |s| (((t - s) as f64 / self.grid).round() as i64).max(0))
     }
 
+    /// Burnt-in clicks are animating at active time `t`.
+    fn animating(&self, t: i64) -> bool {
+        self.burn.as_ref().is_some_and(|s| clicks::moving(self.clicks.clicks(), t, s))
+    }
+
+    /// A frame at `t` would start a new slot.
+    fn due(&self, t: i64) -> bool {
+        self.pending.as_ref().is_none_or(|(_, ps)| self.slot(t) > *ps)
+    }
+
     fn frame<F, O>(&mut self, frames: &mut F, output: &mut O, t: i64) -> Result<(), String>
     where
         F: Frames<Frame = T>,
         O: Output<Frame = T>,
     {
-        self.start.get_or_insert(t);
+        let start = *self.start.get_or_insert(t);
         let slot = self.slot(t);
         match &self.pending {
-            Some((f, ps)) if slot <= *ps => frames.compose(f, self.cursor)?,
+            Some((f, ps)) if slot <= *ps => {
+                let at = start + self.slot_time(*ps);
+                paint(self.burn.as_ref(), &self.clicks, &mut self.shapes, at);
+                frames.compose(f, self.cursor, &self.shapes)?
+            }
             _ => {
                 let Some(next) = frames.alloc()? else {
                     self.dropped += 1;
                     return Ok(());
                 };
-                frames.compose(&next, self.cursor)?;
+                let at = start + self.slot_time(slot);
+                paint(self.burn.as_ref(), &self.clicks, &mut self.shapes, at);
+                frames.compose(&next, self.cursor, &self.shapes)?;
                 if let Some((prev, ps)) = self.pending.take() {
                     output.video(prev, self.slot_time(ps), self.slot_time(slot) - self.slot_time(ps))?;
                     self.frames += 1;
@@ -101,14 +140,22 @@ where
         dropped: 0,
         cursor: None,
         stale: false,
+        clicks: Log::default(),
+        burn: match &ctl.clicks {
+            Clicks::Burn(style) => Some(*style),
+            Clicks::Off | Clicks::Keep => None,
+        },
+        shapes: Vec::new(),
     };
+    let tick = Duration::from_secs_f64(1.0 / fps).min(IDLE);
     let mut placer = AudioPlacer::default();
     let mut early_audio: Vec<(i64, Vec<Vec<i16>>)> = Vec::new();
     let mut audio_open = tracks > 0;
     let mut end = None;
 
     loop {
-        let event = match rx.recv_timeout(Duration::from_millis(50)) {
+        let animating = v.burn.is_some() && end.is_none() && v.animating(lock(ctl.pauses).active_clamped((ctl.now)()));
+        let event = match rx.recv_timeout(if animating { tick } else { IDLE }) {
             Ok(e) => Some(e),
             Err(RecvTimeoutError::Timeout) => None,
             Err(RecvTimeoutError::Disconnected) => break,
@@ -136,6 +183,14 @@ where
                 }
                 None => early_audio.push((start, pcm)),
             },
+            Some(Event::Click(p)) => {
+                let pauses = lock(ctl.pauses);
+                if !p.down {
+                    v.clicks.release(p.button, pauses.active_clamped(p.at));
+                } else if let Some(t) = pauses.active(p.at) {
+                    v.clicks.press(p.button, t, p.x, p.y);
+                }
+            }
             Some(Event::Frame { image, at, cursor }) => {
                 if let Some(image) = image {
                     frames.latch(&image)?;
@@ -153,9 +208,11 @@ where
                 }
             }
         }
-        if v.stale && end.is_none() {
+        if end.is_none() && (v.stale || v.burn.is_some()) {
             let t = lock(ctl.pauses).active((ctl.now)());
-            if let Some(t) = t {
+            if let Some(t) = t
+                && (v.stale || (v.have_image && v.animating(t) && v.due(t)))
+            {
                 v.stale = false;
                 v.frame(frames, output, t)?;
             }
@@ -172,22 +229,29 @@ where
     }
 
     if ctl.abort.load(Ordering::SeqCst) {
-        return Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s: 0.0 });
+        return Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s: 0.0, clicks: None });
     }
     let mut duration_s = 0.0;
+    let mut video_end = 0;
     if let Some((prev, ps)) = v.pending.take() {
         let end = lock(ctl.pauses).active_clamped(end.unwrap_or_else(ctl.now));
         let end_slot = v.slot(end).max(ps + 1);
         output.video(prev, v.slot_time(ps), v.slot_time(end_slot) - v.slot_time(ps))?;
         v.frames += 1;
-        duration_s = v.slot_time(end_slot) as f64 / 1e7;
+        video_end = v.slot_time(end_slot);
+        duration_s = video_end as f64 / 1e7;
         let at = placer.next;
-        let pad = vec![0; 2 * placer.pad(v.slot_time(end_slot))];
+        let pad = vec![0; 2 * placer.pad(video_end)];
         write_audio(output, at, &vec![pad; tracks], tracks)?;
     }
     if v.frames == 0 {
         return Err("no frames were captured".into());
     }
     output.finish()?;
-    Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s })
+    let clicks = matches!(ctl.clicks, Clicks::Keep).then(|| {
+        let mut clicks = std::mem::take(&mut v.clicks).finish(v.start.unwrap_or(0));
+        clicks.retain(|c| c.down < video_end);
+        clicks
+    });
+    Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s, clicks })
 }

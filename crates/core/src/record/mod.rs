@@ -1,3 +1,4 @@
+pub mod clicks;
 pub mod mix;
 pub mod mp4;
 pub mod pipeline;

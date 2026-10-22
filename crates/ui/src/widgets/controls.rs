@@ -7,7 +7,7 @@ use eframe::egui::{
 };
 
 use super::motion::{anim, ease, glide, mix};
-use super::tokens::{LABEL_GAP, LABEL_W, Look, Palette, medium, mono, mono_medium, sans};
+use super::tokens::{LABEL_GAP, LABEL_W, Look, Palette, medium, mono, mono_medium, sans, semibold};
 
 /// 2 px ring in text colour with a 1 px gap, only after keyboard navigation.
 pub(super) fn focus_ring(ui: &Ui, look: &Look, resp: &Response, rect: Rect, radius: f32) {
@@ -86,6 +86,16 @@ pub fn row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: impl FnOnc
 /// 12 px hint text under a control, wrapping.
 pub fn hint(ui: &mut Ui, text: impl Into<String>, color: Color32) {
     ui.add(egui::Label::new(RichText::new(text).font(sans(12.0)).color(color).line_height(Some(16.0))).wrap());
+}
+
+/// A heading over the rows that follow it.
+pub fn group(ui: &mut Ui, look: &Look, title: &str) {
+    ui.add_space(26.0);
+    let text = ui.painter().layout_no_wrap(title.to_owned(), semibold(15.0), look.p.t1);
+    let (rect, resp) = ui.allocate_exact_size(text.size(), Sense::hover());
+    ui.painter().galley(rect.min, text, look.p.t1);
+    resp.widget_info(|| WidgetInfo::labeled(Role::Heading, true, title));
+    ui.add_space(10.0);
 }
 
 fn galley(ui: &Ui, text: &str, font: FontId) -> std::sync::Arc<Galley> {

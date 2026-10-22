@@ -159,7 +159,7 @@ fn read_moov(f: &mut std::fs::File) -> Result<(u64, u64, Vec<u8>), String> {
 }
 
 // the media foundation sink writes moov after mdat, so rewriting it moves no sample data.
-pub fn name_tracks(path: &Path, names: &[String]) -> Result<(), String> {
+fn rewrite_moov(path: &Path, edit: impl FnOnce(&[u8]) -> Result<Vec<u8>, String>) -> Result<(), String> {
     let err = |e: String| format!("{}: {e}", path.display());
     let mut f = OpenOptions::new().read(true).write(true).open(path).map_err(|e| err(e.to_string()))?;
     let (at, len, data) = read_moov(&mut f).map_err(err)?;
@@ -167,13 +167,54 @@ pub fn name_tracks(path: &Path, names: &[String]) -> Result<(), String> {
         return Err(err("moov isn't the last box".into()));
     }
     let m = &atoms(&data)?[0];
-    let renamed = atom(b"moov", &rename_moov(&data[m.body..m.end], names)?);
+    let rewritten = atom(b"moov", &edit(&data[m.body..m.end]).map_err(err)?);
     let write = |f: &mut std::fs::File| {
         f.seek(SeekFrom::Start(at))?;
-        f.write_all(&renamed)?;
-        f.set_len(at + renamed.len() as u64)
+        f.write_all(&rewritten)?;
+        f.set_len(at + rewritten.len() as u64)
     };
     write(&mut f).map_err(|e| err(e.to_string()))
+}
+
+pub fn name_tracks(path: &Path, names: &[String]) -> Result<(), String> {
+    rewrite_moov(path, |moov| rename_moov(moov, names))
+}
+
+fn with_movie_box(moov: &[u8], kind: &[u8; 4], body: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(moov.len() + body.len() + 16);
+    let mut placed = false;
+    for a in atoms(moov)? {
+        if &a.kind != b"udta" || placed {
+            out.extend_from_slice(&moov[a.start..a.end]);
+            continue;
+        }
+        let udta = &moov[a.body..a.end];
+        let mut inner = Vec::with_capacity(udta.len() + body.len() + 8);
+        for u in atoms(udta)?.iter().filter(|u| &u.kind != kind) {
+            inner.extend_from_slice(&udta[u.start..u.end]);
+        }
+        inner.extend(atom(kind, body));
+        out.extend(atom(b"udta", &inner));
+        placed = true;
+    }
+    if !placed {
+        out.extend(atom(b"udta", &atom(kind, body)));
+    }
+    Ok(out)
+}
+
+/// Puts `body` into the box moov/udta/`kind`, replacing one that's there.
+pub fn set_movie_box(path: &Path, kind: &[u8; 4], body: &[u8]) -> Result<(), String> {
+    rewrite_moov(path, |moov| with_movie_box(moov, kind, body))
+}
+
+/// The body of moov/udta/`kind`, if the file has one.
+pub fn movie_box(path: &Path, kind: &[u8; 4]) -> Result<Option<Vec<u8>>, String> {
+    let err = |e: String| format!("{}: {e}", path.display());
+    let mut f = std::fs::File::open(path).map_err(|e| err(e.to_string()))?;
+    let (_, _, data) = read_moov(&mut f).map_err(err)?;
+    let moov = child(&data, b"moov").ok_or_else(|| err("broken moov box".into()))?;
+    Ok(child(moov, b"udta").and_then(|u| child(u, kind)).map(<[u8]>::to_vec))
 }
 
 pub fn track_names(path: &Path) -> Vec<Option<String>> {
@@ -316,5 +357,38 @@ mod tests {
         let after = std::fs::read(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
         assert_eq!(after, data);
+    }
+
+    #[test]
+    fn movie_boxes_go_into_udta_and_replace_their_old_copy() {
+        let path = std::env::temp_dir().join(format!("glint_mp4_movie_box_{}.mp4", std::process::id()));
+        let original = file();
+        std::fs::write(&path, &original).unwrap();
+        assert_eq!(movie_box(&path, b"glck"), Ok(None));
+        set_movie_box(&path, b"glck", b"first").unwrap();
+        set_movie_box(&path, b"glck", b"{\"v\":2}").unwrap();
+        let found = movie_box(&path, b"glck");
+        let data = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(found, Ok(Some(b"{\"v\":2}".to_vec())));
+        let top = atoms(&data).unwrap();
+        assert_eq!(&data[..top[2].start], &original[..top[2].start]);
+        assert_eq!(top.last().unwrap().end, data.len());
+        let moov = child(&data, b"moov").unwrap();
+        let kinds: Vec<[u8; 4]> = atoms(moov).unwrap().iter().map(|a| a.kind).collect();
+        assert_eq!(kinds, [*b"mvhd", *b"trak", *b"trak", *b"trak", *b"udta"]);
+        let mut udta = atom(b"meta", &[3; 20]);
+        udta.extend(atom(b"glck", b"{\"v\":2}"));
+        assert_eq!(child(moov, b"udta").unwrap(), udta);
+        assert_eq!(&moov[..moov.len() - 8 - udta.len()], &child(&original, b"moov").unwrap()[..moov.len() - 8 - udta.len()]);
+    }
+
+    #[test]
+    fn a_movie_box_adds_udta_when_there_is_none() {
+        let moov = [atom(b"mvhd", &[2; 100]), trak(b"vide", "VideoHandler", &[])].concat();
+        let out = with_movie_box(&moov, b"glck", b"[]").unwrap();
+        assert_eq!(out, [moov.clone(), atom(b"udta", &atom(b"glck", b"[]"))].concat());
+        assert_eq!(with_movie_box(&out, b"glck", b"{}").unwrap(), [moov, atom(b"udta", &atom(b"glck", b"{}"))].concat());
     }
 }

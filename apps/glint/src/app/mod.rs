@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use glint_core::config::{Config, ShotStyle, UpdateMode};
+use glint_core::config::{ClickMode, Config, ShotStyle, UpdateMode};
 use glint_core::format::{human_duration, human_size};
 use glint_core::geom::rect::Rect;
 use glint_core::history::{self, Kind};
@@ -11,7 +11,7 @@ use glint_core::naming::Subject;
 use glint_core::record::pipeline::{Outcome, Recorder};
 use glint_core::update::notes_url;
 use glint_core::wide::wide;
-use glint_media::record::{self, Params, Source};
+use glint_media::record::{self, ClickHighlights, Params, Source};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -264,6 +264,10 @@ impl App {
             qp: self.cfg.quality,
             effort: self.cfg.effort,
             draw_cursor: self.cfg.draw_cursor,
+            clicks: self.cfg.click_highlights.then(|| ClickHighlights {
+                burn_in: self.cfg.clicks == ClickMode::BurnIn,
+                accent: self.cfg.accent_rgb(),
+            }),
             audio: self.cfg.audio_sources.clone(),
             track_names: self.cfg.audio_track_names.clone(),
             path,

@@ -33,6 +33,8 @@ pub struct Config {
     pub quality: u32,
     pub effort: u32,
     pub draw_cursor: bool,
+    pub click_highlights: bool,
+    pub clicks: ClickMode,
     pub audio_sources: Vec<AudioSource>,
     pub audio_track_names: Vec<String>,
     pub countdown: u32,
@@ -111,6 +113,16 @@ pub enum IndicatorInside {
     Show,
 }
 
+/// What happens to click highlights.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClickMode {
+    /// The video stays clean; the clicks are saved in the file for the trimmer.
+    Editable,
+    /// Drawn into the video while recording.
+    BurnIn,
+}
+
 /// What glint does about new releases on GitHub.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -173,6 +185,8 @@ impl Default for Config {
             quality: 22,
             effort: 50,
             draw_cursor: true,
+            click_highlights: false,
+            clicks: ClickMode::Editable,
             audio_sources: audio::default_sources(),
             audio_track_names: vec![String::new(); audio::MAX_TRACKS as usize],
             countdown: 0,
@@ -322,6 +336,10 @@ impl Config {
             IndicatorInside::Hide => "hide",
             IndicatorInside::Show => "show",
         };
+        let clicks = match self.clicks {
+            ClickMode::Editable => "editable",
+            ClickMode::BurnIn => "burn-in",
+        };
         let update_mode = match self.update_mode {
             UpdateMode::Auto => "auto",
             UpdateMode::Notify => "notify",
@@ -391,6 +409,12 @@ quality = {quality}
 effort = {effort}
 
 draw_cursor = {draw_cursor}
+
+# A ring ripples out from every mouse click in recordings (only mouse buttons are watched,
+# never the keyboard). clicks: "editable" keeps the video clean and saves the clicks in the
+# file, so the trimmer can move or remove them; "burn-in" draws them into the video while recording.
+click_highlights = {click_highlights}
+clicks = "{clicks}"
 
 # Sound to record. Each source has a kind: "desktop" (what the default output device plays;
 # exclude = "name.exe" leaves one app out of it), "app" (app = "name.exe": only that app and
@@ -467,6 +491,7 @@ update_beta = {update_beta}
             quality = self.quality,
             effort = self.effort,
             draw_cursor = self.draw_cursor,
+            click_highlights = self.click_highlights,
             audio_sources = audio::render_sources(&self.audio_sources),
             audio_track_names = audio::render_track_names(&self.audio_track_names),
             countdown = self.countdown,
@@ -554,6 +579,8 @@ mod tests {
             quality: 18,
             effort: 75,
             draw_cursor: false,
+            click_highlights: true,
+            clicks: ClickMode::BurnIn,
             audio_sources: vec![
                 AudioSource { exclude: "game.exe".into(), ..AudioSource::new(audio::SourceKind::Desktop, 0) },
                 AudioSource { app: "discord.exe".into(), volume: 80, ..AudioSource::new(audio::SourceKind::App, 1) },
@@ -683,5 +710,22 @@ mod tests {
         assert_eq!(Config { accent: "nope".into(), ..Config::default() }.accent_rgb(), [0xE5, 0x40, 0x2F]);
         let parsed = |v: &str| toml::from_str::<Config>(&format!("accent = \"{v}\"")).map(|c| c.accent_rgb());
         assert_eq!(parsed("#1F9E8F").unwrap(), [0x1F, 0x9E, 0x8F]);
+    }
+
+    #[test]
+    fn click_settings_round_trip_with_their_comment() {
+        for on in [false, true] {
+            for mode in [ClickMode::Editable, ClickMode::BurnIn] {
+                let cfg = Config { click_highlights: on, clicks: mode, ..Config::default() };
+                let back = Config::parse(&cfg.render()).unwrap();
+                assert_eq!((back.click_highlights, back.clicks), (on, mode));
+            }
+        }
+        let text = Config::default().render();
+        assert!(text.contains("while recording.\nclick_highlights = false\nclicks = \"editable\"\n"), "{text}");
+        let parsed = |v: &str| Config::parse(&format!("clicks = \"{v}\"")).map(|c| c.clicks);
+        assert_eq!(parsed("burn-in").unwrap(), ClickMode::BurnIn);
+        assert!(parsed("burn_in").is_err());
+        assert_eq!((Config::default().click_highlights, Config::default().clicks), (false, ClickMode::Editable));
     }
 }

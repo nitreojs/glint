@@ -5,6 +5,7 @@ use glint_core::log::log;
 use glint_core::record::Codec;
 use glint_core::record::mix::{RATE, frames_to_hns};
 use glint_core::record::mp4::name_tracks;
+use glint_core::record::clicks::Shape;
 use glint_core::record::pipeline::{Frames, Output, VideoConfig};
 use glint_core::record::pointer::PointerShape;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -17,6 +18,7 @@ use windows::core::{GUID, HSTRING, Interface, PWSTR};
 
 use super::capture::Capture;
 use super::cursor::CursorRenderer;
+use crate::clicks;
 use super::win::{INFINITE, RING, create_device, texture_desc};
 use super::{Ctx, Params};
 
@@ -35,6 +37,7 @@ pub(super) struct Composer {
     ring: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
     clean: ID3D11Texture2D,
     cursor: Option<CursorRenderer>,
+    clicks: Option<clicks::Renderer>,
     alloc: IMFVideoSampleAllocatorEx,
     _mgr: IMFDXGIDeviceManager,
 }
@@ -79,6 +82,16 @@ pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -
         } else {
             None
         };
+        let clicks = match p.clicks {
+            Some(c) if c.burn_in => match clicks::Renderer::new(&device) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    log(&format!("click highlights won't be drawn: {e}"));
+                    None
+                }
+            },
+            _ => None,
+        };
 
         let mut token = 0;
         let mut mgr = None;
@@ -114,7 +127,7 @@ pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -
             },
             p.path.display()
         ));
-        let composer = Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, alloc, _mgr: mgr };
+        let composer = Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, clicks, alloc, _mgr: mgr };
         Ok((composer, output))
     }
 }
@@ -247,8 +260,9 @@ impl Frames for Composer {
         }
     }
 
-    /// Copies the clean region image into a pooled sample texture and draws the cursor on it.
-    fn compose(&mut self, sample: &IMFSample, cursor: Option<(i32, i32)>) -> Result<(), String> {
+    /// Copies the clean region image into a pooled sample texture and draws the clicks and the
+    /// cursor on it.
+    fn compose(&mut self, sample: &IMFSample, cursor: Option<(i32, i32)>, clicks: &[Shape]) -> Result<(), String> {
         unsafe {
             let buf = sample.GetBufferByIndex(0).ctx("GetBufferByIndex")?;
             let dx: IMFDXGIBuffer = buf.cast().ctx("IMFDXGIBuffer")?;
@@ -263,29 +277,33 @@ impl Frames for Composer {
             }
 
             let r = self.region;
-            let rtv = match (&self.cursor, cursor) {
-                (Some(c), Some(_)) if c.size().is_some() => {
-                    let mut desc = D3D11_RENDER_TARGET_VIEW_DESC {
-                        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                        ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
-                        ..Default::default()
-                    };
-                    desc.Anonymous.Texture2DArray =
-                        D3D11_TEX2D_ARRAY_RTV { MipSlice: 0, FirstArraySlice: sub, ArraySize: 1 };
-                    let mut rtv = None;
-                    self.device.CreateRenderTargetView(&tex, Some(&desc), Some(&mut rtv)).ctx("CreateRenderTargetView")?;
-                    rtv
-                }
-                _ => None,
+            let pointer = matches!((&self.cursor, cursor), (Some(c), Some(_)) if c.size().is_some());
+            let ripples = self.clicks.is_some() && !clicks.is_empty();
+            let rtv = if pointer || ripples {
+                let mut desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+                    ..Default::default()
+                };
+                desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_RTV { MipSlice: 0, FirstArraySlice: sub, ArraySize: 1 };
+                let mut rtv = None;
+                self.device.CreateRenderTargetView(&tex, Some(&desc), Some(&mut rtv)).ctx("CreateRenderTargetView")?;
+                rtv
+            } else {
+                None
             };
 
             self.mt.Enter();
             self.ctx.CopySubresourceRegion(&tex, sub, 0, 0, 0, &self.clean, 0, None);
+            let drawn = match (&rtv, &self.clicks) {
+                (Some(rtv), Some(c)) => c.draw(&self.ctx, rtv, (r.w as u32, r.h as u32), clicks),
+                _ => Ok(()),
+            };
             if let (Some(rtv), Some(c), Some((x, y))) = (&rtv, &self.cursor, cursor) {
                 c.draw(&self.ctx, rtv, r.w, r.h, x - r.x, y - r.y);
             }
             self.mt.Leave();
-            Ok(())
+            drawn
         }
     }
 }
