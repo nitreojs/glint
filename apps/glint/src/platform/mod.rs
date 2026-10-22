@@ -7,4 +7,5 @@ pub mod log;
 pub(crate) mod monitors;
 pub(crate) mod paths;
 pub(crate) mod rect;
+pub(crate) mod shell;
 pub(crate) mod windows;

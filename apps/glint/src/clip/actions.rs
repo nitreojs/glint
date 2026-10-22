@@ -1,5 +1,4 @@
 use std::os::windows::ffi::OsStrExt;
-use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 
 use glint_core::clip::export::Settings;
@@ -83,7 +82,7 @@ pub(super) fn place(hwnd: HWND, [x, y, w, h]: [i32; 4]) {
 }
 
 pub(super) fn show_in_folder(path: &Path) {
-    let _ = std::process::Command::new("explorer.exe").raw_arg(format!("/select,\"{}\"", path.display())).spawn();
+    crate::platform::shell::reveal(path);
 }
 
 pub(super) fn open_url(url: &str) {

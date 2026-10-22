@@ -539,7 +539,7 @@ impl App {
             return self.install_update();
         }
         match &self.click {
-            ClickTarget::File(p) => shell("explorer.exe", &format!("/select,\"{}\"", p.display())),
+            ClickTarget::File(p) => crate::platform::shell::reveal(p),
             ClickTarget::Link(url) => shell(url, ""),
             ClickTarget::Log => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
             ClickTarget::Update | ClickTarget::None => {}

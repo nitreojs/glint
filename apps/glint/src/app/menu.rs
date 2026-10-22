@@ -70,7 +70,7 @@ fn recent_action(hwnd: HWND, e: &Entry, action: usize) {
     };
     match (action, path, url) {
         (OPEN, Some(p), _) => shell(&p.display().to_string(), ""),
-        (SHOW, Some(p), _) => shell("explorer.exe", &format!("/select,\"{}\"", p.display())),
+        (SHOW, Some(p), _) => crate::platform::shell::reveal(p),
         (OPEN_LINK, _, Some(u)) => shell(u, ""),
         (COPY_LINK, _, Some(u)) => {
             if let Err(e) = shot::copy_text(Some(hwnd), u) {
