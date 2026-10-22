@@ -3,7 +3,7 @@ members = ["apps/glint", "crates/core", "crates/media", "crates/ui"]
 resolver = "3"
 
 [workspace.package]
-version = "0.2.1"
+version = "0.3.0-beta.1"
 edition = "2024"
 repository = "https://github.com/nitreojs/glint"
 
