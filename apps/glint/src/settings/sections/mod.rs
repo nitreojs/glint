@@ -74,6 +74,9 @@ impl Section {
                     + n(a.open_trimmer == b.open_trimmer)
                     + n(a.click_highlights == b.click_highlights)
                     + n(a.clicks == b.clicks)
+                    + n(a.keystrokes == b.keystrokes)
+                    + n(a.keystroke_position == b.keystroke_position)
+                    + n(a.keystrokes_mode == b.keystrokes_mode)
             }
             Section::Audio => {
                 let (x, y) = (&a.audio_sources, &b.audio_sources);
@@ -129,6 +132,9 @@ impl Section {
                 cfg.open_trimmer = d.open_trimmer;
                 cfg.click_highlights = d.click_highlights;
                 cfg.clicks = d.clicks;
+                cfg.keystrokes = d.keystrokes;
+                cfg.keystroke_position = d.keystroke_position;
+                cfg.keystrokes_mode = d.keystrokes_mode;
             }
             Section::Audio => {
                 cfg.audio_sources = d.audio_sources;

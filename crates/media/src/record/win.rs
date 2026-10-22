@@ -2,7 +2,8 @@ use std::sync::LazyLock;
 
 use glint_core::geom::rect::Rect;
 use glint_core::record::clicks::Style;
-use glint_core::record::pipeline::{Backend, ClickCapture, Parts, Role, open_audio};
+use glint_core::record::keys::Style as KeyStyle;
+use glint_core::record::pipeline::{Backend, ClickCapture, KeyCapture, Parts, Role, open_audio};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -17,6 +18,7 @@ use windows::Win32::System::Threading::{
 
 use super::capture::Capture;
 use super::encoder::{self, Composer, SinkWriter};
+use super::keys::Hook as KeyHook;
 use super::mouse::{self, Hook};
 use super::{Ctx, Params, audio};
 
@@ -50,6 +52,7 @@ impl Backend for Windows {
     type Output = SinkWriter;
     type Audio = audio::Source;
     type Mouse = Hook;
+    type Keys = KeyHook;
     type Guard = Thread;
 
     fn enter(role: Role) -> Thread {
@@ -58,6 +61,7 @@ impl Backend for Windows {
             Role::Capture => (THREAD_PRIORITY_HIGHEST, false, false),
             Role::Audio => (THREAD_PRIORITY_HIGHEST, true, false),
             Role::Mouse => (THREAD_PRIORITY_HIGHEST, false, false),
+            Role::Keys => (THREAD_PRIORITY_HIGHEST, true, false),
         };
         set_priority(priority);
         unsafe {
@@ -91,7 +95,11 @@ unsafe fn open(p: &Params) -> Result<Parts<Windows>, String> {
             let scale = mouse::scale(p.region);
             ClickCapture { mouse: Hook { region: p.region }, style: Style::new(c.accent, scale), scale, burn_in: c.burn_in }
         });
-        Ok(Parts { capture, frames, output, audio, fps: p.fps, path: p.path.clone(), clicks })
+        let keys = p.keys.map(|o| {
+            let scale = mouse::scale(p.region);
+            KeyCapture { keys: KeyHook::new(o.level), style: KeyStyle::new(o.accent, scale).with(o.pos), scale, burn_in: o.burn_in }
+        });
+        Ok(Parts { capture, frames, output, audio, fps: p.fps, path: p.path.clone(), clicks, keys })
     }
 }
 

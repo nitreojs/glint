@@ -18,6 +18,7 @@ use std::thread;
 
 use super::Codec;
 use super::clicks::{self, Payload, Press, Shape, Style};
+use super::keys::{self, KeyFrame, Stroke};
 use super::pointer::PointerShape;
 use super::timeline::Pauses;
 use crate::config::audio::AudioSource;
@@ -43,6 +44,7 @@ pub enum Event<I> {
     Audio { start: i64, tracks: Vec<Vec<i16>> },
     AudioEnd,
     Click(Press),
+    Key(Stroke),
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -65,8 +67,15 @@ pub trait Frames {
     fn latch(&mut self, image: &Self::Image) -> Result<(), String>;
     fn set_pointer(&mut self, shape: &PointerShape);
     fn alloc(&mut self) -> Result<Option<Self::Frame>, String>;
-    /// `clicks`: highlights to draw over the image, under the cursor.
-    fn compose(&mut self, frame: &Self::Frame, cursor: Option<(i32, i32)>, clicks: &[Shape]) -> Result<(), String>;
+    /// `clicks`: highlights to draw over the image; `keys`: the keycap stack for this frame's
+    /// time, drawn over the clicks and under the cursor (`None` unless keystrokes are burnt in).
+    fn compose(
+        &mut self,
+        frame: &Self::Frame,
+        cursor: Option<(i32, i32)>,
+        clicks: &[Shape],
+        keys: Option<KeyFrame>,
+    ) -> Result<(), String>;
 }
 
 /// Mouse buttons on a global hook: presses inside the region and every release, positions in
@@ -82,6 +91,22 @@ pub struct ClickCapture<M> {
     /// DPI / 96 of the region's monitor, saved with the clicks.
     pub scale: f32,
     /// Drawn into the video; otherwise the clicks are saved in the file for the trimmer.
+    pub burn_in: bool,
+}
+
+/// Keys on a global hook, resolved to labels off the hook thread: a [`Stroke`] per down and up,
+/// times on the capture clock.
+pub trait Keys: Send + 'static {
+    /// Reports keystrokes until `stop`, listening only while `listening()` holds (not paused).
+    fn run(&mut self, stop: &AtomicBool, listening: &dyn Fn() -> bool, out: &mut dyn FnMut(Stroke));
+}
+
+pub struct KeyCapture<K> {
+    pub keys: K,
+    pub style: keys::Style,
+    /// DPI / 96 of the region's monitor, saved with the keystrokes.
+    pub scale: f32,
+    /// Drawn into the video; otherwise the keystrokes are saved in the file for the trimmer.
     pub burn_in: bool,
 }
 
@@ -158,6 +183,7 @@ pub enum Role {
     Capture,
     Audio,
     Mouse,
+    Keys,
 }
 
 pub trait Backend: Send + Sized + 'static {
@@ -166,6 +192,7 @@ pub trait Backend: Send + Sized + 'static {
     type Output: Output<Frame = <Self::Frames as Frames>::Frame>;
     type Audio: AudioInput;
     type Mouse: Mouse;
+    type Keys: Keys;
     type Guard;
 
     fn enter(role: Role) -> Self::Guard;
@@ -181,6 +208,7 @@ pub struct Parts<B: Backend> {
     pub fps: f64,
     pub path: PathBuf,
     pub clicks: Option<ClickCapture<B::Mouse>>,
+    pub keys: Option<KeyCapture<B::Keys>>,
 }
 
 #[derive(Clone, Debug)]
@@ -307,7 +335,7 @@ fn run_session<B: Backend>(
     abort: &AtomicBool,
     pauses: &Arc<Mutex<Pauses>>,
 ) -> Result<Summary, String> {
-    let Parts { capture, mut frames, mut output, audio, fps, path, clicks } = parts;
+    let Parts { capture, mut frames, mut output, audio, fps, path, clicks, keys } = parts;
     let OpenedAudio { sources, tracks, issues: mut audio_issues } = audio;
     let names: Vec<String> = tracks.iter().map(|t| t.name.clone()).collect();
     let routes: Vec<Vec<usize>> = tracks.into_iter().map(|t| t.sources).collect();
@@ -328,6 +356,11 @@ fn run_session<B: Backend>(
         Some(c) if c.burn_in => (video::Clicks::Burn(c.style), c.scale),
         Some(c) => (video::Clicks::Keep, c.scale),
     };
+    let (kmode, kscale) = match &keys {
+        None => (video::Keys::Off, 1.0),
+        Some(c) if c.burn_in => (video::Keys::Burn(c.style), c.scale),
+        Some(c) => (video::Keys::Keep, c.scale),
+    };
     let mouse = match clicks {
         None => None,
         Some(ClickCapture { mut mouse, .. }) => {
@@ -341,6 +374,22 @@ fn run_session<B: Backend>(
             Some(spawned.map_err(|e| {
                 stop.store(true, Ordering::SeqCst);
                 format!("failed to spawn mouse thread: {e}")
+            })?)
+        }
+    };
+    let keyboard = match keys {
+        None => None,
+        Some(KeyCapture { keys: mut hook, .. }) => {
+            let (st, ps, tx) = (stop.clone(), pauses.clone(), tx.clone());
+            let spawned = thread::Builder::new().name("glint-keys".into()).spawn(move || {
+                let _thread = B::enter(Role::Keys);
+                hook.run(&st, &|| !lock(&ps).paused(), &mut |s| {
+                    let _ = tx.send(Event::Key(s));
+                });
+            });
+            Some(spawned.map_err(|e| {
+                stop.store(true, Ordering::SeqCst);
+                format!("failed to spawn keyboard thread: {e}")
             })?)
         }
     };
@@ -359,7 +408,7 @@ fn run_session<B: Backend>(
             stop.store(true, Ordering::SeqCst);
             format!("failed to spawn capture thread: {e}")
         })?;
-    let control = video::Control { abort, pauses, now: B::now, clicks: mode };
+    let control = video::Control { abort, pauses, now: B::now, clicks: mode, keys: kmode };
     let enc_res = video::run(&mut frames, &mut output, &rx, &free_tx, &control, fps, names.len());
     if enc_res.is_err() {
         stop.store(true, Ordering::SeqCst);
@@ -374,12 +423,24 @@ fn run_session<B: Backend>(
     {
         log("mouse thread panicked");
     }
-    let video::Stats { frames: written, dropped: enc_dropped, duration_s, clicks } = enc_res?;
+    if let Some(k) = keyboard
+        && k.join().is_err()
+    {
+        log("keyboard thread panicked");
+    }
+    let video::Stats { frames: written, dropped: enc_dropped, duration_s, clicks, keys } = enc_res?;
     if let Some(clicks) = clicks {
         let n = clicks.len();
         match clicks::save(&path, &Payload { version: clicks::VERSION, scale, clicks }) {
             Ok(()) => log(&format!("saved {n} click(s) for the trimmer")),
             Err(e) => log(&format!("couldn't save the clicks: {e}")),
+        }
+    }
+    if let Some(keys) = keys {
+        let n = keys.len();
+        match keys::save(&path, &keys::Payload { version: keys::VERSION, scale: kscale, keys }) {
+            Ok(()) => log(&format!("saved {n} keystroke(s) for the trimmer")),
+            Err(e) => log(&format!("couldn't save the keystrokes: {e}")),
         }
     }
     let (cap_dropped, coalesced, stopped_early) = match cap_res {

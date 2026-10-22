@@ -1,6 +1,7 @@
 use super::clicks::Clicks;
 use super::crop::Crop;
 use super::info::Track;
+use super::keys::Keys;
 use super::math::Range;
 
 const UNDO_LIMIT: usize = 200;
@@ -44,6 +45,7 @@ pub struct Edit {
     pub lanes: Vec<Lane>,
     pub crop: Option<Crop>,
     pub clicks: Option<Clicks>,
+    pub keys: Option<Keys>,
 }
 
 impl Edit {
@@ -56,6 +58,7 @@ impl Edit {
             lanes: (0..tracks).map(|k| Lane::of(Some(k))).collect(),
             crop: None,
             clicks: None,
+            keys: None,
         }
     }
 

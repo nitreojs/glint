@@ -844,7 +844,8 @@ mod tests {
     #[test]
     fn click_highlights_reveal_their_mode_and_count_as_changes() {
         use egui::accesskit::{Node, Role, Toggled};
-        use glint_core::config::ClickMode;
+        use glint_core::config::{ClickMode, Keystrokes};
+        use glint_core::record::keys::Position;
         fn find(tree: &[(egui::accesskit::NodeId, Node)], role: Role, text: &str) -> Option<Node> {
             let named = |n: &Node| n.label() == Some(text) || n.value() == Some(text);
             tree.iter().find(|(_, n)| n.role() == role && named(n)).map(|(_, n)| n.clone())
@@ -859,6 +860,9 @@ mod tests {
         let toggle = find(&tree, Role::CheckBox, "click highlights").expect("the toggle");
         assert_eq!((toggle.toggled(), toggle.description()), (Some(Toggled::False), Some("off")));
         assert!(find(&tree, Role::RadioGroup, "clicks").is_none());
+        assert!(find(&tree, Role::RadioGroup, "keystrokes").is_some());
+        assert!(find(&tree, Role::RadioGroup, "keystroke position").is_none());
+        assert!(find(&tree, Role::RadioGroup, "keystrokes mode").is_none());
 
         let c = h.control("click highlights");
         h.click(pos2(c.left() + 18.0, c.top() + 10.0));
@@ -880,7 +884,49 @@ mod tests {
         let picker = h.control("clicks");
         h.click(pos2(picker.left() + 126.0, picker.top() + 16.0));
         assert_eq!(h.app.cfg.clicks, ClickMode::BurnIn);
-        assert_eq!(Section::Recording.changes(&h.app.cfg, &h.app.saved), 2);
+
+        let keys = h.control("keystrokes");
+        h.click(pos2(keys.left() + 167.0, keys.top() + 16.0));
+        assert_eq!(h.app.cfg.keystrokes, Keystrokes::All);
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        let levels = find(&tree, Role::RadioGroup, "keystrokes").expect("the level picker");
+        let options: Vec<_> = levels
+            .children()
+            .iter()
+            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
+            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
+            .collect();
+        assert_eq!(
+            options,
+            [
+                ("off".to_owned(), Some(Toggled::False)),
+                ("shortcuts".to_owned(), Some(Toggled::False)),
+                ("all keys".to_owned(), Some(Toggled::True)),
+            ]
+        );
+        assert!(find(&tree, Role::Label, "all keys skips password fields").is_some());
+        assert!(find(&tree, Role::RadioGroup, "keystroke position").is_some());
+        let modes = find(&tree, Role::RadioGroup, "keystrokes mode").expect("the mode picker");
+        let options: Vec<_> = modes
+            .children()
+            .iter()
+            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
+            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
+            .collect();
+        assert_eq!(options, [("editable".to_owned(), Some(Toggled::True)), ("burn in".to_owned(), Some(Toggled::False))]);
+        assert!(find(&tree, Role::Label, "editable keystrokes can be moved or removed in the trimmer").is_some());
+
+        let keys = h.control("keystrokes");
+        h.click(pos2(keys.left() + 100.0, keys.top() + 16.0));
+        assert_eq!(h.app.cfg.keystrokes, Keystrokes::Shortcuts);
+        let place = h.control("keystroke position");
+        h.click(pos2(place.left() + 33.0, place.top() + 16.0));
+        assert_eq!(h.app.cfg.keystroke_position, Position::Left);
+        let mode = h.control("keystrokes mode");
+        h.click(pos2(mode.left() + 126.0, mode.top() + 16.0));
+        assert_eq!(h.app.cfg.keystrokes_mode, ClickMode::BurnIn);
+        assert_eq!(Section::Recording.changes(&h.app.cfg, &h.app.saved), 5);
         Section::Recording.reset(&mut h.app.cfg);
         assert_eq!(h.app.cfg, h.app.saved);
     }

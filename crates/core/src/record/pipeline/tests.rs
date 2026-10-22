@@ -7,6 +7,7 @@ use super::video::{self, Clicks, Control, Stats};
 use super::*;
 use crate::config::audio::SourceKind;
 use crate::record::clicks::{Button, Click};
+use crate::record::keys::{Key, KeyFrame, KeyLabel, Mods, Named, Stroke};
 use crate::record::pointer::PointerKind;
 
 const MS: i64 = 10_000;
@@ -68,7 +69,7 @@ impl Frames for FakeFrames {
         Ok(Some(log.contents.len() as u32 - 1))
     }
 
-    fn compose(&mut self, frame: &u32, cursor: Option<(i32, i32)>, clicks: &[Shape]) -> Result<(), String> {
+    fn compose(&mut self, frame: &u32, cursor: Option<(i32, i32)>, clicks: &[Shape], _keys: Option<KeyFrame>) -> Result<(), String> {
         let mut log = get(&self.log);
         log.contents[*frame as usize] = (self.image, cursor);
         log.drawn[*frame as usize] = clicks.to_vec();
@@ -133,7 +134,7 @@ fn encode<O: Output<Frame = u32>>(
     let (free_tx, free_rx) = mpsc::channel();
     let abort = AtomicBool::new(abort);
     let pauses = Mutex::new(pauses);
-    let ctl = Control { abort: &abort, pauses: &pauses, now, clicks: Clicks::Off };
+    let ctl = Control { abort: &abort, pauses: &pauses, now, clicks: Clicks::Off, keys: video::Keys::Off };
     let stats = video::run(frames, output, &rx, &free_tx, &ctl, 10.0, tracks);
     Run { stats, freed: free_rx.try_iter().collect() }
 }
@@ -146,7 +147,7 @@ fn run_video(events: Vec<Event<usize>>, pauses: Pauses, now: fn() -> i64, fail: 
 }
 
 fn stats(frames: u64, dropped: u64, duration_s: f64) -> Result<Stats, String> {
-    Ok(Stats { frames, dropped, duration_s, clicks: None })
+    Ok(Stats { frames, dropped, duration_s, clicks: None, keys: None })
 }
 
 #[test]
@@ -272,7 +273,7 @@ fn run_clicks(events: Vec<Event<usize>>, pauses: Pauses, now: fn() -> i64, click
     drop(tx);
     let (free_tx, free_rx) = mpsc::channel();
     let (abort, pauses) = (AtomicBool::new(false), Mutex::new(pauses));
-    let ctl = Control { abort: &abort, pauses: &pauses, now, clicks };
+    let ctl = Control { abort: &abort, pauses: &pauses, now, clicks, keys: video::Keys::Off };
     let stats = video::run(&mut FakeFrames::new(&log), &mut FakeOutput { log: log.clone() }, &rx, &free_tx, &ctl, 10.0, 0);
     (Run { stats, freed: free_rx.try_iter().collect() }, log)
 }
@@ -300,7 +301,7 @@ fn clicks_land_on_the_video_timeline_without_the_paused_time() {
     let (run, log) = run_clicks(events, pauses, mid_pause, Clicks::Keep);
     let click = |button, down, up: Option<i64>| Click { button, down: down * MS, up: up.map(|u| u * MS), x: 1.5, y: 2.5 };
     let clicks = vec![click(Button::Left, 50, Some(100)), click(Button::Right, 180, Some(200)), click(Button::Left, 350, None)];
-    assert_eq!(run.stats, Ok(Stats { frames: 2, dropped: 0, duration_s: 0.4, clicks: Some(clicks) }));
+    assert_eq!(run.stats, Ok(Stats { frames: 2, dropped: 0, duration_s: 0.4, clicks: Some(clicks), keys: None }));
     assert!(get(&log).drawn.iter().all(Vec::is_empty));
 }
 
@@ -342,6 +343,49 @@ fn burnt_in_ripples_get_frames_on_a_still_screen() {
     assert_eq!(log.drawn[2].len(), 2);
 }
 
+
+fn kstroke(vk: u16, down: bool, at: i64, main: KeyLabel) -> Event<usize> {
+    Event::Key(Stroke { vk, down, at, mods: Mods::default(), main })
+}
+
+fn run_keys(events: Vec<Event<usize>>, pauses: Pauses, now: fn() -> i64, keys: video::Keys) -> (Run, Shared) {
+    let log = Shared::default();
+    let (tx, rx) = mpsc::channel();
+    for e in events {
+        tx.send(e).unwrap();
+    }
+    drop(tx);
+    let (free_tx, free_rx) = mpsc::channel();
+    let (abort, pauses) = (AtomicBool::new(false), Mutex::new(pauses));
+    let ctl = Control { abort: &abort, pauses: &pauses, now, clicks: Clicks::Off, keys };
+    let stats = video::run(&mut FakeFrames::new(&log), &mut FakeOutput { log: log.clone() }, &rx, &free_tx, &ctl, 10.0, 0);
+    (Run { stats, freed: free_rx.try_iter().collect() }, log)
+}
+
+#[test]
+fn keys_land_on_the_video_timeline_without_the_paused_time() {
+    let mut pauses = Pauses::default();
+    pauses.pause(300 * MS);
+    pauses.resume(500 * MS);
+    let txt = |s: &str| KeyLabel::Text(s.into());
+    let events = vec![
+        kstroke(0x41, true, 50 * MS, txt("a")), // before the first frame, dropped
+        kstroke(0x41, false, 60 * MS, txt("a")),
+        frame(Some(0), 100 * MS, None),
+        kstroke(0x42, true, 150 * MS, txt("b")),
+        kstroke(0x42, true, 170 * MS, txt("b")), // the OS repeating the held key, collapsed
+        kstroke(0x42, false, 200 * MS, txt("b")),
+        kstroke(0x1B, true, 350 * MS, KeyLabel::Named(Named::Esc)), // pressed while paused, dropped
+        frame(Some(1), 600 * MS, None),
+        kstroke(0x43, true, 650 * MS, txt("c")),
+        Event::End { at: 700 * MS },
+    ];
+    let (run, log) = run_keys(events, pauses, mid_pause, video::Keys::Keep);
+    let key = |at: i64, hold: Option<i64>, s: &str| Key { at, hold, mods: Mods::default(), main: KeyLabel::Text(s.into()) };
+    let keys = vec![key(50 * MS, Some(100 * MS), "b"), key(350 * MS, None, "c")];
+    assert_eq!(run.stats, Ok(Stats { frames: 2, dropped: 0, duration_s: 0.4, clicks: None, keys: Some(keys) }));
+    assert!(get(&log).drawn.iter().all(Vec::is_empty), "nothing is burnt in when the keystrokes are kept");
+}
 struct FakeAudio {
     name: String,
     gain: f32,
@@ -470,6 +514,16 @@ impl Mouse for FakeMouse {
     }
 }
 
+struct FakeKeys;
+
+impl Keys for FakeKeys {
+    fn run(&mut self, stop: &AtomicBool, _listening: &dyn Fn() -> bool, _out: &mut dyn FnMut(Stroke)) {
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
 struct Fake {
     log: Shared,
     path: PathBuf,
@@ -483,6 +537,7 @@ impl Backend for Fake {
     type Output = FakeOutput;
     type Audio = FakeAudio;
     type Mouse = FakeMouse;
+    type Keys = FakeKeys;
     type Guard = ();
 
     fn enter(_: Role) {}
@@ -509,6 +564,7 @@ impl Backend for Fake {
             fps: 10.0,
             path: self.path,
             clicks: self.mouse.then_some(clicks),
+            keys: None,
         })
     }
 }

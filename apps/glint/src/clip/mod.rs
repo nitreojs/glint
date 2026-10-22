@@ -9,6 +9,7 @@ use eframe::egui::{
     self, Color32, ColorImage, Event, Id, Key, Modifiers, Rect, TextureFilter, TextureHandle, TextureOptions, Ui, pos2, vec2,
 };
 use glint_core::clip::clicks::Clicks;
+use glint_core::clip::keys::Keys;
 use glint_core::clip::crop::{Aspect, Crop, Grip};
 use glint_core::clip::edit::{Edit, Undo};
 use glint_core::clip::export::{Format, Job, Source};
@@ -34,6 +35,7 @@ use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
 
 mod actions;
 mod clicklane;
+mod keylane;
 mod overlay;
 mod panel;
 mod player;
@@ -46,6 +48,7 @@ use actions::Saved;
 use player::{Cmd, Player, Shown};
 use scan::{Found, Scan};
 use clicklane::ClickDrag;
+use keylane::KeyDrag;
 use timeline::{Drag, View};
 use wave::Waves;
 
@@ -237,6 +240,10 @@ struct ClipApp {
     click_focus: bool,
     click_menu: Option<(egui::Pos2, Rect)>,
     click_drag: Option<ClickDrag>,
+    key_sel: Vec<usize>,
+    key_focus: bool,
+    key_menu: Option<(egui::Pos2, Rect)>,
+    key_drag: Option<KeyDrag>,
     frame_rect: Rect,
     keyboard: bool,
     rounded: bool,
@@ -273,6 +280,7 @@ impl ClipApp {
         let duration = info.as_ref().map_or(0, |i| i.duration);
         let tracks = info.as_ref().map_or(0, |i| i.tracks.len());
         let clicks = info.as_ref().ok().and_then(|i| i.clicks.as_ref()).map(Clicks::new);
+        let keys = info.as_ref().ok().and_then(|i| i.keys.as_ref()).map(Keys::new);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let file_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
         let custom_mb = match saved.export.target_mb {
@@ -306,7 +314,7 @@ impl ClipApp {
             shown: None,
             pos: 0,
             play: Play::Paused,
-            edit: Edit { clicks, ..Edit::new(duration, tracks) },
+            edit: Edit { clicks, keys, ..Edit::new(duration, tracks) },
             undo: Undo::default(),
             before_drag: None,
             selected: None,
@@ -336,6 +344,10 @@ impl ClipApp {
             click_drag: None,
             frame_rect: Rect::NOTHING,
             menu: false,
+            key_sel: Vec::new(),
+            key_focus: false,
+            key_menu: None,
+            key_drag: None,
             save_rect: Rect::NOTHING,
             sheet: false,
             confirm_delete: false,
@@ -890,6 +902,9 @@ impl ClipApp {
         if delete && !self.click_sel.is_empty() {
             let picked = std::mem::take(&mut self.click_sel);
             self.change(|e| e.clicks.as_mut().is_some_and(|c| c.delete(&picked)));
+        } else if delete && !self.key_sel.is_empty() {
+            let picked = std::mem::take(&mut self.key_sel);
+            self.change(|e| e.keys.as_mut().is_some_and(|k| k.delete(&picked)));
         } else if delete {
             let selected = self.selected;
             match selected {
@@ -911,6 +926,8 @@ impl ClipApp {
             self.lane_menu = None;
             self.click_menu = None;
             self.click_sel.clear();
+            self.key_menu = None;
+            self.key_sel.clear();
             self.sync_gains();
         }
         if crop {
@@ -1014,8 +1031,9 @@ impl eframe::App for ClipApp {
         let lanes = if self.info.is_ok() { self.edit.lanes.len() } else { 0 };
         let room = (main.height() - FILE_H - HINT_H - 3.0 * GAP) * 0.45;
         let clicks = self.info.is_ok() && self.edit.clicks.is_some();
-        let lane = timeline::lane_height(lanes, room, clicks);
-        let line_h = timeline::height(lanes, lane, clicks);
+        let keys = self.info.is_ok() && self.edit.keys.is_some();
+        let lane = timeline::lane_height(lanes, room, clicks, keys);
+        let line_h = timeline::height(lanes, lane, clicks, keys);
         let hint = Rect::from_min_max(pos2(main.left(), main.bottom() - HINT_H), main.max);
         let line = Rect::from_min_max(pos2(main.left(), hint.top() - GAP - line_h), pos2(main.right(), hint.top() - GAP));
         let file = Rect::from_min_size(main.min, vec2(main.width(), FILE_H));
@@ -1045,6 +1063,7 @@ impl eframe::App for ClipApp {
         self.menu_popup(&ctx, &look, self.save_rect);
         self.lane_menu_popup(&ctx, &look);
         self.click_menu_popup(&ctx, &look);
+        self.key_menu_popup(&ctx, &look);
         self.keys_sheet(&ctx, &look, body);
         self.show_toast(&ctx, &look, body);
         self.delete_dialog(&ctx, &look);
@@ -1056,6 +1075,8 @@ impl eframe::App for ClipApp {
                 self.lane_menu = None;
             } else if self.click_menu.is_some() {
                 self.click_menu = None;
+            } else if self.key_menu.is_some() {
+                self.key_menu = None;
             } else if self.sheet {
                 self.sheet = false;
             } else if self.menu {

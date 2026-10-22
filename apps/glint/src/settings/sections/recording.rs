@@ -1,5 +1,6 @@
 use eframe::egui::{Id, Ui};
-use glint_core::config::{ClickMode, CodecName, IndicatorInside};
+use glint_core::config::{ClickMode, CodecName, IndicatorInside, Keystrokes};
+use glint_core::record::keys::Position;
 use glint_ui::widgets::{self, Look, hint, row};
 
 use crate::settings::SettingsApp;
@@ -100,6 +101,26 @@ impl SettingsApp {
                     let modes = [(ClickMode::Editable, "editable"), (ClickMode::BurnIn, "burn in")];
                     widgets::segmented(ui, look, &mut self.cfg.clicks, &modes, Some(168.0));
                     hint(ui, "editable clicks can be moved or removed in the trimmer", t3);
+                });
+            });
+        }
+        row(ui, look, "keystrokes", 7.0, |ui| {
+            let levels = [(Keystrokes::Off, "off"), (Keystrokes::Shortcuts, "shortcuts"), (Keystrokes::All, "all keys")];
+            widgets::segmented(ui, look, &mut self.cfg.keystrokes, &levels, Some(200.0));
+            hint(ui, "all keys skips password fields", t3);
+        });
+        let shown = widgets::glide(ui, Id::unique("keystroke-mode"), if self.cfg.keystrokes != Keystrokes::Off { 1.0 } else { 0.0 }, 0.12);
+        if shown > 0.0 {
+            ui.scope(|ui| {
+                ui.multiply_opacity(shown);
+                row(ui, look, "keystroke position", 7.0, |ui| {
+                    let places = [(Position::Left, "left"), (Position::Centre, "centre"), (Position::Right, "right")];
+                    widgets::segmented(ui, look, &mut self.cfg.keystroke_position, &places, Some(200.0));
+                });
+                row(ui, look, "keystrokes mode", 7.0, |ui| {
+                    let modes = [(ClickMode::Editable, "editable"), (ClickMode::BurnIn, "burn in")];
+                    widgets::segmented(ui, look, &mut self.cfg.keystrokes_mode, &modes, Some(168.0));
+                    hint(ui, "editable keystrokes can be moved or removed in the trimmer", t3);
                 });
             });
         }

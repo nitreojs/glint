@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
-
 use super::clicks::ClickLook;
 use super::crop::Crop;
 use super::edit::Edit;
 use super::index::Index;
 use super::info::Info;
+use super::keys::KeyLook;
 use super::math::{Range, SECOND, gif_estimate, gif_frames};
 use crate::record::Codec;
 use crate::record::clicks::{Click, Style};
+use crate::record::keys;
 
 pub const TARGETS_MB: [u32; 3] = [10, 25, 50];
 pub(super) const HEIGHTS: [u32; 3] = [720, 540, 360];
@@ -71,6 +72,7 @@ pub struct Settings {
     pub codec: CodecChoice,
     pub combine: bool,
     pub clicks: ClickLook,
+    pub keys: KeyLook,
 }
 
 impl Default for Settings {
@@ -85,6 +87,7 @@ impl Default for Settings {
             codec: CodecChoice::Same,
             combine: false,
             clicks: ClickLook::default(),
+            keys: KeyLook::default(),
         }
     }
 }
@@ -180,6 +183,12 @@ pub struct Burn {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct KeyBurn {
+    pub keys: Vec<keys::Key>,
+    pub style: keys::Style,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VideoJob {
     pub pieces: Vec<Piece>,
     pub tracks: Vec<Sound>,
@@ -187,6 +196,7 @@ pub struct VideoJob {
     pub video: Video,
     pub target: Option<u64>,
     pub burn: Option<Burn>,
+    pub keys: Option<KeyBurn>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -197,6 +207,7 @@ pub struct GifJob {
     pub fps: u32,
     pub target: Option<u64>,
     pub burn: Option<Burn>,
+    pub keys: Option<KeyBurn>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -225,6 +236,7 @@ impl VideoJob {
         self.video == Video::Copy
             && !self.combine
             && info.clicks.is_none()
+            && info.keys.is_none()
             && self.tracks.len() == info.tracks.len()
             && (self.tracks.iter().enumerate()).all(|(k, t)| t.source == Some(k) && t.name == info.tracks[k].name)
             && matches!(self.pieces[..], [p] if p.lead <= 0 && p.end >= info.duration)
@@ -304,6 +316,11 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
         let clicks = c.burnt(&kept, &style);
         (!clicks.is_empty()).then_some(Burn { clicks, style })
     });
+    let keys = edit.keys.as_ref().and_then(|k| {
+        let style = s.keys.style(src.accent, k.scale);
+        let list = k.burnt(&kept, &style);
+        (!list.is_empty()).then_some(KeyBurn { keys: list, style })
+    });
     if s.format == Format::Gif {
         let len = kept.iter().map(|r| r.len()).sum();
         let mut out = scaled(base, s.height);
@@ -315,7 +332,7 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
             let k = (t as f64 * UNDER / est).sqrt();
             out = (even(out.0 as f64 * k).max(MIN_GIF), even(out.1 as f64 * k).max(MIN_GIF));
         }
-        return Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target, burn });
+        return Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target, burn, keys });
     }
     let tracks = sounds(edit, src.info);
     let combine = s.combine && tracks.iter().filter(|t| t.source.is_some()).count() > 1;
@@ -324,17 +341,17 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
     let kbps = s.kbps.filter(|k| KBPS.contains(k));
     let codec = s.codec.resolve(src.info.codec);
     let same_codec = src.info.codec.is_none_or(|c| c == codec);
-    let plain = crop.is_none() && height.is_none() && fps.is_none() && kbps.is_none() && burn.is_none();
+    let plain = crop.is_none() && height.is_none() && fps.is_none() && kbps.is_none() && burn.is_none() && keys.is_none();
     if src.index.is_some() && plain && same_codec {
         let pieces = kept.iter().map(|r| Piece { lead: lead(src.keys(), r.start), start: r.start, end: r.end }).collect();
-        let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target, burn: None };
+        let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target, burn: None, keys: None };
         if target.is_none_or(|t| estimate(&Job::Video(copy.clone()), src) <= t) {
             return Job::Video(copy);
         }
     }
     let out = scaled(base, height);
     let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end }).collect();
-    let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn };
+    let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn, keys };
     let bitrate = match (kbps, target) {
         (Some(k), _) => k * 1000,
         (None, Some(t)) => {
@@ -402,6 +419,7 @@ mod tests {
             codec: None,
             tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: format!("t{k}") }).collect(),
             clicks: None,
+            keys: None,
         }
     }
 

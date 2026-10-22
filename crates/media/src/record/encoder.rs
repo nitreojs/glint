@@ -6,6 +6,7 @@ use glint_core::record::Codec;
 use glint_core::record::mix::{RATE, frames_to_hns};
 use glint_core::record::mp4::name_tracks;
 use glint_core::record::clicks::Shape;
+use glint_core::record::keys::KeyFrame;
 use glint_core::record::pipeline::{Frames, Output, VideoConfig};
 use glint_core::record::pointer::PointerShape;
 use windows::Win32::Graphics::Direct3D11::*;
@@ -19,6 +20,7 @@ use windows::core::{GUID, HSTRING, Interface, PWSTR};
 use super::capture::Capture;
 use super::cursor::CursorRenderer;
 use crate::clicks;
+use crate::keys;
 use super::win::{INFINITE, RING, create_device, texture_desc};
 use super::{Ctx, Params};
 
@@ -38,6 +40,7 @@ pub(super) struct Composer {
     clean: ID3D11Texture2D,
     cursor: Option<CursorRenderer>,
     clicks: Option<clicks::Renderer>,
+    keys: Option<keys::Renderer>,
     alloc: IMFVideoSampleAllocatorEx,
     _mgr: IMFDXGIDeviceManager,
 }
@@ -92,6 +95,16 @@ pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -
             },
             _ => None,
         };
+        let keys = match &p.keys {
+            Some(k) if k.burn_in => match keys::Renderer::new(&device) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    log(&format!("the keystroke overlay won't be drawn: {e}"));
+                    None
+                }
+            },
+            _ => None,
+        };
 
         let mut token = 0;
         let mut mgr = None;
@@ -127,7 +140,7 @@ pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -
             },
             p.path.display()
         ));
-        let composer = Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, clicks, alloc, _mgr: mgr };
+        let composer = Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, clicks, keys, alloc, _mgr: mgr };
         Ok((composer, output))
     }
 }
@@ -260,9 +273,15 @@ impl Frames for Composer {
         }
     }
 
-    /// Copies the clean region image into a pooled sample texture and draws the clicks and the
-    /// cursor on it.
-    fn compose(&mut self, sample: &IMFSample, cursor: Option<(i32, i32)>, clicks: &[Shape]) -> Result<(), String> {
+    /// Copies the clean region image into a pooled sample texture and draws the clicks, the key
+    /// pills and the cursor on it (in that order; the cursor stays on top).
+    fn compose(
+        &mut self,
+        sample: &IMFSample,
+        cursor: Option<(i32, i32)>,
+        clicks: &[Shape],
+        keys: Option<KeyFrame>,
+    ) -> Result<(), String> {
         unsafe {
             let buf = sample.GetBufferByIndex(0).ctx("GetBufferByIndex")?;
             let dx: IMFDXGIBuffer = buf.cast().ctx("IMFDXGIBuffer")?;
@@ -277,9 +296,13 @@ impl Frames for Composer {
             }
 
             let r = self.region;
+            let pills = match (&self.keys, &keys) {
+                (Some(kr), Some(kf)) => keys::pills(kf.keys, kf.t, kf.style, (r.w as f32, r.h as f32), kr),
+                _ => Vec::new(),
+            };
             let pointer = matches!((&self.cursor, cursor), (Some(c), Some(_)) if c.size().is_some());
             let ripples = self.clicks.is_some() && !clicks.is_empty();
-            let rtv = if pointer || ripples {
+            let rtv = if pointer || ripples || !pills.is_empty() {
                 let mut desc = D3D11_RENDER_TARGET_VIEW_DESC {
                     Format: DXGI_FORMAT_B8G8R8A8_UNORM,
                     ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
@@ -295,10 +318,16 @@ impl Frames for Composer {
 
             self.mt.Enter();
             self.ctx.CopySubresourceRegion(&tex, sub, 0, 0, 0, &self.clean, 0, None);
-            let drawn = match (&rtv, &self.clicks) {
+            let mut drawn = match (&rtv, &self.clicks) {
                 (Some(rtv), Some(c)) => c.draw(&self.ctx, rtv, (r.w as u32, r.h as u32), clicks),
                 _ => Ok(()),
             };
+            if drawn.is_ok()
+                && !pills.is_empty()
+                && let (Some(rtv), Some(kr)) = (&rtv, &self.keys)
+            {
+                drawn = kr.draw(&self.ctx, rtv, (r.w as u32, r.h as u32), &pills);
+            }
             if let (Some(rtv), Some(c), Some((x, y))) = (&rtv, &self.cursor, cursor) {
                 c.draw(&self.ctx, rtv, r.w, r.h, x - r.x, y - r.y);
             }

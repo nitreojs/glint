@@ -163,7 +163,11 @@ pub fn probe(path: &Path) -> Result<Info, String> {
             log(&format!("clip: the clicks in {} can't be read: {e}", path.display()));
             None
         });
-        Ok(Info { duration, size, fps, codec, tracks, clicks })
+        let keys = glint_core::record::keys::load(path).unwrap_or_else(|e| {
+            log(&format!("clip: the keystrokes in {} can't be read: {e}", path.display()));
+            None
+        });
+        Ok(Info { duration, size, fps, codec, tracks, clicks, keys })
     }
 }
 

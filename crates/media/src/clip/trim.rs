@@ -11,7 +11,7 @@ use glint_core::record::Codec;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::{GUID, HSTRING};
 
-use super::burn::Burner;
+use super::burn::{Burner, KeyBurner};
 use super::gif;
 use super::media::{self, ANY, Got, Gpu, attributes, pack};
 use super::process::Processor;
@@ -290,6 +290,7 @@ fn run(
         reader.SetStreamSelection(video, true).ctx("SetStreamSelection")?;
         let mut processor = None;
         let mut burner = None;
+        let mut key_burner = None;
         targets[video as usize] = Some(match job.video {
             Video::Copy => {
                 let native = &streams[video as usize].2;
@@ -298,14 +299,15 @@ fn run(
                 Target::Remux(w)
             }
             Video::Encode { crop, size, bitrate, fps, codec } => {
-                let subtype = if job.burn.is_some() { MFVideoFormat_RGB32 } else { MFVideoFormat_NV12 };
+                let subtype = if job.burn.is_some() || job.keys.is_some() { MFVideoFormat_RGB32 } else { MFVideoFormat_NV12 };
                 media::set_video_output(&reader, subtype, info.size)?;
                 let rate = fps.map_or(info.fps, f64::from);
                 let area = crop.unwrap_or(Crop::full(info.size));
-                if crop.is_some() || size != info.size || job.burn.is_some() {
+                if crop.is_some() || size != info.size || job.burn.is_some() || job.keys.is_some() {
                     processor = Some(Processor::new(gpu, subtype, info.size, area, size, rate)?);
                 }
                 burner = job.burn.as_ref().map(|b| Burner::new(b, area, size));
+                key_burner = job.keys.as_ref().map(|k| KeyBurner::new(k, size));
                 Target::Encode(video_stream(&writer, codec, subtype, size, rate, bitrate, effort)?)
             }
         });
@@ -357,6 +359,9 @@ fn run(
             };
             if let Some(b) = &burner {
                 b.draw(&out, t)?;
+            }
+            if let Some(k) = &key_burner {
+                k.draw(&out, t)?;
             }
             Ok(out)
         };

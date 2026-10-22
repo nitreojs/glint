@@ -5,6 +5,7 @@ use serde::Deserialize;
 use crate::naming::{DEFAULT_PATTERN, pattern_problem};
 use crate::paths::app_dir;
 use crate::record::Codec;
+use crate::record::keys::Position;
 
 pub mod audio;
 pub mod color;
@@ -35,6 +36,9 @@ pub struct Config {
     pub draw_cursor: bool,
     pub click_highlights: bool,
     pub clicks: ClickMode,
+    pub keystrokes: Keystrokes,
+    pub keystroke_position: Position,
+    pub keystrokes_mode: ClickMode,
     pub audio_sources: Vec<AudioSource>,
     pub audio_track_names: Vec<String>,
     pub countdown: u32,
@@ -123,6 +127,18 @@ pub enum ClickMode {
     BurnIn,
 }
 
+/// How much of the keyboard the keystroke overlay records.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Keystrokes {
+    /// No overlay, no keyboard hook.
+    Off,
+    /// Only chords (Ctrl/Alt/Win) and standalone special keys; never typed text.
+    Shortcuts,
+    /// Also printable text, skipping password fields.
+    All,
+}
+
 /// What glint does about new releases on GitHub.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -187,6 +203,9 @@ impl Default for Config {
             draw_cursor: true,
             click_highlights: false,
             clicks: ClickMode::Editable,
+            keystrokes: Keystrokes::Off,
+            keystroke_position: Position::Centre,
+            keystrokes_mode: ClickMode::Editable,
             audio_sources: audio::default_sources(),
             audio_track_names: vec![String::new(); audio::MAX_TRACKS as usize],
             countdown: 0,
@@ -340,6 +359,20 @@ impl Config {
             ClickMode::Editable => "editable",
             ClickMode::BurnIn => "burn-in",
         };
+        let keystrokes = match self.keystrokes {
+            Keystrokes::Off => "off",
+            Keystrokes::Shortcuts => "shortcuts",
+            Keystrokes::All => "all",
+        };
+        let keystroke_position = match self.keystroke_position {
+            Position::Left => "left",
+            Position::Centre => "centre",
+            Position::Right => "right",
+        };
+        let keystrokes_mode = match self.keystrokes_mode {
+            ClickMode::Editable => "editable",
+            ClickMode::BurnIn => "burn-in",
+        };
         let update_mode = match self.update_mode {
             UpdateMode::Auto => "auto",
             UpdateMode::Notify => "notify",
@@ -415,6 +448,15 @@ draw_cursor = {draw_cursor}
 # file, so the trimmer can move or remove them; "burn-in" draws them into the video while recording.
 click_highlights = {click_highlights}
 clicks = "{clicks}"
+
+# On-screen keystroke overlay for recordings, shown only while recording your own screen.
+# keystrokes: "off"; "shortcuts" shows only chords (Ctrl/Alt/Win) and special keys, never
+# typed text; "all" also shows printable text and skips password fields. keystroke_position:
+# "left", "centre" or "right" along the bottom. keystrokes_mode: "editable" saves them in the
+# file for the trimmer; "burn-in" draws them into the video while recording.
+keystrokes = "{keystrokes}"
+keystroke_position = "{keystroke_position}"
+keystrokes_mode = "{keystrokes_mode}"
 
 # Sound to record. Each source has a kind: "desktop" (what the default output device plays;
 # exclude = "name.exe" leaves one app out of it), "app" (app = "name.exe": only that app and
@@ -492,6 +534,9 @@ update_beta = {update_beta}
             effort = self.effort,
             draw_cursor = self.draw_cursor,
             click_highlights = self.click_highlights,
+            keystrokes = keystrokes,
+            keystroke_position = keystroke_position,
+            keystrokes_mode = keystrokes_mode,
             audio_sources = audio::render_sources(&self.audio_sources),
             audio_track_names = audio::render_track_names(&self.audio_track_names),
             countdown = self.countdown,
@@ -581,6 +626,9 @@ mod tests {
             draw_cursor: false,
             click_highlights: true,
             clicks: ClickMode::BurnIn,
+            keystrokes: Keystrokes::All,
+            keystroke_position: Position::Right,
+            keystrokes_mode: ClickMode::BurnIn,
             audio_sources: vec![
                 AudioSource { exclude: "game.exe".into(), ..AudioSource::new(audio::SourceKind::Desktop, 0) },
                 AudioSource { app: "discord.exe".into(), volume: 80, ..AudioSource::new(audio::SourceKind::App, 1) },

@@ -185,6 +185,7 @@ impl ClipApp {
 
         self.frame_rect = frame;
         self.clicks_overlay(ui, &painter, frame, place.scale, cropping);
+        self.keys_overlay(ui, &painter, frame, place.scale);
         let adding = !cropping && self.click_focus && self.edit.clicks.is_some();
         if resp.double_clicked() {
             if let (true, Some(at)) = (adding, resp.interact_pointer_pos()) {

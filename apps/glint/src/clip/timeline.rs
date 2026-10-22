@@ -22,6 +22,7 @@ const LANE_MIN: f32 = 22.0;
 const SCROLL_H: f32 = 10.0;
 const ADD_H: f32 = 18.0;
 const CLICKS_H: f32 = 24.0;
+const KEYS_H: f32 = 24.0;
 const HANDLE_W: f32 = 6.0;
 const HANDLE_HIT: f32 = 14.0;
 const RENAME_W: f32 = 140.0;
@@ -41,19 +42,19 @@ const WAVES: [Color32; 6] = [
     Color32::from_rgb(0xE0, 0xD4, 0x6A),
 ];
 
-/// The timeline's height with `lanes` sound lanes `lane` tall, and the clicks lane when there is one.
-pub(super) fn height(lanes: usize, lane: f32, clicks: bool) -> f32 {
+/// The timeline's height with `lanes` sound lanes `lane` tall, and the overlay lanes when present.
+pub(super) fn height(lanes: usize, lane: f32, clicks: bool, keys: bool) -> f32 {
     let sound = if lanes > 0 { GAP + HEAD_H + GAP + lanes as f32 * (lane + GAP) - GAP } else { 0.0 };
-    let clicks = if clicks { GAP + CLICKS_H } else { 0.0 };
-    TOP + VIDEO_H + clicks + sound + GAP + ADD_H + SCROLL_H
+    let overlay = if clicks { GAP + CLICKS_H } else { 0.0 } + if keys { GAP + KEYS_H } else { 0.0 };
+    TOP + VIDEO_H + overlay + sound + GAP + ADD_H + SCROLL_H
 }
 
 /// Sound lanes shrink from 34 to 22 px to fit in `room`.
-pub(super) fn lane_height(tracks: usize, room: f32, clicks: bool) -> f32 {
+pub(super) fn lane_height(tracks: usize, room: f32, clicks: bool, keys: bool) -> f32 {
     if tracks == 0 {
         return LANE_MAX;
     }
-    ((room - height(tracks, 0.0, clicks)) / tracks as f32).clamp(LANE_MIN, LANE_MAX)
+    ((room - height(tracks, 0.0, clicks, keys)) / tracks as f32).clamp(LANE_MIN, LANE_MAX)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -119,6 +120,7 @@ fn hatch(painter: &Painter, r: Rect, color: Color32) {
 struct Rows {
     video: Rect,
     clicks: Option<Rect>,
+    keys: Option<Rect>,
     head: Rect,
     lanes: Vec<Rect>,
     span: Rect,
@@ -153,10 +155,12 @@ impl LaneItem {
     }
 }
 
-fn rows(area: Rect, lanes: usize, lane: f32, clicks: bool) -> Rows {
+fn rows(area: Rect, lanes: usize, lane: f32, clicks: bool, keys: bool) -> Rows {
     let video = Rect::from_min_size(pos2(area.left(), area.top() + TOP), vec2(area.width(), VIDEO_H));
     let clicks = clicks.then(|| Rect::from_min_size(pos2(area.left(), video.bottom() + GAP), vec2(area.width(), CLICKS_H)));
-    let picture = clicks.map_or(video, |c| video.union(c));
+    let below = clicks.map_or(video, |c| video.union(c));
+    let keys = keys.then(|| Rect::from_min_size(pos2(area.left(), below.bottom() + GAP), vec2(area.width(), KEYS_H)));
+    let picture = keys.map_or(below, |k| below.union(k));
     let head = Rect::from_min_size(pos2(area.left(), picture.bottom() + GAP), vec2(area.width(), HEAD_H));
     let lanes: Vec<Rect> = (0..lanes)
         .map(|k| Rect::from_min_size(pos2(area.left(), head.bottom() + GAP + k as f32 * (lane + GAP)), vec2(area.width(), lane)))
@@ -169,7 +173,7 @@ fn rows(area: Rect, lanes: usize, lane: f32, clicks: bool) -> Rows {
     }
     let add = Rect::from_min_size(pos2(area.left(), bottom + GAP), vec2(area.width(), ADD_H));
     let bar = Rect::from_min_size(pos2(area.left() + 6.0, add.bottom() + 4.0), vec2(area.width() - 12.0, 4.0));
-    Rows { video, clicks, head, lanes, span, bands, add, bar }
+    Rows { video, clicks, keys, head, lanes, span, bands, add, bar }
 }
 
 fn grips(rows: &Rows, x: f32) -> Vec<Rect> {
@@ -201,7 +205,7 @@ impl ClipApp {
             ui.painter().rect_filled(Rect::from_min_size(area.min + vec2(0.0, TOP), vec2(area.width(), VIDEO_H)), 6, p.ctl);
             return;
         };
-        let rows = rows(area, self.edit.lanes.len(), lane_h, self.edit.clicks.is_some());
+        let rows = rows(area, self.edit.lanes.len(), lane_h, self.edit.clicks.is_some(), self.edit.keys.is_some());
         let dur = info.duration.max(1);
         let frame = math::frame_len(info.fps);
         let inner = area.shrink2(vec2(6.0, 0.0));
@@ -209,7 +213,7 @@ impl ClipApp {
         self.view.clamp(dur, min_span);
         let light = self.light == Some(true);
 
-        let blocked = self.sheet || self.menu || self.confirm_delete || self.lane_menu.is_some() || self.click_menu.is_some();
+        let blocked = self.sheet || self.menu || self.confirm_delete || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| area.contains(*at));
         if let Some(at) = hover
             && !blocked
@@ -298,6 +302,7 @@ impl ClipApp {
         add.widget_info(|| WidgetInfo::labeled(Role::Button, true, ADD_TEXT));
         let axis = Axis { left: inner.left(), width: inner.width(), view: v, dur, fps: info.fps, snapping };
         let click_lane = rows.clicks.and_then(|lane| self.clicks_input(ui, look, lane, &axis));
+        let key_lane = rows.keys.and_then(|lane| self.keys_input(ui, look, lane, &axis));
         let start_tip = if pieces.is_some() {
             "drag to trim · snaps to keyframes so it saves instantly · ctrl + drag for an exact frame (the file then starts at the keyframe before it)"
         } else {
@@ -397,6 +402,8 @@ impl ClipApp {
             self.drag = Some(Drag::Head);
             self.click_focus = false;
             self.click_sel.clear();
+            self.key_focus = false;
+            self.key_sel.clear();
             if body.clicked()
                 && let Some(at) = body.interact_pointer_pos()
             {
@@ -580,6 +587,9 @@ impl ClipApp {
         if let Some(lane) = &click_lane {
             self.clicks_paint(ui, look, lane, &axis, &painter);
         }
+        if let Some(lane) = &key_lane {
+            self.keys_paint(ui, look, lane, &axis, &painter);
+        }
         let shade = Color32::from_black_alpha(if light { 70 } else { 158 });
         for band in &rows.bands {
             let clip = lane_clip(Rect::from_min_max(pos2(area.left(), band.top()), pos2(area.right(), band.bottom())));
@@ -666,6 +676,9 @@ impl ClipApp {
         }
         if let Some(lane) = &click_lane {
             self.clicks_chip(ui, look, lane, &painter);
+        }
+        if let Some(lane) = &key_lane {
+            self.keys_chip(ui, look, lane, &painter);
         }
         let h = anim(ui, add.id.with("hov"), add.hovered(), 0.12);
         painter.text(add_r.left_center(), egui::Align2::LEFT_CENTER, ADD_TEXT, sans(12.0), mix(p.t3, p.t1, h));
@@ -849,23 +862,23 @@ mod tests {
     #[test]
     fn lanes_shrink_to_fit_and_every_track_gets_one() {
         let add = GAP + ADD_H;
-        assert_eq!(height(0, 34.0, false), TOP + VIDEO_H + add + SCROLL_H);
-        assert_eq!(height(3, 34.0, false), TOP + VIDEO_H + GAP + HEAD_H + GAP + 3.0 * 40.0 - GAP + add + SCROLL_H);
-        assert_eq!(lane_height(3, 1000.0, false), LANE_MAX);
-        assert_eq!(lane_height(8, 100.0, false), LANE_MIN);
-        let fit = lane_height(3, 230.0, false);
-        assert!((height(3, fit, false) - 230.0).abs() < 0.01 && fit < LANE_MAX && fit > LANE_MIN, "{fit}");
-        let r = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(2, 30.0, false))), 2, 30.0, false);
+        assert_eq!(height(0, 34.0, false, false), TOP + VIDEO_H + add + SCROLL_H);
+        assert_eq!(height(3, 34.0, false, false), TOP + VIDEO_H + GAP + HEAD_H + GAP + 3.0 * 40.0 - GAP + add + SCROLL_H);
+        assert_eq!(lane_height(3, 1000.0, false, false), LANE_MAX);
+        assert_eq!(lane_height(8, 100.0, false, false), LANE_MIN);
+        let fit = lane_height(3, 230.0, false, false);
+        assert!((height(3, fit, false, false) - 230.0).abs() < 0.01 && fit < LANE_MAX && fit > LANE_MIN, "{fit}");
+        let r = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(2, 30.0, false, false))), 2, 30.0, false, false);
         assert_eq!(r.lanes.len(), 2);
         assert_eq!(r.span.bottom(), r.lanes[1].bottom());
         assert!(r.add.top() > r.span.bottom() && r.bar.top() > r.add.bottom());
-        assert!(r.bar.bottom() <= height(2, 30.0, false));
+        assert!(r.bar.bottom() <= height(2, 30.0, false, false));
     }
 
     #[test]
     fn trim_grips_cover_the_video_and_the_sound_lanes_but_never_the_header() {
-        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0, false)));
-        let r = rows(area, 3, 30.0, false);
+        let area = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0, false, false)));
+        let r = rows(area, 3, 30.0, false, false);
         for x in [6.0, 400.0, 794.0] {
             let g = grips(&r, x);
             assert_eq!(g.len(), 2);
@@ -873,26 +886,36 @@ mod tests {
             assert!(g[0].contains(pos2(x, r.video.top())) && g[0].contains(pos2(x, r.video.bottom())));
             assert!(g[1].contains(pos2(x, r.lanes[0].top())) && g[1].contains(pos2(x, r.lanes[2].bottom())));
         }
-        let silent = rows(area, 0, 30.0, false);
+        let silent = rows(area, 0, 30.0, false, false);
         assert_eq!(grips(&silent, 400.0).len(), 1);
-        let with = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0, true))), 3, 30.0, true);
+        let with = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0, true, false))), 3, 30.0, true, false);
         let lane = with.clicks.unwrap();
         assert!(lane.top() > with.video.bottom() && lane.bottom() < with.head.top());
         let g = grips(&with, 400.0);
         assert!(g[0].contains(pos2(400.0, with.video.top())) && g[0].contains(pos2(400.0, lane.bottom())), "the clicks trim with the video");
         assert!(!g[0].intersects(with.head) && !g[1].intersects(with.head));
-        assert_eq!(height(3, 30.0, true) - height(3, 30.0, false), GAP + CLICKS_H);
-        assert!(with.add.bottom() <= height(3, 30.0, true));
+        assert_eq!(height(3, 30.0, true, false) - height(3, 30.0, false, false), GAP + CLICKS_H);
+        assert!(with.add.bottom() <= height(3, 30.0, true, false));
+
+        let both = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0, true, true))), 3, 30.0, true, true);
+        let clicks = both.clicks.unwrap();
+        let keys = both.keys.unwrap();
+        assert!(keys.top() > clicks.bottom() && keys.bottom() < both.head.top(), "the keys lane sits under the clicks lane");
+        let g = grips(&both, 400.0);
+        assert!(g[0].contains(pos2(400.0, both.video.top())) && g[0].contains(pos2(400.0, keys.bottom())), "the keys trim with the video");
+        assert!(!g[0].intersects(both.head) && !g[1].intersects(both.head));
+        assert_eq!(height(3, 30.0, true, true) - height(3, 30.0, true, false), GAP + KEYS_H);
+        assert!(both.add.bottom() <= height(3, 30.0, true, true));
     }
 
     #[test]
     fn a_dragged_lane_lands_in_the_slot_under_the_pointer() {
-        let r = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0, false))), 3, 30.0, false);
+        let r = rows(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, height(3, 30.0, false, false))), 3, 30.0, false, false);
         assert_eq!(lane_slot(&r, r.head.top()), 0);
         assert_eq!(lane_slot(&r, r.lanes[0].center().y), 0);
         assert_eq!(lane_slot(&r, r.lanes[1].top() - 1.0), 1);
         assert_eq!(lane_slot(&r, r.lanes[1].center().y), 1);
         assert_eq!(lane_slot(&r, r.lanes[2].bottom() + 50.0), 2);
-        assert_eq!(lane_slot(&rows(r.span, 0, 30.0, false), 10.0), 0);
+        assert_eq!(lane_slot(&rows(r.span, 0, 30.0, false, false), 10.0), 0);
     }
 }

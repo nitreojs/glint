@@ -2,13 +2,15 @@ use std::cell::RefCell;
 
 use glint_core::clip::clicks::{into_output, paint_bgrx};
 use glint_core::clip::crop::Crop;
-use glint_core::clip::export::Burn;
+use glint_core::clip::export::{Burn, KeyBurn};
 use glint_core::record::clicks::{Shape, shapes_at};
+use glint_core::record::keys::{Key, Pill, Style};
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::Interface;
 
 use crate::clicks::Renderer;
+use crate::keys;
 use crate::record::Ctx;
 
 pub(super) struct Burner {
@@ -93,5 +95,113 @@ unsafe fn in_memory(buf: &IMFMediaBuffer, size: (u32, u32), shapes: &[Shape]) ->
         }
         let _ = buf.Unlock();
         if fits { Ok(()) } else { Err("the frame is smaller than expected".into()) }
+    }
+}
+
+/// Burns the keystroke overlay into re-encoded frames, the keyboard analogue of [`Burner`].
+pub(super) struct KeyBurner {
+    keys: Vec<Key>,
+    style: Style,
+    out: (u32, u32),
+    pills: RefCell<Vec<Pill>>,
+    gpu: RefCell<Option<keys::Renderer>>,
+    cpu: RefCell<Option<keys::Surface>>,
+}
+
+impl KeyBurner {
+    pub(super) fn new(burn: &KeyBurn, out: (u32, u32)) -> KeyBurner {
+        KeyBurner {
+            keys: burn.keys.clone(),
+            style: burn.style,
+            out,
+            pills: RefCell::new(Vec::new()),
+            gpu: RefCell::new(None),
+            cpu: RefCell::new(None),
+        }
+    }
+
+    pub(super) fn draw(&self, sample: &IMFSample, t: i64) -> Result<(), String> {
+        unsafe {
+            let buf = sample.GetBufferByIndex(0).ctx("GetBufferByIndex")?;
+            match buf.cast::<IMFDXGIBuffer>() {
+                Ok(dx) => self.on_gpu(&dx, t),
+                Err(_) => self.in_memory(&buf, t),
+            }
+        }
+    }
+
+    unsafe fn on_gpu(&self, dx: &IMFDXGIBuffer, t: i64) -> Result<(), String> {
+        unsafe {
+            let mut raw = std::ptr::null_mut();
+            dx.GetResource(&ID3D11Texture2D::IID, &mut raw).ctx("IMFDXGIBuffer::GetResource")?;
+            let tex = ID3D11Texture2D::from_raw(raw);
+            let sub = dx.GetSubresourceIndex().ctx("GetSubresourceIndex")?;
+            let mut td = D3D11_TEXTURE2D_DESC::default();
+            tex.GetDesc(&mut td);
+            let device = tex.GetDevice().ctx("GetDevice")?;
+            let mut desc = D3D11_RENDER_TARGET_VIEW_DESC {
+                Format: td.Format,
+                ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2DARRAY,
+                ..Default::default()
+            };
+            desc.Anonymous.Texture2DArray = D3D11_TEX2D_ARRAY_RTV { MipSlice: 0, FirstArraySlice: sub, ArraySize: 1 };
+            let mut rtv = None;
+            device.CreateRenderTargetView(&tex, Some(&desc), Some(&mut rtv)).ctx("CreateRenderTargetView (keys)")?;
+            let rtv = rtv.ok_or("no render target for the keystrokes")?;
+            let mut gpu = self.gpu.borrow_mut();
+            if gpu.is_none() {
+                *gpu = Some(keys::Renderer::new(&device)?);
+            }
+            let renderer = gpu.as_ref().unwrap();
+            let mut pills = self.pills.borrow_mut();
+            *pills = keys::pills(&self.keys, t, &self.style, (self.out.0 as f32, self.out.1 as f32), renderer);
+            if pills.is_empty() {
+                return Ok(());
+            }
+            let ctx = device.GetImmediateContext().ctx("GetImmediateContext")?;
+            let mt: ID3D11Multithread = device.cast().ctx("ID3D11Multithread")?;
+            mt.Enter();
+            let drawn = renderer.draw(&ctx, &rtv, self.out, &pills);
+            mt.Leave();
+            drawn
+        }
+    }
+
+    unsafe fn in_memory(&self, buf: &IMFMediaBuffer, t: i64) -> Result<(), String> {
+        let mut cpu = self.cpu.borrow_mut();
+        if cpu.is_none() {
+            *cpu = Some(keys::Surface::new()?);
+        }
+        let surface = cpu.as_ref().unwrap();
+        let mut pills = self.pills.borrow_mut();
+        *pills = keys::pills(&self.keys, t, &self.style, (self.out.0 as f32, self.out.1 as f32), surface.renderer());
+        if pills.is_empty() {
+            return Ok(());
+        }
+        unsafe {
+            if let Ok(b2) = buf.cast::<IMF2DBuffer>() {
+                let (mut scan0, mut pitch) = (std::ptr::null_mut(), 0);
+                b2.Lock2D(&mut scan0, &mut pitch).ctx("Lock2D")?;
+                let res = if pitch > 0 {
+                    let px = std::slice::from_raw_parts_mut(scan0, pitch as usize * self.out.1 as usize);
+                    surface.draw(px, pitch as usize, self.out, &pills)
+                } else {
+                    Err("bottom-up frames can't take keystrokes".into())
+                };
+                let _ = b2.Unlock2D();
+                return res;
+            }
+            let (mut data, mut len) = (std::ptr::null_mut(), 0u32);
+            buf.Lock(&mut data, None, Some(&mut len)).ctx("Lock")?;
+            let pitch = self.out.0 as usize * 4;
+            let res = if len as usize >= pitch * self.out.1 as usize {
+                let px = std::slice::from_raw_parts_mut(data, pitch * self.out.1 as usize);
+                surface.draw(px, pitch, self.out, &pills)
+            } else {
+                Err("the frame is smaller than expected".into())
+            };
+            let _ = buf.Unlock();
+            res
+        }
     }
 }

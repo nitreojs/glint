@@ -26,6 +26,8 @@ pub(crate) mod cursor;
 #[cfg(windows)]
 mod encoder;
 #[cfg(windows)]
+mod keys;
+#[cfg(windows)]
 mod mouse;
 #[cfg(windows)]
 mod rotate;
@@ -55,6 +57,8 @@ pub struct Params {
     pub draw_cursor: bool,
     /// Click highlights; `None` = off (no mouse hook).
     pub clicks: Option<ClickHighlights>,
+    /// Keystroke overlay; `None` = off (no keyboard hook).
+    pub keys: Option<KeyOverlay>,
     pub audio: Vec<AudioSource>,
     pub track_names: Vec<String>,
     pub path: PathBuf,
@@ -64,6 +68,16 @@ pub struct Params {
 pub struct ClickHighlights {
     /// Drawn into the video; otherwise saved in the file for the trimmer.
     pub burn_in: bool,
+    pub accent: [u8; 3],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct KeyOverlay {
+    /// `Shortcuts` or `All` (`Off` means the whole option is `None`).
+    pub level: glint_core::config::Keystrokes,
+    /// Drawn into the video; otherwise saved in the file for the trimmer.
+    pub burn_in: bool,
+    pub pos: glint_core::record::keys::Position,
     pub accent: [u8; 3],
 }
 

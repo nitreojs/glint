@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use super::{Event, Frames, Output, lock};
 use crate::record::clicks::{self, Click, Log, Shape, Style};
+use crate::record::keys::{self, KeyFrame};
 use crate::record::timeline::{AudioPlacer, Pauses};
 
 const IDLE: Duration = Duration::from_millis(50);
@@ -16,11 +17,19 @@ pub(super) enum Clicks {
     Burn(Style),
 }
 
+pub(super) enum Keys {
+    Off,
+    /// Collected and returned in [`Stats::keys`].
+    Keep,
+    Burn(keys::Style),
+}
+
 pub(super) struct Control<'a> {
     pub abort: &'a AtomicBool,
     pub pauses: &'a Mutex<Pauses>,
     pub now: fn() -> i64,
     pub clicks: Clicks,
+    pub keys: Keys,
 }
 
 #[derive(Debug, PartialEq)]
@@ -30,6 +39,8 @@ pub(super) struct Stats {
     pub duration_s: f64,
     /// With [`Clicks::Keep`]: the clicks on the video timeline.
     pub clicks: Option<Vec<Click>>,
+    /// With [`Keys::Keep`]: the keystrokes on the video timeline.
+    pub keys: Option<Vec<keys::Key>>,
 }
 
 struct Video<T> {
@@ -46,6 +57,9 @@ struct Video<T> {
     clicks: Log,
     burn: Option<Style>,
     shapes: Vec<Shape>,
+    /// Keystrokes with active capture-clock times.
+    keys: keys::Log,
+    kburn: Option<keys::Style>,
 }
 
 fn paint(burn: Option<&Style>, clicks: &Log, shapes: &mut Vec<Shape>, t: i64) {
@@ -68,6 +82,16 @@ impl<T> Video<T> {
         self.burn.as_ref().is_some_and(|s| clicks::moving(self.clicks.clicks(), t, s))
     }
 
+    /// Burnt-in keystrokes are animating at active time `t`.
+    fn animating_keys(&self, t: i64) -> bool {
+        self.kburn.as_ref().is_some_and(|s| keys::moving(self.keys.keys(), t, s))
+    }
+
+    /// The keycap stack to burn into a frame stamped `t`, if keystrokes are burnt in.
+    fn keyframe(&self, t: i64) -> Option<KeyFrame<'_>> {
+        self.kburn.as_ref().map(|style| KeyFrame { keys: self.keys.keys(), t, style })
+    }
+
     /// A frame at `t` would start a new slot.
     fn due(&self, t: i64) -> bool {
         self.pending.as_ref().is_none_or(|(_, ps)| self.slot(t) > *ps)
@@ -84,7 +108,7 @@ impl<T> Video<T> {
             Some((f, ps)) if slot <= *ps => {
                 let at = start + self.slot_time(*ps);
                 paint(self.burn.as_ref(), &self.clicks, &mut self.shapes, at);
-                frames.compose(f, self.cursor, &self.shapes)?
+                frames.compose(f, self.cursor, &self.shapes, self.keyframe(at))?
             }
             _ => {
                 let Some(next) = frames.alloc()? else {
@@ -93,7 +117,7 @@ impl<T> Video<T> {
                 };
                 let at = start + self.slot_time(slot);
                 paint(self.burn.as_ref(), &self.clicks, &mut self.shapes, at);
-                frames.compose(&next, self.cursor, &self.shapes)?;
+                frames.compose(&next, self.cursor, &self.shapes, self.keyframe(at))?;
                 if let Some((prev, ps)) = self.pending.take() {
                     output.video(prev, self.slot_time(ps), self.slot_time(slot) - self.slot_time(ps))?;
                     self.frames += 1;
@@ -146,6 +170,11 @@ where
             Clicks::Off | Clicks::Keep => None,
         },
         shapes: Vec::new(),
+        keys: keys::Log::default(),
+        kburn: match &ctl.keys {
+            Keys::Burn(style) => Some(*style),
+            Keys::Off | Keys::Keep => None,
+        },
     };
     let tick = Duration::from_secs_f64(1.0 / fps).min(IDLE);
     let mut placer = AudioPlacer::default();
@@ -154,7 +183,8 @@ where
     let mut end = None;
 
     loop {
-        let animating = v.burn.is_some() && end.is_none() && v.animating(lock(ctl.pauses).active_clamped((ctl.now)()));
+        let active = lock(ctl.pauses).active_clamped((ctl.now)());
+        let animating = end.is_none() && (v.animating(active) || v.animating_keys(active));
         let event = match rx.recv_timeout(if animating { tick } else { IDLE }) {
             Ok(e) => Some(e),
             Err(RecvTimeoutError::Timeout) => None,
@@ -191,6 +221,14 @@ where
                     v.clicks.press(p.button, t, p.x, p.y);
                 }
             }
+            Some(Event::Key(s)) => {
+                let pauses = lock(ctl.pauses);
+                if !s.down {
+                    v.keys.up(s.vk, pauses.active_clamped(s.at));
+                } else if let Some(t) = pauses.active(s.at) {
+                    v.keys.down(s.vk, t, s.mods, s.main);
+                }
+            }
             Some(Event::Frame { image, at, cursor }) => {
                 if let Some(image) = image {
                     frames.latch(&image)?;
@@ -208,10 +246,10 @@ where
                 }
             }
         }
-        if end.is_none() && (v.stale || v.burn.is_some()) {
+        if end.is_none() && (v.stale || v.burn.is_some() || v.kburn.is_some()) {
             let t = lock(ctl.pauses).active((ctl.now)());
             if let Some(t) = t
-                && (v.stale || (v.have_image && v.animating(t) && v.due(t)))
+                && (v.stale || (v.have_image && (v.animating(t) || v.animating_keys(t)) && v.due(t)))
             {
                 v.stale = false;
                 v.frame(frames, output, t)?;
@@ -229,7 +267,7 @@ where
     }
 
     if ctl.abort.load(Ordering::SeqCst) {
-        return Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s: 0.0, clicks: None });
+        return Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s: 0.0, clicks: None, keys: None });
     }
     let mut duration_s = 0.0;
     let mut video_end = 0;
@@ -253,5 +291,10 @@ where
         clicks.retain(|c| c.down < video_end);
         clicks
     });
-    Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s, clicks })
+    let keys = matches!(ctl.keys, Keys::Keep).then(|| {
+        let mut keys = std::mem::take(&mut v.keys).finish(v.start.unwrap_or(0));
+        keys.retain(|k| k.at < video_end);
+        keys
+    });
+    Ok(Stats { frames: v.frames, dropped: v.dropped, duration_s, clicks, keys })
 }

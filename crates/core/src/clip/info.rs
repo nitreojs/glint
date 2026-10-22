@@ -1,5 +1,6 @@
 use crate::record::Codec;
 use crate::record::clicks::Payload;
+use crate::record::keys;
 
 #[derive(Clone, Debug)]
 pub struct Track {
@@ -15,4 +16,5 @@ pub struct Info {
     pub codec: Option<Codec>,
     pub tracks: Vec<Track>,
     pub clicks: Option<Payload>,
+    pub keys: Option<keys::Payload>,
 }

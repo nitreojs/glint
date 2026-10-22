@@ -14,6 +14,7 @@ use glint_core::clip::math::{gif_delay, gif_frames, gif_tick};
 use glint_core::record::clicks::{Shape, shapes_at};
 
 use super::media::{self, Decoded};
+use crate::keys;
 use super::trim::Progress;
 
 const COLORS: usize = 255;
@@ -65,6 +66,10 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
         return Err("the selection is empty".into());
     }
     let reader = media::rgb_reader(src, area.full)?;
+    let surface = match &job.keys {
+        Some(_) => Some(keys::Surface::new()?),
+        None => None,
+    };
     let mut shapes = Vec::new();
     let clicks_at = |t: i64, shapes: &mut Vec<Shape>| {
         shapes.clear();
@@ -87,6 +92,10 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
             bgrx(&f, area, &mut px)?;
             clicks_at(t, &mut shapes);
             paint_bgrx(&mut px, size.0 as usize * 4, size, &shapes);
+            if let (Some(kb), Some(surf)) = (&job.keys, &surface) {
+                let pills = keys::pills(&kb.keys, t, &kb.style, (size.0 as f32, size.1 as f32), surf.renderer());
+                surf.draw(&mut px, size.0 as usize * 4, size, &pills)?;
+            }
             sample.extend(px.chunks_exact(4).flat_map(|c| [c[2], c[1], c[0], 255]));
         }
         p.set(j as i64 + 1, picks as i64 * 10);
@@ -136,13 +145,23 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
         let Some(f) = &cur else { break };
         let delay = gif_delay(k, fps);
         clicks_at(t, &mut shapes);
-        let changed = if shown_ts == Some(f.ts) && shapes.is_empty() && !drew {
+        let pills = match (&job.keys, &surface) {
+            (Some(kb), Some(surf)) => keys::pills(&kb.keys, t, &kb.style, (size.0 as f32, size.1 as f32), surf.renderer()),
+            _ => Vec::new(),
+        };
+        let overlay = !shapes.is_empty() || !pills.is_empty();
+        let changed = if shown_ts == Some(f.ts) && !overlay && !drew {
             None
         } else {
             shown_ts = Some(f.ts);
             bgrx(f, area, &mut px)?;
             paint_bgrx(&mut px, size.0 as usize * 4, size, &shapes);
-            drew = !shapes.is_empty();
+            if let Some(surf) = &surface
+                && !pills.is_empty()
+            {
+                surf.draw(&mut px, size.0 as usize * 4, size, &pills)?;
+            }
+            drew = overlay;
             dither.frame(&mut q, &px)
         };
         if changed.is_none()

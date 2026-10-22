@@ -3,7 +3,9 @@ use eframe::egui::{Event, PointerButton, Pos2};
 use glint_core::clip::export::Format;
 use glint_core::clip::info::Track;
 use glint_core::clip::math::SECOND;
+use glint_core::clip::keys::KeySize;
 use glint_core::record::clicks::{Button, Click, Payload};
+use glint_core::record::keys;
 
 use super::*;
 
@@ -20,10 +22,18 @@ struct Harness {
 
 impl Harness {
     fn new(tracks: usize) -> Harness {
-        Harness::with_clicks(tracks, None)
+        Harness::build(tracks, None, None)
     }
 
     fn with_clicks(tracks: usize, clicks: Option<Payload>) -> Harness {
+        Harness::build(tracks, clicks, None)
+    }
+
+    fn with_keys(tracks: usize, keys: Option<keys::Payload>) -> Harness {
+        Harness::build(tracks, None, keys)
+    }
+
+    fn build(tracks: usize, clicks: Option<Payload>, keys: Option<keys::Payload>) -> Harness {
         let ctx = egui::Context::default();
         glint_ui::theme::fonts(&ctx);
         let names = ["desktop", "spotifast.exe", "mic: HyperX QuadCast"];
@@ -34,6 +44,7 @@ impl Harness {
             codec: None,
             tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: names[k % 3].into() }).collect(),
             clicks,
+            keys,
         };
         let path = PathBuf::from("C:/nowhere/glint_2026-10-21_04-36.mp4");
         let app = ClipApp::new(path, Ok(info), None, &Config::default(), Saved::default(), [0xE5, 0x40, 0x2F]);
@@ -364,7 +375,7 @@ fn the_preview_smooths_below_200_percent_and_decodes_room_to_shrink() {
     assert!(!crisp(0.5, true) && !crisp(0.5, false) && !crisp(1.5, false) && !crisp(1.999 - 0.01, false));
     assert!(!crisp(2.6, true), "fitting a small video up stays smooth");
     assert!(crisp(2.0, false) && crisp(8.0, false), "zooming in to 200 % and past shows pixels");
-    let info = Info { duration: SECOND, size: (1920, 1080), fps: 60.0, codec: None, tracks: Vec::new(), clicks: None };
+    let info = Info { duration: SECOND, size: (1920, 1080), fps: 60.0, codec: None, tracks: Vec::new(), clicks: None, keys: None };
     assert_eq!(decode_size(&info, vec2(480.0, 270.0)), (960, 540));
     assert_eq!(decode_size(&info, vec2(1200.0, 675.0)), (1920, 1080));
     assert_eq!(decode_size(&info, vec2(3840.0, 2160.0)), (1920, 1080));
@@ -489,4 +500,87 @@ fn clicks_move_on_the_preview_and_a_double_click_adds_one() {
 fn files_without_clicks_get_no_lane() {
     let h = Harness::new(1);
     assert!(h.app.edit.clicks.is_none() && !h.texts.iter().any(|(t, _)| t.ends_with("clicks") || t == "show clicks"));
+}
+
+fn keys_harness() -> Harness {
+    let txt = |s: &str| keys::KeyLabel::Text(s.into());
+    let key = |at: i64, hold: Option<i64>, mods: keys::Mods, main: keys::KeyLabel| keys::Key { at, hold, mods, main };
+    let list = vec![
+        key(5 * SECOND, Some(5 * SECOND + SECOND / 10), keys::Mods::default(), txt("a")),
+        key(10 * SECOND, Some(12 * SECOND), keys::Mods { ctrl: true, ..Default::default() }, txt("c")),
+        key(20 * SECOND, None, keys::Mods::default(), keys::KeyLabel::Named(keys::Named::Enter)),
+    ];
+    Harness::with_keys(1, Some(keys::Payload { version: 1, scale: 1.0, keys: list }))
+}
+
+impl Harness {
+    fn keys(&self) -> Vec<keys::Key> {
+        self.app.edit.keys.as_ref().map_or(Vec::new(), |k| k.list.clone())
+    }
+}
+
+#[test]
+fn the_keys_lane_selects_moves_deletes_realigns_and_hides_with_undo() {
+    let mut h = keys_harness();
+    assert!(h.has("3 keys") && !h.has("· hidden, not exported"));
+    let x_of = h.timeline_x();
+    let y = h.at("3 keys").y;
+    let ats = |h: &Harness| h.keys().iter().map(|k| k.at).collect::<Vec<_>>();
+
+    h.click(pos2(x_of(5 * SECOND), y));
+    assert_eq!((h.app.key_sel.clone(), h.app.pos, h.app.key_focus), (vec![0], 5 * SECOND, true));
+    assert!(!h.app.preview_pills(&h.ctx).is_empty(), "the preview shows the key at the playhead");
+    h.key(Key::Delete, true);
+    assert_eq!(ats(&h), [10 * SECOND, 20 * SECOND]);
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert_eq!(ats(&h), [5 * SECOND, 10 * SECOND, 20 * SECOND]);
+
+    let px = x_of(SECOND) - x_of(0);
+    h.drag(pos2(x_of(10 * SECOND), y), pos2(x_of(10 * SECOND) + 4.0 * px, y));
+    let moved = h.keys()[1].clone();
+    assert!((moved.at - 14 * SECOND).abs() < SECOND / 10, "{}", moved.at);
+    assert_eq!(math::snap(moved.at, 60.0), moved.at, "snapped to a frame");
+    assert_eq!(moved.hold, Some(moved.at + 2 * SECOND), "the release moves along");
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert_eq!(h.keys()[1].at, 10 * SECOND);
+
+    h.drag(pos2(x_of(13 * SECOND), y), pos2(x_of(4 * SECOND + SECOND / 2), y));
+    let mut picked = h.app.key_sel.clone();
+    picked.sort();
+    assert_eq!(picked, [0, 1], "box select");
+    h.key(Key::Delete, true);
+    assert_eq!(ats(&h), [20 * SECOND]);
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+
+    h.right_click(pos2(x_of(20 * SECOND), y));
+    assert!(h.has("delete") && h.has("align left") && h.has("align centre") && h.has("align right"));
+    h.click(h.at("align left"));
+    assert_eq!(h.app.saved.export.keys.pos, keys::Position::Left);
+    assert!(!h.has("align left"), "the menu closes");
+
+    let burning = |h: &Harness| matches!(h.app.job(), Some(Job::Video(v)) if v.keys.is_some());
+    assert!(burning(&h));
+    h.click(h.at("3 keys"));
+    assert!(h.has("· hidden, not exported") && !burning(&h));
+    assert!(h.app.preview_pills(&h.ctx).is_empty(), "hidden keys aren't drawn");
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert!(burning(&h) && h.app.edit.keys.as_ref().unwrap().shown);
+
+    assert!(h.has("show keys") && h.has("large"));
+    h.click(h.at("large"));
+    let Some(Job::Video(v)) = h.app.job() else { panic!() };
+    assert!((v.keys.unwrap().style.radius - 8.0 * KeySize::Large.factor()).abs() < 0.001, "the size reaches the burn");
+    h.click(h.at("show keys"));
+    assert!(!h.app.edit.keys.as_ref().unwrap().shown && !burning(&h));
+}
+
+#[test]
+fn files_without_keys_get_no_lane() {
+    let h = Harness::new(1);
+    let chip = h.texts.iter().any(|(t, _)| t.ends_with("keys") && t.chars().next().is_some_and(|c| c.is_ascii_digit()));
+    assert!(h.app.edit.keys.is_none() && !h.has("show keys") && !chip);
 }

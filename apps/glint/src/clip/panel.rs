@@ -5,10 +5,12 @@ use eframe::egui::{
     StrokeKind, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 use glint_core::clip::clicks::{ClickColor, ClickSize};
+use glint_core::clip::keys::KeySize;
 use glint_core::clip::crop::Crop;
 use glint_core::clip::export::{self, CodecChoice, Format, Job, MB, TARGETS_MB, Video, VideoJob};
 use glint_core::clip::math::{GIF_FPS, GIF_WARN_BYTES, fmt_short};
 use glint_core::record::Codec;
+use glint_core::record::keys::Position;
 use glint_ui::widgets::{self, Look, anim, ease, glide, mix, mono, sans, semibold};
 
 use super::{ClipApp, PAD};
@@ -231,6 +233,10 @@ impl ClipApp {
             gap(ui);
             self.clicks_row(ui, look);
         }
+        if self.edit.keys.is_some() {
+            gap(ui);
+            self.keys_row(ui, look);
+        }
         if video {
             gap(ui);
             self.more_options(ui, look);
@@ -358,6 +364,23 @@ impl ClipApp {
                 }
             }
         });
+    }
+
+    fn keys_row(&mut self, ui: &mut Ui, look: &Look) {
+        let Some(mut shown) = self.edit.keys.as_ref().map(|k| k.shown) else { return };
+        let width = ui.available_width();
+        label(ui, look, "keys");
+        let toggled = widgets::checkbox(ui, look, &mut shown, "show keys")
+            .on_hover_text("draws the keys you pressed into the file; hidden keys aren't in it at all")
+            .changed();
+        if toggled {
+            self.change(|e| e.keys.as_mut().map(|k| k.shown = shown).is_some());
+        }
+        let look_ = &mut self.saved.export.keys;
+        let places = [(Position::Left, "left"), (Position::Centre, "centre"), (Position::Right, "right")];
+        widgets::segmented(ui, look, &mut look_.pos, &places, Some(width));
+        let sizes = [(KeySize::Small, "small"), (KeySize::Normal, "normal"), (KeySize::Large, "large")];
+        widgets::segmented(ui, look, &mut look_.size, &sizes, Some(width));
     }
 
     fn crop_row(&mut self, ui: &mut Ui, look: &Look, c: Crop) {

@@ -33,24 +33,24 @@ pub(super) struct Axis {
 }
 
 impl Axis {
-    fn x(&self, t: i64) -> f32 {
+    pub(super) fn x(&self, t: i64) -> f32 {
         self.view.x(t, self.left, self.width)
     }
 
-    fn t(&self, x: f32) -> i64 {
+    pub(super) fn t(&self, x: f32) -> i64 {
         self.view.start + (((x - self.left) / self.width) as f64 * self.view.span as f64) as i64
     }
 
-    fn shows(&self, x: f32) -> bool {
+    pub(super) fn shows(&self, x: f32) -> bool {
         x >= self.left - MARK_W && x <= self.left + self.width + MARK_W
     }
 }
 
 pub(super) struct Lane {
-    rect: Rect,
-    chip: Rect,
-    toggle: Response,
-    marks: Vec<(usize, Response)>,
+    pub(super) rect: Rect,
+    pub(super) chip: Rect,
+    pub(super) toggle: Response,
+    pub(super) marks: Vec<(usize, Response)>,
 }
 
 pub(super) fn color32(c: [f32; 4]) -> Color32 {
