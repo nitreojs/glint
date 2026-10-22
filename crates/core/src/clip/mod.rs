@@ -1,3 +1,4 @@
+pub mod clicks;
 pub mod crop;
 pub mod edit;
 pub mod export;

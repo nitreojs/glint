@@ -5,11 +5,13 @@ use std::path::Path;
 
 use color_quant::NeuQuant;
 use gif::{DisposalMethod, Encoder, Frame, Repeat};
+use glint_core::clip::clicks::{into_output, paint_bgrx};
 use glint_core::clip::crop::Crop;
 use glint_core::clip::edit::source_time;
 use glint_core::clip::export::GifJob;
 use glint_core::clip::info::Info;
 use glint_core::clip::math::{gif_delay, gif_frames, gif_tick};
+use glint_core::record::clicks::{Shape, shapes_at};
 
 use super::media::{self, Decoded};
 use super::trim::Progress;
@@ -63,6 +65,14 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
         return Err("the selection is empty".into());
     }
     let reader = media::rgb_reader(src, area.full)?;
+    let mut shapes = Vec::new();
+    let clicks_at = |t: i64, shapes: &mut Vec<Shape>| {
+        shapes.clear();
+        if let Some(b) = &job.burn {
+            shapes_at(&b.clicks, t, &b.style, shapes);
+            into_output(shapes, job.crop.unwrap_or(Crop::full(info.size)), size);
+        }
+    };
 
     let picks = frames.min(PALETTE_FRAMES);
     let mut sample = Vec::with_capacity(picks as usize * size.0 as usize * size.1 as usize * 4);
@@ -75,6 +85,8 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
         media::seek(&reader, t)?;
         if let (Some(f), _) = media::decode_until(&reader, t, None)? {
             bgrx(&f, area, &mut px)?;
+            clicks_at(t, &mut shapes);
+            paint_bgrx(&mut px, size.0 as usize * 4, size, &shapes);
             sample.extend(px.chunks_exact(4).flat_map(|c| [c[2], c[1], c[0], 255]));
         }
         p.set(j as i64 + 1, picks as i64 * 10);
@@ -96,6 +108,7 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
     let (mut cur, mut next): (Option<Decoded>, Option<Decoded>) = (None, None);
     let mut eof = false;
     let mut shown_ts = None;
+    let mut drew = false;
     let mut segment = None;
     for k in 0..frames {
         if p.cancelled() {
@@ -122,11 +135,14 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
         }
         let Some(f) = &cur else { break };
         let delay = gif_delay(k, fps);
-        let changed = if shown_ts == Some(f.ts) {
+        clicks_at(t, &mut shapes);
+        let changed = if shown_ts == Some(f.ts) && shapes.is_empty() && !drew {
             None
         } else {
             shown_ts = Some(f.ts);
             bgrx(f, area, &mut px)?;
+            paint_bgrx(&mut px, size.0 as usize * 4, size, &shapes);
+            drew = !shapes.is_empty();
             dither.frame(&mut q, &px)
         };
         if changed.is_none()

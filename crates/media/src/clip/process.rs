@@ -5,12 +5,13 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D11::D3D11_BIND_RENDER_TARGET;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-use windows::core::Interface;
+use windows::core::{GUID, Interface};
 
 use super::media::{Gpu, attributes, pack};
 use crate::record::Ctx;
 
-/// The media foundation video processor cutting `crop` out of each frame and scaling it, on the gpu when given.
+/// The media foundation video processor cutting `crop` out of each frame and scaling it (nv12 or rgb32), on the gpu
+/// when given.
 pub(super) struct Processor {
     mft: IMFTransform,
     alloc: Option<IMFVideoSampleAllocatorEx>,
@@ -18,11 +19,14 @@ pub(super) struct Processor {
     out_bytes: u32,
 }
 
-fn nv12(size: (u32, u32), fps: f64) -> Result<IMFMediaType, String> {
+fn video_type(subtype: GUID, size: (u32, u32), fps: f64) -> Result<IMFMediaType, String> {
     unsafe {
         let t = MFCreateMediaType().ctx("MFCreateMediaType")?;
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
-        t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ctx("mt")?;
+        t.SetGUID(&MF_MT_SUBTYPE, &subtype).ctx("mt")?;
+        if subtype == MFVideoFormat_RGB32 {
+            t.SetUINT32(&MF_MT_DEFAULT_STRIDE, size.0 * 4).ctx("mt")?;
+        }
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).ctx("mt")?;
         t.SetUINT64(&MF_MT_FRAME_SIZE, pack(size.0, size.1)).ctx("mt")?;
         t.SetUINT64(&MF_MT_FRAME_RATE, pack((fps * 1000.0).round() as u32, 1000)).ctx("mt")?;
@@ -32,15 +36,22 @@ fn nv12(size: (u32, u32), fps: f64) -> Result<IMFMediaType, String> {
 }
 
 impl Processor {
-    pub(super) fn new(gpu: Option<&Gpu>, input: (u32, u32), crop: Crop, out: (u32, u32), fps: f64) -> Result<Self, String> {
+    pub(super) fn new(
+        gpu: Option<&Gpu>,
+        subtype: GUID,
+        input: (u32, u32),
+        crop: Crop,
+        out: (u32, u32),
+        fps: f64,
+    ) -> Result<Self, String> {
         unsafe {
             let mft: IMFTransform =
                 CoCreateInstance(&CLSID_VideoProcessorMFT, None, CLSCTX_INPROC_SERVER).ctx("video processor")?;
             if let Some(g) = gpu {
                 mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, g.mgr.as_raw() as usize).ctx("video processor d3d")?;
             }
-            mft.SetInputType(0, &nv12(input, fps)?, 0).ctx("video processor input type")?;
-            let out_t = nv12(out, fps)?;
+            mft.SetInputType(0, &video_type(subtype, input, fps)?, 0).ctx("video processor input type")?;
+            let out_t = video_type(subtype, out, fps)?;
             mft.SetOutputType(0, &out_t, 0).ctx("video processor output type")?;
             let ctl: IMFVideoProcessorControl = mft.cast().ctx("IMFVideoProcessorControl")?;
             let src = RECT {
@@ -69,9 +80,10 @@ impl Processor {
                 }
                 _ => None,
             };
+            let frame_bytes = if subtype == MFVideoFormat_RGB32 { out.0 * out.1 * 4 } else { out.0 * out.1 * 3 / 2 };
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).ctx("video processor start")?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).ctx("video processor start")?;
-            Ok(Processor { mft, alloc, provides, out_bytes: info.cbSize.max(out.0 * out.1 * 3 / 2) })
+            Ok(Processor { mft, alloc, provides, out_bytes: info.cbSize.max(frame_bytes) })
         }
     }
 

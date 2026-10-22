@@ -4,6 +4,7 @@ use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, Id, Layout, Margin, Rect, Response, RichText, Role, Sense, Shape, Stroke,
     StrokeKind, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
+use glint_core::clip::clicks::{ClickColor, ClickSize};
 use glint_core::clip::crop::Crop;
 use glint_core::clip::export::{self, CodecChoice, Format, Job, MB, TARGETS_MB, Video, VideoJob};
 use glint_core::clip::math::{GIF_FPS, GIF_WARN_BYTES, fmt_short};
@@ -15,6 +16,7 @@ use super::{ClipApp, PAD};
 const ROW_GAP: f32 = 14.0;
 const SAVE_H: f32 = 44.0;
 const MORE_W: f32 = 40.0;
+const CLICK_COLORS: [([u8; 3], &str); 3] = [([0xFF, 0xD6, 0x0A], "yellow"), ([0x34, 0xC7, 0x59], "green"), ([0x0A, 0x84, 0xFF], "blue")];
 const HEVC_TIP: &str = "hevc makes smaller files, but some pcs need the free “hevc video extensions” to play them";
 
 fn label(ui: &mut Ui, look: &Look, text: &str) {
@@ -225,6 +227,10 @@ impl ClipApp {
             gap(ui);
             self.crop_row(ui, look, c);
         }
+        if self.edit.clicks.is_some() {
+            gap(ui);
+            self.clicks_row(ui, look);
+        }
         if video {
             gap(ui);
             self.more_options(ui, look);
@@ -324,6 +330,34 @@ impl ClipApp {
         if let Some(i) = d.picked {
             s.codec = choices[i].0;
         }
+    }
+
+    fn clicks_row(&mut self, ui: &mut Ui, look: &Look) {
+        let Some(mut shown) = self.edit.clicks.as_ref().map(|c| c.shown) else { return };
+        let width = ui.available_width();
+        label(ui, look, "clicks");
+        let toggled = widgets::checkbox(ui, look, &mut shown, "show clicks")
+            .on_hover_text("draws a ripple on every click into the file; hidden clicks aren't in it at all")
+            .changed();
+        if toggled {
+            self.change(|e| e.clicks.as_mut().map(|c| c.shown = shown).is_some());
+        }
+        let look_ = &mut self.saved.export.clicks;
+        let sizes = [(ClickSize::Small, "small"), (ClickSize::Normal, "normal"), (ClickSize::Large, "large")];
+        widgets::segmented(ui, look, &mut look_.size, &sizes, Some(width));
+        let accent = Color32::from_rgb(self.accent[0], self.accent[1], self.accent[2]);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 0.0);
+            let mut choices = vec![(ClickColor::Accent, accent, "accent"), (ClickColor::White, Color32::WHITE, "white")];
+            choices.extend(CLICK_COLORS.iter().map(|&(rgb, name)| (ClickColor::Custom(rgb), Color32::from_rgb(rgb[0], rgb[1], rgb[2]), name)));
+            for (choice, color, name) in choices {
+                let resp = widgets::swatch(ui, look, color, look_.color == choice).on_hover_text(name);
+                resp.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, look_.color == choice, format!("click colour: {name}")));
+                if resp.clicked() {
+                    look_.color = choice;
+                }
+            }
+        });
     }
 
     fn crop_row(&mut self, ui: &mut Ui, look: &Look, c: Crop) {

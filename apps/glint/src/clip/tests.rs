@@ -3,6 +3,7 @@ use eframe::egui::{Event, PointerButton, Pos2};
 use glint_core::clip::export::Format;
 use glint_core::clip::info::Track;
 use glint_core::clip::math::SECOND;
+use glint_core::record::clicks::{Button, Click, Payload};
 
 use super::*;
 
@@ -19,6 +20,10 @@ struct Harness {
 
 impl Harness {
     fn new(tracks: usize) -> Harness {
+        Harness::with_clicks(tracks, None)
+    }
+
+    fn with_clicks(tracks: usize, clicks: Option<Payload>) -> Harness {
         let ctx = egui::Context::default();
         glint_ui::theme::fonts(&ctx);
         let names = ["desktop", "spotifast.exe", "mic: HyperX QuadCast"];
@@ -28,6 +33,7 @@ impl Harness {
             fps: 60.0,
             codec: None,
             tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: names[k % 3].into() }).collect(),
+            clicks,
         };
         let path = PathBuf::from("C:/nowhere/glint_2026-10-21_04-36.mp4");
         let app = ClipApp::new(path, Ok(info), None, &Config::default(), Saved::default(), [0xE5, 0x40, 0x2F]);
@@ -358,8 +364,129 @@ fn the_preview_smooths_below_200_percent_and_decodes_room_to_shrink() {
     assert!(!crisp(0.5, true) && !crisp(0.5, false) && !crisp(1.5, false) && !crisp(1.999 - 0.01, false));
     assert!(!crisp(2.6, true), "fitting a small video up stays smooth");
     assert!(crisp(2.0, false) && crisp(8.0, false), "zooming in to 200 % and past shows pixels");
-    let info = Info { duration: SECOND, size: (1920, 1080), fps: 60.0, codec: None, tracks: Vec::new() };
+    let info = Info { duration: SECOND, size: (1920, 1080), fps: 60.0, codec: None, tracks: Vec::new(), clicks: None };
     assert_eq!(decode_size(&info, vec2(480.0, 270.0)), (960, 540));
     assert_eq!(decode_size(&info, vec2(1200.0, 675.0)), (1920, 1080));
     assert_eq!(decode_size(&info, vec2(3840.0, 2160.0)), (1920, 1080));
+}
+
+fn clicks_harness() -> Harness {
+    let at = |button, down: i64, up: Option<i64>, x: f32| Click { button, down, up, x, y: 300.5 };
+    let clicks = vec![
+        at(Button::Left, 5 * SECOND, Some(5 * SECOND + SECOND / 10), 400.5),
+        at(Button::Right, 10 * SECOND, Some(12 * SECOND), 800.5),
+        at(Button::Middle, 20 * SECOND, None, 1200.5),
+    ];
+    Harness::with_clicks(1, Some(Payload { version: 1, scale: 1.0, clicks }))
+}
+
+impl Harness {
+    fn clicks(&self) -> Vec<Click> {
+        self.app.edit.clicks.as_ref().map_or(Vec::new(), |c| c.list.clone())
+    }
+
+    fn timeline_x(&self) -> impl Fn(i64) -> f32 + use<> {
+        let (left, right) = (self.rect_of("sound · muted tracks won't be in the file").left() + 6.0, self.rect_of("mute all").right() - 6.0);
+        move |t| left + (right - left) * t as f32 / (42 * SECOND) as f32
+    }
+
+    fn double_click(&mut self, at: Pos2) {
+        let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        self.frame(vec![Event::PointerMoved(at), button(true)]);
+        self.frame(vec![button(false)]);
+        self.frame(vec![button(true)]);
+        self.frame(vec![button(false)]);
+        self.settle();
+    }
+}
+
+#[test]
+fn the_clicks_lane_selects_moves_deletes_relabels_and_hides_with_undo() {
+    let mut h = clicks_harness();
+    assert!(h.has("3 clicks") && !h.has("· hidden, not exported"));
+    let x_of = h.timeline_x();
+    let y = h.at("3 clicks").y;
+    let downs = |h: &Harness| h.clicks().iter().map(|c| c.down).collect::<Vec<_>>();
+
+    h.click(pos2(x_of(5 * SECOND), y));
+    assert_eq!((h.app.click_sel.clone(), h.app.pos, h.app.click_focus), (vec![0], 5 * SECOND, true));
+    assert!(!h.app.preview_shapes().is_empty(), "the preview shows the click at the playhead");
+    h.key(Key::Delete, true);
+    assert_eq!(downs(&h), [10 * SECOND, 20 * SECOND]);
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert_eq!(downs(&h), [5 * SECOND, 10 * SECOND, 20 * SECOND]);
+
+    let px = x_of(SECOND) - x_of(0);
+    h.drag(pos2(x_of(10 * SECOND), y), pos2(x_of(10 * SECOND) + 4.0 * px, y));
+    let moved = h.clicks()[1];
+    assert!((moved.down - 14 * SECOND).abs() < SECOND / 10, "{}", moved.down);
+    assert_eq!(math::snap(moved.down, 60.0), moved.down, "snapped to a frame");
+    assert_eq!(moved.up, Some(moved.down + 2 * SECOND), "the release moves along");
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert_eq!(h.clicks()[1].down, 10 * SECOND);
+
+    h.drag(pos2(x_of(13 * SECOND), y), pos2(x_of(4 * SECOND + SECOND / 2), y));
+    let mut picked = h.app.click_sel.clone();
+    picked.sort();
+    assert_eq!(picked, [0, 1], "box select");
+    h.key(Key::Delete, true);
+    assert_eq!(downs(&h), [20 * SECOND]);
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+
+    h.right_click(pos2(x_of(20 * SECOND), y));
+    assert!(h.has("delete") && h.has("left click") && h.has("right click") && h.has("middle click"));
+    h.click(h.at("left click"));
+    assert_eq!(h.clicks()[2].button, Button::Left);
+    assert!(!h.has("left click"));
+
+    let burning = |h: &Harness| matches!(h.app.job(), Some(Job::Video(v)) if v.burn.is_some());
+    assert!(burning(&h));
+    h.click(h.at("3 clicks"));
+    assert!(h.has("· hidden, not exported") && !burning(&h));
+    assert!(h.app.preview_shapes().is_empty(), "hidden clicks aren't drawn");
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert!(burning(&h) && h.app.edit.clicks.as_ref().unwrap().shown);
+
+    assert!(h.has("show clicks") && h.has("large"));
+    h.click(h.at("large"));
+    let Some(Job::Video(v)) = h.app.job() else { panic!() };
+    assert_eq!(v.burn.unwrap().style.radius, 42.0);
+    h.click(h.at("show clicks"));
+    assert!(!h.app.edit.clicks.as_ref().unwrap().shown && !burning(&h));
+}
+
+#[test]
+fn clicks_move_on_the_preview_and_a_double_click_adds_one() {
+    let mut h = clicks_harness();
+    let x_of = h.timeline_x();
+    let y = h.at("3 clicks").y;
+    h.click(pos2(x_of(10 * SECOND), y));
+    let (frame, scale) = (h.app.frame_rect, h.app.frame_rect.width() / 1920.0);
+    let handle = frame.min + vec2(800.5, 300.5) * scale;
+    h.drag(handle, handle + vec2(60.0, 30.0));
+    let c = h.clicks()[1];
+    assert!((c.x - (800.5 + 60.0 / scale)).abs() < 0.5 && (c.y - (300.5 + 30.0 / scale)).abs() < 0.5, "{c:?}");
+    assert!(h.app.play == Play::Paused);
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert_eq!((h.clicks()[1].x, h.clicks()[1].y), (800.5, 300.5));
+
+    h.click(pos2(x_of(10 * SECOND), y));
+    h.double_click(frame.center());
+    let list = h.clicks();
+    assert_eq!(list.len(), 4);
+    assert_eq!((list[3].down, list[3].button), (10 * SECOND, Button::Left));
+    assert!((list[3].x - 960.0).abs() < 2.0 && (list[3].y - 540.0).abs() < 2.0, "{:?}", list[3]);
+    assert!(h.app.play == Play::Paused, "adding doesn't start playback");
+    assert_eq!(h.app.click_sel, [3]);
+}
+
+#[test]
+fn files_without_clicks_get_no_lane() {
+    let h = Harness::new(1);
+    assert!(h.app.edit.clicks.is_none() && !h.texts.iter().any(|(t, _)| t.ends_with("clicks") || t == "show clicks"));
 }

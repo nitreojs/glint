@@ -10,6 +10,8 @@ use glint_core::clip::math::{Range, SECOND};
 use super::media::{self, Com};
 use super::trim::{self, Progress};
 
+const ACCENT: [u8; 3] = [0xE5, 0x40, 0x2F];
+
 // ---- headless exports: need ffmpeg and ffprobe on PATH -------------------------------------------
 
 fn tool(name: &str, args: &[&str]) -> String {
@@ -53,7 +55,7 @@ fn export_to(src: &Path, edit: &Edit, settings: &export::Settings, out: &Path) -
     let _com = Com::init();
     let info = media::probe(src).unwrap();
     let index = index::read(src).unwrap();
-    let source = Source { info: &info, index: Some(&index), bytes: std::fs::metadata(src).unwrap().len() };
+    let source = Source { info: &info, index: Some(&index), bytes: std::fs::metadata(src).unwrap().len(), accent: ACCENT };
     let job = export::plan(edit, settings, &source);
     let estimate = export::estimate(&job, &source);
     let (pm, c) = (AtomicU32::new(0), AtomicBool::new(false));
@@ -94,6 +96,80 @@ fn the_fast_path_copies_drops_a_muted_track_and_cuts() {
     assert!(same_start && same_cut, "the pieces start with the source's own keyframes");
     let off = (estimate as f64 - size as f64).abs() / size as f64;
     assert!(off < 0.05, "estimate {estimate} vs {size}");
+}
+
+fn pixel(path: &Path, at: f64, x: u32, y: u32) -> [u8; 3] {
+    let (p, t, crop) = (path.to_string_lossy(), format!("{at}"), format!("crop=2:2:{x}:{y}"));
+    let args = ["-v", "error", "-ss", &t, "-i", &p, "-frames:v", "1", "-vf", &crop, "-f", "rawvideo", "-pix_fmt", "rgb24", "-"];
+    let out = std::process::Command::new("ffmpeg").args(args).output().unwrap_or_else(|e| panic!("ffmpeg: {e}"));
+    assert!(out.status.success() && out.stdout.len() == 12, "{}", String::from_utf8_lossy(&out.stderr));
+    [out.stdout[0], out.stdout[1], out.stdout[2]]
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn shown_clicks_burn_into_the_reencode_and_hidden_ones_leave_the_file_clean() {
+    use glint_core::clip::clicks::{ClickColor, ClickLook, ClickSize, Clicks};
+    use glint_core::record::clicks::{self, Button, Click, Payload};
+    let src = std::env::temp_dir().join(format!("glint-clip-clicks-{}.mp4", std::process::id()));
+    let p = src.to_string_lossy().into_owned();
+    let args = [
+        "-y", "-v", "error", "-f", "lavfi", "-i", "color=c=0x202020:size=640x360:rate=30:duration=3", "-f", "lavfi", "-i",
+        "sine=frequency=440:sample_rate=48000:duration=3", "-map", "0", "-map", "1", "-c:v", "libx264", "-bf", "0", "-g", "30",
+        "-pix_fmt", "yuv420p", "-c:a", "aac", &p,
+    ];
+    tool("ffmpeg", &args);
+    let held = Click { button: Button::Left, down: SECOND, up: Some(2 * SECOND), x: 400.5, y: 200.5 };
+    let early = Click { button: Button::Right, down: SECOND / 50, up: Some(SECOND / 25), x: 100.5, y: 100.5 };
+    clicks::save(&src, &Payload { version: 1, scale: 1.0, clicks: vec![early, held] }).unwrap();
+    let info = {
+        let _com = Com::init();
+        media::probe(&src).unwrap()
+    };
+    assert_eq!(info.clicks.as_ref().map(|c| c.clicks.len()), Some(2));
+
+    let mut edit = Edit::new(3 * SECOND, 1);
+    edit.range = Range { start: SECOND / 2, end: 3 * SECOND };
+    edit.clicks = info.clicks.as_ref().map(Clicks::new);
+    let look = ClickLook { size: ClickSize::Large, color: ClickColor::White };
+    let settings = export::Settings { clicks: look, ..export::Settings::default() };
+    let mut seen = Vec::new();
+    for gpu in [true, false] {
+        let out = src.with_file_name(format!("glint-clip-clicks-out-{gpu}-{}.mp4", std::process::id()));
+        let job = if gpu {
+            export_to(&src, &edit, &settings, &out).0
+        } else {
+            let index = index::read(&src).unwrap();
+            let source = Source { info: &info, index: Some(&index), bytes: 0, accent: ACCENT };
+            let job = export::plan(&edit, &settings, &source);
+            let (pm, c) = (AtomicU32::new(0), AtomicBool::new(false));
+            let _com = Com::init();
+            assert_eq!(trim::export_in_software(&src, &info, &job, &out, &Progress { permille: &pm, cancel: &c }), Ok(true));
+            job
+        };
+        let facts = (pixel(&out, 1.0, 400, 200), pixel(&out, 1.0, 300, 200), pixel(&out, 2.0, 400, 200), clicks::load(&out).unwrap().is_none());
+        let _ = std::fs::remove_file(&out);
+        seen.push((gpu, job, facts));
+    }
+    edit.clicks.as_mut().unwrap().shown = false;
+    let out = src.with_file_name(format!("glint-clip-clicks-hidden-{}.mp4", std::process::id()));
+    let (hidden, _) = export_to(&src, &edit, &settings, &out);
+    let (hidden_px, hidden_box) = (pixel(&out, 1.0, 400, 200), clicks::load(&out).unwrap());
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+
+    for (gpu, job, (dot, beside, after, no_box)) in seen {
+        let Job::Video(v) = &job else { panic!("{job:?}") };
+        assert!(matches!(v.video, Video::Encode { .. }), "burning in re-encodes");
+        assert_eq!(v.burn.as_ref().map(|b| b.clicks.clone()), Some(vec![held]), "the click before the trim start is left out");
+        assert!(dot.iter().all(|&c| c > 200), "gpu {gpu}: the held dot is drawn: {dot:?}");
+        assert!(beside.iter().all(|&c| c < 60), "gpu {gpu}: and nothing around it: {beside:?}");
+        assert!(after.iter().all(|&c| c < 60), "gpu {gpu}: gone after the release: {after:?}");
+        assert!(no_box, "gpu {gpu}: burnt-in clicks aren't saved again");
+    }
+    assert!(matches!(&hidden, Job::Video(VideoJob { video: Video::Copy, burn: None, .. })), "{hidden:?}");
+    assert!(hidden_px.iter().all(|&c| c < 60), "{hidden_px:?}");
+    assert_eq!(hidden_box, None, "hidden clicks leave the file with none");
 }
 
 fn max_volume(path: &Path, track: usize) -> f64 {

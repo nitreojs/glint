@@ -9,8 +9,9 @@ use glint_core::clip::pcm::{self, Lane};
 use glint_core::log::log;
 use glint_core::record::Codec;
 use windows::Win32::Media::MediaFoundation::*;
-use windows::core::HSTRING;
+use windows::core::{GUID, HSTRING};
 
+use super::burn::Burner;
 use super::gif;
 use super::media::{self, ANY, Got, Gpu, attributes, pack};
 use super::process::Processor;
@@ -288,6 +289,7 @@ fn run(
         };
         reader.SetStreamSelection(video, true).ctx("SetStreamSelection")?;
         let mut processor = None;
+        let mut burner = None;
         targets[video as usize] = Some(match job.video {
             Video::Copy => {
                 let native = &streams[video as usize].2;
@@ -296,13 +298,15 @@ fn run(
                 Target::Remux(w)
             }
             Video::Encode { crop, size, bitrate, fps, codec } => {
-                media::set_video_output(&reader, MFVideoFormat_NV12, info.size)?;
+                let subtype = if job.burn.is_some() { MFVideoFormat_RGB32 } else { MFVideoFormat_NV12 };
+                media::set_video_output(&reader, subtype, info.size)?;
                 let rate = fps.map_or(info.fps, f64::from);
-                if crop.is_some() || size != info.size {
-                    let area = crop.unwrap_or(Crop::full(info.size));
-                    processor = Some(Processor::new(gpu, info.size, area, size, rate)?);
+                let area = crop.unwrap_or(Crop::full(info.size));
+                if crop.is_some() || size != info.size || job.burn.is_some() {
+                    processor = Some(Processor::new(gpu, subtype, info.size, area, size, rate)?);
                 }
-                Target::Encode(video_stream(&writer, codec, size, rate, bitrate, effort)?)
+                burner = job.burn.as_ref().map(|b| Burner::new(b, area, size));
+                Target::Encode(video_stream(&writer, codec, subtype, size, rate, bitrate, effort)?)
             }
         });
         let (silent_rate, silent_channels) = silence_format(&reader, info, job);
@@ -346,11 +350,15 @@ fn run(
             }
             writer.WriteSample(stream, sample).ctx("WriteSample")
         };
-        let frame = |s: &IMFSample| -> Result<IMFSample, String> {
-            match &processor {
-                Some(proc) => proc.run(s),
-                None => Ok(s.clone()),
+        let frame = |s: &IMFSample, t: i64| -> Result<IMFSample, String> {
+            let out = match &processor {
+                Some(proc) => proc.run(s)?,
+                None => s.clone(),
+            };
+            if let Some(b) = &burner {
+                b.draw(&out, t)?;
             }
+            Ok(out)
         };
         let grid = match job.video {
             Video::Encode { fps, .. } => fps,
@@ -391,13 +399,13 @@ fn run(
                             Some(Target::Encode(w)) => {
                                 if let (Some(fps), Some(prev)) = (grid, &pending) {
                                     tick = on_grid(fps, tick, seg.len(), |t0, t1| {
-                                        write(w, &copy_of(&frame(prev)?)?, base + t0, Some(t1 - t0))
+                                        write(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0))
                                     })?;
                                     started = true;
                                 } else if let Some(h) = held.take() {
                                     let d = media::duration(&h.sample);
                                     let stop = if d > 0 { (h.ts + d).min(seg.end) } else { seg.end };
-                                    write(w, &frame(&h.sample)?, base, Some((stop - seg.start).max(1)))?;
+                                    write(w, &frame(&h.sample, seg.start)?, base, Some((stop - seg.start).max(1)))?;
                                     started = true;
                                 }
                             }
@@ -454,7 +462,7 @@ fn run(
                         if let Some(prev) = &pending {
                             let until = ts.min(seg.end) - seg.start;
                             let before = tick;
-                            tick = on_grid(fps, tick, until, |t0, t1| write(w, &copy_of(&frame(prev)?)?, base + t0, Some(t1 - t0)))?;
+                            tick = on_grid(fps, tick, until, |t0, t1| write(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0)))?;
                             started |= tick > before;
                             p.set(base + until, total);
                         }
@@ -470,13 +478,13 @@ fn run(
                             }
                             started = true;
                             if let Some(h) = held.take() {
-                                write(w, &frame(&h.sample)?, base, Some(ts.min(seg.end) - seg.start))?;
+                                write(w, &frame(&h.sample, seg.start)?, base, Some(ts.min(seg.end) - seg.start))?;
                             }
                         }
                         let dur = media::duration(&sample);
                         done |= seg.end - ts < dur / 2;
                         if !done {
-                            write(w, &frame(&sample)?, out_ts(ts), (dur > 0).then(|| dur.min(seg.end - ts)))?;
+                            write(w, &frame(&sample, ts)?, out_ts(ts), (dur > 0).then(|| dur.min(seg.end - ts)))?;
                             p.set(out_ts(ts), total);
                         }
                     }
@@ -534,7 +542,15 @@ fn copy_of(s: &IMFSample) -> Result<IMFSample, String> {
     }
 }
 
-unsafe fn video_stream(writer: &IMFSinkWriter, codec: Codec, size: (u32, u32), fps: f64, bitrate: u32, effort: u32) -> Result<u32, String> {
+unsafe fn video_stream(
+    writer: &IMFSinkWriter,
+    codec: Codec,
+    input: GUID,
+    size: (u32, u32),
+    fps: f64,
+    bitrate: u32,
+    effort: u32,
+) -> Result<u32, String> {
     unsafe {
         let (w, h) = size;
         let (subtype, profile) = match codec {
@@ -555,7 +571,10 @@ unsafe fn video_stream(writer: &IMFSinkWriter, codec: Codec, size: (u32, u32), f
 
         let in_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
         in_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
-        in_t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12).ctx("mt")?;
+        in_t.SetGUID(&MF_MT_SUBTYPE, &input).ctx("mt")?;
+        if input == MFVideoFormat_RGB32 {
+            in_t.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4).ctx("mt")?;
+        }
         in_t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).ctx("mt")?;
         in_t.SetUINT64(&MF_MT_FRAME_SIZE, pack(w, h)).ctx("mt")?;
         in_t.SetUINT64(&MF_MT_FRAME_RATE, pack(fps_milli, 1000)).ctx("mt")?;

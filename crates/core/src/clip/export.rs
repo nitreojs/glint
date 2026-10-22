@@ -1,11 +1,13 @@
 use serde::{Deserialize, Serialize};
 
+use super::clicks::ClickLook;
 use super::crop::Crop;
 use super::edit::Edit;
 use super::index::Index;
 use super::info::Info;
 use super::math::{Range, SECOND, gif_estimate, gif_frames};
 use crate::record::Codec;
+use crate::record::clicks::{Click, Style};
 
 pub const TARGETS_MB: [u32; 3] = [10, 25, 50];
 pub(super) const HEIGHTS: [u32; 3] = [720, 540, 360];
@@ -68,6 +70,7 @@ pub struct Settings {
     pub kbps: Option<u32>,
     pub codec: CodecChoice,
     pub combine: bool,
+    pub clicks: ClickLook,
 }
 
 impl Default for Settings {
@@ -81,6 +84,7 @@ impl Default for Settings {
             kbps: None,
             codec: CodecChoice::Same,
             combine: false,
+            clicks: ClickLook::default(),
         }
     }
 }
@@ -120,6 +124,7 @@ pub struct Source<'a> {
     pub info: &'a Info,
     pub index: Option<&'a Index>,
     pub bytes: u64,
+    pub accent: [u8; 3],
 }
 
 impl Source<'_> {
@@ -168,25 +173,33 @@ pub struct Sound {
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
+pub struct Burn {
+    pub clicks: Vec<Click>,
+    pub style: Style,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct VideoJob {
     pub pieces: Vec<Piece>,
     pub tracks: Vec<Sound>,
     pub combine: bool,
     pub video: Video,
     pub target: Option<u64>,
+    pub burn: Option<Burn>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GifJob {
     pub kept: Vec<Range>,
     pub crop: Option<Crop>,
     pub size: (u32, u32),
     pub fps: u32,
     pub target: Option<u64>,
+    pub burn: Option<Burn>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Job {
     Video(VideoJob),
     Gif(GifJob),
@@ -211,6 +224,7 @@ impl VideoJob {
     pub fn whole(&self, info: &Info) -> bool {
         self.video == Video::Copy
             && !self.combine
+            && info.clicks.is_none()
             && self.tracks.len() == info.tracks.len()
             && (self.tracks.iter().enumerate()).all(|(k, t)| t.source == Some(k) && t.name == info.tracks[k].name)
             && matches!(self.pieces[..], [p] if p.lead <= 0 && p.end >= info.duration)
@@ -285,6 +299,11 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
     let crop = edit.crop.filter(|c| !c.is_full(size)).map(|c| c.even(size));
     let base = base_size(size, crop);
     let target = s.target_mb.map(|mb| mb as u64 * MB);
+    let burn = edit.clicks.as_ref().and_then(|c| {
+        let style = s.clicks.style(src.accent, c.scale);
+        let clicks = c.burnt(&kept, &style);
+        (!clicks.is_empty()).then_some(Burn { clicks, style })
+    });
     if s.format == Format::Gif {
         let len = kept.iter().map(|r| r.len()).sum();
         let mut out = scaled(base, s.height);
@@ -296,7 +315,7 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
             let k = (t as f64 * UNDER / est).sqrt();
             out = (even(out.0 as f64 * k).max(MIN_GIF), even(out.1 as f64 * k).max(MIN_GIF));
         }
-        return Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target });
+        return Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target, burn });
     }
     let tracks = sounds(edit, src.info);
     let combine = s.combine && tracks.iter().filter(|t| t.source.is_some()).count() > 1;
@@ -305,16 +324,17 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
     let kbps = s.kbps.filter(|k| KBPS.contains(k));
     let codec = s.codec.resolve(src.info.codec);
     let same_codec = src.info.codec.is_none_or(|c| c == codec);
-    if src.index.is_some() && crop.is_none() && height.is_none() && fps.is_none() && kbps.is_none() && same_codec {
+    let plain = crop.is_none() && height.is_none() && fps.is_none() && kbps.is_none() && burn.is_none();
+    if src.index.is_some() && plain && same_codec {
         let pieces = kept.iter().map(|r| Piece { lead: lead(src.keys(), r.start), start: r.start, end: r.end }).collect();
-        let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target };
+        let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target, burn: None };
         if target.is_none_or(|t| estimate(&Job::Video(copy.clone()), src) <= t) {
             return Job::Video(copy);
         }
     }
     let out = scaled(base, height);
     let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end }).collect();
-    let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target };
+    let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn };
     let bitrate = match (kbps, target) {
         (Some(k), _) => k * 1000,
         (None, Some(t)) => {
@@ -381,6 +401,7 @@ mod tests {
             fps: 30.0,
             codec: None,
             tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: format!("t{k}") }).collect(),
+            clicks: None,
         }
     }
 
@@ -392,7 +413,7 @@ mod tests {
     }
 
     fn src<'a>(info: &'a Info, index: Option<&'a Index>) -> Source<'a> {
-        Source { info, index, bytes: 31_000_000 }
+        Source { info, index, bytes: 31_000_000, accent: [0xE5, 0x40, 0x2F] }
     }
 
     fn edit(tracks: usize) -> Edit {
@@ -615,6 +636,44 @@ mod tests {
         let both = Settings { kbps: Some(4000), target_mb: Some(1), ..Settings::default() };
         let job = plan(&edit(2), &both, &src(&info, Some(&idx)));
         assert!(matches!(job, Job::Video(VideoJob { video: Video::Encode { bitrate: 4_000_000, .. }, .. })));
+    }
+
+    #[test]
+    fn shown_clicks_in_the_kept_range_burn_in_and_anything_else_keeps_the_fast_path() {
+        use crate::clip::clicks::{ClickColor, ClickSize, Clicks};
+        use crate::record::clicks::{Button, Payload};
+        let (mut info, idx) = (info(1), index(1));
+        let at = |down: i64| Click { button: Button::Left, down, up: Some(down + S / 10), x: 10.0, y: 10.0 };
+        let payload = Payload { version: 1, scale: 1.25, clicks: vec![at(S), at(5 * S)] };
+        info.clicks = Some(payload.clone());
+        let source = src(&info, Some(&idx));
+        let mut e = edit(1);
+        let copies = |e: &Edit, s: &Settings| matches!(plan(e, s, &source), Job::Video(VideoJob { video: Video::Copy, burn: None, .. }));
+        assert!(copies(&e, &Settings::default()), "no clicks in the timeline");
+        e.clicks = Some(Clicks::new(&payload));
+        let look = ClickLook { size: ClickSize::Large, color: ClickColor::White };
+        let s = Settings { clicks: look, ..Settings::default() };
+        let Job::Video(v) = plan(&e, &s, &source) else { panic!() };
+        assert!(matches!(v.video, Video::Encode { crop: None, size: (1920, 1080), .. }));
+        let burn = v.burn.clone().unwrap();
+        assert_eq!(burn.clicks, [at(5 * S)], "the one before the trim start is left out");
+        assert_eq!(burn.style, look.style([0xE5, 0x40, 0x2F], 1.25));
+        assert!(!v.whole(&info));
+
+        e.clicks.as_mut().unwrap().shown = false;
+        assert!(copies(&e, &s), "hidden clicks: nothing drawn, the fast path stays");
+        e.clicks.as_mut().unwrap().shown = true;
+        e.range = Range { start: 6 * S, end: 15 * S };
+        assert!(copies(&e, &s), "no click shows in what's kept");
+        let Job::Video(v) = plan(&Edit::new(20 * S, 1), &Settings::default(), &source) else { panic!() };
+        assert!(!v.whole(&info), "a copy of the file would carry its clicks along");
+        info.clicks = None;
+        assert!(v.whole(&info));
+
+        let mut gif = edit(1);
+        gif.clicks = Some(Clicks::new(&payload));
+        let Job::Gif(g) = plan(&gif, &Settings { format: Format::Gif, ..s }, &src(&info, Some(&idx))) else { panic!() };
+        assert_eq!(g.burn.map(|b| b.clicks.len()), Some(1));
     }
 
     #[test]

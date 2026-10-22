@@ -159,7 +159,11 @@ pub fn probe(path: &Path) -> Result<Info, String> {
         let duration = pv.Anonymous.Anonymous.Anonymous.uhVal as i64;
         let _ = PropVariantClear(&mut pv);
         let tracks = tracks(path, &reader);
-        Ok(Info { duration, size, fps, codec, tracks })
+        let clicks = glint_core::record::clicks::load(path).unwrap_or_else(|e| {
+            log(&format!("clip: the clicks in {} can't be read: {e}", path.display()));
+            None
+        });
+        Ok(Info { duration, size, fps, codec, tracks, clicks })
     }
 }
 

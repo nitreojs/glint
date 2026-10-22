@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{
     self, Color32, ColorImage, Event, Id, Key, Modifiers, Rect, TextureFilter, TextureHandle, TextureOptions, Ui, pos2, vec2,
 };
+use glint_core::clip::clicks::Clicks;
 use glint_core::clip::crop::{Aspect, Crop, Grip};
 use glint_core::clip::edit::{Edit, Undo};
 use glint_core::clip::export::{Format, Job, Source};
@@ -32,6 +33,7 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
 
 mod actions;
+mod clicklane;
 mod overlay;
 mod panel;
 mod player;
@@ -43,6 +45,7 @@ mod wave;
 use actions::Saved;
 use player::{Cmd, Player, Shown};
 use scan::{Found, Scan};
+use clicklane::ClickDrag;
 use timeline::{Drag, View};
 use wave::Waves;
 
@@ -230,6 +233,11 @@ struct ClipApp {
     lane_drag: Option<usize>,
     playhead: Glide,
     trim: [Glide; 2],
+    click_sel: Vec<usize>,
+    click_focus: bool,
+    click_menu: Option<(egui::Pos2, Rect)>,
+    click_drag: Option<ClickDrag>,
+    frame_rect: Rect,
     keyboard: bool,
     rounded: bool,
     light: Option<bool>,
@@ -264,6 +272,7 @@ impl ClipApp {
     ) -> Self {
         let duration = info.as_ref().map_or(0, |i| i.duration);
         let tracks = info.as_ref().map_or(0, |i| i.tracks.len());
+        let clicks = info.as_ref().ok().and_then(|i| i.clicks.as_ref()).map(Clicks::new);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let file_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
         let custom_mb = match saved.export.target_mb {
@@ -297,7 +306,7 @@ impl ClipApp {
             shown: None,
             pos: 0,
             play: Play::Paused,
-            edit: Edit::new(duration, tracks),
+            edit: Edit { clicks, ..Edit::new(duration, tracks) },
             undo: Undo::default(),
             before_drag: None,
             selected: None,
@@ -321,6 +330,11 @@ impl ClipApp {
             lane_drag: None,
             playhead: Glide::new(0),
             trim: [Glide::new(0), Glide::new(duration)],
+            click_sel: Vec::new(),
+            click_focus: false,
+            click_menu: None,
+            click_drag: None,
+            frame_rect: Rect::NOTHING,
             menu: false,
             save_rect: Rect::NOTHING,
             sheet: false,
@@ -355,7 +369,7 @@ impl ClipApp {
     }
 
     fn source(&self) -> Option<Source<'_>> {
-        Some(Source { info: self.info()?, index: self.index.as_ref(), bytes: self.file_bytes })
+        Some(Source { info: self.info()?, index: self.index.as_ref(), bytes: self.file_bytes, accent: self.accent })
     }
 
     /// What saving would write right now.
@@ -873,7 +887,10 @@ impl ClipApp {
         if split && self.change(|e| e.split(pos, frame)) {
             self.selected = None;
         }
-        if delete {
+        if delete && !self.click_sel.is_empty() {
+            let picked = std::mem::take(&mut self.click_sel);
+            self.change(|e| e.clicks.as_mut().is_some_and(|c| c.delete(&picked)));
+        } else if delete {
             let selected = self.selected;
             match selected {
                 Some(Selected::Marker(i)) if i < self.edit.markers.len() => {
@@ -892,6 +909,8 @@ impl ClipApp {
         if redo && self.undo.redo(&mut self.edit) || undo && self.undo.undo(&mut self.edit) {
             self.selected = None;
             self.lane_menu = None;
+            self.click_menu = None;
+            self.click_sel.clear();
             self.sync_gains();
         }
         if crop {
@@ -994,8 +1013,9 @@ impl eframe::App for ClipApp {
         let main = Rect::from_min_max(body.min + vec2(PAD, PAD), pos2(side.left() - PAD, body.bottom() - GAP));
         let lanes = if self.info.is_ok() { self.edit.lanes.len() } else { 0 };
         let room = (main.height() - FILE_H - HINT_H - 3.0 * GAP) * 0.45;
-        let lane = timeline::lane_height(lanes, room);
-        let line_h = timeline::height(lanes, lane);
+        let clicks = self.info.is_ok() && self.edit.clicks.is_some();
+        let lane = timeline::lane_height(lanes, room, clicks);
+        let line_h = timeline::height(lanes, lane, clicks);
         let hint = Rect::from_min_max(pos2(main.left(), main.bottom() - HINT_H), main.max);
         let line = Rect::from_min_max(pos2(main.left(), hint.top() - GAP - line_h), pos2(main.right(), hint.top() - GAP));
         let file = Rect::from_min_size(main.min, vec2(main.width(), FILE_H));
@@ -1024,6 +1044,7 @@ impl eframe::App for ClipApp {
         self.panel(ui, &look, side);
         self.menu_popup(&ctx, &look, self.save_rect);
         self.lane_menu_popup(&ctx, &look);
+        self.click_menu_popup(&ctx, &look);
         self.keys_sheet(&ctx, &look, body);
         self.show_toast(&ctx, &look, body);
         self.delete_dialog(&ctx, &look);
@@ -1033,6 +1054,8 @@ impl eframe::App for ClipApp {
                 self.renaming = None;
             } else if self.lane_menu.is_some() {
                 self.lane_menu = None;
+            } else if self.click_menu.is_some() {
+                self.click_menu = None;
             } else if self.sheet {
                 self.sheet = false;
             } else if self.menu {

@@ -31,7 +31,7 @@ const KEYS: [(&[&str], &str, &str); 18] = [
     (&["←", "→"], "", "step a frame"),
     (&["I", "O"], "", "trim start / end here"),
     (&["S"], "", "cut here"),
-    (&["delete"], "", "remove the selected piece"),
+    (&["delete"], "", "remove the selected piece or clicks"),
     (&["M"], "", "add marker"),
     (&["[", "]"], "", "previous / next marker"),
     (&["ctrl"], "+ drag", "no snapping"),

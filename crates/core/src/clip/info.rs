@@ -1,4 +1,5 @@
 use crate::record::Codec;
+use crate::record::clicks::Payload;
 
 #[derive(Clone, Debug)]
 pub struct Track {
@@ -13,4 +14,5 @@ pub struct Info {
     pub fps: f64,
     pub codec: Option<Codec>,
     pub tracks: Vec<Track>,
+    pub clicks: Option<Payload>,
 }

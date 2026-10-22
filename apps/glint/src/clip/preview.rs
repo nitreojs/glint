@@ -183,12 +183,19 @@ impl ClipApp {
             }
         }
 
+        self.frame_rect = frame;
+        self.clicks_overlay(ui, &painter, frame, place.scale, cropping);
+        let adding = !cropping && self.click_focus && self.edit.clicks.is_some();
         if resp.double_clicked() {
-            self.viewer.fit_view(now, place, img);
-            if !cropping && !self.space.held {
-                self.toggle_play();
+            if let (true, Some(at)) = (adding, resp.interact_pointer_pos()) {
+                self.add_click_at(frame, place.scale, at);
+            } else {
+                self.viewer.fit_view(now, place, img);
+                if !cropping && !self.space.held {
+                    self.toggle_play();
+                }
             }
-        } else if resp.clicked() && !self.space.held && !cropping {
+        } else if resp.clicked() && !self.space.held && !cropping && !adding {
             self.toggle_play();
         }
 

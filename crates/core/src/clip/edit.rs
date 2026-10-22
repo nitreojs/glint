@@ -1,3 +1,4 @@
+use super::clicks::Clicks;
 use super::crop::Crop;
 use super::info::Track;
 use super::math::Range;
@@ -35,13 +36,14 @@ impl Lane {
 }
 
 /// The timeline: the trimmed range, its pieces, markers, the sound lanes, and the crop.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Edit {
     pub range: Range,
     pub segments: Vec<Segment>,
     pub markers: Vec<i64>,
     pub lanes: Vec<Lane>,
     pub crop: Option<Crop>,
+    pub clicks: Option<Clicks>,
 }
 
 impl Edit {
@@ -53,6 +55,7 @@ impl Edit {
             markers: Vec::new(),
             lanes: (0..tracks).map(|k| Lane::of(Some(k))).collect(),
             crop: None,
+            clicks: None,
         }
     }
 
