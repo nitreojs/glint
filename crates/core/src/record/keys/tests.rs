@@ -88,29 +88,70 @@ fn a_pill_rises_holds_then_fades() {
 }
 
 #[test]
-fn newest_pills_stack_at_the_bottom_up_to_three() {
+fn typing_a_word_batches_into_one_row_that_backspace_edits() {
     let style = Style::new(ACCENT, 1.0);
-    let at = |t: i64, c: &str| key(t, None, Mods::default(), text(c));
-    let keys = [at(0, "a"), at(10 * MS, "b"), at(20 * MS, "c"), at(30 * MS, "d")];
+    let p = |t: i64, c: &str| key(t, Some(t + MS), Mods::default(), text(c));
+    // h e l l o typed within a second → one cap "hello".
+    let word = [p(0, "h"), p(10 * MS, "e"), p(20 * MS, "l"), p(30 * MS, "l"), p(40 * MS, "o")];
+    let shown = pills(&word, 50 * MS, &style);
+    assert_eq!(shown.len(), 1, "one row, one strip cap");
+    assert_eq!(shown[0].text, "hello");
+    // Space joins the run as a literal space; a key typed before `t` isn't shown yet.
+    let typing = [p(0, "h"), p(10 * MS, "i"), key(20 * MS, Some(21 * MS), Mods::default(), KeyLabel::Named(Named::Space)), p(30 * MS, "u")];
+    assert_eq!(pills(&typing, 25 * MS, &style)[0].text, "hi ");
+    assert_eq!(pills(&typing, 35 * MS, &style)[0].text, "hi u");
+    // Backspace edits the live row instead of adding a cap.
+    let edited = [p(0, "c"), p(10 * MS, "a"), p(20 * MS, "t"), key(30 * MS, Some(31 * MS), Mods::default(), KeyLabel::Named(Named::Backspace)), p(40 * MS, "b")];
+    assert_eq!(pills(&edited, 50 * MS, &style)[0].text, "cab");
+    // A gap longer than the burst starts a fresh row (but short enough that the first is still up).
+    let gap = style.burst + style.burst / 5;
+    let spaced = [p(0, "x"), p(gap, "y")];
+    let two = pills(&spaced, gap + MS, &style);
+    assert_eq!(two.iter().map(|p| p.text.clone()).collect::<Vec<_>>(), ["y", "x"], "two rows, newest first");
+}
+
+#[test]
+fn a_chord_or_special_is_its_own_row_of_caps_and_breaks_typing() {
+    let style = Style::new(ACCENT, 1.0);
+    // Ctrl+Shift+S is one row of three caps.
+    let chorded = [key(0, Some(MS), chord(true, false, true, false), text("S"))];
+    let caps = pills(&chorded, 10 * MS, &style);
+    assert_eq!(caps.iter().map(|p| p.text.clone()).collect::<Vec<_>>(), ["Ctrl", "Shift", "S"]);
+    assert!(caps[0].rect.right() <= caps[1].rect.left() && caps[1].rect.right() <= caps[2].rect.left(), "laid out left to right");
+    assert!(caps.iter().all(|c| (c.alpha - caps[0].alpha).abs() < 1e-6), "the whole row shares one alpha");
+
+    // Typing, then a shortcut: the text row stays, the chord is a separate row below it.
+    let p = |t: i64, c: &str| key(t, Some(t + MS), Mods::default(), text(c));
+    let mix = [p(0, "h"), p(10 * MS, "i"), key(20 * MS, Some(21 * MS), chord(true, false, false, false), text("S"))];
+    let rows = pills(&mix, 30 * MS, &style);
+    assert_eq!(rows[0].text, "Ctrl", "the newest row (the chord) is at the bottom");
+    assert!(rows.iter().any(|r| r.text == "hi"), "the typed row is kept");
+
+    // An Enter during typing closes the row as a trailing cap.
+    let sent = [p(0, "h"), p(10 * MS, "i"), key(20 * MS, Some(21 * MS), Mods::default(), KeyLabel::Named(Named::Enter))];
+    let one = pills(&sent, 30 * MS, &style);
+    assert_eq!(one.iter().map(|p| p.text.clone()).collect::<Vec<_>>(), ["hi", "Enter"], "same row: the text then the Enter cap");
+}
+
+#[test]
+fn rows_stack_newest_at_the_bottom_up_to_three() {
+    let style = Style::new(ACCENT, 1.0);
+    let special = |t: i64, n: Named| key(t, Some(t + MS), Mods::default(), KeyLabel::Named(n));
+    let keys = [special(0, Named::Esc), special(10 * MS, Named::Tab), special(20 * MS, Named::Enter), special(30 * MS, Named::Delete)];
     let shown = pills(&keys, 40 * MS, &style);
-    assert_eq!(shown.len(), 3, "only three stack");
-    assert_eq!(shown.iter().map(|p| p.text.clone()).collect::<Vec<_>>(), ["d", "c", "b"], "newest first, oldest dropped");
-    // The bottom pill (newest) sits lower than the ones above it.
+    assert_eq!(shown.len(), 3, "only three rows stack");
+    assert_eq!(shown.iter().map(|p| p.text.clone()).collect::<Vec<_>>(), ["Delete", "Enter", "Tab"], "newest first, oldest dropped");
     assert!(shown[0].rect.bottom() > shown[1].rect.bottom() && shown[1].rect.bottom() > shown[2].rect.bottom());
 }
 
 #[test]
-fn a_burst_of_the_same_chord_collapses_with_a_count() {
+fn a_long_typed_row_keeps_its_tail() {
     let style = Style::new(ACCENT, 1.0);
-    let z = |t: i64| key(t, Some(t + MS), chord(true, false, false, false), text("Z"));
-    let keys = [z(0), z(200 * MS), z(400 * MS)];
-    let shown = pills(&keys, 500 * MS, &style);
-    assert_eq!(shown.len(), 1);
-    assert_eq!(shown[0].text, "Ctrl+Z \u{00d7}3");
-
-    // Far apart, they are separate pills again.
-    let spaced = [z(0), z(10 * style.hold)];
-    assert_eq!(pills(&spaced, 10 * style.hold + MS, &style).len(), 1, "the first has long gone");
+    let typed: Vec<Key> = (0..50).map(|i| key(i * MS, Some(i * MS + MS), Mods::default(), text(&((b'a' + (i % 26) as u8) as char).to_string()))).collect();
+    let text = pills(&typed, 60 * MS, &style).remove(0).text;
+    assert_eq!(text.chars().count(), style.keep, "clipped to the last {} characters", style.keep);
+    let want: String = (50 - style.keep..50).map(|i| (b'a' + (i % 26) as u8) as char).collect();
+    assert_eq!(text, want);
 }
 
 #[test]

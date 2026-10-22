@@ -573,7 +573,7 @@ fn the_keys_lane_selects_moves_deletes_realigns_and_hides_with_undo() {
     assert!(h.has("show keys") && h.has("large"));
     h.click(h.at("large"));
     let Some(Job::Video(v)) = h.app.job() else { panic!() };
-    assert!((v.keys.unwrap().style.radius - 8.0 * KeySize::Large.factor()).abs() < 0.001, "the size reaches the burn");
+    assert!((v.keys.unwrap().style.radius - 6.0 * KeySize::Large.factor()).abs() < 0.001, "the size reaches the burn");
     h.click(h.at("show keys"));
     assert!(!h.app.edit.keys.as_ref().unwrap().shown && !burning(&h));
 }

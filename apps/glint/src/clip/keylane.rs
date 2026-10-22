@@ -1,10 +1,10 @@
 use eframe::egui::{
-    self, Color32, CursorIcon, Id, Order, Painter, Rect, Response, Role, Sense, Stroke, StrokeKind, Ui, WidgetInfo, pos2,
-    vec2,
+    self, Color32, CornerRadius, CursorIcon, Id, Order, Painter, Rect, Response, Role, Sense, Stroke, StrokeKind, Ui,
+    WidgetInfo, pos2, vec2,
 };
 use glint_core::clip::math;
 use glint_core::record::keys::{self, Pill, Position, Style, state_at};
-use glint_ui::widgets::{Look, anim, ease, medium, mix, sans};
+use glint_ui::widgets::{Look, anim, ease, medium, mix, sans, semibold};
 
 use super::clicklane::{Axis, Lane, color32};
 use super::ClipApp;
@@ -177,13 +177,13 @@ impl ClipApp {
     }
 
     pub(super) fn keys_paint(&self, ui: &Ui, look: &Look, lane: &Lane, axis: &Axis, painter: &Painter) {
-        let (Some(keys), Some(style)) = (&self.edit.keys, self.key_style()) else { return };
+        let Some(keys) = &self.edit.keys else { return };
         let p = look.p;
         let clip = painter.with_clip_rect(lane.rect.intersect(painter.clip_rect()));
         let fade = 1.0 - 0.62 * ease(anim(ui, Id::unique("clip-keys-fade"), !keys.shown, 0.3));
         clip.rect_filled(lane.rect, 6, p.ctl.gamma_multiply(fade));
         let y = lane.rect.center().y;
-        let accent = color32(style.accent).gamma_multiply(fade);
+        let accent = p.acc.gamma_multiply(fade);
         for k in &keys.list {
             let start = axis.x(k.at);
             let end = k.hold.map_or(start, |h| axis.x(h));
@@ -239,11 +239,28 @@ impl ClipApp {
         for pill in self.preview_pills(ui.ctx()) {
             let min = frame.min + pill.rect.min.to_vec2() * scale;
             let max = frame.min + pill.rect.max.to_vec2() * scale;
-            let r = Rect::from_min_max(min, max);
+            let rect = Rect::from_min_max(min, max);
             let a = pill.alpha;
-            painter.rect_filled(r, pill.radius * scale, color32(pill.fill).gamma_multiply(a));
-            painter.rect_stroke(r, pill.radius * scale, Stroke::new(scale, color32(pill.accent).gamma_multiply(a)), StrokeKind::Inside);
-            painter.text(r.center(), egui::Align2::CENTER_CENTER, &pill.text, medium(pill.font * scale), color32(pill.text_color).gamma_multiply(a));
+            let tint = |c: [f32; 4]| color32(c).gamma_multiply(a);
+            let r = pill.radius * scale;
+            let d = pill.depth * scale;
+            let top_r = r.round().max(0.0) as u8;
+            let bot_r = (r - d).max(1.0).round() as u8;
+            let face_cr = CornerRadius { nw: top_r, ne: top_r, sw: bot_r, se: bot_r };
+            // drop shadow, offset down by the cap depth
+            painter.rect_filled(rect.translate(vec2(0.0, d)), r, tint(pill.shadow));
+            // raised bottom edge: fills the whole cap
+            painter.rect_filled(rect, r, tint(pill.edge));
+            // face, leaving the bottom `d` px showing the edge as the keycap lip
+            let face = Rect::from_min_max(rect.min, pos2(rect.max.x, rect.max.y - d));
+            painter.rect_filled(face, face_cr, tint(pill.fill));
+            // thin top highlight just inside the top of the face
+            let hl = face.top() + 0.75 * scale;
+            painter.hline(face.left() + r..=face.right() - r, hl, Stroke::new(1.5 * scale, tint(pill.top)));
+            // thin outline around the face
+            painter.rect_stroke(face, face_cr, Stroke::new(scale, tint(pill.border)), StrokeKind::Inside);
+            // centred semibold label in the face area above the lip
+            painter.text(face.center(), egui::Align2::CENTER_CENTER, &pill.text, semibold(pill.font * scale), tint(pill.text_color));
         }
     }
 

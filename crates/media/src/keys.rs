@@ -30,9 +30,6 @@ use windows::core::{Interface, s, w};
 use crate::record::Ctx;
 use crate::record::cursor::{blob_bytes, compile};
 
-/// Width of the accent hairline around a pill, in pixels.
-const HAIRLINE: f32 = 1.0;
-
 const SHADER: &str = r#"
 cbuffer C : register(b0) { float4 rect; float4 tint; };
 struct V { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
@@ -204,13 +201,17 @@ impl Renderer {
         }
     }
 
-    /// Paints `pill`'s fill, hairline and text into a `w`×`h` premultiplied BGRA texture with the
-    /// D2D device context bound to the same D3D device, so the result is coherent to sample.
+    /// Paints `pill` as a keycap (shadow, raised bottom edge, lipped face, top highlight, outline
+    /// and centred semibold label) into a premultiplied BGRA texture, the `w`×`h` cap bordered by
+    /// [`margin`] so its drop shadow has room. The colours keep their own alpha; the pill's fade
+    /// alpha is folded in by the quad's tint, so the bake stays frame-independent and cacheable.
     fn bake(&self, pill: &Pill, w: u32, h: u32) -> Result<ID3D11ShaderResourceView, String> {
         unsafe {
+            let m = margin(pill.depth);
+            let (tw, th) = (w + 2 * m, h + 2 * m);
             let desc = D3D11_TEXTURE2D_DESC {
-                Width: w,
-                Height: h,
+                Width: tw,
+                Height: th,
                 MipLevels: 1,
                 ArraySize: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -233,21 +234,32 @@ impl Renderer {
             let bmp = self.d2d.CreateBitmapFromDxgiSurface(&surface, Some(&bmp_props)).ctx("CreateBitmapFromDxgiSurface")?;
             self.d2d.SetTarget(&bmp);
             let fill = brush(&self.d2d, pill.fill)?;
-            let accent = brush(&self.d2d, pill.accent)?;
+            let edge = brush(&self.d2d, pill.edge)?;
+            let top = brush(&self.d2d, pill.top)?;
+            let border = brush(&self.d2d, pill.border)?;
+            let shadow = brush(&self.d2d, pill.shadow)?;
             let text = brush(&self.d2d, pill.text_color)?;
             let format = self.format(pill.font)?;
+            let (mf, r, d) = (m as f32, pill.radius, pill.depth);
+            // the cap's rectangle inside the bordered texture.
+            let (l, t, rr, b) = (mf, mf, mf + w as f32, mf + h as f32);
+            let rounded = |rect: D2D_RECT_F| D2D1_ROUNDED_RECT { rect, radiusX: r, radiusY: r };
+            let face = rounded(D2D_RECT_F { left: l, top: t, right: rr, bottom: b - d });
             self.d2d.BeginDraw();
             self.d2d.Clear(Some(&color([0.0; 4])));
-            let half = HAIRLINE * 0.5;
-            let rr = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: half, top: half, right: w as f32 - half, bottom: h as f32 - half },
-                radiusX: pill.radius,
-                radiusY: pill.radius,
-            };
-            self.d2d.FillRoundedRectangle(&rr, &fill);
-            self.d2d.DrawRoundedRectangle(&rr, &accent, HAIRLINE, None);
+            // 1. drop shadow: the cap silhouette, offset down and outset 1px, behind everything.
+            self.d2d.FillRoundedRectangle(&rounded(D2D_RECT_F { left: l - 1.0, top: t - 1.0 + d, right: rr + 1.0, bottom: b + 1.0 + d }), &shadow);
+            // 2. raised bottom edge: the whole cap, the darker lip showing below the face.
+            self.d2d.FillRoundedRectangle(&rounded(D2D_RECT_F { left: l, top: t, right: rr, bottom: b }), &edge);
+            // 3. face: the cap minus its bottom `d` px, leaving the edge as the 3D lip.
+            self.d2d.FillRoundedRectangle(&face, &fill);
+            // 4. top highlight: a ~1.5px bright strip just inside the face's top.
+            self.d2d.FillRectangle(&D2D_RECT_F { left: l + r, top: t + 0.5, right: rr - r, bottom: t + 2.0 }, &top);
+            // 5. outline around the face.
+            self.d2d.DrawRoundedRectangle(&face, &border, 1.0, None);
+            // 6. label centred by ink in the face area above the lip.
             let line: Vec<u16> = pill.text.encode_utf16().collect();
-            let box_ = D2D_RECT_F { left: 0.0, top: 0.0, right: w as f32, bottom: h as f32 };
+            let box_ = D2D_RECT_F { left: l, top: t, right: rr, bottom: b - d };
             self.d2d.DrawText(&line, &format, &box_, &text, D2D1_DRAW_TEXT_OPTIONS_NONE, DWRITE_MEASURING_MODE_NATURAL);
             let ended = self.d2d.EndDraw(None, None);
             self.d2d.SetTarget(None::<&ID2D1Image>);
@@ -288,8 +300,10 @@ impl Renderer {
             let w = (pill.rect.max.x - pill.rect.min.x).round().max(1.0) as u32;
             let h = (pill.rect.max.y - pill.rect.min.y).round().max(1.0) as u32;
             let srv = self.srv(pill, w, h)?;
-            let (x0, y0) = (pill.rect.min.x, pill.rect.min.y);
-            let (x1, y1) = (x0 + w as f32, y0 + h as f32);
+            // the quad covers the cap plus the shadow border the texture was baked with.
+            let m = margin(pill.depth) as f32;
+            let (x0, y0) = (pill.rect.min.x - m, pill.rect.min.y - m);
+            let (x1, y1) = (x0 + w as f32 + 2.0 * m, y0 + h as f32 + 2.0 * m);
             let a = pill.alpha;
             quads.push((srv, Quad { rect: [ndc_x(x0), ndc_y(y0), ndc_x(x1), ndc_y(y1)], tint: [a, a, a, a] }));
         }
@@ -331,6 +345,11 @@ fn color(c: [f32; 4]) -> D2D1_COLOR_F {
 
 fn brush(rt: &ID2D1DeviceContext, c: [f32; 4]) -> Result<ID2D1SolidColorBrush, String> {
     unsafe { rt.CreateSolidColorBrush(&color(c), None).ctx("CreateSolidColorBrush") }
+}
+
+/// Texture border (px) around a cap of `depth`, so its drop shadow fits inside the baked texture.
+fn margin(depth: f32) -> u32 {
+    depth.ceil() as u32 + 2
 }
 
 /// The keycap stack for `keys` at time `t`, laid out in `region` with `r`'s text measurements.
@@ -446,7 +465,7 @@ fn device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
 
 #[cfg(test)]
 mod tests {
-    use glint_core::record::keys::{Key, KeyLabel, Mods, Named, Style};
+    use glint_core::record::keys::{Key, KeyLabel, Mods, Style};
     use windows::Win32::Foundation::HMODULE;
     use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_WARP;
     use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
@@ -475,11 +494,12 @@ mod tests {
         t.unwrap()
     }
 
-    /// Composes one key's pill over BACKGROUND on the WARP device and asserts the pill rect
-    /// gains text/fill pixels while the rest stays untouched.
+    /// Composes a typed-word cap and a `Ctrl`+`s` chord row over BACKGROUND on the WARP device and
+    /// checks the keycap look: pixels change only inside the caps (plus their shadow border), the
+    /// frame's alpha survives, and each cap's dark face is darker than its light label ink.
     #[test]
     #[ignore = "renders on the WARP software device"]
-    fn a_keycap_paints_only_inside_its_pill() {
+    fn keycaps_draw_dark_faces_with_light_labels() {
         unsafe {
             let (mut device, mut ctx) = (None, None);
             D3D11CreateDevice(
@@ -504,35 +524,68 @@ mod tests {
 
             let renderer = Renderer::new(&device).unwrap();
             let style = Style::new([230, 120, 40], 1.0);
-            let key = Key { at: 0, hold: Some(500_000), mods: Mods::default(), main: KeyLabel::Named(Named::Enter) };
-            let shown = pills(&[key], 1_300_000, &style, (SIZE as f32, SIZE as f32), &renderer);
-            assert_eq!(shown.len(), 1, "one pill");
-            let rect = shown[0].rect;
+            let ch = |at: i64, c: &str| Key { at, hold: Some(at + 20_000), mods: Mods::default(), main: KeyLabel::Text(c.into()) };
+            let chord = Key {
+                at: 50_000,
+                hold: Some(70_000),
+                mods: Mods { ctrl: true, ..Mods::default() },
+                main: KeyLabel::Text("s".into()),
+            };
+            // "hi" batches into one wide text cap; the chord is a two-cap row (`Ctrl`, `s`).
+            let keys = [ch(0, "h"), ch(10_000, "i"), chord];
+            let shown = pills(&keys, 3_000_000, &style, (SIZE as f32, SIZE as f32), &renderer);
+            let texts: Vec<&str> = shown.iter().map(|p| p.text.as_str()).collect();
+            assert_eq!(texts, ["Ctrl", "s", "hi"], "two rows: the chord at the bottom, the word above");
             renderer.draw(&ctx, &rtv, (SIZE, SIZE), &shown).unwrap();
 
             let staging = texture(&device, D3D11_BIND_FLAG(0), true);
             ctx.CopyResource(&staging, &target);
             let mut m = D3D11_MAPPED_SUBRESOURCE::default();
             ctx.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut m)).unwrap();
+            let at = |x: usize, y: usize| {
+                let row = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), SIZE as usize * 4);
+                let p = &row[x * 4..x * 4 + 4];
+                [p[0], p[1], p[2], p[3]]
+            };
+            let lum = |p: [u8; 4]| 0.114 * p[0] as f32 + 0.587 * p[1] as f32 + 0.299 * p[2] as f32;
+
+            // every changed pixel sits within some cap rect, grown by the shadow border it bakes.
+            let pad = margin(style.depth) as f32 + 1.0;
             let mut changed = 0;
             for y in 0..SIZE as usize {
-                let row = std::slice::from_raw_parts((m.pData as *const u8).add(y * m.RowPitch as usize), SIZE as usize * 4);
-                for (x, p) in row.chunks(4).enumerate() {
-                    let p = [p[0], p[1], p[2], p[3]];
+                for x in 0..SIZE as usize {
+                    let p = at(x, y);
                     if p == BACKGROUND {
                         continue;
                     }
                     changed += 1;
-                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-                    assert!(
-                        fx >= rect.min.x - 1.0 && fx <= rect.max.x + 1.0 && fy >= rect.min.y - 1.0 && fy <= rect.max.y + 1.0,
-                        "pixel ({fx}, {fy}) outside the pill changed to {p:?}"
-                    );
                     assert_eq!(p[3], 255, "the frame's alpha is kept");
+                    let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
+                    let inside = shown.iter().any(|q| {
+                        fx >= q.rect.min.x - pad && fx <= q.rect.max.x + pad && fy >= q.rect.min.y - pad && fy <= q.rect.max.y + pad
+                    });
+                    assert!(inside, "pixel ({fx}, {fy}) changed to {p:?} outside every cap");
                 }
             }
+            assert!(changed > 400, "{changed} pixels changed");
+
+            // each cap: a dark face dominating the area, with much lighter label ink on top.
+            for q in &shown {
+                let (mut peak, mut sum, mut n) = (0.0_f32, 0.0_f32, 0u32);
+                for y in q.rect.min.y as usize..q.rect.max.y as usize {
+                    for x in q.rect.min.x as usize..q.rect.max.x as usize {
+                        let l = lum(at(x, y));
+                        peak = peak.max(l);
+                        sum += l;
+                        n += 1;
+                    }
+                }
+                let avg = sum / n as f32;
+                assert!(avg < 120.0, "{:?} cap face not dark (avg lum {avg})", q.text);
+                assert!(peak > 180.0, "{:?} cap has no light label ink (peak lum {peak})", q.text);
+                assert!(peak > avg + 100.0, "{:?} label not clearly lighter than its face", q.text);
+            }
             ctx.Unmap(&staging, 0);
-            assert!(changed > 200, "{changed} pixels changed");
         }
     }
 }

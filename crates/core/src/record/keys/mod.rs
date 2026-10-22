@@ -208,52 +208,74 @@ pub enum Position {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Style {
-    /// How long a pill stays fully shown after its (release or press) time.
+    /// How long a row stays fully shown after its last key's (release or press) time.
     pub hold: i64,
     /// How long it then takes to fade out.
     pub fade: i64,
-    /// How long it slides and fades in.
+    /// How long a row slides and fades in.
     pub rise: i64,
+    /// A gap longer than this ends a typing burst, so the next key starts a new row.
+    pub burst: i64,
     pub height: f32,
-    /// Horizontal padding around the text.
+    /// Horizontal padding around a cap's text.
     pub pad: f32,
-    /// Vertical gap between stacked pills.
-    pub gap: f32,
+    /// Smallest cap width, so a single letter stays squarish.
+    pub min_cap: f32,
+    /// Gap between caps within a row.
+    pub cap_gap: f32,
+    /// Gap between stacked rows.
+    pub row_gap: f32,
     pub radius: f32,
     pub font: f32,
-    /// Distance the pill slides up as it appears.
+    /// The raised bottom edge of a cap, in pixels (the keycap's depth).
+    pub depth: f32,
+    /// Distance a row slides up as it appears.
     pub slide: f32,
     /// Margin from the region edges, as a fraction of the region height.
     pub margin: f32,
-    /// Up to this many pills stack, the newest at the bottom.
+    /// Up to this many rows stack, the newest at the bottom.
     pub max: usize,
+    /// A typed-text cap keeps at most this many trailing characters.
+    pub keep: usize,
     pub pos: Position,
-    /// Straight-alpha RGBA: the translucent fill, the text, the accent hairline.
+    /// Straight-alpha RGBA of the keycap: the face, the raised bottom edge, the top highlight,
+    /// the thin outline, the text, and the drop shadow.
     pub fill: [f32; 4],
+    pub edge: [f32; 4],
+    pub top: [f32; 4],
+    pub border: [f32; 4],
     pub text: [f32; 4],
-    pub accent: [f32; 4],
+    pub shadow: [f32; 4],
 }
 
 impl Style {
-    /// `scale`: the region's monitor DPI / 96.
-    pub fn new(accent: [u8; 3], scale: f32) -> Style {
-        let [r, g, b] = accent.map(|c| c as f32 / 255.0);
+    /// `scale`: the region's monitor DPI / 96. `accent` is unused: keycaps are intentionally
+    /// neutral (dark cap, light text) so they don't read as UI buttons.
+    pub fn new(_accent: [u8; 3], scale: f32) -> Style {
         Style {
             hold: 1500 * MS,
             fade: 200 * MS,
-            rise: 120 * MS,
+            rise: 110 * MS,
+            burst: 1000 * MS,
             height: 30.0 * scale,
-            pad: 11.0 * scale,
-            gap: 6.0 * scale,
-            radius: 8.0 * scale,
+            pad: 9.0 * scale,
+            min_cap: 26.0 * scale,
+            cap_gap: 4.0 * scale,
+            row_gap: 6.0 * scale,
+            radius: 6.0 * scale,
             font: 15.0 * scale,
+            depth: 3.0 * scale,
             slide: 10.0 * scale,
             margin: 0.045,
             max: 3,
+            keep: 30,
             pos: Position::Centre,
-            fill: [0.09, 0.10, 0.12, 0.82],
-            text: [0.96, 0.96, 0.97, 1.0],
-            accent: [r, g, b, 1.0],
+            fill: [0.113, 0.113, 0.121, 0.95],
+            edge: [0.05, 0.05, 0.06, 0.95],
+            top: [0.42, 0.42, 0.45, 0.6],
+            border: [0.6, 0.6, 0.62, 0.22],
+            text: [0.97, 0.97, 0.98, 1.0],
+            shadow: [0.0, 0.0, 0.0, 0.38],
         }
     }
 
@@ -263,8 +285,9 @@ impl Style {
     }
 }
 
-/// A keycap to draw: its text (with `\u{00d7}N` already appended for a burst), its rectangle in
-/// region pixels, the alpha the fade and the slide-in leave, and the colours.
+/// One keycap to draw: its label, its rectangle in region pixels, the alpha the fade and
+/// slide-in leave, and the keycap colours (`depth` is the raised-bottom-edge height). A typed
+/// word is one wide cap; a chord is one cap per key in a row.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pill {
     pub text: String,
@@ -272,26 +295,139 @@ pub struct Pill {
     pub alpha: f32,
     pub radius: f32,
     pub font: f32,
+    pub depth: f32,
     pub fill: [f32; 4],
+    pub edge: [f32; 4],
+    pub top: [f32; 4],
+    pub border: [f32; 4],
     pub text_color: [f32; 4],
-    pub accent: [f32; 4],
+    pub shadow: [f32; 4],
 }
 
 fn ease_out(p: f32) -> f32 {
     1.0 - (1.0 - p).powi(3)
 }
 
-struct Run {
-    label: String,
-    /// When the pill first appeared (the first key of the burst), for the slide-in.
-    appear: i64,
-    /// The latest (release or press) time of the burst, where the hold countdown starts.
-    base: i64,
-    count: u32,
+/// The caps a single key shows as its own row: its modifiers then its main key.
+fn caps_of(k: &Key) -> Vec<String> {
+    let mut caps = Vec::new();
+    for (on, name) in [(k.mods.ctrl, "Ctrl"), (k.mods.alt, "Alt"), (k.mods.shift, "Shift"), (k.mods.win, "Win")] {
+        if on {
+            caps.push(name.to_string());
+        }
+    }
+    caps.push(k.main.text());
+    caps
 }
 
-/// What a burnt-in frame needs to draw its keycap stack: the keystrokes, the frame's time on
-/// the video timeline, and the style. The renderer measures text and lays the pills out via
+enum Cells {
+    /// A typing burst: each edit pushes a grapheme or (with `None`) backspaces one; `tail` is a
+    /// special key (Enter, Esc, …) that closed the burst, shown as caps after the text.
+    Text { edits: Vec<(i64, Option<String>)>, tail: Option<(i64, Vec<String>)> },
+    /// A shortcut or standalone special key: its caps, shown together from `at`.
+    Caps { at: i64, caps: Vec<String> },
+}
+
+struct Row {
+    /// The first key's time, for the slide-in.
+    appear: i64,
+    /// The last key's (release or press) time, where the hold countdown starts.
+    base: i64,
+    cells: Cells,
+}
+
+/// Groups the keystrokes into rows: a run of typed printables (and spaces, with backspace
+/// editing it) batches into one text row; a chord or a standalone special is its own row.
+fn rows_of(keys: &[Key], style: &Style) -> Vec<Row> {
+    let base = |k: &Key| k.hold.unwrap_or(k.at);
+    let mut order: Vec<&Key> = keys.iter().collect();
+    order.sort_by_key(|k| k.at);
+    let mut rows: Vec<Row> = Vec::new();
+    let mut open: Option<usize> = None; // the live text row, if any
+    let mut last = i64::MIN; // the last key added to the open row
+    for k in order {
+        let printable = matches!(k.main, KeyLabel::Text(_)) && !k.mods.chord();
+        let space = matches!(k.main, KeyLabel::Named(Named::Space)) && !k.mods.chord();
+        let back = matches!(k.main, KeyLabel::Named(Named::Backspace)) && !k.mods.chord();
+        let joins = open.is_some() && k.at - last <= style.burst;
+        if k.mods.chord() {
+            open = None;
+            rows.push(Row { appear: k.at, base: base(k), cells: Cells::Caps { at: k.at, caps: caps_of(k) } });
+        } else if printable || space {
+            let ch = if space { " ".to_string() } else { k.main.text() };
+            if let Some(i) = open.filter(|_| joins) {
+                if let Cells::Text { edits, .. } = &mut rows[i].cells {
+                    edits.push((k.at, Some(ch)));
+                }
+                rows[i].base = base(k);
+            } else {
+                rows.push(Row { appear: k.at, base: base(k), cells: Cells::Text { edits: vec![(k.at, Some(ch))], tail: None } });
+                open = Some(rows.len() - 1);
+            }
+            last = k.at;
+        } else if let (true, Some(i)) = (back, open.filter(|_| joins)) {
+            if let Cells::Text { edits, .. } = &mut rows[i].cells {
+                edits.push((k.at, None));
+            }
+            rows[i].base = base(k);
+            last = k.at;
+        } else if let Some(i) = open.filter(|_| joins) {
+            // a special key ends the burst, shown as its own cap(s) after the text.
+            if let Cells::Text { tail, .. } = &mut rows[i].cells {
+                *tail = Some((k.at, caps_of(k)));
+            }
+            rows[i].base = base(k);
+            open = None;
+        } else {
+            open = None;
+            rows.push(Row { appear: k.at, base: base(k), cells: Cells::Caps { at: k.at, caps: caps_of(k) } });
+        }
+    }
+    rows
+}
+
+/// The caps a row shows at time `t` (its typed text replayed up to `t`, then any tail).
+fn caps_at(row: &Row, t: i64, style: &Style) -> Vec<String> {
+    match &row.cells {
+        Cells::Caps { at, caps } => {
+            if *at <= t {
+                caps.clone()
+            } else {
+                Vec::new()
+            }
+        }
+        Cells::Text { edits, tail } => {
+            let mut chars: Vec<String> = Vec::new();
+            for (at, edit) in edits {
+                if *at > t {
+                    break;
+                }
+                match edit {
+                    Some(c) => chars.push(c.clone()),
+                    None => {
+                        chars.pop();
+                    }
+                }
+            }
+            if chars.len() > style.keep {
+                chars.drain(0..chars.len() - style.keep);
+            }
+            let mut caps = Vec::new();
+            if !chars.is_empty() {
+                caps.push(chars.concat());
+            }
+            if let Some((at, tail)) = tail
+                && *at <= t
+            {
+                caps.extend(tail.clone());
+            }
+            caps
+        }
+    }
+}
+
+/// What a burnt-in frame needs to draw its keycap rows: the keystrokes, the frame's time on
+/// the video timeline, and the style. The renderer measures text and lays the caps out via
 /// [`state_at`].
 pub struct KeyFrame<'a> {
     pub keys: &'a [Key],
@@ -299,60 +435,56 @@ pub struct KeyFrame<'a> {
     pub style: &'a Style,
 }
 
-/// The keycap stack at time `t`: the live pills, newest at the bottom, up to [`Style::max`].
-/// `region` is the drawn area in pixels; `measure` gives a label's width at [`Style::font`].
+/// The keycaps at time `t`: rows stacked newest at the bottom (up to [`Style::max`]), the caps
+/// within a row laid out left to right. `region` is the drawn area in pixels; `measure` gives a
+/// label's width at [`Style::font`].
 pub fn state_at(keys: &[Key], t: i64, style: &Style, region: (f32, f32), measure: &dyn Fn(&str) -> f32) -> Vec<Pill> {
-    let base = |k: &Key| k.hold.unwrap_or(k.at);
-    let mut order: Vec<&Key> = keys.iter().collect();
-    order.sort_by_key(|k| k.at);
-
-    // Collapse a burst of the same label (while the previous one is still within its hold) into
-    // one pill with a repeat count.
-    let mut runs: Vec<Run> = Vec::new();
-    for k in order {
-        let text = label(k);
-        match runs.last_mut() {
-            Some(r) if r.label == text && k.at <= r.base + style.hold => {
-                r.base = base(k);
-                r.count += 1;
-            }
-            _ => runs.push(Run { label: text, appear: k.at, base: base(k), count: 1 }),
-        }
-    }
-
-    let end = |r: &Run| r.base + style.hold + style.fade;
-    let mut live: Vec<&Run> = runs.iter().filter(|r| (r.appear..end(r)).contains(&t)).collect();
-    live.sort_by_key(|r| std::cmp::Reverse(r.appear)); // newest first → bottom slot
+    let rows = rows_of(keys, style);
+    let end = |r: &Row| r.base + style.hold + style.fade;
+    let mut live: Vec<(&Row, Vec<String>)> = rows
+        .iter()
+        .filter(|r| (r.appear..end(r)).contains(&t))
+        .map(|r| (r, caps_at(r, t, style)))
+        .filter(|(_, caps)| !caps.is_empty())
+        .collect();
+    live.sort_by_key(|(r, _)| std::cmp::Reverse(r.appear)); // newest first → bottom slot
     live.truncate(style.max);
 
     let margin = style.margin * region.1;
-    live.iter()
-        .enumerate()
-        .map(|(slot, r)| {
-            let text = if r.count > 1 { format!("{} \u{00d7}{}", r.label, r.count) } else { r.label.clone() };
-            let w = measure(&text) + 2.0 * style.pad;
-            let fs = r.base + style.hold;
-            let fade = if t < fs { 1.0 } else { 1.0 - (t - fs) as f32 / style.fade as f32 };
-            let reveal = ease_out(((t - r.appear) as f32 / style.rise as f32).clamp(0.0, 1.0));
-            let left = match style.pos {
-                Position::Left => margin,
-                Position::Centre => (region.0 - w) / 2.0,
-                Position::Right => region.0 - margin - w,
-            };
-            let bottom = region.1 - margin - slot as f32 * (style.height + style.gap) + (1.0 - reveal) * style.slide;
-            let rect = Rect::from_min_size(pos2(left, bottom - style.height), vec2(w, style.height));
-            Pill {
-                text,
+    let mut out = Vec::new();
+    for (slot, (row, caps)) in live.iter().enumerate() {
+        let fs = row.base + style.hold;
+        let fade = if t < fs { 1.0 } else { 1.0 - (t - fs) as f32 / style.fade as f32 };
+        let reveal = ease_out(((t - row.appear) as f32 / style.rise as f32).clamp(0.0, 1.0));
+        let alpha = (fade * reveal).clamp(0.0, 1.0);
+        let widths: Vec<f32> = caps.iter().map(|c| (measure(c) + 2.0 * style.pad).max(style.min_cap)).collect();
+        let row_w = widths.iter().sum::<f32>() + style.cap_gap * (caps.len().saturating_sub(1)) as f32;
+        let mut x = match style.pos {
+            Position::Left => margin,
+            Position::Centre => (region.0 - row_w) / 2.0,
+            Position::Right => region.0 - margin - row_w,
+        };
+        let bottom = region.1 - margin - slot as f32 * (style.height + style.row_gap) + (1.0 - reveal) * style.slide;
+        for (c, w) in caps.iter().zip(&widths) {
+            let rect = Rect::from_min_size(pos2(x, bottom - style.height), vec2(*w, style.height));
+            out.push(Pill {
+                text: c.clone(),
                 rect,
-                alpha: (fade * reveal).clamp(0.0, 1.0),
+                alpha,
                 radius: style.radius,
                 font: style.font,
+                depth: style.depth,
                 fill: style.fill,
+                edge: style.edge,
+                top: style.top,
+                border: style.border,
                 text_color: style.text,
-                accent: style.accent,
-            }
-        })
-        .collect()
+                shadow: style.shadow,
+            });
+            x += w + style.cap_gap;
+        }
+    }
+    out
 }
 
 /// Whether the keycap stack changes right after `t` (a pill sliding in or fading out), so a
