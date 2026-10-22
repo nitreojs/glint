@@ -6,11 +6,11 @@ use glint_core::clip::edit::snap_to;
 use glint_core::clip::export::{self, Job, Video};
 use glint_core::clip::info::Info;
 use glint_core::clip::math::{self, SECOND};
-use glint_ui::widgets::{Look, anim, ease, medium, mix, sans};
+use glint_ui::widgets::{Look, anim, ease, medium, mix, motion, sans};
 
 use super::preview::speaker;
 use super::wave::BUCKET;
-use super::{ClipApp, Selected, scan};
+use super::{ClipApp, Play, Selected, scan};
 
 const TOP: f32 = 18.0;
 const VIDEO_H: f32 = 52.0;
@@ -70,6 +70,10 @@ pub(super) struct View {
 impl View {
     pub(super) fn full(duration: i64) -> View {
         View { start: 0, span: duration.max(1) }
+    }
+
+    pub(super) fn x(&self, t: i64, left: f32, width: f32) -> f32 {
+        left + width * ((t - self.start) as f64 / self.span as f64) as f32
     }
 
     fn clamp(&mut self, duration: i64, min_span: i64) {
@@ -217,7 +221,7 @@ impl ClipApp {
         }
 
         let v = self.view;
-        let x_of = move |t: i64| inner.left() + inner.width() * ((t - v.start) as f64 / v.span as f64) as f32;
+        let x_of = move |t: i64| v.x(t, inner.left(), inner.width());
         let t_raw = move |x: f32| v.start + (((x - inner.left()) / inner.width()) as f64 * v.span as f64) as i64;
         let t_of = move |x: f32| t_raw(x).clamp(0, dur);
         let visible = move |x: f32| x >= inner.left() - 6.0 && x <= inner.right() + 6.0;
@@ -456,6 +460,35 @@ impl ClipApp {
             s.widget_info(|| WidgetInfo::slider(true, self.view.start as f64 / SECOND as f64, "timeline scroll"));
         }
 
+        let (now, animate) = (self.now, motion());
+        let head_t = match self.drag {
+            _ if matches!(self.play, Play::Running { .. }) => self.playhead.play(now, self.pos),
+            Some(Drag::Head | Drag::Start { .. } | Drag::End { .. }) => {
+                self.playhead.set(self.pos);
+                self.pos
+            }
+            _ => {
+                self.playhead.glide(now, self.pos, animate, ease);
+                self.playhead.at(now, ease)
+            }
+        };
+        let ends = [
+            (self.edit.range.start, matches!(self.drag, Some(Drag::Start { .. }))),
+            (self.edit.range.end, matches!(self.drag, Some(Drag::End { .. }))),
+        ];
+        let trim_t = [0, 1].map(|k| {
+            let (t, dragged) = ends[k];
+            if dragged {
+                self.trim[k].set(t);
+            } else {
+                self.trim[k].glide(now, t, animate, ease);
+            }
+            self.trim[k].at(now, ease)
+        });
+        if self.playhead.moving(now) || self.trim.iter().any(|g| g.moving(now)) {
+            ui.ctx().request_repaint();
+        }
+
         let painter = ui.painter().with_clip_rect(area.expand2(vec2(0.0, 4.0)).intersect(ui.clip_rect()));
         let lane_clip = |r: Rect| painter.with_clip_rect(r.intersect(painter.clip_rect()));
 
@@ -543,7 +576,7 @@ impl ClipApp {
                 clip.rect_filled(r, 0, shade);
                 hatch(&clip, r, p.t3.gamma_multiply(0.6));
             }
-            let (x0, x1) = (x_of(self.edit.range.start), x_of(self.edit.range.end));
+            let (x0, x1) = (x_of(trim_t[0]), x_of(trim_t[1]));
             clip.rect_filled(Rect::from_min_max(pos2(area.left(), band.top()), pos2(x0, band.bottom())), 0, shade);
             clip.rect_filled(Rect::from_min_max(pos2(x1, band.top()), pos2(area.right(), band.bottom())), 0, shade);
             if let Some(pieces) = &pieces {
@@ -631,18 +664,20 @@ impl ClipApp {
             }
             painter.vline(x, rows.video.y_range(), Stroke::new(1.0, MARKER.gamma_multiply(0.45)));
         }
-        for (t, resp) in [(self.edit.range.start, &start), (self.edit.range.end, &end)] {
-            let Some(resp) = resp else { continue };
-            let lit = resp.iter().any(|r| r.hovered() || r.dragged());
-            let h = ease(anim(ui, resp[0].id.with("hov"), lit, 0.2));
-            let x = x_of(t);
+        for (k, resp) in [&start, &end].into_iter().enumerate() {
+            let x = x_of(trim_t[k]);
+            if !visible(x) {
+                continue;
+            }
+            let lit = resp.as_ref().is_some_and(|r| r.iter().any(|r| r.hovered() || r.dragged()));
+            let h = ease(anim(ui, Id::unique(("clip-trim-hov", k)), lit, 0.2));
             for band in &rows.bands {
                 let bar = Rect::from_center_size(pos2(x, band.center().y), vec2(HANDLE_W + 2.0 * h, band.height()));
                 painter.rect_filled(bar.expand(2.0 + 2.0 * h), 3.0 + 2.0 * h, p.acc.gamma_multiply(0.15 + 0.07 * h));
                 painter.rect_filled(bar, 3, mix(p.acc, p.acch, h));
             }
         }
-        let x = x_of(self.pos);
+        let x = x_of(head_t);
         if visible(x) {
             let top = area.top() + 8.0;
             painter.vline(x, top..=rows.span.bottom() + 2.0, Stroke::new(2.0, p.t1));
@@ -754,6 +789,20 @@ impl ClipApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_time_lands_on_its_x_in_the_visible_span() {
+        use glint_core::clip::glide::Glide;
+        let v = View { start: 10 * SECOND, span: 20 * SECOND };
+        assert_eq!(v.x(10 * SECOND, 100.0, 400.0), 100.0);
+        assert_eq!(v.x(20 * SECOND, 100.0, 400.0), 300.0);
+        assert_eq!(v.x(30 * SECOND, 100.0, 400.0), 500.0);
+        assert_eq!(v.x(SECOND / 2 + 10 * SECOND, 100.0, 400.0), 110.0);
+        let mut g = Glide::new(0);
+        let xs: Vec<f32> = (0..=60).map(|f| v.x(g.play(f as f64 / 60.0, 15 * SECOND + f * SECOND / 60), 100.0, 400.0)).collect();
+        assert_eq!(xs[0], 200.0);
+        assert!(xs.windows(2).all(|w| (w[1] - w[0] - 20.0 / 60.0).abs() < 0.01), "one second of playback moves 20 px evenly");
+    }
 
     #[test]
     fn zooming_keeps_the_point_under_the_pointer() {

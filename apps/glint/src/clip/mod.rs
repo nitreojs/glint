@@ -11,6 +11,7 @@ use eframe::egui::{
 use glint_core::clip::crop::{Aspect, Crop, Grip};
 use glint_core::clip::edit::{Edit, Undo};
 use glint_core::clip::export::{Format, Job, Source};
+use glint_core::clip::glide::Glide;
 use glint_core::clip::index::Index;
 use glint_core::clip::info::Info;
 use glint_core::clip::math::frame_len;
@@ -227,6 +228,8 @@ struct ClipApp {
     lane_menu: Option<(usize, egui::Pos2, Rect)>,
     renaming: Option<(usize, String)>,
     lane_drag: Option<usize>,
+    playhead: Glide,
+    trim: [Glide; 2],
     keyboard: bool,
     rounded: bool,
     light: Option<bool>,
@@ -316,6 +319,8 @@ impl ClipApp {
             lane_menu: None,
             renaming: None,
             lane_drag: None,
+            playhead: Glide::new(0),
+            trim: [Glide::new(0), Glide::new(duration)],
             menu: false,
             save_rect: Rect::NOTHING,
             sheet: false,
@@ -570,6 +575,7 @@ impl ClipApp {
                 }
                 Some(next) if next > now + self.frame_len() / 2 => {
                     self.pos = next;
+                    self.playhead.set(next);
                     self.seek(next, true);
                     ctx.request_repaint();
                 }

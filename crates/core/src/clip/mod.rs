@@ -1,6 +1,7 @@
 pub mod crop;
 pub mod edit;
 pub mod export;
+pub mod glide;
 pub mod index;
 pub mod info;
 pub mod math;
