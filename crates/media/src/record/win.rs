@@ -1,15 +1,16 @@
+use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use glint_core::geom::rect::Rect;
 use glint_core::record::clicks::Style;
 use glint_core::record::keys::Style as KeyStyle;
-use glint_core::record::pipeline::{Backend, ClickCapture, KeyCapture, Parts, Role, open_audio};
+use glint_core::record::pipeline::{Backend, ClickCapture, Encoded, KeyCapture, PacketSink, Parts, Role, open_audio};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFShutdown, MFStartup};
+use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MF_VERSION, MFSTARTUP_FULL, MFShutdown, MFStartup};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
@@ -17,7 +18,8 @@ use windows::Win32::System::Threading::{
 };
 
 use super::capture::Capture;
-use super::encoder::{self, Composer, SinkWriter};
+use super::encoder::{self, Composer, SinkWriter, log_start, video_config};
+use super::packets::{AacEncoder, HwVideoEncoder};
 use super::keys::Hook as KeyHook;
 use super::mouse::{self, Hook};
 use super::{Ctx, Params, audio};
@@ -26,7 +28,16 @@ use super::{Ctx, Params, audio};
 pub(super) const RING: usize = 6;
 pub(super) const INFINITE: u32 = u32::MAX;
 
+/// Records with the sink writer encoding and muxing in one.
 pub(super) struct Windows(pub(super) Params);
+
+/// Records through the packet path: the encoders' packets go to the sink `make` opens (on the
+/// encoder thread, where COM and Media Foundation are up).
+pub(super) struct Packets<F, S> {
+    pub(super) params: Params,
+    pub(super) make: F,
+    pub(super) sink: PhantomData<fn() -> S>,
+}
 
 pub(super) struct Thread {
     com: bool,
@@ -46,6 +57,22 @@ impl Drop for Thread {
     }
 }
 
+fn enter(role: Role) -> Thread {
+    let (priority, com, mf) = match role {
+        Role::Encode => (THREAD_PRIORITY_ABOVE_NORMAL, true, true),
+        Role::Capture => (THREAD_PRIORITY_HIGHEST, false, false),
+        Role::Audio => (THREAD_PRIORITY_HIGHEST, true, false),
+        Role::Mouse => (THREAD_PRIORITY_HIGHEST, false, false),
+        Role::Keys => (THREAD_PRIORITY_HIGHEST, true, false),
+    };
+    set_priority(priority);
+    unsafe {
+        let com = com && CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
+        let mf = mf && MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok();
+        Thread { com, mf }
+    }
+}
+
 impl Backend for Windows {
     type Capture = Capture;
     type Frames = Composer;
@@ -56,19 +83,7 @@ impl Backend for Windows {
     type Guard = Thread;
 
     fn enter(role: Role) -> Thread {
-        let (priority, com, mf) = match role {
-            Role::Encode => (THREAD_PRIORITY_ABOVE_NORMAL, true, true),
-            Role::Capture => (THREAD_PRIORITY_HIGHEST, false, false),
-            Role::Audio => (THREAD_PRIORITY_HIGHEST, true, false),
-            Role::Mouse => (THREAD_PRIORITY_HIGHEST, false, false),
-            Role::Keys => (THREAD_PRIORITY_HIGHEST, true, false),
-        };
-        set_priority(priority);
-        unsafe {
-            let com = com && CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-            let mf = mf && MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok();
-            Thread { com, mf }
-        }
+        enter(role)
     }
 
     fn now() -> i64 {
@@ -76,21 +91,74 @@ impl Backend for Windows {
     }
 
     fn open(self) -> Result<Parts<Self>, String> {
-        let p = self.0;
-        let opened = unsafe { open(&p) };
-        if opened.is_err() {
-            let _ = std::fs::remove_file(&p.path);
-        }
-        opened
+        unsafe { open(self.0, |p, mgr, names| encoder::sink_writer(p, mgr, names)) }
     }
 }
 
-unsafe fn open(p: &Params) -> Result<Parts<Windows>, String> {
+impl<F, S> Backend for Packets<F, S>
+where
+    F: FnOnce() -> Result<S, String> + Send + 'static,
+    S: PacketSink + 'static,
+{
+    type Capture = Capture;
+    type Frames = Composer;
+    type Output = Encoded<HwVideoEncoder, AacEncoder, S>;
+    type Audio = audio::Source;
+    type Mouse = Hook;
+    type Keys = KeyHook;
+    type Guard = Thread;
+
+    fn enter(role: Role) -> Thread {
+        enter(role)
+    }
+
+    fn now() -> i64 {
+        hns(qpc())
+    }
+
+    fn open(self) -> Result<Parts<Self>, String> {
+        let make = self.make;
+        unsafe {
+            open(self.params, move |p, mgr, names| {
+                let tracks = names.len();
+                let audio = names.into_iter().map(|n| Ok((n, AacEncoder::new()?))).collect::<Result<Vec<_>, String>>()?;
+                let output = Encoded::new(HwVideoEncoder::new(mgr), &video_config(p), audio, make()?)?;
+                log_start(p, "packet path", tracks);
+                Ok(output)
+            })
+        }
+    }
+}
+
+/// Opens everything but the output, which `output` makes on the compositor's device (with the
+/// audio tracks' names). On failure the partial file is deleted.
+unsafe fn open<B>(
+    p: Params,
+    output: impl FnOnce(&Params, &IMFDXGIDeviceManager, Vec<String>) -> Result<B::Output, String>,
+) -> Result<Parts<B>, String>
+where
+    B: Backend<Capture = Capture, Frames = Composer, Audio = audio::Source, Mouse = Hook, Keys = KeyHook>,
+{
+    let opened = unsafe { open_parts::<B>(&p, output) };
+    if opened.is_err() {
+        let _ = std::fs::remove_file(&p.path);
+    }
+    opened
+}
+
+unsafe fn open_parts<B>(
+    p: &Params,
+    output: impl FnOnce(&Params, &IMFDXGIDeviceManager, Vec<String>) -> Result<B::Output, String>,
+) -> Result<Parts<B>, String>
+where
+    B: Backend<Capture = Capture, Frames = Composer, Audio = audio::Source, Mouse = Hook, Keys = KeyHook>,
+{
     unsafe {
         let capture = Capture::new(p)?;
         let audio = open_audio::<audio::Source>(&p.audio, &p.track_names);
         let names = audio.tracks.iter().map(|t| t.name.clone()).collect();
-        let (frames, output) = encoder::open(p, &capture, names)?;
+        let (frames, mgr) = encoder::composer(p, &capture)?;
+        let output = output(p, &mgr, names)?;
         let clicks = p.clicks.map(|c| {
             let scale = mouse::scale(p.region);
             ClickCapture { mouse: Hook { region: p.region }, style: Style::new(c.accent, scale), scale, burn_in: c.burn_in }

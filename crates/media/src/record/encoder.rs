@@ -25,9 +25,9 @@ use super::win::{INFINITE, RING, create_device, texture_desc};
 use super::{Ctx, Params};
 
 /// 192 kbps, one of the four rates the media foundation aac encoder accepts.
-const AAC_BYTES_PER_SECOND: u32 = 24_000;
+pub(super) const AAC_BYTES_PER_SECOND: u32 = 24_000;
 
-fn pack(hi: u32, lo: u32) -> u64 {
+pub(super) fn pack(hi: u32, lo: u32) -> u64 {
     ((hi as u64) << 32) | lo as u64
 }
 
@@ -53,7 +53,9 @@ pub(super) struct SinkWriter {
     path: PathBuf,
 }
 
-pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -> Result<(Composer, SinkWriter), String> {
+/// The frame compositor on a device shared with Media Foundation through the returned manager;
+/// frames are ARGB32 samples of [`input_type`].
+pub(super) unsafe fn composer(p: &Params, cap: &Capture) -> Result<(Composer, IMFDXGIDeviceManager), String> {
     unsafe {
         let (device, ctx) = create_device(&cap.adapter, D3D11_CREATE_DEVICE_VIDEO_SUPPORT)?;
         // Media Foundation uses this device from its own worker threads.
@@ -112,9 +114,6 @@ pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -
         let mgr = mgr.unwrap();
         mgr.ResetDevice(&device, token).ctx("IMFDXGIDeviceManager::ResetDevice")?;
 
-        let config = VideoConfig { codec: p.codec, width: r.w as u32, height: r.h as u32, fps: p.fps, qp: p.qp, effort: p.effort };
-        let (output, in_t, name) = SinkWriter::new(&mgr, &config, track_names, &p.path)?;
-
         let mut raw = std::ptr::null_mut();
         MFCreateVideoSampleAllocatorEx(&IMFVideoSampleAllocatorEx::IID, &mut raw).ctx("MFCreateVideoSampleAllocatorEx")?;
         let alloc = IMFVideoSampleAllocatorEx::from_raw(raw);
@@ -124,24 +123,65 @@ pub(super) unsafe fn open(p: &Params, cap: &Capture, track_names: Vec<String>) -
             .SetUINT32(&MF_SA_D3D11_BINDFLAGS, (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32)
             .ctx("attr")?;
         aattrs.SetUINT32(&MF_SA_D3D11_USAGE, D3D11_USAGE_DEFAULT.0 as u32).ctx("attr")?;
+        let in_t = input_type(r.w as u32, r.h as u32, p.fps)?;
         alloc.InitializeSampleAllocatorEx(4, 16, &aattrs, &in_t).ctx("InitializeSampleAllocatorEx")?;
 
-        log(&format!(
-            "recording {}x{}@{:.3} {:?} qp={} effort={}{} -> {} [{name}]",
-            config.width,
-            config.height,
-            config.fps,
-            config.codec,
-            config.qp,
-            config.effort,
-            match output.audio.len() {
-                0 => String::new(),
-                n => format!(" + {n} aac track(s)"),
-            },
-            p.path.display()
-        ));
-        let composer = Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, clicks, keys, alloc, _mgr: mgr };
-        Ok((composer, output))
+        let composer =
+            Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, clicks, keys, alloc, _mgr: mgr.clone() };
+        Ok((composer, mgr))
+    }
+}
+
+/// What the encoder records, with `p`'s settings.
+pub(super) fn video_config(p: &Params) -> VideoConfig {
+    let r = p.region;
+    VideoConfig { codec: p.codec, width: r.w as u32, height: r.h as u32, fps: p.fps, qp: p.qp, effort: p.effort }
+}
+
+pub(super) fn log_start(p: &Params, encoder: &str, tracks: usize) {
+    let c = video_config(p);
+    log(&format!(
+        "recording {}x{}@{:.3} {:?} qp={} effort={}{} -> {} [{encoder}]",
+        c.width,
+        c.height,
+        c.fps,
+        c.codec,
+        c.qp,
+        c.effort,
+        match tracks {
+            0 => String::new(),
+            n => format!(" + {n} aac track(s)"),
+        },
+        p.path.display()
+    ));
+}
+
+/// The sink writer encoding and muxing in one, on the device behind `mgr`.
+pub(super) unsafe fn sink_writer(
+    p: &Params,
+    mgr: &IMFDXGIDeviceManager,
+    track_names: Vec<String>,
+) -> Result<SinkWriter, String> {
+    let tracks = track_names.len();
+    let (writer, name) = unsafe { SinkWriter::new(mgr, &video_config(p), track_names, &p.path)? };
+    log_start(p, &name, tracks);
+    Ok(writer)
+}
+
+/// Uncompressed frames as the compositor makes them: ARGB32 textures.
+pub(super) unsafe fn input_type(w: u32, h: u32, fps: f64) -> Result<IMFMediaType, String> {
+    let fps_milli = (fps * 1000.0).round() as u32;
+    unsafe {
+        let in_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
+        in_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
+        in_t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).ctx("mt")?;
+        in_t.SetUINT64(&MF_MT_FRAME_SIZE, pack(w, h)).ctx("mt")?;
+        in_t.SetUINT64(&MF_MT_FRAME_RATE, pack(fps_milli, 1000)).ctx("mt")?;
+        in_t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4).ctx("mt")?;
+        in_t.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1).ctx("mt")?;
+        Ok(in_t)
     }
 }
 
@@ -151,7 +191,7 @@ impl SinkWriter {
         config: &VideoConfig,
         track_names: Vec<String>,
         path: &Path,
-    ) -> Result<(SinkWriter, IMFMediaType, String), String> {
+    ) -> Result<(SinkWriter, String), String> {
         unsafe {
             let attrs = attributes(3)?;
             attrs.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1).ctx("attr")?;
@@ -186,16 +226,7 @@ impl SinkWriter {
             out_t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32).ctx("mt")?;
             let stream = writer.AddStream(&out_t).ctx("IMFSinkWriter::AddStream (codec not supported by this GPU?)")?;
 
-            let in_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
-            in_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
-            in_t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_ARGB32).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).ctx("mt")?;
-            in_t.SetUINT64(&MF_MT_FRAME_SIZE, pack(w, h)).ctx("mt")?;
-            in_t.SetUINT64(&MF_MT_FRAME_RATE, pack(fps_milli, 1000)).ctx("mt")?;
-            in_t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_DEFAULT_STRIDE, w * 4).ctx("mt")?;
-            in_t.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1).ctx("mt")?;
-
+            let in_t = input_type(w, h, config.fps)?;
             let enc = attributes(4)?;
             enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_Quality.0 as u32)
                 .ctx("enc")?;
@@ -208,7 +239,7 @@ impl SinkWriter {
             let name = describe_encoder(&writer, stream);
             writer.BeginWriting().ctx("IMFSinkWriter::BeginWriting")?;
             let path = path.to_path_buf();
-            Ok((SinkWriter { writer, stream, audio, track_names, path }, in_t, name))
+            Ok((SinkWriter { writer, stream, audio, track_names, path }, name))
         }
     }
 }
@@ -383,7 +414,7 @@ unsafe fn write_pcm(writer: &IMFSinkWriter, stream: u32, at: i64, data: &[i16]) 
     }
 }
 
-unsafe fn attributes(n: u32) -> Result<IMFAttributes, String> {
+pub(super) unsafe fn attributes(n: u32) -> Result<IMFAttributes, String> {
     let mut a = None;
     unsafe { MFCreateAttributes(&mut a, n).ctx("MFCreateAttributes")? };
     Ok(a.unwrap())

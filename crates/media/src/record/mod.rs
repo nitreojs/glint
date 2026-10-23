@@ -26,6 +26,10 @@ pub(crate) mod cursor;
 #[cfg(windows)]
 mod encoder;
 #[cfg(windows)]
+mod packets;
+#[cfg(all(test, windows))]
+mod tests;
+#[cfg(windows)]
 mod keys;
 #[cfg(windows)]
 mod mouse;
@@ -38,6 +42,8 @@ mod win;
 pub use apps::{App, running_apps};
 #[cfg(windows)]
 pub use audio::{Microphone, microphones};
+#[cfg(windows)]
+pub use packets::{AacEncoder, HwVideoEncoder, Mp4Sink};
 
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -95,6 +101,18 @@ pub fn start(
     on_done: impl FnOnce(Result<glint_core::record::pipeline::Outcome, String>) + Send + 'static,
 ) -> Result<glint_core::record::pipeline::Starting, String> {
     glint_core::record::pipeline::start(win::Windows(p), on_done)
+}
+
+/// Records through the packet path: the hardware encoder and AAC encoders hand their packets
+/// to the sink `sink` opens on the encoder thread, an [`Mp4Sink`] or afterglow's replay buffer.
+#[cfg(windows)]
+pub fn start_packets<S: glint_core::record::pipeline::PacketSink + 'static>(
+    p: Params,
+    sink: impl FnOnce() -> Result<S, String> + Send + 'static,
+    on_done: impl FnOnce(Result<glint_core::record::pipeline::Outcome, String>) + Send + 'static,
+) -> Result<glint_core::record::pipeline::Starting, String> {
+    let backend = win::Packets { params: p, make: sink, sink: std::marker::PhantomData };
+    glint_core::record::pipeline::start(backend, on_done)
 }
 
 pub trait Ctx<T> {
