@@ -22,7 +22,7 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --release --all-targets --locked -- -D warnings
       - name: test
-        run: cargo test --workspace --release --lib --locked
+        run: cargo test --workspace --release --lib --bins --locked
 
   core:
     strategy:

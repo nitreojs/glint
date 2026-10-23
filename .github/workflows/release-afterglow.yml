@@ -1,0 +1,71 @@
+name: release afterglow
+
+on:
+  push:
+    tags: ["afterglow-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      ASSET: ${{ github.ref_name }}-windows-x64.exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: tag matches Cargo.toml
+        shell: bash
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "afterglow") | .version')
+          if [ "afterglow-v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version" >&2
+            exit 1
+          fi
+      - name: test
+        run: cargo test --workspace --release --lib --bins --locked
+      - name: build
+        run: cargo build --release --locked -p afterglow
+      - name: package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/afterglow.exe "dist/$ASSET"
+          cd dist
+          sha256sum "$ASSET" > SHA256SUMS
+          cat SHA256SUMS
+      - name: sign
+        shell: bash
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_URL: https://github.com/jedisct1/minisign/releases/download/0.12/minisign-0.12-win64.zip
+          MINISIGN_SHA256: 37b600344e20c19314b2e82813db2bfdcc408b77b876f7727889dbd46d539479
+        run: |
+          tmp=$(cygpath -u "$RUNNER_TEMP")
+          curl -sSLfo "$tmp/minisign.zip" "$MINISIGN_URL"
+          echo "$MINISIGN_SHA256  $tmp/minisign.zip" | sha256sum -c -
+          unzip -q "$tmp/minisign.zip" -d "$tmp/minisign"
+          minisign="$tmp/minisign/minisign-win64/x86_64/minisign.exe"
+          key="$tmp/glint.minisign.key"
+          trap 'rm -f "$key"' EXIT
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          "$minisign" -S -s "$key" -m "dist/$ASSET" -t "$GITHUB_REF_NAME $ASSET" < /dev/null
+          rm -f "$key"
+          public=$(sed -n 's/.*PUBLIC_KEY: &str = "\(.*\)";/\1/p' apps/glint/src/update/mod.rs)
+          "$minisign" -V -P "$public" -m "dist/$ASSET"
+          cat "dist/$ASSET.minisig"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/${{ env.ASSET }}
+      - name: publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prerelease=()
+          if [[ "${GITHUB_REF_NAME#afterglow-}" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "afterglow ${GITHUB_REF_NAME#afterglow-}" --generate-notes --verify-tag "${prerelease[@]}"

@@ -27,7 +27,7 @@ jobs:
             exit 1
           fi
       - name: test
-        run: cargo test --workspace --release --lib --locked
+        run: cargo test --workspace --release --lib --bins --locked
       - name: build
         run: cargo build --release --locked -p glint
       - name: package

@@ -60,9 +60,9 @@ fn primary() -> Result<glint_core::geom::monitor::Output, String> {
 }
 
 impl Buffer {
-    /// Starts buffering the primary monitor; `ended` hears when the recording stops on its own
-    /// (a `Result<Outcome, String>`).
-    pub fn start(cfg: &Config, ended: Notify) -> Result<Buffer, String> {
+    /// Starts buffering the primary monitor; `ended` hears when the recording stops, as
+    /// `(generation, Result<Outcome, String>)`.
+    pub fn start(cfg: &Config, generation: u64, ended: Notify) -> Result<Buffer, String> {
         let monitor = primary()?;
         let r = monitor.rect;
         let fps = match cfg.fps {
@@ -88,7 +88,7 @@ impl Buffer {
         let length = cfg.length as i64 * SECOND;
         let replay = ReplaySink::new(Limits { keep: length, max_bytes: (cfg.max_memory_mb as usize) << 20 });
         let sink = replay.clone();
-        let starting = start_packets(params, move || Ok(sink), move |r: Result<Outcome, String>| ended.post(r))?;
+        let starting = start_packets(params, move || Ok(sink), move |r: Result<Outcome, String>| ended.post((generation, r)))?;
         let recorder = starting.wait()?;
         Ok(Buffer { recorder, replay, length })
     }

@@ -124,6 +124,9 @@ quality = {quality}
 # The buffer never holds more than this many MB; it keeps less time instead.
 max_memory_mb = {memory}
 
+# Start afterglow when you sign in to Windows.
+launch_at_startup = {autostart}
+
 # What's heard, as in glint: "desktop" (what your speakers play), "app" (one app, by exe name)
 # or "mic".
 [[audio_sources]]
@@ -138,6 +141,7 @@ tracks = [1]
             fps = self.fps,
             quality = self.quality,
             memory = self.max_memory_mb,
+            autostart = self.launch_at_startup,
         )
     }
 }

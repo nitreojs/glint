@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/glint", "crates/core", "crates/media", "crates/shell", "crates/ui"]
+members = ["apps/afterglow", "apps/glint", "crates/core", "crates/media", "crates/shell", "crates/ui"]
 resolver = "3"
 
 [workspace.package]
