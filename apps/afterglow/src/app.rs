@@ -19,10 +19,15 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::buffer::{self, Buffer, Notify};
-use crate::config::{self, APP, Config};
+use crate::config::{APP, Config};
+use crate::settings::SETTINGS_ARG;
 
 /// Window class of the hidden main window: glint (or anything) posts [`WM_SAVE_REPLAY`] to it.
 pub const MAIN_CLASS: &str = "afterglow_main";
+/// The settings window saved: re-read config.toml.
+pub const WM_RELOAD: u32 = WM_APP + 20;
+/// WPARAM 1: let go of the save hotkey (the settings window is recording a new one); 0: take it back.
+pub const WM_HOTKEY_PAUSE: u32 = WM_APP + 21;
 /// Save the replay now, from another process.
 pub const WM_SAVE_REPLAY: u32 = WM_APP + 30;
 
@@ -33,16 +38,16 @@ const SAVE_HOTKEY: i32 = 1;
 const RESTART_TIMER: usize = 1;
 const TIP_TIMER: usize = 2;
 
-const AMBER: [u8; 3] = [0xF5, 0x9E, 0x0B];
+/// afterglow's accent: the tray icon while buffering, the settings window.
+pub const AMBER: [u8; 3] = [0xF5, 0x9E, 0x0B];
 const GREY: [u8; 3] = [0x7A, 0x77, 0x72];
 
 const ID_SAVE: usize = 1;
 const ID_PAUSE: usize = 2;
 const ID_FOLDER: usize = 3;
 const ID_SETTINGS: usize = 4;
-const ID_RELOAD: usize = 5;
-const ID_LOG: usize = 6;
-const ID_QUIT: usize = 7;
+const ID_LOG: usize = 5;
+const ID_QUIT: usize = 6;
 
 struct App {
     hwnd: HWND,
@@ -176,17 +181,27 @@ impl App {
         }
     }
 
+    /// Applies saved settings. What the recording itself is made of (monitor, frame rate, codec,
+    /// quality, sound) takes a new one; a new length or memory cap applies to the buffer as it is,
+    /// and the rest keeps what's buffered.
     fn reload(&mut self) {
         match Config::load() {
             Ok(cfg) => {
-                let restart = cfg != self.cfg;
+                let recording = |c: &Config| (c.monitor, c.fps, c.codec, c.quality, c.audio_sources.clone());
+                let restart = recording(&cfg) != recording(&self.cfg);
+                let hotkey = cfg.save_hotkey != self.cfg.save_hotkey;
                 self.cfg = cfg;
-                self.grab_hotkey();
+                if hotkey || !self.hotkey {
+                    self.grab_hotkey();
+                }
                 self.sync_autostart();
                 if restart && self.buffer.is_some() {
-                    // the new length, quality or sources take a new recording
+                    log("settings changed the recording: starting a new buffer");
                     self.stop();
                     self.start();
+                } else if let Some(b) = &mut self.buffer {
+                    log("settings applied; the buffer keeps what it holds");
+                    b.set_limits(&self.cfg);
                 }
                 self.refresh_tray();
             }
@@ -216,8 +231,11 @@ impl App {
                 let _ = std::fs::create_dir_all(&dir);
                 open(&dir.display().to_string(), None);
             }
-            ID_SETTINGS => open("notepad.exe", Some(&format!("\"{}\"", config::path().display()))),
-            ID_RELOAD => self.reload(),
+            ID_SETTINGS => {
+                if let Ok(exe) = std::env::current_exe() {
+                    open(&exe.display().to_string(), Some(SETTINGS_ARG));
+                }
+            }
             ID_LOG => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
             ID_QUIT => unsafe {
                 let _ = DestroyWindow(self.hwnd);
@@ -253,8 +271,7 @@ fn menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, ID_PAUSE, PCWSTR(pause.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open folder"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Edit settings"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_RELOAD, w!("Reload settings"));
+        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings"));
         let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
@@ -297,6 +314,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_HOTKEY if wp.0 as i32 == SAVE_HOTKEY => {
             with_app(App::save);
+            return LRESULT(0);
+        }
+        WM_RELOAD => {
+            with_app(App::reload);
+            return LRESULT(0);
+        }
+        WM_HOTKEY_PAUSE => {
+            with_app(|a| {
+                if wp.0 == 1 {
+                    if a.hotkey {
+                        hotkey::unregister(a.hwnd, SAVE_HOTKEY);
+                        a.hotkey = false;
+                    }
+                } else if !a.hotkey {
+                    a.grab_hotkey();
+                }
+            });
             return LRESULT(0);
         }
         WM_SAVE_REPLAY => {

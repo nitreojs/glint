@@ -10,15 +10,9 @@ use glint_core::naming::{
     with_app_folders, with_window_names,
 };
 use glint_ui::widgets::{self, Kind, Look, hint, mono, row};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
-use windows::Win32::UI::Shell::{
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, IShellItem, SHCreateItemFromParsingName,
-    SIGDN_FILESYSPATH,
-};
-use windows::core::HSTRING;
 
 use crate::app::ipc;
+use glint_shell::explorer::pick_folder;
 use glint_shell::time::date_time;
 use crate::platform::paths::{old_default_dir, output_dir, previous_output_dir, unused};
 use crate::settings::{SettingsApp, repaint};
@@ -26,23 +20,6 @@ use crate::settings::{SettingsApp, repaint};
 const CAPTURE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "mp4", "gif"];
 /// Folder levels searched below a folder glint made itself (the pattern's folders).
 const DEPTH: usize = 3;
-
-fn pick_folder(start: &Path) -> Option<PathBuf> {
-    unsafe {
-        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
-        let opts = dialog.GetOptions().ok()?;
-        dialog.SetOptions(opts | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM).ok()?;
-        if let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(start.as_os_str()), None) {
-            let _ = dialog.SetFolder(&item);
-        }
-        let parent: Option<HWND> = ipc::find_settings();
-        dialog.Show(parent).ok()?; // Err when cancelled
-        let path = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
-        let s = path.to_string().ok();
-        CoTaskMemFree(Some(path.0 as _));
-        s.map(PathBuf::from)
-    }
-}
 
 /// Captures left in a folder glint used before.
 #[derive(Clone, Debug, PartialEq)]
@@ -214,7 +191,7 @@ impl SettingsApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if widgets::button(ui, look, "browse…", Kind::Secondary, 28.0, true).clicked()
-                    && let Some(dir) = pick_folder(&output_dir(&self.cfg))
+                    && let Some(dir) = pick_folder(&output_dir(&self.cfg), ipc::find_settings())
                 {
                     self.cfg.output_dir = dir.display().to_string();
                 }

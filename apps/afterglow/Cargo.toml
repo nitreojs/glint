@@ -5,9 +5,11 @@ edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+eframe.workspace = true
 glint-core.workspace = true
 glint-media.workspace = true
 glint-shell.workspace = true
+glint-ui.workspace = true
 serde.workspace = true
 toml.workspace = true
 windows.workspace = true
@@ -15,3 +17,6 @@ windows.workspace = true
 [build-dependencies]
 embed-resource.workspace = true
 glint-core.workspace = true
+
+[dev-dependencies]
+glint-ui = { workspace = true, features = ["test-rows"] }

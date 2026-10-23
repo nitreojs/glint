@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
+use glint_core::geom::monitor::Output;
 use glint_core::geom::rect::Rect;
 use glint_core::record::pipeline::{Outcome, Recorder};
 use glint_core::record::replay::{Clip, Limits, ReplaySink};
@@ -53,17 +54,24 @@ pub struct Buffer {
     length: i64,
 }
 
-/// The primary monitor: the one holding the desktop's origin.
-fn primary() -> Result<glint_core::geom::monitor::Output, String> {
+fn limits(cfg: &Config) -> Limits {
+    Limits { keep: cfg.length as i64 * SECOND, max_bytes: (cfg.max_memory_mb as usize) << 20 }
+}
+
+/// Monitor `n` (1 = the first Windows lists), or with 0 (or one that's gone) the primary one: the
+/// one holding the desktop's origin.
+pub fn monitor(n: u32) -> Result<Output, String> {
     let outputs = monitors::enumerate().map_err(|e| format!("can't list monitors: {}", e.message()))?;
-    outputs.iter().find(|o| o.rect.contains(0, 0)).or(outputs.first()).cloned().ok_or_else(|| "no monitors".into())
+    let primary = || outputs.iter().find(|o| o.rect.contains(0, 0)).or(outputs.first());
+    let chosen = n.checked_sub(1).and_then(|i| outputs.get(i as usize)).or_else(primary);
+    chosen.cloned().ok_or_else(|| "no monitors".into())
 }
 
 impl Buffer {
-    /// Starts buffering the primary monitor; `ended` hears when the recording stops, as
+    /// Starts buffering the configured monitor; `ended` hears when the recording stops, as
     /// `(generation, Result<Outcome, String>)`.
     pub fn start(cfg: &Config, generation: u64, ended: Notify) -> Result<Buffer, String> {
-        let monitor = primary()?;
+        let monitor = monitor(cfg.monitor)?;
         let r = monitor.rect;
         let fps = match cfg.fps {
             0 => monitor.refresh_hz,
@@ -86,11 +94,17 @@ impl Buffer {
             path: std::env::temp_dir().join("afterglow-buffer.mp4"),
         };
         let length = cfg.length as i64 * SECOND;
-        let replay = ReplaySink::new(Limits { keep: length, max_bytes: (cfg.max_memory_mb as usize) << 20 });
+        let replay = ReplaySink::new(limits(cfg));
         let sink = replay.clone();
         let starting = start_packets(params, move || Ok(sink), move |r: Result<Outcome, String>| ended.post((generation, r)))?;
         let recorder = starting.wait()?;
         Ok(Buffer { recorder, replay, length })
+    }
+
+    /// A new length or memory cap, for what's buffered already.
+    pub fn set_limits(&mut self, cfg: &Config) {
+        self.length = cfg.length as i64 * SECOND;
+        self.replay.lock().set_limits(limits(cfg));
     }
 
     /// How much the buffer holds now (seconds).
