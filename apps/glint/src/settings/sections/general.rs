@@ -43,9 +43,8 @@ impl SettingsApp {
         let mut clicked = false;
         row(ui, look, label, 7.0, |ui| {
             clicked = widgets::hotkey_field(ui, look, &keys, state).clicked();
-            if let Some((_, msg)) = self.hotkey_error.as_ref().filter(|_| mine) {
-                hint(ui, msg.clone(), look.p.warn);
-            }
+            let error = self.hotkey_error.as_ref().filter(|_| mine).map(|(_, msg)| msg.clone());
+            widgets::reveal_with(ui, Id::unique(("hotkey-error", label)), error, |ui, msg| hint(ui, msg, look.p.warn));
         });
         if clicked {
             self.stop_listening();

@@ -1,6 +1,6 @@
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use eframe::egui::{Context, Ui, vec2};
+use eframe::egui::{Context, Id, Ui, vec2};
 use glint_core::config::audio::{AudioSource, MAX_TRACKS, MAX_VOLUME, SourceKind};
 use glint_core::record::tracks::plan;
 use glint_media::record::{App, Microphone, microphones, running_apps};
@@ -62,6 +62,96 @@ impl Devices {
     }
 }
 
+/// Which source row is which from frame to frame, so added sources open and removed ones fold.
+#[derive(Default)]
+pub(in crate::settings) struct SourceRows {
+    keys: Vec<u64>,
+    next: u64,
+    listed: widgets::Listed<u64, AudioSource>,
+}
+
+impl SourceRows {
+    /// Keys for `n` sources; a list that changed size some other way (reset, cancel) gets new ones.
+    fn sync(&mut self, n: usize) {
+        if self.keys.len() != n {
+            self.keys = (self.next..self.next + n as u64).collect();
+            self.next += n as u64;
+        }
+    }
+
+    fn push(&mut self) {
+        self.keys.push(self.next);
+        self.next += 1;
+    }
+}
+
+fn source_id(key: &u64) -> Id {
+    Id::unique(("audio-source", *key))
+}
+
+/// One source's row; whether it asked for an app rescan, and whether "remove" was clicked.
+fn source_row(ui: &mut Ui, look: &Look, s: &mut AudioSource, devices: &Devices) -> (bool, bool) {
+    let p = look.p;
+    let (mut rescan, mut remove) = (false, false);
+    row(ui, look, row_label(s.kind), 1.0, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            let label = devices.label(s);
+            widgets::toggle(ui, look, &mut s.enabled, &label);
+            remove = widgets::link(ui, look, "remove").clicked();
+        });
+        ui.add_space(4.0);
+        match s.kind {
+            SourceKind::Desktop => {
+                hint(ui, "what your default output device plays, minus one app if you name it", p.t3);
+                rescan |= app_picker(ui, look, &mut s.exclude, devices, "leave out an app, like game.exe", false);
+            }
+            SourceKind::App => {
+                hint(ui, "only this app and what it starts; picked up if it starts mid-recording", p.t3);
+                let warn = s.app.trim().is_empty();
+                rescan |= app_picker(ui, look, &mut s.app, devices, "name.exe", warn);
+            }
+            SourceKind::Mic => {
+                let default = match devices.mic("") {
+                    Some(m) => format!("default ({})", m.name),
+                    None => "default device".into(),
+                };
+                let mut items = vec![default.clone()];
+                items.extend(devices.mics.iter().map(|m| m.name.clone()));
+                let current = match devices.mic(&s.device) {
+                    _ if s.device.is_empty() => default,
+                    Some(m) => m.name.clone(),
+                    None => "not connected".into(),
+                };
+                let w = ui.available_width();
+                match widgets::dropdown(ui, look, &current, &items, w) {
+                    Some(0) => s.device.clear(),
+                    Some(k) => s.device = devices.mics[k - 1].id.clone(),
+                    None => {}
+                }
+            }
+        }
+        ui.add_space(4.0);
+        let word = volume_word(s.volume);
+        widgets::slider(ui, look, &mut s.volume, 0..=MAX_VOLUME, word, "0", "200 %");
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            hint(ui, "tracks", p.t2);
+            for n in 1..=MAX_TRACKS {
+                let mut on = s.tracks.contains(&n);
+                if widgets::checkbox(ui, look, &mut on, &n.to_string()).changed() {
+                    s.tracks.retain(|&t| t != n);
+                    if on {
+                        s.tracks.push(n);
+                        s.tracks.sort_unstable();
+                    }
+                }
+            }
+        });
+    });
+    (rescan, remove)
+}
+
 fn row_label(kind: SourceKind) -> &'static str {
     match kind {
         SourceKind::Desktop => "desktop audio",
@@ -85,73 +175,35 @@ impl SettingsApp {
         let ctx = ui.ctx().clone();
         let devices = self.audio_devices.get_or_insert_with(|| Devices::load(&ctx));
         devices.poll();
+        let rows = &mut self.source_rows;
+        rows.sync(self.cfg.audio_sources.len());
+        let current = rows.keys.iter().copied().zip(self.cfg.audio_sources.iter().cloned()).collect();
         let mut rescan = false;
         let mut removed = None;
-        for (i, s) in self.cfg.audio_sources.iter_mut().enumerate() {
-            row(ui, look, row_label(s.kind), 1.0, |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 16.0;
-                    let label = devices.label(s);
-                    widgets::toggle(ui, look, &mut s.enabled, &label);
-                    if widgets::link(ui, look, "remove").clicked() {
-                        removed = Some(i);
-                    }
-                });
-                ui.add_space(4.0);
-                match s.kind {
-                    SourceKind::Desktop => {
-                        hint(ui, "what your default output device plays, minus one app if you name it", p.t3);
-                        rescan |= app_picker(ui, look, &mut s.exclude, devices, "leave out an app, like game.exe", false);
-                    }
-                    SourceKind::App => {
-                        hint(ui, "only this app and what it starts; picked up if it starts mid-recording", p.t3);
-                        let warn = s.app.trim().is_empty();
-                        rescan |= app_picker(ui, look, &mut s.app, devices, "name.exe", warn);
-                    }
-                    SourceKind::Mic => {
-                        let default = match devices.mic("") {
-                            Some(m) => format!("default ({})", m.name),
-                            None => "default device".into(),
-                        };
-                        let mut items = vec![default.clone()];
-                        items.extend(devices.mics.iter().map(|m| m.name.clone()));
-                        let current = match devices.mic(&s.device) {
-                            _ if s.device.is_empty() => default,
-                            Some(m) => m.name.clone(),
-                            None => "not connected".into(),
-                        };
-                        let w = ui.available_width();
-                        match widgets::dropdown(ui, look, &current, &items, w) {
-                            Some(0) => s.device.clear(),
-                            Some(k) => s.device = devices.mics[k - 1].id.clone(),
-                            None => {}
-                        }
-                    }
+        for (key, mut leaving, present) in rows.listed.update(&ctx, source_id, current) {
+            let at = rows.keys.iter().position(|&k| k == key);
+            let drawn = widgets::reveal(ui, source_id(&key), present, |ui| {
+                // a removed source folds away drawn from its last copy; clicks on it do nothing
+                let s = match at {
+                    Some(i) => &mut self.cfg.audio_sources[i],
+                    None => &mut leaving,
+                };
+                let (scan, remove) = source_row(ui, look, s, devices);
+                rescan |= scan && present;
+                if remove && present {
+                    removed = at;
                 }
-                ui.add_space(4.0);
-                let word = volume_word(s.volume);
-                widgets::slider(ui, look, &mut s.volume, 0..=MAX_VOLUME, word, "0", "200 %");
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    hint(ui, "tracks", p.t2);
-                    for n in 1..=MAX_TRACKS {
-                        let mut on = s.tracks.contains(&n);
-                        if widgets::checkbox(ui, look, &mut on, &n.to_string()).changed() {
-                            s.tracks.retain(|&t| t != n);
-                            if on {
-                                s.tracks.push(n);
-                                s.tracks.sort_unstable();
-                            }
-                        }
-                    }
-                });
             });
+            if drawn.is_none() {
+                rows.listed.folded(&key);
+            }
         }
         if rescan {
             devices.rescan(&ctx);
         }
         if let Some(i) = removed {
             self.cfg.audio_sources.remove(i);
+            rows.keys.remove(i);
         }
         row(ui, look, "add", 7.0, |ui| {
             ui.horizontal(|ui| {
@@ -160,6 +212,7 @@ impl SettingsApp {
                     if widgets::button(ui, look, kind.name(), Kind::Secondary, 28.0, true).clicked() {
                         let n = self.cfg.audio_sources.len();
                         self.cfg.audio_sources.push(AudioSource::new(kind, n));
+                        rows.push();
                     }
                 }
                 if widgets::button(ui, look, "refresh apps", Kind::Text, 28.0, true).clicked()

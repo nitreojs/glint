@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use eframe::egui::{RichText, Ui};
+use eframe::egui::{Id, RichText, Ui};
 use glint_core::config::UpdateMode;
 use glint_core::update::{RELEASES_PAGE, notes_url};
 use glint_ui::widgets::{self, Kind, Look, hint, row, sans};
@@ -129,12 +129,12 @@ impl SettingsApp {
                 }
             });
         });
-        if let State::Failed { error } = &state {
-            hint(ui, error.clone(), p.warn);
-        }
-        if let Some(note) = &self.updater.note {
-            hint(ui, note.clone(), p.warn);
-        }
+        let failed = match &state {
+            State::Failed { error } => Some(error.clone()),
+            _ => None,
+        };
+        widgets::reveal_with(ui, Id::unique("update-failed"), failed, |ui, error| hint(ui, error, p.warn));
+        widgets::reveal_with(ui, Id::unique("update-note"), self.updater.note.clone(), |ui, note| hint(ui, note, p.warn));
         let checked = match &self.updater.status.checked {
             Some(at) => format!("last checked {at}"),
             None => "not checked yet".to_string(),

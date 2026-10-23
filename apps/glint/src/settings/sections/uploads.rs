@@ -68,6 +68,7 @@ enum ProxyPick {
 
 pub(in crate::settings) struct Uploaders {
     names: Vec<String>,
+    listed: widgets::Listed<String, ()>,
     note: Option<(String, bool)>,
     system_proxy: String,
     custom_proxy: bool,
@@ -75,7 +76,13 @@ pub(in crate::settings) struct Uploaders {
 
 impl Uploaders {
     pub(in crate::settings) fn load() -> Uploaders {
-        Uploaders { names: custom::names(), note: None, system_proxy: describe_system(), custom_proxy: false }
+        Uploaders {
+            names: custom::names(),
+            listed: widgets::Listed::default(),
+            note: None,
+            system_proxy: describe_system(),
+            custom_proxy: false,
+        }
     }
 
     fn refresh(&mut self, note: String, warn: bool) {
@@ -104,21 +111,17 @@ impl SettingsApp {
             hint(ui, "uploads are public: anyone with the link can open the file", p.warn);
         });
         let litterbox = self.cfg.upload_destination == "litterbox";
-        let shown = widgets::glide(ui, Id::unique("litterbox-expiry"), if litterbox { 1.0 } else { 0.0 }, 0.12);
-        if shown > 0.0 {
-            ui.scope(|ui| {
-                ui.multiply_opacity(shown);
-                row(ui, look, "keep for", 7.0, |ui| {
-                    let times = [
-                        (Expiry::Hour, "1 hour"),
-                        (Expiry::HalfDay, "12 hours"),
-                        (Expiry::Day, "1 day"),
-                        (Expiry::ThreeDays, "3 days"),
-                    ];
-                    widgets::segmented(ui, look, &mut self.cfg.litterbox_expiry, &times, None);
-                });
+        widgets::reveal(ui, Id::unique("litterbox-expiry"), litterbox, |ui| {
+            row(ui, look, "keep for", 7.0, |ui| {
+                let times = [
+                    (Expiry::Hour, "1 hour"),
+                    (Expiry::HalfDay, "12 hours"),
+                    (Expiry::Day, "1 day"),
+                    (Expiry::ThreeDays, "3 days"),
+                ];
+                widgets::segmented(ui, look, &mut self.cfg.litterbox_expiry, &times, None);
             });
-        }
+        });
         row(ui, look, "custom uploaders", 1.0, |ui| self.custom_list(ui, look));
         row(ui, look, "after upload", 1.0, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
@@ -146,13 +149,23 @@ impl SettingsApp {
                 ProxyPick::Custom => String::new(),
             };
         }
+        // folding away it keeps showing what was typed, not the "system" or "none" that replaced it
+        let custom = pick == ProxyPick::Custom;
+        let typed = Id::unique("custom-proxy-text");
+        if custom {
+            ui.data_mut(|d| d.insert_temp(typed, self.cfg.upload_proxy.clone()));
+        }
+        widgets::reveal(ui, Id::unique("custom-proxy"), custom, |ui| {
+            let mut leaving = ui.data(|d| d.get_temp::<String>(typed)).unwrap_or_default();
+            let text = if custom { &mut self.cfg.upload_proxy } else { &mut leaving };
+            let problem = proxy::parse(text).is_err();
+            widgets::text_field(ui, look, text, "http://host:port", problem);
+        });
         match pick {
             ProxyPick::System => hint(ui, self.uploaders.system_proxy.clone(), p.t3),
             ProxyPick::Direct => hint(ui, "uploads connect straight to the host", p.t3),
             ProxyPick::Custom => {
-                let problem = proxy::parse(&self.cfg.upload_proxy).err();
-                widgets::text_field(ui, look, &mut self.cfg.upload_proxy, "http://host:port", problem.is_some());
-                let (text, color) = match problem {
+                let (text, color) = match proxy::parse(&self.cfg.upload_proxy).err() {
                     Some(e) => (e, p.warn),
                     None if self.cfg.upload_proxy.trim().is_empty() => ("empty uses the system proxy".into(), p.t3),
                     None => ("http proxies only: socks can't carry uploads".into(), p.t3),
@@ -166,21 +179,29 @@ impl SettingsApp {
         let p = look.p;
         ui.spacing_mut().item_spacing.y = 8.0;
         let mut removed = None;
-        for name in &self.uploaders.names {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 12.0;
-                let mut on = self.cfg.upload_destination == *name;
-                if widgets::checkbox(ui, look, &mut on, name).clicked() {
-                    self.cfg.upload_destination = if on { name.clone() } else { Config::default().upload_destination };
-                }
-                if widgets::link(ui, look, "remove").clicked() {
-                    removed = Some(name.clone());
-                }
+        let id = |name: &String| Id::unique(("custom-uploader", name.as_str()));
+        let current = self.uploaders.names.iter().map(|n| (n.clone(), ())).collect();
+        for (name, (), present) in self.uploaders.listed.update(ui.ctx(), id, current) {
+            let drawn = widgets::reveal(ui, id(&name), present, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 12.0;
+                    let mut on = self.cfg.upload_destination == name;
+                    if widgets::checkbox(ui, look, &mut on, &name).clicked() && present {
+                        self.cfg.upload_destination = if on { name.clone() } else { Config::default().upload_destination };
+                    }
+                    if widgets::link(ui, look, "remove").clicked() && present {
+                        removed = Some(name.clone());
+                    }
+                });
             });
+            if drawn.is_none() {
+                self.uploaders.listed.folded(&name);
+            }
         }
-        if self.uploaders.names.is_empty() {
+        let empty = self.uploaders.names.is_empty();
+        widgets::reveal(ui, Id::unique("no-custom-uploaders"), empty, |ui| {
             hint(ui, "sharex .sxcu files; imported ones show up here", p.t3);
-        }
+        });
         if let Some(name) = removed {
             match custom::remove(&name) {
                 Ok(()) => {
@@ -217,9 +238,9 @@ impl SettingsApp {
                 self.uploaders.refresh(note.0, note.1);
             }
         });
-        if let Some((note, warn)) = &self.uploaders.note {
-            hint(ui, note.clone(), if *warn { p.warn } else { p.t3 });
-        }
+        widgets::reveal_with(ui, Id::unique("uploaders-note"), self.uploaders.note.clone(), |ui, (note, warn)| {
+            hint(ui, note, if warn { p.warn } else { p.t3 });
+        });
     }
 
     fn import_files(&mut self) {

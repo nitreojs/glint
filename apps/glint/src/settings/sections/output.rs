@@ -228,9 +228,8 @@ impl SettingsApp {
             hint(ui, "recordings and screenshots are saved here. leave empty for the default.", p.t3);
         });
         let shown = folder_saved || running.is_some() || self.mover.result.is_some();
-        if shown && (!self.mover.leftovers.is_empty() || running.is_some() || self.mover.result.is_some()) {
-            self.move_row(ui, look, &current, running);
-        }
+        let any = !self.mover.leftovers.is_empty() || running.is_some() || self.mover.result.is_some();
+        widgets::reveal(ui, egui::Id::unique("older-captures"), shown && any, |ui| self.move_row(ui, look, &current, running));
         let problem = pattern_problem(&self.cfg.file_name);
         row(ui, look, "file names", 7.0, |ui| {
             widgets::text_field(ui, look, &mut self.cfg.file_name, DEFAULT_PATTERN, problem.is_some());
@@ -286,9 +285,10 @@ impl SettingsApp {
                 });
                 ui.add_space(4.0);
             }
-            if let Some((text, failed)) = &self.mover.result {
-                hint(ui, text.clone(), if *failed { p.warn } else { p.t3 });
-            }
+            let result = self.mover.result.clone();
+            widgets::reveal_with(ui, egui::Id::unique("move-result"), result, |ui, (text, failed)| {
+                hint(ui, text, if failed { p.warn } else { p.t3 });
+            });
         });
         if let Some(i) = start {
             self.mover.start(i, current.to_path_buf());

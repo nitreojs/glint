@@ -16,7 +16,7 @@ pub use controls::{
 };
 #[cfg(feature = "test-rows")]
 pub use controls::ROWS;
-pub use motion::{anim, anim_ctx, ease, glide, mix, motion};
+pub use motion::{Listed, anim, anim_ctx, ease, glide, mix, motion, reveal, reveal_with, snap};
 pub use tokens::{
     BAR_H, CONTENT_X, FOOTER_H, Look, MEDIUM, MONO_MEDIUM, Palette, SEMIBOLD, SIDEBAR_W, WINDOW, medium, mono,
     mono_medium, palette, sans, semibold,

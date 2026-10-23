@@ -32,10 +32,17 @@ mod sections;
 
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, Listener};
+use sections::audio::SourceRows;
 use sections::output::Mover;
 use sections::updates::Updater;
 use sections::uploads::Uploaders;
 use sections::{SECTIONS, Section};
+
+/// The bright panel's rounding where it meets the darker frame.
+const PANEL_RADIUS: u8 = 8;
+/// How long a newly picked section takes to fade in, and how far it drops from.
+const SECTION_ENTER: f32 = 0.18;
+const SECTION_DROP: f32 = 8.0;
 
 /// Where the settings window's last size is kept, in points: `[width, height]` as JSON.
 fn size_path() -> PathBuf {
@@ -88,6 +95,7 @@ pub fn run() {
         uploaders: Uploaders::load(),
         updater: Updater::load(),
         audio_devices: None,
+        source_rows: SourceRows::default(),
         mover: Mover::default(),
         shown: None,
         pinned: false,
@@ -139,6 +147,7 @@ struct SettingsApp {
     uploaders: Uploaders,
     updater: Updater,
     audio_devices: Option<sections::audio::Devices>,
+    source_rows: SourceRows,
     mover: Mover,
     shown: Option<Section>,
     pinned: bool,
@@ -255,8 +264,9 @@ impl eframe::App for SettingsApp {
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
         let had_overlay = self.dialog.is_some() || egui::Popup::is_any_open(&ctx);
 
+        // The bar and the sidebar share this fill: one darker L-shaped frame around the panel.
         let full = ui.max_rect();
-        ui.painter().rect_filled(full, radius, p.surf);
+        ui.painter().rect_filled(full, radius, p.side);
         let bar = Rect::from_min_size(full.min, vec2(full.width(), BAR_H));
         match widgets::title_bar(ui, &look, bar, "settings", active, radius) {
             TitleAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
@@ -264,9 +274,7 @@ impl eframe::App for SettingsApp {
             TitleAction::None => {}
         }
 
-        // Sidebar: shares the bar's fill, so the two read as one L-shaped frame.
         let side = Rect::from_min_max(pos2(full.left(), bar.bottom()), pos2(full.left() + SIDEBAR_W, full.bottom()));
-        ui.painter().rect_filled(side, CornerRadius { nw: 0, ne: 0, sw: radius, se: 0 }, p.side);
         let item = |i: f32| Rect::from_min_size(pos2(side.left() + 8.0, side.top() + 6.0 + i * 34.0), vec2(SIDEBAR_W - 16.0, 32.0));
         let current = SECTIONS.iter().position(|&s| s == self.section).unwrap_or(0);
         let pos = widgets::glide(ui, Id::unique("nav-selection"), current as f32, 0.18);
@@ -280,18 +288,29 @@ impl eframe::App for SettingsApp {
         }
 
         let main = Rect::from_min_max(pos2(side.right(), side.top()), full.right_bottom());
+        // Rounded where it meets the frame; its last corner is the window's own.
+        let corners = CornerRadius { nw: PANEL_RADIUS, ne: PANEL_RADIUS, sw: PANEL_RADIUS, se: radius };
+        ui.painter().rect_filled(main, corners, p.surf);
         let body = Rect::from_min_max(
             pos2(main.left() + CONTENT_X, main.top()),
             pos2(main.right() - CONTENT_X, main.bottom() - FOOTER_H),
         );
-        ui.painter().text(pos2(body.left(), body.top() + 18.0), Align2::LEFT_TOP, self.section.name(), semibold(20.0), p.t1);
-        let rows = Rect::from_min_max(pos2(body.left(), body.top() + 56.0), pos2(main.right() - 10.0, body.bottom()));
-        let gutter = (rows.right() - body.right()) as i8;
-        let mut content = ui.new_child(UiBuilder::new().max_rect(rows).layout(Layout::top_down(Align::Min)));
         if self.shown != Some(self.section) {
+            // a newly picked section drops in; the first one is simply there
+            if self.shown.is_some() {
+                widgets::snap(&ctx, Id::unique("section-enter"), 0.0);
+            }
             self.shown = Some(self.section);
             self.pinned = true;
         }
+        let enter = widgets::glide(ui, Id::unique("section-enter"), 1.0, SECTION_ENTER);
+        let lift = (1.0 - enter) * SECTION_DROP;
+        let mut heading = ui.painter().clone();
+        heading.multiply_opacity(enter);
+        heading.text(pos2(body.left(), body.top() + 18.0 + lift), Align2::LEFT_TOP, self.section.name(), semibold(20.0), p.t1);
+        let rows = Rect::from_min_max(pos2(body.left(), body.top() + 56.0), pos2(main.right() - 10.0, body.bottom()));
+        let gutter = (rows.right() - body.right()) as i8;
+        let mut content = ui.new_child(UiBuilder::new().max_rect(rows).layout(Layout::top_down(Align::Min)));
         // observed on the user's machine: a fresh window opened scrolled to the bottom with no input
         let touched = ctx.input(|i| {
             i.pointer.any_pressed()
@@ -310,10 +329,12 @@ impl eframe::App for SettingsApp {
         }
         scroll.show(&mut content, |content| {
             content.spacing_mut().item_spacing = vec2(8.0, 0.0);
-            if let Some(e) = &self.error {
-                hint(content, e.clone(), p.warn);
-                content.add_space(12.0);
-            }
+            content.multiply_opacity(enter);
+            content.add_space(lift);
+            widgets::reveal_with(content, Id::unique("save-error"), self.error.clone(), |ui, e| {
+                hint(ui, e, p.warn);
+                ui.add_space(12.0);
+            });
             match self.section {
                 Section::General => self.general(content, &look),
                 Section::Recording => self.recording(content, &look),
@@ -370,10 +391,18 @@ impl SettingsApp {
                     self.close(&ctx);
                 }
             }
+            // fades out still saying how many there were
+            let count = Id::unique("unsaved-count");
             if changes > 0 {
+                ui.data_mut(|d| d.insert_temp(count, changes));
+            }
+            let shown = widgets::anim(ui, Id::unique("unsaved-label"), changes > 0, 0.15);
+            if shown > 0.0 {
+                let n = ui.data(|d| d.get_temp::<usize>(count)).unwrap_or(changes);
                 ui.add_space(6.0);
-                let s = if changes == 1 { "" } else { "s" };
-                ui.label(RichText::new(format!("{changes} unsaved change{s}")).font(sans(12.0)).color(look.p.t3));
+                let s = if n == 1 { "" } else { "s" };
+                let color = look.p.t3.gamma_multiply(widgets::ease(shown));
+                ui.label(RichText::new(format!("{n} unsaved change{s}")).font(sans(12.0)).color(color));
             }
         });
     }
@@ -478,6 +507,7 @@ mod tests {
                 uploaders: Uploaders::load(),
                 updater: Updater::at(std::env::temp_dir().join("glint-tests-no-update-status.json")),
                 audio_devices: None,
+                source_rows: SourceRows::default(),
                 mover: Mover::default(),
                 shown: None,
                 pinned: false,
@@ -562,9 +592,12 @@ mod tests {
         }
         assert!(h.frame(Vec::new(), "record hotkey").is_none_or(|y| y < TOP));
 
+        // a picked section drops in, then rests at the top
         h.app.go(Section::Recording);
+        h.settle();
         assert_eq!(h.frame(Vec::new(), "frame rate"), Some(TOP));
         h.app.go(Section::General);
+        h.settle();
         assert_eq!(h.frame(Vec::new(), "record hotkey"), Some(TOP));
     }
 
