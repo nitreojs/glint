@@ -5,8 +5,8 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use super::{ClickTarget, State, open_settings, shell, with_app};
-use crate::platform::format::local_time;
-use crate::platform::log::log_path;
+use glint_shell::time::local_time;
+use glint_shell::log::path as log_path;
 use crate::platform::paths::output_dir;
 use crate::shot;
 use crate::upload;
@@ -70,7 +70,7 @@ fn recent_action(hwnd: HWND, e: &Entry, action: usize) {
     };
     match (action, path, url) {
         (OPEN, Some(p), _) => shell(&p.display().to_string(), ""),
-        (SHOW, Some(p), _) => crate::platform::shell::reveal(p),
+        (SHOW, Some(p), _) => glint_shell::explorer::reveal(p),
         (OPEN_LINK, _, Some(u)) => shell(u, ""),
         (COPY_LINK, _, Some(u)) => {
             if let Err(e) = shot::copy_text(Some(hwnd), u) {

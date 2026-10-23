@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIFactory1};
 use windows::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW};
 use windows::core::PCWSTR;
 
-pub(crate) fn enumerate() -> windows::core::Result<Vec<Output>> {
+pub fn enumerate() -> windows::core::Result<Vec<Output>> {
     let rates = refresh_rates();
     let mut out = Vec::new();
     unsafe {

@@ -1,5 +1,5 @@
 [workspace]
-members = ["apps/glint", "crates/core", "crates/media", "crates/ui"]
+members = ["apps/glint", "crates/core", "crates/media", "crates/shell", "crates/ui"]
 resolver = "3"
 
 [workspace.package]
@@ -10,6 +10,7 @@ repository = "https://github.com/nitreojs/glint"
 [workspace.dependencies]
 glint-core = { path = "crates/core" }
 glint-media = { path = "crates/media" }
+glint-shell = { path = "crates/shell" }
 glint-ui = { path = "crates/ui" }
 color_quant = "1.1.0"
 embed-resource = "3.0.12"

@@ -1,0 +1,10 @@
+[package]
+name = "glint-shell"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+glint-core.workspace = true
+glint-media.workspace = true
+windows.workspace = true

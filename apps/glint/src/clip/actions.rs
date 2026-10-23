@@ -82,7 +82,7 @@ pub(super) fn place(hwnd: HWND, [x, y, w, h]: [i32; 4]) {
 }
 
 pub(super) fn show_in_folder(path: &Path) {
-    crate::platform::shell::reveal(path);
+    glint_shell::explorer::reveal(path);
 }
 
 pub(super) fn open_url(url: &str) {

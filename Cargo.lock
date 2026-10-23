@@ -1144,6 +1144,7 @@ dependencies = [
  "embed-resource",
  "glint-core",
  "glint-media",
+ "glint-shell",
  "glint-ui",
  "raw-window-handle",
  "serde",
@@ -1174,6 +1175,15 @@ dependencies = [
  "glint-core",
  "windows",
  "windows-core",
+]
+
+[[package]]
+name = "glint-shell"
+version = "0.3.0-beta.1"
+dependencies = [
+ "glint-core",
+ "glint-media",
+ "windows",
 ]
 
 [[package]]

@@ -1,11 +1,11 @@
 //! Messages between the tray app and the settings process (`glint.exe --settings`).
 
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_APP};
-use windows::core::{HSTRING, PCWSTR, w};
+use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, WM_APP};
+use windows::core::HSTRING;
 
 /// Window class of the tray app's hidden main window.
-pub(crate) const MAIN_CLASS: PCWSTR = w!("glint_main");
+pub(crate) const MAIN_CLASS: &str = "glint_main";
 pub(crate) const SETTINGS_TITLE: &str = "glint settings";
 
 /// Settings were saved: re-read config.toml.
@@ -20,12 +20,7 @@ pub(crate) const WM_UPDATE_INSTALL: u32 = WM_APP + 23;
 
 /// Posts `msg` to the running tray app, if any.
 pub(crate) fn post_to_main(msg: u32, wparam: usize) -> bool {
-    unsafe {
-        match FindWindowW(MAIN_CLASS, None) {
-            Ok(h) => PostMessageW(Some(h), msg, WPARAM(wparam), LPARAM(0)).is_ok(),
-            Err(_) => false,
-        }
-    }
+    glint_shell::window::post(MAIN_CLASS, msg, wparam)
 }
 
 /// The open settings window, if any.

@@ -1,7 +1,7 @@
 #![windows_subsystem = "windows"]
 
 fn main() {
-    glint::platform::log::install();
+    glint_shell::log::install("glint");
     if std::env::args().any(|a| a == glint::settings::CAPTURE_ARG) {
         glint::settings::capture_keys();
         return;

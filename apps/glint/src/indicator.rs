@@ -32,7 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
 use crate::platform::gfx::{Dib, Painter, animate, ease_out, make_glass, rgba};
-use crate::platform::monitors;
+use glint_shell::monitors;
 
 const FADE_IN_MS: f32 = 160.0;
 const FADE_OUT_MS: f32 = 120.0;

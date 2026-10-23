@@ -4,7 +4,7 @@ use windows::Win32::Graphics::Gdi::{BitBlt, CAPTUREBLT, GdiFlush, GetDC, ROP_COD
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
 use super::gfx::Dib;
-use super::monitors;
+use glint_shell::monitors;
 
 const BLACK: u32 = 0xFF00_0000;
 

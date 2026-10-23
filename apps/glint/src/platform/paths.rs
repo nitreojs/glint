@@ -9,7 +9,7 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::UI::Shell::{FOLDERID_Documents, FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 use windows::core::GUID;
 
-use super::format::date_time;
+use glint_shell::time::date_time;
 
 /// Migrations already done, one name per line.
 const MIGRATED: &str = "migrated";

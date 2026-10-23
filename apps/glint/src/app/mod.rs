@@ -1,6 +1,5 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use glint_core::config::{ClickMode, Config, Keystrokes, ShotStyle, UpdateMode};
 use glint_core::format::{human_duration, human_size};
@@ -12,9 +11,9 @@ use glint_core::record::pipeline::{Outcome, Recorder};
 use glint_core::update::notes_url;
 use glint_core::wide::wide;
 use glint_media::record::{self, ClickHighlights, KeyOverlay, Params, Source};
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use glint_shell::log::path as log_path;
+use glint_shell::{autostart, instance, monitors, window};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
 use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, NIN_SELECT, ShellExecuteW};
@@ -24,15 +23,12 @@ use windows::core::{PCWSTR, w};
 use crate::indicator::{self, Indicator};
 use crate::picker::{self, Picked, Purpose};
 use crate::platform::{capture, cursor};
-use crate::platform::log::log_path;
-use crate::platform::monitors;
 use crate::platform::paths::{migrate_output_dir, unique_path};
 use crate::shot::editor::Output;
 use crate::shot::{self, Delivered, Shot};
 use crate::update::{self, Checked, UPDATED_ARG};
 use crate::upload::{self, Done};
 
-mod autostart;
 mod hotkeys;
 pub(crate) mod ipc;
 mod menu;
@@ -146,7 +142,7 @@ impl App {
     }
 
     fn sync_autostart(&mut self) {
-        if let Err(e) = autostart::sync(self.cfg.launch_at_startup) {
+        if let Err(e) = autostart::sync("glint", self.cfg.launch_at_startup) {
             self.notify("glint: launch at startup", &e, true, ClickTarget::None);
         }
     }
@@ -555,7 +551,7 @@ impl App {
             return self.install_update();
         }
         match &self.click {
-            ClickTarget::File(p) => crate::platform::shell::reveal(p),
+            ClickTarget::File(p) => glint_shell::explorer::reveal(p),
             ClickTarget::Link(url) => shell(url, ""),
             ClickTarget::Log => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
             ClickTarget::Update | ClickTarget::None => {}
@@ -714,34 +710,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
 }
 
-/// Takes the single-instance mutex for the life of the process. Right after an update the
-/// previous process is still exiting, so `wait` keeps trying for a while.
-fn single_instance(wait: bool) -> bool {
-    for _ in 0..200 {
-        unsafe {
-            let mutex = CreateMutexW(None, false, w!("Local\\glint-single-instance"));
-            if GetLastError() != ERROR_ALREADY_EXISTS {
-                return true;
-            }
-            if let Ok(h) = mutex {
-                let _ = CloseHandle(h);
-            }
-        }
-        if !wait {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
-}
-
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     let updated_from = args.iter().position(|a| a == UPDATED_ARG).and_then(|i| args.get(i + 1)).cloned();
     let autostarted = args.iter().any(|a| a == autostart::ARG);
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        if !single_instance(updated_from.is_some()) {
+        if !instance::take("glint", updated_from.is_some()) {
             MessageBoxW(None, w!("glint is already running (see the tray icon)."), w!("glint"), MB_ICONINFORMATION);
             return;
         }
@@ -776,31 +751,7 @@ pub fn run() {
             }
         }
 
-        let hinst = GetModuleHandleW(None).expect("module handle");
-        let class = ipc::MAIN_CLASS;
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(wndproc),
-            hInstance: hinst.into(),
-            lpszClassName: class,
-            ..Default::default()
-        };
-        RegisterClassExW(&wc);
-        let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            class,
-            w!("glint"),
-            WS_POPUP,
-            0,
-            0,
-            0,
-            0,
-            None,
-            None,
-            Some(hinst.into()),
-            None,
-        )
-        .expect("main window");
+        let hwnd = window::hidden(ipc::MAIN_CLASS, "glint", Some(wndproc)).expect("main window");
 
         let tray = Tray::new(hwnd, WM_APP_TRAY, cfg.accent_rgb());
         let mut app = App {
@@ -813,7 +764,7 @@ pub fn run() {
             pause_hotkey: None,
             state: State::Idle,
             tray,
-            taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
+            taskbar_created: window::taskbar_created(),
             click: ClickTarget::None,
             exiting: false,
             update: updates::Updates::default(),
@@ -853,10 +804,6 @@ pub fn run() {
         ));
         APP.with(|a| *a.borrow_mut() = Some(app));
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        window::run();
     }
 }

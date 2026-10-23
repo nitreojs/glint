@@ -1,9 +1,7 @@
 use glint_core::config::Config;
-use glint_core::config::hotkeys::parse_hotkey;
 use glint_core::log::log;
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE,
-};
+use glint_shell::hotkey::{register, register_key, unregister};
+use windows::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 
 use super::{App, ClickTarget, State};
 
@@ -17,14 +15,11 @@ pub(super) const MONITOR_HOTKEY_ID: i32 = 6;
 impl App {
     /// (Re-)registers one global hotkey; returns the combo it now holds.
     fn grab_hotkey(&mut self, id: i32, held: bool, combo: &str, what: &str, announce: bool) -> Option<String> {
-        unsafe {
-            if held {
-                let _ = UnregisterHotKey(Some(self.hwnd), id);
-            }
-            let (mods, vk) = parse_hotkey(combo).expect("validated in Config::load");
-            if RegisterHotKey(Some(self.hwnd), id, HOT_KEY_MODIFIERS(mods) | MOD_NOREPEAT, vk).is_ok() {
-                return Some(combo.to_string());
-            }
+        if held {
+            unregister(self.hwnd, id);
+        }
+        if register(self.hwnd, id, combo) {
+            return Some(combo.to_string());
         }
         if announce {
             let text = format!(
@@ -68,24 +63,18 @@ impl App {
 
     pub(super) fn release_pause_hotkey(&mut self) {
         if self.pause_hotkey.take().is_some() {
-            unsafe {
-                let _ = UnregisterHotKey(Some(self.hwnd), PAUSE_HOTKEY_ID);
-            }
+            unregister(self.hwnd, PAUSE_HOTKEY_ID);
         }
     }
 
     pub(super) fn grab_escape(&self) {
-        unsafe {
-            if RegisterHotKey(Some(self.hwnd), ESC_HOTKEY_ID, MOD_NOREPEAT, VK_ESCAPE.0 as u32).is_err() {
-                log("esc is taken by another app; the record hotkey cancels the countdown");
-            }
+        if !register_key(self.hwnd, ESC_HOTKEY_ID, VK_ESCAPE.0 as u32) {
+            log("esc is taken by another app; the record hotkey cancels the countdown");
         }
     }
 
     pub(super) fn release_escape(&self) {
-        unsafe {
-            let _ = UnregisterHotKey(Some(self.hwnd), ESC_HOTKEY_ID);
-        }
+        unregister(self.hwnd, ESC_HOTKEY_ID);
     }
 
     /// Releases the hotkeys while the settings window records a new one.
@@ -99,9 +88,7 @@ impl App {
         ];
         for (id, held) in held {
             if held.is_some() {
-                unsafe {
-                    let _ = UnregisterHotKey(Some(self.hwnd), id);
-                }
+                unregister(self.hwnd, id);
             }
         }
     }

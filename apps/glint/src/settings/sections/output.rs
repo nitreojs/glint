@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::HSTRING;
 
 use crate::app::ipc;
-use crate::platform::format::date_time;
+use glint_shell::time::date_time;
 use crate::platform::paths::{old_default_dir, output_dir, previous_output_dir, unused};
 use crate::settings::{SettingsApp, repaint};
 
