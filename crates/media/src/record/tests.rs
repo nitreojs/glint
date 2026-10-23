@@ -109,8 +109,8 @@ fn frame(gpu: &Gpu, (w, h): (u32, u32), rgba: [f32; 4]) -> IMFSample {
 }
 
 /// `frames` of colour changes at 30 fps and a tone, through the hardware encoders into `sink`.
-fn encode<S: PacketSink>(gpu: &Gpu, codec: Codec, frames: i64, sink: S) {
-    let config = VideoConfig { codec, width: 640, height: 360, fps: 30.0, qp: 23, effort: 50 };
+fn encode<S: PacketSink>(gpu: &Gpu, codec: Codec, keyframe_secs: f64, frames: i64, sink: S) {
+    let config = VideoConfig { codec, width: 640, height: 360, fps: 30.0, qp: 23, effort: 50, keyframe_secs };
     let audio = vec![("music".to_string(), AacEncoder::new().unwrap())];
     let mut out = Encoded::new(HwVideoEncoder::new(&gpu.mgr), &config, audio, sink).unwrap();
     let frame_hns = 10_000_000 / 30;
@@ -142,7 +142,7 @@ fn record(codec: Codec) -> (Seen, std::path::PathBuf) {
     let path = temp_mp4(&format!("packets-{codec:?}"));
     let seen = Rc::new(RefCell::new(Seen::default()));
     let spy = Spy { inner: Mp4Sink::create(&path).unwrap(), seen: seen.clone() };
-    encode(&gpu, codec, 60, spy);
+    encode(&gpu, codec, 2.0, 60, spy);
     (Rc::into_inner(seen).unwrap().into_inner(), path)
 }
 
@@ -185,15 +185,15 @@ fn hevc_packets_make_a_playable_mp4() {
 fn the_replay_buffer_saves_its_last_stretch_as_an_mp4() {
     let gpu = gpu();
     let replay = ReplaySink::new(Limits { keep: 600_000_000, max_bytes: 64 << 20 });
-    // 5 s at 30 fps: keyframes every 2 s, at 0, 2 and 4 s
-    encode(&gpu, Codec::H264, 150, replay.clone());
+    // 5 s at 30 fps, a keyframe every second
+    encode(&gpu, Codec::H264, 1.0, 150, replay.clone());
     let clip = replay.lock().last(15_000_000).unwrap();
-    assert!((clip.duration - 30_000_000).abs() < 100, "1.5 s back is before the keyframe at 4 s, so from 2 s");
+    assert!((clip.duration - 20_000_000).abs() < 100, "1.5 s back is past the keyframe at 4 s, so from 3 s");
     let path = temp_mp4("replay");
     clip.write(&mut Mp4Sink::create(&path).unwrap()).unwrap();
     let info = probe(&path).unwrap();
     let _ = std::fs::remove_file(&path);
     assert_eq!((info.size, info.codec), ((640, 360), Some(Codec::H264)));
-    assert!((info.duration - 30_000_000).abs() < 1_000_000, "{} s", info.duration as f64 / 1e7);
+    assert!((info.duration - 20_000_000).abs() < 1_000_000, "{} s", info.duration as f64 / 1e7);
     assert_eq!(info.tracks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["music"]);
 }

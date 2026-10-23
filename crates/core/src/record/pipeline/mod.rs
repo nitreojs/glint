@@ -128,6 +128,8 @@ pub struct VideoConfig {
     pub qp: u32,
     /// Encoder quality-vs-speed knob, 0 (fastest) ..= 100 (best).
     pub effort: u32,
+    /// Seconds between keyframes: where a cut without re-encoding can start.
+    pub keyframe_secs: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]

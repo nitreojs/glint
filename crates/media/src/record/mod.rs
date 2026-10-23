@@ -60,6 +60,8 @@ pub struct Params {
     pub qp: u32,
     /// Encoder quality-vs-speed knob, 0 (fastest) ..= 100 (best).
     pub effort: u32,
+    /// Seconds between keyframes.
+    pub keyframe_secs: f64,
     pub draw_cursor: bool,
     /// Click highlights; `None` = off (no mouse hook).
     pub clicks: Option<ClickHighlights>,

@@ -135,7 +135,15 @@ pub(super) unsafe fn composer(p: &Params, cap: &Capture) -> Result<(Composer, IM
 /// What the encoder records, with `p`'s settings.
 pub(super) fn video_config(p: &Params) -> VideoConfig {
     let r = p.region;
-    VideoConfig { codec: p.codec, width: r.w as u32, height: r.h as u32, fps: p.fps, qp: p.qp, effort: p.effort }
+    VideoConfig {
+        codec: p.codec,
+        width: r.w as u32,
+        height: r.h as u32,
+        fps: p.fps,
+        qp: p.qp,
+        effort: p.effort,
+        keyframe_secs: p.keyframe_secs,
+    }
 }
 
 pub(super) fn log_start(p: &Params, encoder: &str, tracks: usize) {
@@ -166,6 +174,11 @@ pub(super) unsafe fn sink_writer(
     let (writer, name) = unsafe { SinkWriter::new(mgr, &video_config(p), track_names, &p.path)? };
     log_start(p, &name, tracks);
     Ok(writer)
+}
+
+/// Frames between keyframes.
+pub(super) fn gop(config: &VideoConfig) -> u32 {
+    (config.fps * config.keyframe_secs).round().max(1.0) as u32
 }
 
 /// Uncompressed frames as the compositor makes them: ARGB32 textures.
@@ -232,7 +245,7 @@ impl SinkWriter {
                 .ctx("enc")?;
             enc.SetUINT64(&CODECAPI_AVEncVideoEncodeQP, config.qp.min(51) as u64).ctx("enc")?;
             enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, config.effort.min(100)).ctx("enc")?;
-            enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (config.fps * 2.0).round() as u32).ctx("enc")?;
+            enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, gop(config)).ctx("enc")?;
             writer.SetInputMediaType(stream, &in_t, &enc).ctx("IMFSinkWriter::SetInputMediaType")?;
             let audio = track_names.iter().map(|_| add_audio_stream(&writer)).collect::<Result<Vec<u32>, String>>()?;
 

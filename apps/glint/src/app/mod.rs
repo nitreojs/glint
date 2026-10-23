@@ -265,6 +265,7 @@ impl App {
             codec: self.cfg.codec.codec(),
             qp: self.cfg.quality,
             effort: self.cfg.effort,
+            keyframe_secs: 2.0,
             draw_cursor: self.cfg.draw_cursor,
             clicks: self.cfg.click_highlights.then(|| ClickHighlights {
                 burn_in: self.cfg.clicks == ClickMode::BurnIn,

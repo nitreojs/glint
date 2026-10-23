@@ -18,7 +18,7 @@ use windows::Win32::System::Variant::VARIANT;
 use windows::core::{HSTRING, Interface, PWSTR};
 
 use super::Ctx;
-use super::encoder::{AAC_BYTES_PER_SECOND, attributes, input_type, pack};
+use super::encoder::{AAC_BYTES_PER_SECOND, attributes, gop, input_type, pack};
 
 /// The fields of `HEAACWAVEINFO` after `WAVEFORMATEX` that MF keeps in `MF_MT_USER_DATA` before the
 /// AudioSpecificConfig: raw AAC (payload type 0), AAC-LC level 2 (0x29).
@@ -138,7 +138,7 @@ fn friendly_name(a: &IMFActivate) -> String {
 
 /// The GPU's video encoder MFT, asynchronous, fed D3D11 textures from the device behind `mgr`.
 /// Constant QP like the sink writer path, no B-frames (packets come out in display order, so
-/// decode time equals presentation time), a keyframe every two seconds.
+/// decode time equals presentation time), keyframes as the config says.
 pub struct HwVideoEncoder {
     mgr: IMFDXGIDeviceManager,
     mft: Option<(IMFActivate, IMFTransform, IMFMediaEventGenerator)>,
@@ -210,7 +210,7 @@ impl HwVideoEncoder {
             set(&CODECAPI_AVEncVideoEncodeQP, (config.qp.min(51) as u64).into(), "qp")?;
             // the rest are hints some encoders don't take
             let _ = set(&CODECAPI_AVEncCommonQualityVsSpeed, config.effort.min(100).into(), "effort");
-            let _ = set(&CODECAPI_AVEncMPVGOPSize, ((config.fps * 2.0).round() as u32).into(), "gop");
+            let _ = set(&CODECAPI_AVEncMPVGOPSize, gop(config).into(), "gop");
             let _ = set(&CODECAPI_AVEncMPVDefaultBPictureCount, 0u32.into(), "b-frames");
             mft.SetOutputType(0, &video_type(config)?, 0).ctx("SetOutputType")?;
             mft.SetInputType(0, &input_type(config.width, config.height, config.fps)?, 0).ctx("SetInputType")?;

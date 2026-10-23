@@ -717,7 +717,7 @@ impl PacketSink for Arc<Mutex<Ring>> {
 
 #[test]
 fn encoded_packets_reach_a_sink_between_encoder_and_muxer() {
-    let config = VideoConfig { codec: Codec::Hevc, width: 640, height: 360, fps: 10.0, qp: 20, effort: 50 };
+    let config = VideoConfig { codec: Codec::Hevc, width: 640, height: 360, fps: 10.0, qp: 20, effort: 50, keyframe_secs: 2.0 };
     let ring = Arc::new(Mutex::new(Ring::default()));
     let audio = vec![("mic".to_string(), FakeAac { tail: false }), ("desktop".to_string(), FakeAac { tail: true })];
     let mut output = Encoded::new(FakeEncoder { frames: 0 }, &config, audio, ring.clone()).unwrap();
