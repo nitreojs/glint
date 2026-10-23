@@ -5,6 +5,7 @@ use std::rc::Rc;
 use glint_core::record::Codec;
 use glint_core::record::mix::RATE;
 use glint_core::record::pipeline::{Encoded, Output, Packet, PacketSink, Stream, VideoConfig};
+use glint_core::record::replay::{Limits, ReplaySink};
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
@@ -107,20 +108,16 @@ fn frame(gpu: &Gpu, (w, h): (u32, u32), rgba: [f32; 4]) -> IMFSample {
     }
 }
 
-/// Two seconds of colour changes and a tone through the packet path into `codec`.mp4.
-fn record(codec: Codec) -> (Seen, std::path::PathBuf) {
-    let gpu = gpu();
-    let path = std::env::temp_dir().join(format!("glint-packets-{codec:?}-{}.mp4", std::process::id()));
+/// `frames` of colour changes at 30 fps and a tone, through the hardware encoders into `sink`.
+fn encode<S: PacketSink>(gpu: &Gpu, codec: Codec, frames: i64, sink: S) {
     let config = VideoConfig { codec, width: 640, height: 360, fps: 30.0, qp: 23, effort: 50 };
-    let seen = Rc::new(RefCell::new(Seen::default()));
-    let spy = Spy { inner: Mp4Sink::create(&path).unwrap(), seen: seen.clone() };
     let audio = vec![("music".to_string(), AacEncoder::new().unwrap())];
-    let mut out = Encoded::new(HwVideoEncoder::new(&gpu.mgr), &config, audio, spy).unwrap();
+    let mut out = Encoded::new(HwVideoEncoder::new(&gpu.mgr), &config, audio, sink).unwrap();
     let frame_hns = 10_000_000 / 30;
     let chunk = RATE as usize / 10;
-    for i in 0..60 {
-        let t = i as f32 / 60.0;
-        out.video(frame(&gpu, (640, 360), [t, 1.0 - t, 0.5, 1.0]), i * frame_hns, frame_hns).unwrap();
+    for i in 0..frames {
+        let t = (i % 60) as f32 / 60.0;
+        out.video(frame(gpu, (640, 360), [t, 1.0 - t, 0.5, 1.0]), i * frame_hns, frame_hns).unwrap();
         if i % 3 == 0 {
             let at = (i / 3) as usize * chunk;
             let pcm: Vec<i16> = (at..at + chunk)
@@ -133,7 +130,19 @@ fn record(codec: Codec) -> (Seen, std::path::PathBuf) {
         }
     }
     out.finish().unwrap();
-    drop(out);
+}
+
+fn temp_mp4(what: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("glint-{what}-{}.mp4", std::process::id()))
+}
+
+/// Two seconds through the packet path into `codec`.mp4.
+fn record(codec: Codec) -> (Seen, std::path::PathBuf) {
+    let gpu = gpu();
+    let path = temp_mp4(&format!("packets-{codec:?}"));
+    let seen = Rc::new(RefCell::new(Seen::default()));
+    let spy = Spy { inner: Mp4Sink::create(&path).unwrap(), seen: seen.clone() };
+    encode(&gpu, codec, 60, spy);
     (Rc::into_inner(seen).unwrap().into_inner(), path)
 }
 
@@ -169,4 +178,22 @@ fn h264_packets_make_a_playable_mp4() {
 #[ignore = "needs a hardware video encoder"]
 fn hevc_packets_make_a_playable_mp4() {
     check(Codec::Hevc);
+}
+
+#[test]
+#[ignore = "needs a hardware video encoder"]
+fn the_replay_buffer_saves_its_last_stretch_as_an_mp4() {
+    let gpu = gpu();
+    let replay = ReplaySink::new(Limits { keep: 600_000_000, max_bytes: 64 << 20 });
+    // 5 s at 30 fps: keyframes every 2 s, at 0, 2 and 4 s
+    encode(&gpu, Codec::H264, 150, replay.clone());
+    let clip = replay.lock().last(15_000_000).unwrap();
+    assert!((clip.duration - 30_000_000).abs() < 100, "1.5 s back is before the keyframe at 4 s, so from 2 s");
+    let path = temp_mp4("replay");
+    clip.write(&mut Mp4Sink::create(&path).unwrap()).unwrap();
+    let info = probe(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    assert_eq!((info.size, info.codec), ((640, 360), Some(Codec::H264)));
+    assert!((info.duration - 30_000_000).abs() < 1_000_000, "{} s", info.duration as f64 / 1e7);
+    assert_eq!(info.tracks.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(), ["music"]);
 }

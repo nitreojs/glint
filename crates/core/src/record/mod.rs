@@ -4,6 +4,7 @@ pub mod mix;
 pub mod mp4;
 pub mod pipeline;
 pub mod pointer;
+pub mod replay;
 pub mod timeline;
 pub mod tracks;
 
