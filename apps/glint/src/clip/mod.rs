@@ -1018,7 +1018,7 @@ impl eframe::App for ClipApp {
         let full = ui.max_rect();
         ui.painter().rect_filled(full, radius, p.surf);
         let bar = Rect::from_min_size(full.min, vec2(full.width(), BAR_H));
-        match widgets::title_bar(ui, &look, bar, "clip", active, radius) {
+        match widgets::title_bar(ui, &look, bar, "glint", "clip", active, radius) {
             TitleAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             TitleAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             TitleAction::None => {}

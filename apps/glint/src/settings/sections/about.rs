@@ -5,7 +5,7 @@ use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, w};
 
-use crate::settings::{Dialog, SettingsApp};
+use crate::settings::SettingsApp;
 
 const REPO_URL: &str = "https://github.com/nitreojs/glint";
 
@@ -29,7 +29,7 @@ impl SettingsApp {
         });
         row(ui, look, "licences", 0.0, |ui| {
             if widgets::link(ui, look, "open-source licences").clicked() {
-                self.dialog = Some(Dialog::Licences);
+                self.licences = true;
             }
         });
         row(ui, look, "all settings", 5.0, |ui| {

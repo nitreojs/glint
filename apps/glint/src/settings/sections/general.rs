@@ -4,10 +4,11 @@ use eframe::egui::{
 };
 use glint_core::config::color::{hsv_to_rgb, rgb_to_hsv, rgb_to_hsv_near};
 use glint_core::config::{DEFAULT_ACCENT, UiElements, hex, parse_hex};
+use glint_ui::capture::{held_names, key_names};
 use glint_ui::widgets::{self, HotkeyState, Look, hint, row};
 
 use crate::settings::SettingsApp;
-use crate::settings::hotkey_capture::{HotkeyField, held_names, key_names};
+use crate::settings::hotkey_capture::HotkeyField;
 
 pub(in crate::settings) const ACCENTS: [[u8; 3]; 8] = [
     [0xE5, 0x40, 0x2F],
@@ -34,16 +35,17 @@ impl SettingsApp {
     fn hotkey_row(&mut self, ui: &mut Ui, look: &Look, label: &str, field: HotkeyField) {
         let keys = key_names(field.of(&mut self.cfg));
         let held = held_names();
-        let mine = self.listening.is_some() && self.listen_for == field;
-        let state = match (mine, &self.hotkey_error) {
-            (true, Some((keys, _))) => HotkeyState::Error { keys },
-            (true, None) => HotkeyState::Listening { held: &held },
-            _ => HotkeyState::Idle,
+        let mine = self.keys.listening() && self.listen_for == field;
+        let problem = self.keys.error().filter(|_| mine).cloned();
+        let state = match &problem {
+            Some((keys, _)) => HotkeyState::Error { keys },
+            None if mine => HotkeyState::Listening { held: &held },
+            None => HotkeyState::Idle,
         };
         let mut clicked = false;
         row(ui, look, label, 7.0, |ui| {
             clicked = widgets::hotkey_field(ui, look, &keys, state).clicked();
-            let error = self.hotkey_error.as_ref().filter(|_| mine).map(|(_, msg)| msg.clone());
+            let error = problem.as_ref().map(|(_, msg)| msg.clone());
             widgets::reveal_with(ui, Id::unique(("hotkey-error", label)), error, |ui, msg| hint(ui, msg, look.p.warn));
         });
         if clicked {

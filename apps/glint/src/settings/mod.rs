@@ -1,27 +1,14 @@
-//! Settings window, run as `glint.exe --settings`: a separate short-lived process, because
-//! winit allows only one event loop per process and the window can be opened many times.
-//! It edits config.toml and asks the tray app to apply it.
-//!
-//! The window draws its own title bar (see [`glint_ui::window::frameless`]) and follows the
-//! Windows light / dark app setting.
+//! Settings window, run as `glint.exe --settings` (see [`glint_ui::settings`] for the window):
+//! it edits config.toml and asks the tray app to apply it.
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
-
-use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Id, Key, Layout, Margin, Rect, RichText, Stroke, Ui, UiBuilder, pos2, vec2,
-};
+use eframe::egui::{self, Ui};
 use glint_core::config::Config;
 use glint_core::icon::icon_rgba;
 use glint_core::naming::pattern_problem;
 use glint_core::paths::app_dir;
-use glint_ui::theme::{FONT_LICENSE, fonts, visuals};
-use glint_ui::widgets::{
-    self, BAR_H, CONTENT_X, FOOTER_H, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, mono, sans, semibold,
-};
-use glint_ui::window::frameless;
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use windows::Win32::Foundation::HWND;
+use glint_ui::capture::Recorder;
+use glint_ui::settings::{self as frame, Pages};
+use glint_ui::widgets::Look;
 use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 use crate::app::ipc::{self, SETTINGS_TITLE, WM_RELOAD};
@@ -31,29 +18,12 @@ mod hotkey_capture;
 mod sections;
 
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
-use hotkey_capture::{HotkeyField, Listener};
+use hotkey_capture::{HotkeyField, release_tray_hotkeys};
 use sections::audio::SourceRows;
 use sections::output::Mover;
 use sections::updates::Updater;
 use sections::uploads::Uploaders;
 use sections::{SECTIONS, Section};
-
-/// The bright panel's rounding where it meets the darker frame.
-const PANEL_RADIUS: u8 = 8;
-/// How long a newly picked section takes to fade in, and how far it drops from.
-const SECTION_ENTER: f32 = 0.18;
-const SECTION_DROP: f32 = 8.0;
-
-/// Where the settings window's last size is kept, in points: `[width, height]` as JSON.
-fn size_path() -> PathBuf {
-    app_dir().join("settings-window.json")
-}
-
-fn saved_size() -> [f32; 2] {
-    let read = std::fs::read_to_string(size_path()).ok().and_then(|t| serde_json::from_str::<[f32; 2]>(&t).ok());
-    let [w, h] = read.unwrap_or(WINDOW);
-    [w.clamp(WINDOW[0], 8000.0), h.clamp(WINDOW[1], 8000.0)]
-}
 
 pub fn run() {
     if let Some(h) = ipc::find_settings() {
@@ -66,61 +36,9 @@ pub fn run() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(format!("couldn't read the settings, showing defaults: {e}"))),
     };
-    let size = saved_size();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title(SETTINGS_TITLE)
-            .with_inner_size(size)
-            .with_min_inner_size(WINDOW)
-            .with_resizable(true)
-            .with_decorations(false)
-            .with_icon(egui::IconData { rgba: icon_rgba(64, cfg.accent_rgb()), width: 64, height: 64 }),
-        centered: true,
-        ..Default::default()
-    };
-    let app = SettingsApp {
-        saved: cfg.clone(),
-        accent_text: cfg.accent.clone(),
-        cfg,
-        error: load_error,
-        listening: None,
-        listen_for: HotkeyField::Record,
-        hotkey_error: None,
-        section: Section::General,
-        dialog: None,
-        keyboard: false,
-        rounded: false,
-        styled: None,
-        closing: false,
-        uploaders: Uploaders::load(),
-        updater: Updater::load(),
-        audio_devices: None,
-        source_rows: SourceRows::default(),
-        mover: Mover::default(),
-        shown: None,
-        pinned: false,
-        size: (size, size),
-    };
-    let _ = eframe::run_native(
-        SETTINGS_TITLE,
-        options,
-        Box::new(|cc| {
-            fonts(&cc.egui_ctx);
-            let _ = CTX.set(cc.egui_ctx.clone());
-            let mut app = app;
-            if let Ok(RawWindowHandle::Win32(h)) = cc.window_handle().map(|h| h.as_raw()) {
-                app.rounded = frameless(HWND(h.hwnd.get() as _), true);
-            }
-            Ok(Box::new(app))
-        }),
-    );
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Dialog {
-    /// Closing with unsaved changes.
-    SaveChanges,
-    Licences,
+    let icon = icon_rgba(64, cfg.accent_rgb());
+    let app = SettingsApp::new(cfg, load_error, Updater::load());
+    frame::run(SETTINGS_TITLE, app_dir().join("settings-window.json"), icon, app);
 }
 
 struct SettingsApp {
@@ -129,49 +47,90 @@ struct SettingsApp {
     /// What is being edited.
     cfg: Config,
     error: Option<String>,
-    /// The keyboard hook's thread while a new hotkey is being recorded, and for which field.
-    listening: Option<Listener>,
+    /// Records a new hotkey, for `listen_for`.
+    keys: Recorder,
     listen_for: HotkeyField,
-    /// Keys and reason of the last combo that can't be used; listening goes on.
-    hotkey_error: Option<(Vec<String>, String)>,
-    section: Section,
-    dialog: Option<Dialog>,
-    /// The last input was keyboard navigation, so focus rings show.
-    keyboard: bool,
-    /// Windows 11 rounds the window corners.
-    rounded: bool,
-    /// The theme and accent the egui visuals were set up for.
-    styled: Option<(bool, [u8; 3])>,
-    /// Closing was confirmed (or there was nothing to lose): let the close through.
-    closing: bool,
+    /// The licences dialog is open.
+    licences: bool,
     uploaders: Uploaders,
     updater: Updater,
     audio_devices: Option<sections::audio::Devices>,
     source_rows: SourceRows,
     mover: Mover,
-    shown: Option<Section>,
-    pinned: bool,
     /// What's typed in the custom accent field; `cfg.accent` follows it while it's a colour.
     accent_text: String,
-    /// The window's inner size in points when it opened, and now.
-    size: ([f32; 2], [f32; 2]),
 }
 
-static CTX: OnceLock<egui::Context> = OnceLock::new();
-
 fn repaint() {
-    if let Some(ctx) = CTX.get() {
-        ctx.request_repaint();
-    }
+    frame::repaint();
 }
 
 impl SettingsApp {
-    fn changes(&self) -> usize {
-        SECTIONS.iter().map(|s| s.changes(&self.cfg, &self.saved)).sum()
+    fn new(cfg: Config, error: Option<String>, updater: Updater) -> SettingsApp {
+        SettingsApp {
+            saved: cfg.clone(),
+            accent_text: cfg.accent.clone(),
+            cfg,
+            error,
+            keys: Recorder::new(release_tray_hotkeys),
+            listen_for: HotkeyField::Record,
+            licences: false,
+            uploaders: Uploaders::load(),
+            updater,
+            audio_devices: None,
+            source_rows: SourceRows::default(),
+            mover: Mover::default(),
+        }
+    }
+}
+
+impl Pages for SettingsApp {
+    type Page = Section;
+    const APP: &'static str = "glint";
+
+    fn pages(&self) -> &'static [Section] {
+        &SECTIONS
+    }
+
+    fn name(&self, page: Section) -> &'static str {
+        page.name()
+    }
+
+    fn accent(&self) -> [u8; 3] {
+        self.cfg.accent_rgb()
+    }
+
+    fn changes(&self, page: Section) -> usize {
+        page.changes(&self.cfg, &self.saved)
+    }
+
+    fn resettable(&self, page: Section) -> Option<bool> {
+        (page != Section::About).then(|| page.changes(&self.cfg, &Config::default()) > 0)
+    }
+
+    fn reset(&mut self, page: Section) {
+        page.reset(&mut self.cfg);
+    }
+
+    fn show(&mut self, page: Section, ui: &mut Ui, look: &Look) {
+        match page {
+            Section::General => self.general(ui, look),
+            Section::Recording => self.recording(ui, look),
+            Section::Audio => self.audio(ui, look),
+            Section::Screenshots => self.screenshots(ui, look),
+            Section::Uploads => self.uploads(ui, look),
+            Section::Output => self.output(ui, look),
+            Section::Updates => self.updates(ui, look),
+            Section::About => self.about(ui, look),
+        }
+    }
+
+    fn error(&self) -> Option<String> {
+        self.error.clone()
     }
 
     fn can_save(&self) -> bool {
-        self.changes() > 0 && self.listening.is_none() && pattern_problem(&self.cfg.file_name).is_none()
+        !self.keys.listening() && pattern_problem(&self.cfg.file_name).is_none()
     }
 
     /// Writes config.toml and tells the tray app; returns whether it worked.
@@ -199,274 +158,28 @@ impl SettingsApp {
         }
     }
 
-    fn close(&mut self, ctx: &egui::Context) {
-        self.closing = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    fn revert(&mut self) {
+        self.cfg = self.saved.clone();
     }
 
-    /// Closes, or asks first when there are unsaved changes.
-    fn request_close(&mut self, ctx: &egui::Context) {
-        if self.changes() > 0 {
-            self.dialog = Some(Dialog::SaveChanges);
-        } else {
-            self.close(ctx);
-        }
-    }
-
-    fn go(&mut self, section: Section) {
+    fn leave(&mut self) {
         self.stop_listening();
-        self.section = section;
     }
-}
 
-impl Drop for SettingsApp {
-    fn drop(&mut self) {
-        self.stop_listening();
-        let (opened, now) = self.size;
-        if now != opened {
-            let _ = std::fs::write(size_path(), format!("[{}, {}]", now[0].round(), now[1].round()));
-        }
-    }
-}
-
-impl eframe::App for SettingsApp {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn tick(&mut self) {
         self.poll_capture();
-        let ctx = ui.ctx().clone();
-        let light = ctx.system_theme() == Some(egui::Theme::Light);
-        let accent = self.cfg.accent_rgb();
-        let p = widgets::palette(light, accent);
-        if self.styled != Some((light, accent)) {
-            self.styled = Some((light, accent));
-            visuals(&ctx, &p, light);
-        }
-        ctx.input(|i| {
-            if i.pointer.any_pressed() {
-                self.keyboard = false;
-            } else if [Key::Tab, Key::ArrowLeft, Key::ArrowRight, Key::ArrowUp, Key::ArrowDown]
-                .into_iter()
-                .any(|k| i.key_pressed(k))
-            {
-                self.keyboard = true;
-            }
-        });
-        let viewport = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized, i.viewport().minimized));
-        if let (Some(r), Some(false) | None, Some(false) | None) = viewport
-            && r.width() >= WINDOW[0] - 1.0
-            && r.height() >= WINDOW[1] - 1.0
-        {
-            self.size.1 = [r.width(), r.height()];
-        }
-        let look = Look { p, keyboard: self.keyboard };
-        let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
-        let active = widgets::anim(ui, Id::unique("window-active"), focused, 0.15);
-        let radius: u8 = if self.rounded { 8 } else { 0 };
-        let esc = ctx.input(|i| i.key_pressed(Key::Escape));
-        let had_overlay = self.dialog.is_some() || egui::Popup::is_any_open(&ctx);
-
-        // The bar and the sidebar share this fill: one darker L-shaped frame around the panel.
-        let full = ui.max_rect();
-        ui.painter().rect_filled(full, radius, p.side);
-        let bar = Rect::from_min_size(full.min, vec2(full.width(), BAR_H));
-        match widgets::title_bar(ui, &look, bar, "settings", active, radius) {
-            TitleAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-            TitleAction::Close => self.request_close(&ctx),
-            TitleAction::None => {}
-        }
-
-        let side = Rect::from_min_max(pos2(full.left(), bar.bottom()), pos2(full.left() + SIDEBAR_W, full.bottom()));
-        let item = |i: f32| Rect::from_min_size(pos2(side.left() + 8.0, side.top() + 6.0 + i * 34.0), vec2(SIDEBAR_W - 16.0, 32.0));
-        let current = SECTIONS.iter().position(|&s| s == self.section).unwrap_or(0);
-        let pos = widgets::glide(ui, Id::unique("nav-selection"), current as f32, 0.18);
-        ui.painter().rect_filled(item(pos), 5, p.sel);
-        for (i, &s) in SECTIONS.iter().enumerate() {
-            let near = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
-            let dirty = s.changes(&self.cfg, &self.saved) > 0;
-            if widgets::nav_item(ui, &look, item(i as f32), i + 1, s.name(), (i == current, near), dirty).clicked() {
-                self.go(s);
-            }
-        }
-
-        let main = Rect::from_min_max(pos2(side.right(), side.top()), full.right_bottom());
-        // Rounded where it meets the frame; its last corner is the window's own.
-        let corners = CornerRadius { nw: PANEL_RADIUS, ne: PANEL_RADIUS, sw: PANEL_RADIUS, se: radius };
-        ui.painter().rect_filled(main, corners, p.surf);
-        let body = Rect::from_min_max(
-            pos2(main.left() + CONTENT_X, main.top()),
-            pos2(main.right() - CONTENT_X, main.bottom() - FOOTER_H),
-        );
-        if self.shown != Some(self.section) {
-            // a newly picked section drops in; the first one is simply there
-            if self.shown.is_some() {
-                widgets::snap(&ctx, Id::unique("section-enter"), 0.0);
-            }
-            self.shown = Some(self.section);
-            self.pinned = true;
-        }
-        let enter = widgets::glide(ui, Id::unique("section-enter"), 1.0, SECTION_ENTER);
-        let lift = (1.0 - enter) * SECTION_DROP;
-        let mut heading = ui.painter().clone();
-        heading.multiply_opacity(enter);
-        heading.text(pos2(body.left(), body.top() + 18.0 + lift), Align2::LEFT_TOP, self.section.name(), semibold(20.0), p.t1);
-        let rows = Rect::from_min_max(pos2(body.left(), body.top() + 56.0), pos2(main.right() - 10.0, body.bottom()));
-        let gutter = (rows.right() - body.right()) as i8;
-        let mut content = ui.new_child(UiBuilder::new().max_rect(rows).layout(Layout::top_down(Align::Min)));
-        // observed on the user's machine: a fresh window opened scrolled to the bottom with no input
-        let touched = ctx.input(|i| {
-            i.pointer.any_pressed()
-                || i.pointer.delta() != egui::Vec2::ZERO
-                || i.events.iter().any(|e| {
-                    matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::AccessKitActionRequest(_))
-                })
-        });
-        self.pinned &= !touched;
-        let mut scroll = egui::ScrollArea::vertical()
-            .id_salt(self.section.name())
-            .auto_shrink(false)
-            .content_margin(Margin { right: gutter, ..Margin::ZERO });
-        if self.pinned {
-            scroll = scroll.vertical_scroll_offset(0.0);
-        }
-        scroll.show(&mut content, |content| {
-            content.spacing_mut().item_spacing = vec2(8.0, 0.0);
-            content.multiply_opacity(enter);
-            content.add_space(lift);
-            widgets::reveal_with(content, Id::unique("save-error"), self.error.clone(), |ui, e| {
-                hint(ui, e, p.warn);
-                ui.add_space(12.0);
-            });
-            match self.section {
-                Section::General => self.general(content, &look),
-                Section::Recording => self.recording(content, &look),
-                Section::Audio => self.audio(content, &look),
-                Section::Screenshots => self.screenshots(content, &look),
-                Section::Uploads => self.uploads(content, &look),
-                Section::Output => self.output(content, &look),
-                Section::Updates => self.updates(content, &look),
-                Section::About => self.about(content, &look),
-            }
-        });
-        self.footer(ui, &look, Rect::from_min_max(pos2(main.left(), body.bottom()), main.right_bottom()));
-        self.dialogs(&ctx, &look);
-
-        // Alt+F4 and the taskbar's "close window" come through here.
-        if ctx.input(|i| i.viewport().close_requested()) && !self.closing && self.changes() > 0 {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.dialog = Some(Dialog::SaveChanges);
-        }
-        if esc && !had_overlay && self.listening.is_none() {
-            self.request_close(&ctx);
-        }
-    }
-}
-
-impl SettingsApp {
-    fn footer(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
-        let ctx = ui.ctx().clone();
-        ui.painter().hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, look.p.line));
-        let inner = Rect::from_min_max(pos2(rect.left() + 20.0, rect.top() + 1.0), pos2(rect.right() - 14.0, rect.bottom()));
-        let mut ui = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
-        ui.spacing_mut().item_spacing = vec2(8.0, 0.0);
-        if self.section != Section::About {
-            let label = format!("reset {}", self.section.name());
-            let differs = self.section.changes(&self.cfg, &Config::default()) > 0;
-            if widgets::button(&mut ui, look, &label, Kind::Text, 30.0, differs).clicked() {
-                self.stop_listening();
-                self.section.reset(&mut self.cfg);
-            }
-        }
-        let changes = self.changes();
-        let can_save = self.can_save();
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if widgets::button(ui, look, "save", Kind::Primary, 30.0, can_save).clicked() {
-                self.save();
-            }
-            // With changes this discards them; without, there's nothing to lose.
-            let label = if changes > 0 { "cancel" } else { "close" };
-            if widgets::button(ui, look, label, Kind::Secondary, 30.0, true).clicked() {
-                if changes > 0 {
-                    self.stop_listening();
-                    self.cfg = self.saved.clone();
-                } else {
-                    self.close(&ctx);
-                }
-            }
-            // fades out still saying how many there were
-            let count = Id::unique("unsaved-count");
-            if changes > 0 {
-                ui.data_mut(|d| d.insert_temp(count, changes));
-            }
-            let shown = widgets::anim(ui, Id::unique("unsaved-label"), changes > 0, 0.15);
-            if shown > 0.0 {
-                let n = ui.data(|d| d.get_temp::<usize>(count)).unwrap_or(changes);
-                ui.add_space(6.0);
-                let s = if n == 1 { "" } else { "s" };
-                let color = look.p.t3.gamma_multiply(widgets::ease(shown));
-                ui.label(RichText::new(format!("{n} unsaved change{s}")).font(sans(12.0)).color(color));
-            }
-        });
     }
 
-    fn dialogs(&mut self, ctx: &egui::Context, look: &Look) {
-        let Some(dialog) = self.dialog else { return };
-        let p = look.p;
-        let frame = egui::Frame::new()
-            .fill(p.surf)
-            .stroke(Stroke::new(1.0, p.line2))
-            .corner_radius(8)
-            .inner_margin(egui::Margin::same(20))
-            .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(80) });
-        let modal = egui::Modal::new(Id::unique("dialog")).frame(frame).backdrop_color(Color32::from_black_alpha(90));
-        let resp = modal.show(ctx, |ui| {
-            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
-            let title = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).font(semibold(15.0)).color(p.t1));
-            let body = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).font(sans(13.0)).color(p.t2));
-            match dialog {
-                Dialog::SaveChanges => {
-                    ui.set_width(340.0);
-                    title(ui, "save changes?");
-                    let n = self.changes();
-                    body(ui, &format!("you have {n} unsaved change{} in glint's settings.", if n == 1 { "" } else { "s" }));
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        if widgets::button(ui, look, "keep editing", Kind::Text, 30.0, true).clicked() {
-                            self.dialog = None;
-                        }
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            let valid = pattern_problem(&self.cfg.file_name).is_none();
-                            if widgets::button(ui, look, "save", Kind::Primary, 30.0, valid).clicked() && self.save() {
-                                self.close(ctx);
-                            }
-                            if widgets::button(ui, look, "discard", Kind::Secondary, 30.0, true).clicked() {
-                                self.close(ctx);
-                            }
-                        });
-                    });
-                }
-                Dialog::Licences => {
-                    ui.set_width(460.0);
-                    title(ui, "open-source licences");
-                    body(ui, "ibm plex sans and ibm plex mono, © 2017 ibm corp., under the sil open font license 1.1:");
-                    egui::ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                        ui.label(RichText::new(FONT_LICENSE).font(mono(11.0)).color(p.t3));
-                    });
-                    body(
-                        ui,
-                        "rust crates (egui, eframe, winit, windows-rs, serde, toml, gif, color_quant, minisign-verify and their dependencies), \
-                         by their authors, under permissive licences, mostly mit or apache-2.0.",
-                    );
-                    ui.add_space(4.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if widgets::button(ui, look, "close", Kind::Secondary, 30.0, true).clicked() {
-                            self.dialog = None;
-                        }
-                    });
-                }
-            }
-        });
-        if resp.should_close() && self.dialog == Some(dialog) {
-            self.dialog = None;
+    fn busy(&self) -> bool {
+        self.keys.listening()
+    }
+
+    fn overlays(&mut self, ctx: &egui::Context, look: &Look) -> bool {
+        const CRATES: &str = "egui, eframe, winit, windows-rs, serde, toml, gif, color_quant, minisign-verify";
+        if self.licences {
+            self.licences = frame::licences(ctx, look, CRATES);
         }
+        self.licences
     }
 }
 
@@ -474,12 +187,16 @@ impl SettingsApp {
 mod tests {
     use super::*;
     use eframe::App;
+    use eframe::egui::{Color32, Key, Rect, pos2, vec2};
+    use glint_ui::settings::Frame;
+    use glint_ui::theme::fonts;
+    use glint_ui::widgets::{self, CONTENT_X, WINDOW};
 
     const TOP: f32 = 118.0;
 
     struct Harness {
         ctx: egui::Context,
-        app: SettingsApp,
+        app: Frame<SettingsApp>,
         frame: eframe::Frame,
         time: f64,
         screen: egui::Vec2,
@@ -490,30 +207,8 @@ mod tests {
         fn new() -> Harness {
             let ctx = egui::Context::default();
             fonts(&ctx);
-            let cfg = Config::default();
-            let app = SettingsApp {
-                saved: cfg.clone(),
-                cfg,
-                error: None,
-                listening: None,
-                listen_for: HotkeyField::Record,
-                hotkey_error: None,
-                section: Section::General,
-                dialog: None,
-                keyboard: false,
-                rounded: false,
-                styled: None,
-                closing: false,
-                uploaders: Uploaders::load(),
-                updater: Updater::at(std::env::temp_dir().join("glint-tests-no-update-status.json")),
-                audio_devices: None,
-                source_rows: SourceRows::default(),
-                mover: Mover::default(),
-                shown: None,
-                pinned: false,
-                accent_text: String::new(),
-                size: (WINDOW, WINDOW),
-            };
+            let updater = Updater::at(std::env::temp_dir().join("glint-tests-no-update-status.json"));
+            let app = Frame::new(SettingsApp::new(Config::default(), None, updater), (WINDOW, WINDOW));
             let screen = vec2(WINDOW[0], WINDOW[1]);
             Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0, screen, tree: Vec::new() }
         }
@@ -607,8 +302,8 @@ mod tests {
         for width in [WINDOW[0], 760.0, 1200.0] {
             let mut h = Harness::new();
             h.screen = vec2(width, WINDOW[1]);
-            h.app.cfg.upload_destination = "litterbox".into();
-            h.app.cfg.audio_sources =
+            h.app.pages.cfg.upload_destination = "litterbox".into();
+            h.app.pages.cfg.audio_sources =
                 [SourceKind::Desktop, SourceKind::App, SourceKind::Mic].iter().enumerate().map(|(i, &k)| AudioSource::new(k, i)).collect();
             for section in SECTIONS {
                 h.app.go(section);
@@ -656,16 +351,16 @@ mod tests {
 
         let square = Rect::from_min_size(popup.min + vec2(13.0, 13.0), vec2(232.0, 148.0));
         h.click(square.lerp_inside(vec2(0.75, 0.25)));
-        let [hue, s, v] = rgb_to_hsv(h.app.cfg.accent_rgb());
+        let [hue, s, v] = rgb_to_hsv(h.app.pages.cfg.accent_rgb());
         let red = rgb_to_hsv(ACCENTS[0])[0];
         assert!((s - 0.75).abs() < 0.02 && (v - 0.75).abs() < 0.02 && (hue - red).abs() < 0.01, "{hue} {s} {v}");
-        assert_eq!(h.app.cfg.accent_custom.as_deref(), Some(h.app.cfg.accent.as_str()));
+        assert_eq!(h.app.pages.cfg.accent_custom.as_deref(), Some(h.app.pages.cfg.accent.as_str()));
 
         let strip = square.bottom() + 10.0 + 6.0;
         h.drag(pos2(square.left() + 10.0, strip), pos2(square.center().x, strip));
-        let picked = h.app.cfg.accent_rgb();
+        let picked = h.app.pages.cfg.accent_rgb();
         assert!((rgb_to_hsv(picked)[0] - 0.5).abs() < 0.01, "{picked:?}");
-        assert_eq!(h.app.styled.map(|s| s.1), Some(picked));
+        assert_eq!(h.app.styled_accent(), Some(picked));
 
         let esc = egui::Event::Key {
             key: Key::Escape,
@@ -677,17 +372,17 @@ mod tests {
         h.frame(vec![esc], "");
         h.settle();
         assert!(!egui::Popup::is_id_open(&h.ctx, accent_popup_id()));
-        assert!(h.app.dialog.is_none() && !h.app.closing);
-        assert_eq!(h.app.cfg.accent_rgb(), picked);
+        assert!(!h.app.asking() && !h.app.closing());
+        assert_eq!(h.app.pages.cfg.accent_rgb(), picked);
 
         h.click(pos2(swatches.left() + 12.0, swatches.top() + 12.0));
-        assert_eq!((h.app.cfg.accent_rgb(), h.app.cfg.accent_custom_rgb()), (ACCENTS[0], Some(picked)));
+        assert_eq!((h.app.pages.cfg.accent_rgb(), h.app.pages.cfg.accent_custom_rgb()), (ACCENTS[0], Some(picked)));
         h.click(custom);
-        assert_eq!(h.app.cfg.accent_rgb(), picked);
+        assert_eq!(h.app.pages.cfg.accent_rgb(), picked);
         assert!(egui::Popup::is_id_open(&h.ctx, accent_popup_id()));
         h.click(pos2(600.0, 70.0));
         assert!(!egui::Popup::is_id_open(&h.ctx, accent_popup_id()));
-        assert_eq!(h.app.cfg.accent_rgb(), picked);
+        assert_eq!(h.app.pages.cfg.accent_rgb(), picked);
     }
 
     #[test]
@@ -696,7 +391,7 @@ mod tests {
         use sections::general::ACCENTS;
         let mut h = Harness::new();
         h.ctx.enable_accesskit();
-        h.app.cfg.upload_destination = "litterbox".into();
+        h.app.pages.cfg.upload_destination = "litterbox".into();
         let named = |tree: &[(egui::accesskit::NodeId, Node)], role: Role, name: &str| {
             tree.iter().filter(|(_, n)| n.role() == role && n.label() == Some(name)).map(|(_, n)| n.clone()).collect::<Vec<_>>()
         };
@@ -752,7 +447,7 @@ mod tests {
             }
             if section == Section::Recording {
                 let quality = named(&tree, Role::Slider, "quality");
-                assert!(quality.len() == 1 && quality[0].numeric_value() == Some(h.app.cfg.quality as f64), "{quality:?}");
+                assert!(quality.len() == 1 && quality[0].numeric_value() == Some(h.app.pages.cfg.quality as f64), "{quality:?}");
             }
         }
         eprintln!("{}", counts.join("\n"));
@@ -770,10 +465,10 @@ mod tests {
         let (old, now) = (root.join("old"), root.join("now"));
         std::fs::create_dir_all(old.join("Telegram")).unwrap();
         std::fs::write(old.join("Telegram").join("a.png"), b"x").unwrap();
-        h.app.saved.output_dir = now.display().to_string();
-        h.app.cfg.output_dir = h.app.saved.output_dir.clone();
-        h.app.mover.scanned = Some(now.clone());
-        h.app.mover.leftovers = vec![Leftover { from: old.clone(), files: vec![old.join("Telegram").join("a.png")] }];
+        h.app.pages.saved.output_dir = now.display().to_string();
+        h.app.pages.cfg.output_dir = h.app.pages.saved.output_dir.clone();
+        h.app.pages.mover.scanned = Some(now.clone());
+        h.app.pages.mover.leftovers = vec![Leftover { from: old.clone(), files: vec![old.join("Telegram").join("a.png")] }];
         h.app.go(Section::Output);
         h.settle();
 
@@ -782,15 +477,15 @@ mod tests {
             h.click(pos2(c.left() + 18.0, c.top() + 10.0));
         };
         toggle(&mut h, "name files after the window");
-        assert_eq!(h.app.cfg.file_name, "{app}_{date}_{time}");
+        assert_eq!(h.app.pages.cfg.file_name, "{app}_{date}_{time}");
         toggle(&mut h, "sort into folders by app");
-        assert_eq!(h.app.cfg.file_name, "{app}/{app}_{date}_{time}");
+        assert_eq!(h.app.pages.cfg.file_name, "{app}/{app}_{date}_{time}");
         toggle(&mut h, "name files after the window");
-        assert_eq!(h.app.cfg.file_name, "{app}/glint_{date}_{time}");
-        assert_eq!(Section::Output.changes(&h.app.cfg, &h.app.saved), 1);
-        Section::Output.reset(&mut h.app.cfg);
-        assert_eq!((h.app.cfg.file_name.as_str(), h.app.cfg.output_dir.as_str()), ("glint_{date}_{time}", ""));
-        h.app.cfg.output_dir = h.app.saved.output_dir.clone();
+        assert_eq!(h.app.pages.cfg.file_name, "{app}/glint_{date}_{time}");
+        assert_eq!(Section::Output.changes(&h.app.pages.cfg, &h.app.pages.saved), 1);
+        Section::Output.reset(&mut h.app.pages.cfg);
+        assert_eq!((h.app.pages.cfg.file_name.as_str(), h.app.pages.cfg.output_dir.as_str()), ("glint_{date}_{time}", ""));
+        h.app.pages.cfg.output_dir = h.app.pages.saved.output_dir.clone();
 
         let shows = |tree: &[(egui::accesskit::NodeId, egui::accesskit::Node)], text: &str| {
             tree.iter().any(|(_, n)| n.role() == Role::Label && (n.value() == Some(text) || n.label() == Some(text)))
@@ -806,7 +501,7 @@ mod tests {
             .expect("the move button");
         h.click(pos2(((button.x0 + button.x1) / 2.0) as f32, ((button.y0 + button.y1) / 2.0) as f32));
         for _ in 0..200 {
-            if !h.app.mover.leftovers.iter().any(|l| l.from == old) {
+            if !h.app.pages.mover.leftovers.iter().any(|l| l.from == old) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -832,7 +527,7 @@ mod tests {
         h.ctx.enable_accesskit();
         h.app.go(Section::Updates);
         let ready = State::Ready { version: "0.2.0".into() };
-        h.app.updater.status = Status { checked: Some("2026-10-21 14:32".into()), state: ready };
+        h.app.pages.updater.status = Status { checked: Some("2026-10-21 14:32".into()), state: ready };
         h.settle();
         let tree = std::mem::take(&mut h.tree);
         assert!(find(&tree, Role::Label, concat!("v", env!("CARGO_PKG_VERSION"))).is_some());
@@ -855,19 +550,19 @@ mod tests {
 
         let picker = h.control("updates");
         h.click(pos2(picker.left() + 150.0, picker.top() + 16.0));
-        assert_eq!(h.app.cfg.update_mode, UpdateMode::Notify);
-        assert_eq!(Section::Updates.changes(&h.app.cfg, &h.app.saved), 1);
-        Section::Updates.reset(&mut h.app.cfg);
-        assert_eq!(h.app.cfg, h.app.saved);
+        assert_eq!(h.app.pages.cfg.update_mode, UpdateMode::Notify);
+        assert_eq!(Section::Updates.changes(&h.app.pages.cfg, &h.app.pages.saved), 1);
+        Section::Updates.reset(&mut h.app.pages.cfg);
+        assert_eq!(h.app.pages.cfg, h.app.pages.saved);
 
-        h.app.updater.status.state = State::Failed { error: "github answered 500 for the release list".into() };
+        h.app.pages.updater.status.state = State::Failed { error: "github answered 500 for the release list".into() };
         h.settle();
         let tree = std::mem::take(&mut h.tree);
         assert!(find(&tree, Role::Label, "github answered 500 for the release list").is_some());
         assert!(find(&tree, Role::Link, "restart").is_none());
         assert!(find(&tree, Role::Link, "github.com/nitreojs/glint/releases ↗").is_some());
 
-        h.app.updater.status = Status { checked: None, state: State::Checking };
+        h.app.pages.updater.status = Status { checked: None, state: State::Checking };
         h.settle();
         let tree = std::mem::take(&mut h.tree);
         assert!(find(&tree, Role::Button, "check now").expect("check now").is_disabled());
@@ -899,7 +594,7 @@ mod tests {
 
         let c = h.control("click highlights");
         h.click(pos2(c.left() + 18.0, c.top() + 10.0));
-        assert!(h.app.cfg.click_highlights);
+        assert!(h.app.pages.cfg.click_highlights);
         h.settle();
         let tree = std::mem::take(&mut h.tree);
         let toggle = find(&tree, Role::CheckBox, "click highlights").expect("the toggle");
@@ -916,11 +611,11 @@ mod tests {
 
         let picker = h.control("clicks");
         h.click(pos2(picker.left() + 126.0, picker.top() + 16.0));
-        assert_eq!(h.app.cfg.clicks, ClickMode::BurnIn);
+        assert_eq!(h.app.pages.cfg.clicks, ClickMode::BurnIn);
 
         let keys = h.control("keystrokes");
         h.click(pos2(keys.left() + 167.0, keys.top() + 16.0));
-        assert_eq!(h.app.cfg.keystrokes, Keystrokes::All);
+        assert_eq!(h.app.pages.cfg.keystrokes, Keystrokes::All);
         h.settle();
         let tree = std::mem::take(&mut h.tree);
         let levels = find(&tree, Role::RadioGroup, "keystrokes").expect("the level picker");
@@ -952,16 +647,16 @@ mod tests {
 
         let keys = h.control("keystrokes");
         h.click(pos2(keys.left() + 100.0, keys.top() + 16.0));
-        assert_eq!(h.app.cfg.keystrokes, Keystrokes::Shortcuts);
+        assert_eq!(h.app.pages.cfg.keystrokes, Keystrokes::Shortcuts);
         let place = h.control("keystroke position");
         h.click(pos2(place.left() + 33.0, place.top() + 16.0));
-        assert_eq!(h.app.cfg.keystroke_position, Position::Left);
+        assert_eq!(h.app.pages.cfg.keystroke_position, Position::Left);
         let mode = h.control("keystrokes mode");
         h.click(pos2(mode.left() + 126.0, mode.top() + 16.0));
-        assert_eq!(h.app.cfg.keystrokes_mode, ClickMode::BurnIn);
-        assert_eq!(Section::Recording.changes(&h.app.cfg, &h.app.saved), 5);
-        Section::Recording.reset(&mut h.app.cfg);
-        assert_eq!(h.app.cfg, h.app.saved);
+        assert_eq!(h.app.pages.cfg.keystrokes_mode, ClickMode::BurnIn);
+        assert_eq!(Section::Recording.changes(&h.app.pages.cfg, &h.app.pages.saved), 5);
+        Section::Recording.reset(&mut h.app.pages.cfg);
+        assert_eq!(h.app.pages.cfg, h.app.pages.saved);
     }
 }
 
