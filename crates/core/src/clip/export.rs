@@ -28,6 +28,10 @@ const MIN_BPS: f64 = 150_000.0;
 const MIN_GIF: u32 = 64;
 /// hevc keeps the look of h.264 at about this share of its bitrate.
 const HEVC_SHARE: f64 = 0.7;
+/// The most an automatic h.264 bitrate spends on 1080p60. Fast game footage already looks clean
+/// there at ~12 Mbps, so carrying a near-lossless recording's rate any higher only grows the file.
+/// Other sizes and frame rates scale like [`bitrate_scaled`].
+const CEILING_BPS: f64 = 19_000_000.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -288,17 +292,29 @@ pub(super) fn bitrate_for(target_bytes: u64, len: i64, audio_bytes: u64) -> u32 
     (budget * 8.0 / secs).max(MIN_BPS) as u32
 }
 
-/// The source's bitrate carried over to the output's pixels, frame rate and codec.
+/// `bps` for `pixels` times as many pixels at `rate` times the frame rate: smaller frames and
+/// fewer of them need more bits each.
+fn bitrate_scaled(bps: f64, pixels: f64, rate: f64) -> f64 {
+    bps * pixels.powf(0.85) * rate.powf(0.6)
+}
+
+/// The source's bitrate carried over to the output's pixels, frame rate and codec, never above
+/// [`CEILING_BPS`].
 fn default_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> u32 {
     let size = src.info.size;
-    let pixels = (out.0 as f64 * out.1 as f64) / (size.0.max(1) as f64 * size.1.max(1) as f64);
+    let out_pixels = out.0 as f64 * out.1 as f64;
+    let pixels = out_pixels / (size.0.max(1) as f64 * size.1.max(1) as f64);
     let rate = fps.map_or(1.0, |f| f as f64 / src.info.fps.max(1.0));
     let share = match (src.info.codec.unwrap_or(Codec::H264), codec) {
         (Codec::H264, Codec::Hevc) => HEVC_SHARE,
         (Codec::Hevc, Codec::H264) => 1.0 / HEVC_SHARE,
         _ => 1.0,
     };
-    (src.video_bps() * pixels.min(1.0).powf(0.85) * rate.min(1.0).powf(0.6) * share).clamp(300_000.0, 400e6).round() as u32
+    let carried = bitrate_scaled(src.video_bps(), pixels.min(1.0), rate.min(1.0)) * share;
+    let out_fps = fps.map_or(src.info.fps, f64::from).max(1.0);
+    let codec_share = if codec == Codec::Hevc { HEVC_SHARE } else { 1.0 };
+    let ceiling = bitrate_scaled(CEILING_BPS, out_pixels / (1920.0 * 1080.0), out_fps / 60.0) * codec_share;
+    carried.min(ceiling).clamp(300_000.0, 400e6).round() as u32
 }
 
 fn muxed(payload: u64) -> u64 {
@@ -623,6 +639,30 @@ mod tests {
         assert_eq!(frame_rates(59.94), [30, 24]);
         assert_eq!(frame_rates(144.0), [60, 30, 24]);
         assert!(frame_rates(24.0).is_empty());
+    }
+
+    #[test]
+    fn near_lossless_sources_export_at_a_sane_bitrate() {
+        // a 144 fps game recording at qp 16: ~69 Mbps, ~104 fps on average
+        let mut info = info(1);
+        (info.size, info.fps, info.codec) = ((1842, 1006), 104.0, Some(Codec::H264));
+        let frame = 69_000_000 / 8 / 104;
+        let video = Samples::new((0..2080).map(|i| (i * S / 104, frame, i % 288 == 0)).collect());
+        let idx = Index { video, audio: index(1).audio };
+        let source = src(&info, Some(&idx));
+        let e = edit(1);
+        let bitrate = |choice| {
+            let Job::Video(v) = plan(&e, &Settings { fps: Some(60), codec: choice, ..Settings::default() }, &source) else {
+                panic!()
+            };
+            let Video::Encode { bitrate, .. } = v.video else { panic!() };
+            bitrate
+        };
+        // carrying the source over would keep ~50 Mbps: 33 MB for 5 seconds
+        let h264 = bitrate(CodecChoice::H264);
+        assert!((12_000_000..19_000_000).contains(&h264), "{h264}");
+        let hevc = bitrate(CodecChoice::Hevc);
+        assert!((hevc as f64 - h264 as f64 * HEVC_SHARE).abs() <= 1.0, "{hevc} vs {h264}");
     }
 
     #[test]
