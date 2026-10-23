@@ -260,6 +260,18 @@ fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR
             c.circle((x, y), 7.5 * s, ink);
             fonts.draw_centred(c, "1", 10.0 * s, (x, y), BAR_BG);
         }
+        Item::Tool(Tool::Cursor) => {
+            let tip = [p(-4.5, -7.0), p(-4.5, 5.5), p(-1.5, 2.5), p(1.0, 7.5), p(3.0, 6.5), p(0.5, 1.5), p(4.5, 1.5)];
+            c.polygon(&tip, ink);
+        }
+        Item::Tool(Tool::Grab) => {
+            // a dashed source box, and the piece it became
+            for (a, b) in [((-7.0, -7.0), (-3.0, -7.0)), ((-7.0, -7.0), (-7.0, -3.0)), ((1.0, -7.0), (3.0, -7.0))] {
+                c.polyline(&[p(a.0, a.1), p(b.0, b.1)], 1.4 * s, ink);
+            }
+            c.polyline(&[p(-7.0, 1.0), p(-7.0, 3.0)], 1.4 * s, ink);
+            c.round_rect(x - 2.0 * s, y - 2.0 * s, 9.0 * s, 9.0 * s, 1.5 * s, ink);
+        }
         Item::Color(i) => {
             c.circle((x, y), 6.0 * s, COLORS[i]);
             if i == color {

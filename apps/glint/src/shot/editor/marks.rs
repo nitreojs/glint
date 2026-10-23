@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use glint_core::geom::rect::Rect;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
 use super::text::Typesetter;
-use crate::platform::gfx::{Canvas, rgba};
+use crate::platform::cursor::CursorImage;
+use crate::platform::gfx::{Canvas, Dib, rgba};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tool {
@@ -15,19 +18,23 @@ pub(super) enum Tool {
     Eraser,
     Text,
     Step,
+    Cursor,
+    Grab,
 }
 
 /// Tools in toolbar order with their tooltip, letter key and digit key.
-pub(super) const TOOLS: [(Tool, &str, u8, u32); 9] = [
-    (Tool::Pen, "pen  ·  1 / P", b'P', 1),
-    (Tool::Highlighter, "highlighter  ·  2 / H", b'H', 2),
-    (Tool::Arrow, "arrow  ·  3 / A", b'A', 3),
-    (Tool::Rectangle, "rectangle  ·  4 / R", b'R', 4),
-    (Tool::Blur, "blur  ·  5 / B", b'B', 5),
-    (Tool::Pixelate, "pixelate  ·  6 / X", b'X', 6),
-    (Tool::Eraser, "smart eraser  ·  9 / E", b'E', 9),
-    (Tool::Text, "text  ·  7 / T", b'T', 7),
-    (Tool::Step, "step  ·  8 / N", b'N', 8),
+pub(super) const TOOLS: [(Tool, &str, u8, Option<u32>); 11] = [
+    (Tool::Pen, "pen  ·  1 / P", b'P', Some(1)),
+    (Tool::Highlighter, "highlighter  ·  2 / H", b'H', Some(2)),
+    (Tool::Arrow, "arrow  ·  3 / A", b'A', Some(3)),
+    (Tool::Rectangle, "rectangle  ·  4 / R", b'R', Some(4)),
+    (Tool::Blur, "blur  ·  5 / B", b'B', Some(5)),
+    (Tool::Pixelate, "pixelate  ·  6 / X", b'X', Some(6)),
+    (Tool::Eraser, "smart eraser  ·  9 / E", b'E', Some(9)),
+    (Tool::Text, "text  ·  7 / T", b'T', Some(7)),
+    (Tool::Step, "step  ·  8 / N", b'N', Some(8)),
+    (Tool::Cursor, "cursor  ·  0 / M", b'M', Some(0)),
+    (Tool::Grab, "grab a piece of the screen  ·  G", b'G', None),
 ];
 
 #[derive(Clone, Copy)]
@@ -48,13 +55,14 @@ impl Tool {
             Tool::Pixelate => ([6.0, 12.0, 20.0], 2.0, 2.0, 80.0, "block size"),
             Tool::Text => ([16.0, 24.0, 36.0], 2.0, 8.0, 160.0, "size"),
             Tool::Step => ([20.0, 28.0, 40.0], 2.0, 12.0, 120.0, "size"),
-            Tool::Eraser => return None,
+            Tool::Cursor => ([75.0, 100.0, 150.0], 25.0, 50.0, 400.0, "size %"),
+            Tool::Eraser | Tool::Grab => return None,
         };
         Some(Strength { presets, step, min, max, name })
     }
 
     pub(super) fn picks_rects(self) -> bool {
-        matches!(self, Tool::Rectangle | Tool::Blur | Tool::Pixelate | Tool::Eraser)
+        matches!(self, Tool::Rectangle | Tool::Blur | Tool::Pixelate | Tool::Eraser | Tool::Grab)
     }
 }
 
@@ -71,6 +79,28 @@ const STEP_INK: D2D1_COLOR_F = rgba(20, 20, 24, 1.0);
 const HIGHLIGHTER_ALPHA: f32 = 0.4;
 pub(super) const MIN_SIDE: i32 = 3;
 
+/// A cursor picture shared by its marks and their undo copies; equal only to itself.
+#[derive(Clone, Debug, Default)]
+pub(super) struct Sprite(pub(super) Arc<CursorImage>);
+
+impl PartialEq for Sprite {
+    fn eq(&self, other: &Sprite) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Where a cursor with its hotspot at `at`, drawn at `size` percent, lands: `[x, y, w, h]`.
+fn cursor_box(at: (f32, f32), sprite: &Sprite, size: f32) -> [f32; 4] {
+    let (img, k) = (&sprite.0, size / 100.0);
+    [at.0 - img.hot.0 as f32 * k, at.1 - img.hot.1 as f32 * k, img.w as f32 * k, img.h as f32 * k]
+}
+
+/// `r` resized from a corner (`e`) with its height following its width at `aspect` (w / h).
+fn keep_aspect(r: Rect, e: Edges, aspect: f32) -> Rect {
+    let h = ((r.w as f32 / aspect).round() as i32).max(MIN_SIDE);
+    Rect { y: if e.t { r.bottom() - h } else { r.y }, h, ..r }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Mark {
     Stroke { highlight: bool, points: Vec<(f32, f32)>, color: usize, width: f32 },
@@ -83,6 +113,10 @@ pub(super) enum Mark {
     Text { at: (f32, f32), text: String, color: usize, size: f32, extent: (f32, f32) },
     /// A numbered disc of diameter `size` (radius `r` in physical pixels), with an arrow to `tail`.
     Step { at: (f32, f32), tail: Option<(f32, f32)>, color: usize, size: f32, r: f32 },
+    /// A cursor picture with its hotspot at `at`, drawn at `size` percent.
+    Cursor { at: (f32, f32), sprite: Sprite, size: f32 },
+    /// The frozen screen's `src` (client coordinates) shown at `rect`.
+    Grab { src: Rect, rect: Rect },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +140,9 @@ impl Mark {
             Tool::Eraser => Mark::Eraser { rect, fill: 0 },
             Tool::Text => Mark::Text { at, text: String::new(), color, size: strength, extent: (0.0, 0.0) },
             Tool::Step => Mark::Step { at, tail: None, color, size: strength, r: 0.0 },
+            // the caller hands it its picture
+            Tool::Cursor => Mark::Cursor { at, sprite: Sprite::default(), size: strength },
+            Tool::Grab => Mark::Grab { src: rect, rect },
         }
     }
 
@@ -120,6 +157,8 @@ impl Mark {
             Mark::Eraser { .. } => Tool::Eraser,
             Mark::Text { .. } => Tool::Text,
             Mark::Step { .. } => Tool::Step,
+            Mark::Cursor { .. } => Tool::Cursor,
+            Mark::Grab { .. } => Tool::Grab,
         }
     }
 
@@ -132,8 +171,8 @@ impl Mark {
             Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => Some(*width),
             Mark::Blur { radius, .. } => Some(*radius),
             Mark::Pixelate { block, .. } => Some(*block),
-            Mark::Text { size, .. } | Mark::Step { size, .. } => Some(*size),
-            Mark::Eraser { .. } => None,
+            Mark::Text { size, .. } | Mark::Step { size, .. } | Mark::Cursor { size, .. } => Some(*size),
+            Mark::Eraser { .. } | Mark::Grab { .. } => None,
         }
     }
 
@@ -142,8 +181,8 @@ impl Mark {
             Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => Some(width),
             Mark::Blur { radius, .. } => Some(radius),
             Mark::Pixelate { block, .. } => Some(block),
-            Mark::Text { size, .. } | Mark::Step { size, .. } => Some(size),
-            Mark::Eraser { .. } => None,
+            Mark::Text { size, .. } | Mark::Step { size, .. } | Mark::Cursor { size, .. } => Some(size),
+            Mark::Eraser { .. } | Mark::Grab { .. } => None,
         }
     }
 
@@ -154,7 +193,9 @@ impl Mark {
             | Mark::Rectangle { color, .. }
             | Mark::Text { color, .. }
             | Mark::Step { color, .. } => Some(*color),
-            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } => None,
+            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } | Mark::Cursor { .. } | Mark::Grab { .. } => {
+                None
+            }
         }
     }
 
@@ -165,7 +206,9 @@ impl Mark {
             | Mark::Rectangle { color, .. }
             | Mark::Text { color, .. }
             | Mark::Step { color, .. } => Some(color),
-            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } => None,
+            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } | Mark::Cursor { .. } | Mark::Grab { .. } => {
+                None
+            }
         }
     }
 
@@ -174,21 +217,23 @@ impl Mark {
             Mark::Rectangle { rect, .. }
             | Mark::Blur { rect, .. }
             | Mark::Pixelate { rect, .. }
-            | Mark::Eraser { rect, .. } => Some(rect),
-            Mark::Stroke { .. } | Mark::Arrow { .. } | Mark::Text { .. } | Mark::Step { .. } => None,
+            | Mark::Eraser { rect, .. }
+            | Mark::Grab { rect, .. } => Some(rect),
+            Mark::Stroke { .. } | Mark::Arrow { .. } | Mark::Text { .. } | Mark::Step { .. } | Mark::Cursor { .. } => None,
         }
     }
 
     /// Whether the mark is big enough to keep (a click without a drag isn't an arrow).
     pub(super) fn worth_keeping(&self) -> bool {
         match self {
-            Mark::Stroke { .. } | Mark::Step { .. } => true,
+            Mark::Stroke { .. } | Mark::Step { .. } | Mark::Cursor { .. } => true,
             Mark::Text { text, .. } => !text.trim().is_empty(),
             Mark::Arrow { from, to, .. } => (from.0 - to.0).abs() >= 3.0 || (from.1 - to.1).abs() >= 3.0,
             Mark::Rectangle { rect, .. }
             | Mark::Blur { rect, .. }
             | Mark::Pixelate { rect, .. }
             | Mark::Eraser { rect, .. } => rect.w >= MIN_SIDE && rect.h >= MIN_SIDE,
+            Mark::Grab { src, .. } => src.w >= MIN_SIDE && src.h >= MIN_SIDE,
         }
     }
 
@@ -199,11 +244,16 @@ impl Mark {
             Mark::Rectangle { rect, .. }
             | Mark::Blur { rect, .. }
             | Mark::Pixelate { rect, .. }
-            | Mark::Eraser { rect, .. } => *rect,
+            | Mark::Eraser { rect, .. }
+            | Mark::Grab { rect, .. } => *rect,
             Mark::Text { at, extent, .. } => span(&[*at, (at.0 + extent.0.max(1.0), at.1 + extent.1)]),
             Mark::Step { at, tail, r, .. } => {
                 let corners = [(at.0 - r, at.1 - r), (at.0 + r, at.1 + r)];
                 span(&[&corners[..], tail.as_slice()].concat())
+            }
+            Mark::Cursor { at, sprite, size } => {
+                let [x, y, w, h] = cursor_box(*at, sprite, *size);
+                Rect::from_points(x.floor() as i32, y.floor() as i32, (x + w).ceil() as i32, (y + h).ceil() as i32)
             }
         }
     }
@@ -218,7 +268,12 @@ impl Mark {
             }
             Mark::Text { size, .. } => outline(size * scale),
             Mark::Step { tail: Some(_), r, .. } => arrow_head(tail_width(*r), f32::MAX) * 0.55,
-            Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::Eraser { .. } | Mark::Step { .. } => 0.0,
+            Mark::Blur { .. }
+            | Mark::Pixelate { .. }
+            | Mark::Eraser { .. }
+            | Mark::Step { .. }
+            | Mark::Cursor { .. }
+            | Mark::Grab { .. } => 0.0,
         };
         self.bbox().inflate(reach.ceil() as i32 + 1)
     }
@@ -235,8 +290,9 @@ impl Mark {
             Mark::Rectangle { rect, .. }
             | Mark::Blur { rect, .. }
             | Mark::Pixelate { rect, .. }
-            | Mark::Eraser { rect, .. } => *rect = rect.offset(dx, dy),
-            Mark::Text { at, .. } => shift(at),
+            | Mark::Eraser { rect, .. }
+            | Mark::Grab { rect, .. } => *rect = rect.offset(dx, dy),
+            Mark::Text { at, .. } | Mark::Cursor { at, .. } => shift(at),
             Mark::Step { at, tail, .. } => {
                 shift(at);
                 tail.iter_mut().for_each(shift);
@@ -257,6 +313,11 @@ impl Mark {
             (Mark::Arrow { from, .. }, Grip::From) => shift(from),
             (Mark::Arrow { to, .. }, Grip::To) => shift(to),
             (Mark::Step { tail: Some(t), .. }, Grip::To) => shift(t),
+            // a grab keeps its proportions from the corners
+            (Mark::Grab { src, rect }, Grip::Edge(e)) if (e.l || e.r) && (e.t || e.b) => {
+                let aspect = src.w.max(1) as f32 / src.h.max(1) as f32;
+                *rect = keep_aspect(resize(*rect, e, (dx, dy), b, MIN_SIDE), e, aspect);
+            }
             (m, Grip::Edge(edges)) => {
                 if let Some(r) = m.area_mut() {
                     *r = resize(*r, edges, (dx, dy), b, MIN_SIDE);
@@ -282,8 +343,10 @@ impl Mark {
                 let reach = width * scale / 2.0 + slop;
                 within(*rect, p, reach) && !within(*rect, p, -reach)
             }
-            Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } | Mark::Eraser { rect, .. } => within(*rect, p, 0.0),
-            Mark::Text { .. } => within(self.bbox(), p, slop),
+            Mark::Blur { rect, .. } | Mark::Pixelate { rect, .. } | Mark::Eraser { rect, .. } | Mark::Grab { rect, .. } => {
+                within(*rect, p, 0.0)
+            }
+            Mark::Text { .. } | Mark::Cursor { .. } => within(self.bbox(), p, slop),
             Mark::Step { at, tail, r, .. } => {
                 dist(p, *at) <= r + slop || tail.is_some_and(|t| seg_dist(p, *at, t) <= tail_width(*r) / 2.0 + slop)
             }
@@ -292,13 +355,14 @@ impl Mark {
 
     pub(super) fn grips(&self) -> Vec<(Grip, (f32, f32))> {
         match self {
-            Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { tail: None, .. } => Vec::new(),
+            Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { tail: None, .. } | Mark::Cursor { .. } => Vec::new(),
             Mark::Step { tail: Some(t), .. } => vec![(Grip::To, *t)],
             Mark::Arrow { from, to, .. } => vec![(Grip::From, *from), (Grip::To, *to)],
             Mark::Rectangle { rect, .. }
             | Mark::Blur { rect, .. }
             | Mark::Pixelate { rect, .. }
-            | Mark::Eraser { rect, .. } => {
+            | Mark::Eraser { rect, .. }
+            | Mark::Grab { rect, .. } => {
                 GRIPS.iter().map(|&e| (Grip::Edge(e), edge_point(*rect, e))).collect()
             }
         }
@@ -417,8 +481,16 @@ pub(super) fn outline(px: f32) -> f32 {
     (px / 14.0).round().max(1.0)
 }
 
-/// Draws `m`; `step` is the number a step marker shows.
-pub(super) fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32), scale: f32, fonts: &Typesetter, step: usize) {
+/// Draws `m`; `step` is the number a step marker shows; `screen` is the frozen screen grabs show.
+pub(super) fn draw_mark(
+    c: &Canvas,
+    m: &Mark,
+    (dx, dy): (f32, f32),
+    scale: f32,
+    fonts: &Typesetter,
+    step: usize,
+    screen: &Dib,
+) {
     let at = |(x, y): (f32, f32)| (x + dx, y + dy);
     match m {
         Mark::Stroke { highlight, points, color, width } => {
@@ -455,6 +527,20 @@ pub(super) fn draw_mark(c: &Canvas, m: &Mark, (dx, dy): (f32, f32), scale: f32, 
             c.circle(o, *r, COLORS[*color]);
             let ink = if LIGHT[*color] { STEP_INK } else { COLORS[4] };
             fonts.draw_centred(c, &step.to_string(), r * 1.15, o, ink);
+        }
+        Mark::Cursor { at: hot, sprite, size } => {
+            let [x, y, w, h] = cursor_box(*hot, sprite, *size);
+            let (x, y) = at((x, y));
+            let img = &sprite.0;
+            c.image(&img.px, img.w as usize, (img.w as u32, img.h as u32), [x, y, w, h]);
+        }
+        Mark::Grab { src, rect } => {
+            let whole = Rect { x: 0, y: 0, w: screen.w, h: screen.h };
+            if whole.intersect(src) == Some(*src) {
+                let (x, y) = at((rect.x as f32, rect.y as f32));
+                let from = &screen.pixels()[(src.y * screen.w + src.x) as usize..];
+                c.image(from, screen.w as usize, (src.w as u32, src.h as u32), [x, y, rect.w as f32, rect.h as f32]);
+            }
         }
         Mark::Blur { .. } | Mark::Pixelate { .. } => {}
     }

@@ -40,6 +40,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
+use crate::platform::cursor::{self, CursorImage};
 use crate::platform::elements::Elements;
 use crate::platform::gfx::{Painter, animate};
 use crate::platform::identity::identify;
@@ -178,6 +179,11 @@ struct State {
     /// once per display refresh.
     last_paint: Cell<Instant>,
     frame: Duration,
+    /// Screenshots: the cursor as it was when the picker opened (hotspot in client coordinates),
+    /// for the editor to start with.
+    shot_cursor: Option<(Arc<CursorImage>, (i32, i32))>,
+    /// Screenshots: the picture the editor's cursor tool places.
+    arrow: Option<Arc<CursorImage>>,
 }
 
 impl Drop for State {
@@ -220,7 +226,8 @@ fn held(vk: u16) -> bool {
 }
 
 /// Fades the picker in. `msg` is posted to `owner` with the result. `elements` says when hovering
-/// highlights UI elements inside windows instead of the windows.
+/// highlights UI elements inside windows instead of the windows. `with_cursor`: a screenshot keeps
+/// the cursor, as a mark the editor can move or delete.
 pub(crate) fn open(
     owner: HWND,
     msg: u32,
@@ -228,8 +235,13 @@ pub(crate) fn open(
     purpose: Purpose,
     freeze: bool,
     elements: UiElements,
+    with_cursor: bool,
 ) -> Result<HWND, String> {
     let draw_first = matches!(purpose, Purpose::Shot { draw_first: true });
+    let shot = matches!(purpose, Purpose::Shot { .. });
+    // before the overlay's own cursor takes over
+    let shot_cursor = if shot && with_cursor { cursor::current() } else { None };
+    let arrow = if shot { cursor::arrow().map(Arc::new) } else { None };
     // drawing needs a still image
     let freeze = freeze || draw_first;
     unsafe {
@@ -338,6 +350,8 @@ pub(crate) fn open(
                 done: false,
                 last_paint: Cell::new(Instant::now()),
                 frame,
+                shot_cursor: shot_cursor.map(|(img, at)| (Arc::new(img), (at.0 - area.x, at.1 - area.y))),
+                arrow,
             };
             if elements == UiElements::Always {
                 st.start_elements();
@@ -351,6 +365,7 @@ pub(crate) fn open(
                 let screen = Rect { x: 0, y: 0, w: area.w, h: area.h };
                 let mut ed = Editor::canvas(screen, st.monitors(), st.painter.scale, st.cursor);
                 st.equip(&mut ed);
+                st.add_cursor(&mut ed);
                 schedule_tick(hwnd, &ed);
                 st.edit = Some(ed);
                 st.sync_mode();
@@ -634,6 +649,16 @@ impl State {
             window_pick(w.1, &self.outputs).map(|r| (self.to_client(r), c.map(|c| self.to_client(c))))
         });
         ed.set_windows(windows.collect());
+        if let Some(arrow) = &self.arrow {
+            ed.set_arrow(arrow.clone());
+        }
+    }
+
+    /// A new editor starts with the cursor the screenshot kept, if it kept one.
+    fn add_cursor(&self, ed: &mut Editor) {
+        if let Some((img, at)) = &self.shot_cursor {
+            ed.add_cursor(img.clone(), *at);
+        }
     }
 
     fn element_at(&self, p: (i32, i32)) -> Option<Rect> {
@@ -921,6 +946,7 @@ impl State {
                 self.chosen.clear();
                 let mut ed = Editor::new(sel, cutout, self.monitors(), self.painter.scale);
                 self.equip(&mut ed);
+                self.add_cursor(&mut ed);
                 self.invalidate(&ed.extent());
                 self.edit = Some(ed);
                 self.target = Some(sel);

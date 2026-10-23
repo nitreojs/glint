@@ -27,28 +27,28 @@ impl SettingsApp {
             widgets::segmented(ui, look, &mut self.cfg.screenshot_format, &formats, Some(168.0));
             hint(ui, "png — lossless · jpg — smaller files", p.t3);
         });
-        // The quality row only matters for jpg; it fades in and out with the choice.
+        // The quality row only matters for jpg.
         let jpg = self.cfg.screenshot_format == ShotFormat::Jpg;
-        let shown = widgets::glide(ui, Id::unique("jpg-quality"), if jpg { 1.0 } else { 0.0 }, 0.12);
-        if shown > 0.0 {
-            ui.scope(|ui| {
-                ui.multiply_opacity(shown);
-                row(ui, look, "quality", 0.0, |ui| {
-                    let word = shot_quality_word(self.cfg.screenshot_quality);
-                    let q = &mut self.cfg.screenshot_quality;
-                    widgets::slider(ui, look, q, 50..=100, word, "50 ← smaller", "sharper → 100");
-                });
+        widgets::reveal(ui, Id::unique("jpg-quality"), jpg, |ui| {
+            row(ui, look, "quality", 0.0, |ui| {
+                let word = shot_quality_word(self.cfg.screenshot_quality);
+                let q = &mut self.cfg.screenshot_quality;
+                widgets::slider(ui, look, q, 50..=100, word, "50 ← smaller", "sharper → 100");
             });
-        }
+        });
+        row(ui, look, "mouse cursor", 1.0, |ui| {
+            let text = if self.cfg.screenshot_cursor { "kept in screenshots" } else { "left out" };
+            widgets::toggle(ui, look, &mut self.cfg.screenshot_cursor, text);
+            hint(ui, "in the editor it's a mark you can move, resize or delete; add more with the cursor tool", p.t3);
+        });
         row(ui, look, "after capture", 1.0, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
             widgets::checkbox(ui, look, &mut self.cfg.screenshot_copy, "copy to clipboard");
             widgets::checkbox(ui, look, &mut self.cfg.screenshot_save, "save to the output folder");
             widgets::checkbox(ui, look, &mut self.cfg.screenshot_upload, "upload");
-            if !self.cfg.screenshot_copy && !self.cfg.screenshot_save && !self.cfg.screenshot_upload {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                hint(ui, "with all off, enter still copies", p.warn);
-            }
+            let none = !self.cfg.screenshot_copy && !self.cfg.screenshot_save && !self.cfg.screenshot_upload;
+            ui.spacing_mut().item_spacing.y = 6.0;
+            widgets::reveal(ui, Id::unique("no-capture-action"), none, |ui| hint(ui, "with all off, enter still copies", p.warn));
         });
         row(ui, look, "in the editor", 0.0, |ui| {
             hint(ui, "enter does the above · ctrl+c copies · ctrl+s saves · ctrl+u uploads · esc cancels", p.t3);

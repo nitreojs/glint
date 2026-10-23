@@ -1,4 +1,5 @@
 pub(crate) mod capture;
+pub(crate) mod cursor;
 pub(crate) mod elements;
 pub(crate) mod format;
 pub(crate) mod gfx;

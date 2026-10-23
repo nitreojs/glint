@@ -46,6 +46,8 @@ pub struct Config {
     pub open_trimmer: bool,
     pub screenshot_style: ShotStyle,
     pub screenshot_format: ShotFormat,
+    /// Screenshots keep the mouse cursor (the editor can move or delete it).
+    pub screenshot_cursor: bool,
     /// JPG quality, 50-100.
     pub screenshot_quality: u32,
     pub screenshot_copy: bool,
@@ -213,6 +215,7 @@ impl Default for Config {
             open_trimmer: false,
             screenshot_style: ShotStyle::Select,
             screenshot_format: ShotFormat::Png,
+            screenshot_cursor: false,
             screenshot_quality: 90,
             screenshot_copy: true,
             screenshot_save: true,
@@ -484,6 +487,10 @@ open_trimmer = {open_trimmer}
 # editor on the whole frozen screen first (pick a region with Q). Recordings always select first.
 screenshot_style = "{style}"
 
+# Screenshots keep the mouse cursor: the editor shows it as a mark you can move, resize or
+# delete; all-screens and monitor shots have it drawn in.
+screenshot_cursor = {screenshot_cursor}
+
 # Screenshots: "png" (lossless) or "jpg" (smaller; screenshot_quality 50-100 applies).
 screenshot_format = "{format}"
 screenshot_quality = {screenshot_quality}
@@ -542,6 +549,7 @@ update_beta = {update_beta}
             countdown = self.countdown,
             open_trimmer = self.open_trimmer,
             screenshot_quality = self.screenshot_quality,
+            screenshot_cursor = self.screenshot_cursor,
             screenshot_copy = self.screenshot_copy,
             screenshot_save = self.screenshot_save,
             screenshot_upload = self.screenshot_upload,
@@ -640,6 +648,7 @@ mod tests {
             open_trimmer: true,
             screenshot_style: ShotStyle::Sharex,
             screenshot_format: ShotFormat::Jpg,
+            screenshot_cursor: true,
             screenshot_quality: 75,
             screenshot_copy: false,
             screenshot_save: true,

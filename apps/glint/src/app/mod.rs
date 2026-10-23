@@ -23,7 +23,7 @@ use windows::core::{PCWSTR, w};
 
 use crate::indicator::{self, Indicator};
 use crate::picker::{self, Picked, Purpose};
-use crate::platform::capture;
+use crate::platform::{capture, cursor};
 use crate::platform::log::log_path;
 use crate::platform::monitors;
 use crate::platform::paths::{migrate_output_dir, unique_path};
@@ -208,7 +208,8 @@ impl App {
             false => Purpose::Record { min: self.cfg.codec.codec().min_size() },
         };
         let (freeze, elements) = (self.cfg.freeze_screen, self.cfg.ui_elements);
-        match picker::open(self.hwnd, WM_APP_SELECTION, outputs, purpose, freeze, elements) {
+        let with_cursor = self.cfg.screenshot_cursor;
+        match picker::open(self.hwnd, WM_APP_SELECTION, outputs, purpose, freeze, elements, with_cursor) {
             Ok(h) => self.state = State::Selecting(h),
             Err(e) => self.notify("glint: can't open the selection overlay", &e, true, ClickTarget::Log),
         }
@@ -220,10 +221,15 @@ impl App {
         if !matches!(self.state, State::Idle) {
             return;
         }
+        let pointer = if self.cfg.screenshot_cursor { cursor::current() } else { None };
         let captured = if under_mouse { capture::monitor_under_mouse() } else { capture::virtual_screen() };
         self.reload();
         match captured {
-            Ok((pixels, at)) => {
+            Ok((mut pixels, at)) => {
+                // nothing to edit it in: the cursor is drawn in
+                if let Some((img, p)) = pointer {
+                    cursor::stamp(&mut pixels, at.w, &img, (p.0 - at.x, p.1 - at.y));
+                }
                 let (w, h) = (at.w as u32, at.h as u32);
                 let shot = Shot { pixels, w, h, alpha: false, at, output: Output::Default, source: None };
                 self.finish_shot(shot, Subject::Screen)

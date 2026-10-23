@@ -1,6 +1,7 @@
 //! Screenshot markup on the frozen picker. Once a region is picked, a toolbar appears next to
-//! it: pen, highlighter, arrow, rectangle, blur, pixelate, smart eraser, text and step markers,
-//! five colours, three sizes, undo and redo, and copy / save / upload / pin / done / cancel. The
+//! it: pen, highlighter, arrow, rectangle, blur, pixelate, smart eraser, text, step markers,
+//! cursors and grabs (a piece of the frozen screen, from anywhere on it, as a picture in the
+//! shot), five colours, three sizes, undo and redo, and copy / save / upload / pin / done / cancel. The
 //! selection keeps handles for resizing (Ctrl moves it instead) and can be dragged while no tool
 //! is active. In canvas mode ([`Editor::canvas`]) there is no selection until one is picked: the
 //! toolbar is docked at the top of the monitor under the mouse (right-click or Tab brings it to
@@ -13,6 +14,7 @@
 //! highlight the window, client area or UI element under the mouse; a click covers it.
 //! Right-click deletes a mark, or cancels the drag in progress.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use glint_core::geom::rect::Rect;
@@ -25,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
+use crate::platform::cursor::CursorImage;
 use crate::platform::gfx::Dib;
 use crate::platform::rect::ring;
 
@@ -35,7 +38,7 @@ mod text;
 mod toolbar;
 mod typing;
 
-use marks::{COLORS, Edges, Grip, MIN_SIDE, Mark, Strength, TOOLS, Tool, dist, resize, shift_within};
+use marks::{COLORS, Edges, Grip, MIN_SIDE, Mark, Sprite, Strength, TOOLS, Tool, dist, resize, shift_within};
 use text::Typesetter;
 use toolbar::{Item, nearest};
 use typing::Typing;
@@ -195,6 +198,8 @@ pub(crate) struct Editor {
     windows: Vec<(Rect, Option<Rect>)>,
     element: Option<Rect>,
     pick: Option<Rect>,
+    /// The picture the cursor tool places.
+    arrow: Option<Sprite>,
 }
 
 impl Editor {
@@ -264,6 +269,7 @@ impl Editor {
             windows: Vec::new(),
             element: None,
             pick: None,
+            arrow: None,
         };
         ed.place_bar();
         ed
@@ -305,6 +311,19 @@ impl Editor {
 
     pub(crate) fn set_windows(&mut self, windows: Vec<(Rect, Option<Rect>)>) {
         self.windows = windows;
+    }
+
+    /// The picture the cursor tool places.
+    pub(crate) fn set_arrow(&mut self, image: Arc<CursorImage>) {
+        self.arrow = Some(Sprite(image));
+    }
+
+    /// The cursor as it was on screen, with its hotspot at `at` (client coordinates): a mark that
+    /// can be moved, resized or deleted like the ones the cursor tool adds. Not an undo step.
+    pub(crate) fn add_cursor(&mut self, image: Arc<CursorImage>, at: (i32, i32)) {
+        let at = (at.0 as f32, at.1 as f32);
+        self.marks.push(Mark::Cursor { at, sprite: Sprite(image), size: 100.0 });
+        self.touch();
     }
 
     pub(crate) fn wants_elements(&self) -> bool {
@@ -354,6 +373,8 @@ impl Editor {
     pub(crate) fn extent(&self) -> Vec<Rect> {
         let mut v = vec![self.drawn()];
         v.extend(self.picked_extent());
+        // a grab's source can be anywhere on the screen
+        v.extend(self.pick);
         v.extend(self.chrome());
         v
     }
@@ -533,7 +554,9 @@ impl Editor {
             }
         }
         if !s.contains(p.0, p.1) {
-            return Hit::Outside;
+            // a grab can start anywhere on the frozen screen
+            let grabs = self.tool == Some(Tool::Grab) && self.area.contains(p.0, p.1);
+            return if grabs { Hit::Inside } else { Hit::Outside };
         }
         match self.mark_at(at, false) {
             Some(i) => Hit::Mark(i),
@@ -586,13 +609,26 @@ impl Editor {
         let inside = |r: &Rect| r.contains(p.0, p.1);
         let window = || self.windows.iter().find(|(w, _)| inside(w)).map(|&(w, client)| client.filter(inside).unwrap_or(w));
         let r = self.element.filter(inside).or_else(window).unwrap_or_else(|| nearest(&self.monitors, p));
-        let clip = if self.selected { self.sel } else { self.area };
+        let clip = if self.selected && self.tool != Some(Tool::Grab) { self.sel } else { self.area };
         r.intersect(&clip).filter(|r| r.w >= MIN_SIDE && r.h >= MIN_SIDE)
     }
 
     fn hover_pick(&self, p: (i32, i32)) -> Option<Rect> {
         let on = self.wants_elements() && matches!(self.hit(p), Hit::Inside);
         on.then(|| self.pick_at(p)).flatten()
+    }
+
+    /// Where a grab of `src` lands: where it was when that's inside the shot, else in the middle of
+    /// the shot, shrunk to fit.
+    fn place_grab(&self, src: Rect) -> Rect {
+        let s = self.output_rect();
+        if s.intersect(&src) == Some(src) {
+            return src;
+        }
+        let k = (0.8 * s.w as f32 / src.w.max(1) as f32).min(0.8 * s.h as f32 / src.h.max(1) as f32).min(1.0);
+        let side = |v: i32| ((v as f32 * k).round() as i32).max(MIN_SIDE);
+        let (w, h) = (side(src.w), side(src.h));
+        Rect { x: s.x + (s.w - w) / 2, y: s.y + (s.h - h) / 2, w, h }
     }
 
     fn snap_threshold(&self) -> i32 {
@@ -651,8 +687,13 @@ impl Editor {
                     let area = tool.picks_rects();
                     let anchor = if area { self.snapped(p, self.snap_threshold()) } else { p };
                     let mut mark = Mark::new(tool, anchor, self.color, self.strength[tool as usize]);
-                    if let Mark::Eraser { fill, .. } = &mut mark {
-                        *fill = under & 0x00FF_FFFF;
+                    match &mut mark {
+                        Mark::Eraser { fill, .. } => *fill = under & 0x00FF_FFFF,
+                        Mark::Cursor { sprite, .. } => match &self.arrow {
+                            Some(arrow) => *sprite = arrow.clone(),
+                            None => return Event::None,
+                        },
+                        _ => {}
                     }
                     self.refit(&mut mark);
                     let click = if area { self.pick_at(p) } else { None };
@@ -697,7 +738,8 @@ impl Editor {
                     Mark::Rectangle { rect, .. }
                     | Mark::Blur { rect, .. }
                     | Mark::Pixelate { rect, .. }
-                    | Mark::Eraser { rect, .. } => {
+                    | Mark::Eraser { rect, .. }
+                    | Mark::Grab { src: rect, .. } => {
                         if !clicking {
                             let x = snap::snap_edge(q.0, (q.1, q.1), &snap.xs, th);
                             let y = snap::snap_edge(q.1, (q.0, q.0), &snap.ys, th);
@@ -705,10 +747,16 @@ impl Editor {
                         }
                     }
                     Mark::Step { at, tail, r, .. } => *tail = (dist(*at, f) > *r + slop).then_some(f),
+                    Mark::Cursor { at, .. } => *at = f,
                     Mark::Text { .. } => {}
                 }
+                // a grab's source shows as the pick outline while it's dragged
+                let source = match mark {
+                    Mark::Grab { src, .. } => Some(*src),
+                    _ => None,
+                };
                 if !clicking {
-                    self.pick = None;
+                    self.pick = source;
                 }
                 self.repaint_ink(before);
                 Event::Repaint
@@ -790,7 +838,10 @@ impl Editor {
             },
             Some(Drag::Mark { mut mark, click, .. }) => {
                 let drawn = mark.ink(self.scale);
-                if let (Some(r), Some(area)) = (click, mark.area_mut()) {
+                if let Mark::Grab { src, rect } = &mut mark {
+                    *src = click.unwrap_or(*src);
+                    *rect = self.place_grab(*src);
+                } else if let (Some(r), Some(area)) = (click, mark.area_mut()) {
                     *area = r;
                 }
                 self.repaint_ink(vec![drawn]);
@@ -1183,10 +1234,10 @@ fn snap_resized(r: Rect, edges: Edges, at: (i32, i32), to: &snap::Edges, th: i32
     Rect::from_points(x0, y0, x1, y1)
 }
 
-fn tool_key(vk: u32, digit: u32, letter: u8) -> bool {
+fn tool_key(vk: u32, digit: Option<u32>, letter: u8) -> bool {
     const VK_0: u32 = 0x30;
     const VK_NUMPAD0: u32 = 0x60;
-    vk == letter as u32 || vk == VK_0 + digit || vk == VK_NUMPAD0 + digit
+    vk == letter as u32 || digit.is_some_and(|d| vk == VK_0 + d || vk == VK_NUMPAD0 + d)
 }
 
 #[cfg(test)]
@@ -1683,5 +1734,86 @@ mod tests {
         assert_eq!(area_of(&ed.marks[0]).x, 120);
         ed.undo();
         assert_eq!(ed.marks.len(), 1);
+    }
+
+    #[test]
+    fn grabs_come_from_anywhere_on_the_screen_and_land_in_the_shot() {
+        let mut ed = editor();
+        ed.key(0x47, false, false); // G
+        ed.mouse_down((600, 500), 0);
+        ed.mouse_move((800, 600));
+        let src = Rect { x: 600, y: 500, w: 200, h: 100 };
+        assert_eq!(ed.pick, Some(src), "the source is outlined while it's dragged");
+        assert!(ed.extent().contains(&src), "outside the shot too");
+        ed.mouse_up((800, 600));
+        assert_eq!(ed.marks[0], Mark::Grab { src, rect: Rect { x: 100, y: 100, w: 200, h: 100 } }, "centred in the shot");
+
+        ed.mouse_down((10, 10), 0);
+        ed.mouse_move((60, 40));
+        ed.mouse_up((60, 40));
+        let inside = Rect { x: 10, y: 10, w: 50, h: 30 };
+        assert_eq!(ed.marks[1], Mark::Grab { src: inside, rect: inside }, "a piece of the shot stays where it was");
+
+        ed.picked = Some(0);
+        ed.mouse_down((300, 200), 0);
+        ed.mouse_move((340, 200));
+        ed.mouse_up((340, 200));
+        assert_eq!(area_of(&ed.marks[0]), Rect { x: 100, y: 100, w: 240, h: 120 }, "corners keep the proportions");
+        ed.undo();
+        assert_eq!(area_of(&ed.marks[0]).w, 200);
+
+        ed.activate(Item::Tool(Tool::Rectangle));
+        ed.mouse_down((600, 500), 0);
+        ed.mouse_move((700, 600));
+        ed.mouse_up((700, 600));
+        assert_eq!(ed.marks.len(), 2, "other tools stay inside the shot");
+    }
+
+    #[test]
+    fn cursors_are_placed_sized_and_deleted() {
+        let image = |hot| Arc::new(CursorImage { w: 12, h: 20, hot, px: vec![0xFF00_0000; 240] });
+        let mut ed = editor();
+        ed.key(0x4D, false, false); // M
+        click(&mut ed, (100, 100));
+        assert!(ed.marks.is_empty(), "nothing to place without a picture");
+
+        ed.set_arrow(image((0, 0)));
+        click(&mut ed, (100, 100));
+        assert_eq!(ed.marks[0].bbox(), Rect { x: 100, y: 100, w: 12, h: 20 });
+        ed.activate(Item::Size(2));
+        assert_eq!(ed.marks[0].bbox(), Rect { x: 100, y: 100, w: 18, h: 30 }, "150 % grows it from the hotspot");
+        ed.mouse_down((110, 110), 0);
+        ed.mouse_move((150, 130));
+        ed.mouse_up((150, 130));
+        assert_eq!(ed.marks[0].bbox(), Rect { x: 140, y: 120, w: 18, h: 30 }, "it moves");
+
+        ed.activate(Item::Tool(Tool::Cursor));
+        let steps = ed.history.len();
+        ed.add_cursor(image((3, 4)), (50, 60));
+        assert_eq!(ed.marks[1].bbox(), Rect { x: 47, y: 56, w: 12, h: 20 }, "the kept cursor sits on its hotspot");
+        assert_eq!(ed.history.len(), steps, "keeping the cursor isn't an undo step");
+        ed.right_click((48, 58));
+        assert_eq!(ed.marks.len(), 1);
+    }
+
+    #[test]
+    fn grabs_and_cursors_render_their_pixels() {
+        let painter = Painter::new().unwrap();
+        let mut bright = Dib::new(640, 480).unwrap();
+        for (i, p) in bright.pixels_mut().iter_mut().enumerate() {
+            *p = 0xFF00_0000 | (i as u32).wrapping_mul(2_654_435_761) >> 8;
+        }
+        let mut ed = editor();
+        let src = Rect { x: 500, y: 400, w: 40, h: 30 };
+        ed.marks.push(Mark::Grab { src, rect: Rect { x: 10, y: 20, ..src } });
+        let red = Arc::new(CursorImage { w: 4, h: 4, hot: (0, 0), px: vec![0xFFFF_0000; 16] });
+        ed.add_cursor(red, (200, 100));
+        ed.render_view(&bright, &painter, None).unwrap();
+        let view = ed.view.as_ref().unwrap();
+        for (x, y) in [(0, 0), (39, 0), (0, 29), (39, 29), (17, 11)] {
+            let shown = view.pixel(10 + x, 20 + y).unwrap() & 0x00FF_FFFF;
+            assert_eq!(shown, bright.pixel(src.x + x, src.y + y).unwrap() & 0x00FF_FFFF, "({x}, {y})");
+        }
+        assert_eq!(view.pixel(201, 102).unwrap() & 0x00FF_FFFF, 0xFF_0000);
     }
 }

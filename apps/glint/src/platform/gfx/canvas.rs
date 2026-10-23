@@ -1,9 +1,10 @@
 use glint_core::wide::wide;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
-    D2D1_FIGURE_END_OPEN,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_PIXEL_FORMAT,
 };
+use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_MEASURING_MODE_NATURAL, DWRITE_OVERHANG_METRICS, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
@@ -118,6 +119,27 @@ impl Canvas<'_> {
         self.color(color);
         let e = D2D1_ELLIPSE { point: Vector2 { X: x, Y: y }, radiusX: r, radiusY: r };
         unsafe { self.rt.DrawEllipse(&e, &self.brush, width, None) };
+    }
+
+    /// Draws `w`×`h` premultiplied 0xAARRGGBB pixels from `px` (rows `stride` pixels apart) into
+    /// the box `[x, y, bw, bh]`, scaled to fit it.
+    pub(crate) fn image(&self, px: &[u32], stride: usize, (w, h): (u32, u32), [x, y, bw, bh]: [f32; 4]) {
+        if w == 0 || h == 0 || px.len() < (h as usize - 1) * stride + w as usize {
+            return;
+        }
+        let props = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        unsafe {
+            let size = D2D_SIZE_U { width: w, height: h };
+            let Ok(bitmap) = self.rt.CreateBitmap(size, Some(px.as_ptr() as _), (stride * 4) as u32, &props) else {
+                return;
+            };
+            let mode = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+            self.rt.DrawBitmap(&bitmap, Some(&rect_f(x, y, bw, bh)), self.fade, mode, None);
+        }
     }
 
     /// Draws `text` left-aligned and vertically centered in the box `[x, y, w, h]`.

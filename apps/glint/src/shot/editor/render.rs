@@ -98,15 +98,17 @@ impl Editor {
             let _ = BitBlt(view.dc, l.x, l.y, l.w, l.h, Some(base.dc), l.x, l.y, SRCCOPY);
             let _ = GdiFlush();
         }
+        // a grab being dragged only shows its source's outline
         let drawing = match &self.drag {
-            Some(Drag::Mark { mark, .. }) => Some(mark),
+            Some(Drag::Mark { mark, .. }) if !matches!(mark, Mark::Grab { .. }) => Some(mark),
             _ => None,
         };
         for m in drawing.into_iter().chain(editing.map(|i| &self.marks[i])).filter(|m| m.is_effect()) {
             apply_effect(view, m, s, self.scale);
         }
         let (shapes, scale, fonts) = (self.marks.iter().chain(drawing), self.scale, &self.fonts);
-        painter.draw_on(view.dc, l.to_win(), |c| draw_shapes(c, shapes, (-r.x as f32, -r.y as f32), scale, fonts))?;
+        let shift = (-r.x as f32, -r.y as f32);
+        painter.draw_on(view.dc, l.to_win(), |c| draw_shapes(c, shapes, shift, scale, fonts, bright))?;
         if let Some(cut) = &self.cutout {
             unsafe {
                 let _ = GdiFlush();
@@ -131,8 +133,8 @@ impl Editor {
         for m in self.marks.iter().filter(|m| m.is_effect()) {
             apply_effect(&mut out, m, a, self.scale);
         }
-        painter
-            .draw(&out, |c| draw_shapes(c, self.marks.iter(), (-a.x as f32, -a.y as f32), self.scale, &self.fonts))?;
+        let shift = (-a.x as f32, -a.y as f32);
+        painter.draw(&out, |c| draw_shapes(c, self.marks.iter(), shift, self.scale, &self.fonts, bright))?;
         unsafe {
             let _ = GdiFlush();
         }
@@ -219,7 +221,7 @@ impl Editor {
                 }
             }
             if let Some(m) = self.picked_mark() {
-                if let Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { .. } = m {
+                if let Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { .. } | Mark::Cursor { .. } = m {
                     dashed_box(dc, local(self.outline(m)), white, black, self.px(4.0) as i32);
                 }
                 if let Some(c) = self.caret_rect() {
@@ -305,9 +307,10 @@ fn draw_shapes<'a>(
     shift: (f32, f32),
     scale: f32,
     fonts: &Typesetter,
+    screen: &Dib,
 ) {
     for (m, step) in numbered(marks.filter(|m| !m.is_effect())) {
-        draw_mark(c, m, shift, scale, fonts, step);
+        draw_mark(c, m, shift, scale, fonts, step, screen);
     }
 }
 

@@ -87,6 +87,7 @@ impl Section {
                 n(a.screenshot_format == b.screenshot_format)
                     + n(a.screenshot_style == b.screenshot_style)
                     + n(a.screenshot_quality == b.screenshot_quality)
+                    + n(a.screenshot_cursor == b.screenshot_cursor)
                     + n(a.screenshot_copy == b.screenshot_copy)
                     + n(a.screenshot_save == b.screenshot_save)
                     + n(a.screenshot_upload == b.screenshot_upload)
@@ -144,6 +145,7 @@ impl Section {
                 cfg.screenshot_format = d.screenshot_format;
                 cfg.screenshot_style = d.screenshot_style;
                 cfg.screenshot_quality = d.screenshot_quality;
+                cfg.screenshot_cursor = d.screenshot_cursor;
                 cfg.screenshot_copy = d.screenshot_copy;
                 cfg.screenshot_save = d.screenshot_save;
                 cfg.screenshot_upload = d.screenshot_upload;
