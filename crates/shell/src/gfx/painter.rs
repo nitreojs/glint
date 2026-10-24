@@ -14,7 +14,7 @@ use windows::core::w;
 
 use super::{Canvas, Dib, rgba};
 
-pub(crate) struct Painter {
+pub struct Painter {
     factory: ID2D1Factory,
     dwrite: IDWriteFactory,
     /// Draws over opaque images (screenshots); destination alpha is ignored. Software
@@ -25,7 +25,7 @@ pub(crate) struct Painter {
 }
 
 impl Painter {
-    pub(crate) fn new() -> Result<Painter, String> {
+    pub fn new() -> Result<Painter, String> {
         unsafe {
             let factory: ID2D1Factory =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).map_err(|e| format!("D2D1CreateFactory: {e}"))?;
@@ -46,12 +46,12 @@ impl Painter {
     }
 
     /// Scales a 96-DPI length to physical pixels.
-    pub(crate) fn px(&self, v: f32) -> f32 {
+    pub fn px(&self, v: f32) -> f32 {
         (v * self.scale).round()
     }
 
     /// Segoe UI Semibold at `size` 96-DPI pixels, single line, vertically centered.
-    pub(crate) fn font(&self, size: f32) -> Result<IDWriteTextFormat, String> {
+    pub fn font(&self, size: f32) -> Result<IDWriteTextFormat, String> {
         unsafe {
             let f = self
                 .dwrite
@@ -73,7 +73,7 @@ impl Painter {
     }
 
     /// Rendered width and line height of `text`.
-    pub(crate) fn measure(&self, text: &str, font: &IDWriteTextFormat) -> (f32, f32) {
+    pub fn measure(&self, text: &str, font: &IDWriteTextFormat) -> (f32, f32) {
         let s = wide(text);
         unsafe {
             let Ok(layout) = self.dwrite.CreateTextLayout(&s[..s.len() - 1], font, 10_000.0, 10_000.0) else {
@@ -86,11 +86,11 @@ impl Painter {
     }
 
     /// Draws onto an opaque DIB (e.g. a copy of the screenshot behind a pill).
-    pub(crate) fn draw(&self, dib: &Dib, f: impl FnOnce(&Canvas)) -> Result<(), String> {
+    pub fn draw(&self, dib: &Dib, f: impl FnOnce(&Canvas)) -> Result<(), String> {
         self.draw_on(dib.dc, RECT { left: 0, top: 0, right: dib.w, bottom: dib.h }, f)
     }
 
-    pub(crate) fn draw_on(&self, hdc: HDC, r: RECT, f: impl FnOnce(&Canvas)) -> Result<(), String> {
+    pub fn draw_on(&self, hdc: HDC, r: RECT, f: impl FnOnce(&Canvas)) -> Result<(), String> {
         let rt = &self.dc_target;
         unsafe {
             rt.BindDC(hdc, &r).map_err(|e| format!("BindDC: {e}"))?;
@@ -100,7 +100,7 @@ impl Painter {
 
     /// A render target drawing straight into `hwnd` with per-pixel alpha. The window must
     /// be a DWM "glass" window (see [`make_glass`]) for the alpha to show through.
-    pub(crate) fn window_target(&self, hwnd: HWND, w: i32, h: i32) -> Result<ID2D1HwndRenderTarget, String> {
+    pub fn window_target(&self, hwnd: HWND, w: i32, h: i32) -> Result<ID2D1HwndRenderTarget, String> {
         unsafe {
             let rt = self
                 .factory
@@ -127,7 +127,7 @@ impl Painter {
     }
 
     /// Redraws a window target from scratch; every color's alpha is scaled by `fade`.
-    pub(crate) fn render(&self, rt: &ID2D1HwndRenderTarget, fade: f32, f: impl FnOnce(&Canvas)) -> Result<(), String> {
+    pub fn render(&self, rt: &ID2D1HwndRenderTarget, fade: f32, f: impl FnOnce(&Canvas)) -> Result<(), String> {
         self.paint(rt, true, fade, f)
     }
 
@@ -161,7 +161,7 @@ impl Painter {
 
 /// Turns a borderless popup into a DWM "glass" surface: its client area is composited with
 /// per-pixel alpha. Unlike layered windows, these can still be excluded from capture.
-pub(crate) fn make_glass(hwnd: HWND) {
+pub fn make_glass(hwnd: HWND) {
     let all = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
     unsafe {
         let _ = DwmExtendFrameIntoClientArea(hwnd, &all);

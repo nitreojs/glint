@@ -10,14 +10,14 @@ use windows::Win32::Graphics::DirectWrite::{
 };
 use windows_numerics::Vector2;
 
-pub(crate) struct Canvas<'a> {
-    pub(super) rt: &'a ID2D1RenderTarget,
-    pub(super) brush: ID2D1SolidColorBrush,
-    pub(super) fade: f32,
-    pub(super) factory: &'a ID2D1Factory,
-    pub(super) dwrite: &'a IDWriteFactory,
+pub struct Canvas<'a> {
+    pub rt: &'a ID2D1RenderTarget,
+    pub brush: ID2D1SolidColorBrush,
+    pub fade: f32,
+    pub factory: &'a ID2D1Factory,
+    pub dwrite: &'a IDWriteFactory,
     /// Round caps and joins, for strokes drawn by hand.
-    pub(super) round: ID2D1StrokeStyle,
+    pub round: ID2D1StrokeStyle,
 }
 
 fn rect_f(x: f32, y: f32, w: f32, h: f32) -> D2D_RECT_F {
@@ -47,7 +47,7 @@ impl Canvas<'_> {
         unsafe { self.brush.SetColor(&D2D1_COLOR_F { a: c.a * self.fade, ..c }) };
     }
 
-    pub(crate) fn round_rect(&self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: D2D1_COLOR_F) {
+    pub fn round_rect(&self, x: f32, y: f32, w: f32, h: f32, radius: f32, color: D2D1_COLOR_F) {
         self.color(color);
         unsafe {
             let rr = D2D1_ROUNDED_RECT { rect: rect_f(x, y, w, h), radiusX: radius, radiusY: radius };
@@ -55,12 +55,12 @@ impl Canvas<'_> {
         }
     }
 
-    pub(crate) fn fill(&self, x: f32, y: f32, w: f32, h: f32, color: D2D1_COLOR_F) {
+    pub fn fill(&self, x: f32, y: f32, w: f32, h: f32, color: D2D1_COLOR_F) {
         self.color(color);
         unsafe { self.rt.FillRectangle(&rect_f(x, y, w, h), &self.brush) };
     }
 
-    pub(crate) fn line(&self, (x0, y0): (f32, f32), (x1, y1): (f32, f32), width: f32, color: D2D1_COLOR_F) {
+    pub fn line(&self, (x0, y0): (f32, f32), (x1, y1): (f32, f32), width: f32, color: D2D1_COLOR_F) {
         self.color(color);
         unsafe {
             self.rt.DrawLine(Vector2 { X: x0, Y: y0 }, Vector2 { X: x1, Y: y1 }, &self.brush, width, None);
@@ -69,7 +69,7 @@ impl Canvas<'_> {
 
     /// An open path through `points` with round caps and joins, drawn as one shape so a
     /// translucent stroke doesn't darken where it overlaps itself.
-    pub(crate) fn polyline(&self, points: &[(f32, f32)], width: f32, color: D2D1_COLOR_F) {
+    pub fn polyline(&self, points: &[(f32, f32)], width: f32, color: D2D1_COLOR_F) {
         if let Some(path) = self.path(points, false) {
             self.color(color);
             unsafe { self.rt.DrawGeometry(&path, &self.brush, width, &self.round) };
@@ -77,7 +77,7 @@ impl Canvas<'_> {
     }
 
     /// A filled closed polygon.
-    pub(crate) fn polygon(&self, points: &[(f32, f32)], color: D2D1_COLOR_F) {
+    pub fn polygon(&self, points: &[(f32, f32)], color: D2D1_COLOR_F) {
         if let Some(path) = self.path(points, true) {
             self.color(color);
             unsafe { self.rt.FillGeometry(&path, &self.brush, None) };
@@ -104,18 +104,18 @@ impl Canvas<'_> {
     }
 
     /// Rectangle outline whose stroke is centred on the edges.
-    pub(crate) fn rect_outline(&self, x: f32, y: f32, w: f32, h: f32, width: f32, color: D2D1_COLOR_F) {
+    pub fn rect_outline(&self, x: f32, y: f32, w: f32, h: f32, width: f32, color: D2D1_COLOR_F) {
         self.color(color);
         unsafe { self.rt.DrawRectangle(&rect_f(x, y, w, h), &self.brush, width, None) };
     }
 
-    pub(crate) fn circle(&self, (x, y): (f32, f32), r: f32, color: D2D1_COLOR_F) {
+    pub fn circle(&self, (x, y): (f32, f32), r: f32, color: D2D1_COLOR_F) {
         self.color(color);
         let e = D2D1_ELLIPSE { point: Vector2 { X: x, Y: y }, radiusX: r, radiusY: r };
         unsafe { self.rt.FillEllipse(&e, &self.brush) };
     }
 
-    pub(crate) fn ring(&self, (x, y): (f32, f32), r: f32, width: f32, color: D2D1_COLOR_F) {
+    pub fn ring(&self, (x, y): (f32, f32), r: f32, width: f32, color: D2D1_COLOR_F) {
         self.color(color);
         let e = D2D1_ELLIPSE { point: Vector2 { X: x, Y: y }, radiusX: r, radiusY: r };
         unsafe { self.rt.DrawEllipse(&e, &self.brush, width, None) };
@@ -123,7 +123,7 @@ impl Canvas<'_> {
 
     /// Draws `w`×`h` premultiplied 0xAARRGGBB pixels from `px` (rows `stride` pixels apart) into
     /// the box `[x, y, bw, bh]`, scaled to fit it.
-    pub(crate) fn image(&self, px: &[u32], stride: usize, (w, h): (u32, u32), [x, y, bw, bh]: [f32; 4]) {
+    pub fn image(&self, px: &[u32], stride: usize, (w, h): (u32, u32), [x, y, bw, bh]: [f32; 4]) {
         if w == 0 || h == 0 || px.len() < (h as usize - 1) * stride + w as usize {
             return;
         }
@@ -143,7 +143,7 @@ impl Canvas<'_> {
     }
 
     /// Draws `text` left-aligned and vertically centered in the box `[x, y, w, h]`.
-    pub(crate) fn text(&self, text: &str, font: &IDWriteTextFormat, [x, y, w, h]: [f32; 4], color: D2D1_COLOR_F) {
+    pub fn text(&self, text: &str, font: &IDWriteTextFormat, [x, y, w, h]: [f32; 4], color: D2D1_COLOR_F) {
         let s = wide(text);
         unsafe {
             self.color(color);
@@ -158,12 +158,12 @@ impl Canvas<'_> {
         }
     }
 
-    pub(crate) fn text_layout(&self, layout: &IDWriteTextLayout, (x, y): (f32, f32), color: D2D1_COLOR_F) {
+    pub fn text_layout(&self, layout: &IDWriteTextLayout, (x, y): (f32, f32), color: D2D1_COLOR_F) {
         self.color(color);
         unsafe { self.rt.DrawTextLayout(Vector2 { X: x, Y: y }, layout, &self.brush, D2D1_DRAW_TEXT_OPTIONS_NONE) };
     }
 
-    pub(crate) fn text_centred(&self, text: &str, font: &IDWriteTextFormat, centre: (f32, f32), color: D2D1_COLOR_F) {
+    pub fn text_centred(&self, text: &str, font: &IDWriteTextFormat, centre: (f32, f32), color: D2D1_COLOR_F) {
         let s: Vec<u16> = text.encode_utf16().collect();
         let Ok(layout) = (unsafe { self.dwrite.CreateTextLayout(&s, font, LAYOUT_BOX, LAYOUT_BOX) }) else { return };
         if let Some(ink) = ink_box(&layout) {

@@ -31,7 +31,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, Tr
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
 
-use crate::platform::gfx::{Dib, Painter, animate, ease_out, make_glass, rgba};
+use glint_shell::gfx::{Dib, Painter, animate, ease_out, make_glass, rgba};
 use glint_shell::monitors;
 
 const FADE_IN_MS: f32 = 160.0;

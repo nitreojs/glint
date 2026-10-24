@@ -1,7 +1,7 @@
 use windows::Win32::Graphics::Gdi::*;
 
 /// Top-down 32-bit DIB selected into its own memory DC.
-pub(crate) struct Dib {
+pub struct Dib {
     pub dc: HDC,
     bmp: HBITMAP,
     old: HGDIOBJ,
@@ -11,7 +11,7 @@ pub(crate) struct Dib {
 }
 
 impl Dib {
-    pub(crate) fn new(w: i32, h: i32) -> Result<Dib, String> {
+    pub fn new(w: i32, h: i32) -> Result<Dib, String> {
         unsafe {
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -39,16 +39,16 @@ impl Dib {
         }
     }
 
-    pub(crate) fn pixels(&self) -> &[u32] {
+    pub fn pixels(&self) -> &[u32] {
         unsafe { std::slice::from_raw_parts(self.bits, (self.w * self.h) as usize) }
     }
 
-    pub(crate) fn pixel(&self, x: i32, y: i32) -> Option<u32> {
+    pub fn pixel(&self, x: i32, y: i32) -> Option<u32> {
         let inside = (0..self.w).contains(&x) && (0..self.h).contains(&y);
         inside.then(|| self.pixels()[(y * self.w + x) as usize])
     }
 
-    pub(crate) fn pixels_mut(&mut self) -> &mut [u32] {
+    pub fn pixels_mut(&mut self) -> &mut [u32] {
         unsafe { std::slice::from_raw_parts_mut(self.bits, (self.w * self.h) as usize) }
     }
 }

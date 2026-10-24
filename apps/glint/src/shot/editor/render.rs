@@ -14,7 +14,7 @@ use super::text::Typesetter;
 use super::toolbar::{BAR_BG, WHITE, beside, nearest};
 use super::{Drag, Editor, HINT, hint_alpha, hull};
 use crate::picker::DIM;
-use crate::platform::gfx::{Canvas, Dib, Painter, rgba};
+use glint_shell::gfx::{Canvas, Dib, Painter, rgba};
 use crate::platform::rect::ring;
 
 const GRIP_EDGE: D2D1_COLOR_F = rgba(20, 20, 24, 0.9);

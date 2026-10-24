@@ -14,7 +14,7 @@ use windows::core::w;
 
 use super::Shot;
 use super::editor::Output;
-use crate::platform::gfx::Dib;
+use glint_shell::gfx::Dib;
 
 const BORDER: i32 = 1;
 /// Palette blue, opaque.

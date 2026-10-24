@@ -6,7 +6,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     LoadCursorW,
 };
 
-use super::gfx::Dib;
+use glint_shell::gfx::Dib;
 
 /// A cursor's picture as premultiplied 0xAARRGGBB rows, and its hotspot.
 #[derive(Debug, Default)]

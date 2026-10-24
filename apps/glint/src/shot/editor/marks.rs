@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
 use super::text::Typesetter;
 use crate::platform::cursor::CursorImage;
-use crate::platform::gfx::{Canvas, Dib, rgba};
+use glint_shell::gfx::{Canvas, Dib, rgba};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Tool {

@@ -28,7 +28,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::PCWSTR;
 
 use crate::platform::cursor::CursorImage;
-use crate::platform::gfx::Dib;
+use glint_shell::gfx::Dib;
 use crate::platform::rect::ring;
 
 mod effects;
@@ -1243,7 +1243,7 @@ fn tool_key(vk: u32, digit: Option<u32>, letter: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::gfx::Painter;
+    use glint_shell::gfx::Painter;
 
     fn editor() -> Editor {
         Editor::new(Rect { x: 0, y: 0, w: 400, h: 300 }, None, vec![Rect { x: 0, y: 0, w: 1920, h: 1080 }], 1.0)

@@ -4,7 +4,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::core::{BOOL, w};
 
-use crate::platform::gfx::{Canvas, rgba};
+use glint_shell::gfx::{Canvas, rgba};
 
 const SHADE: D2D1_COLOR_F = rgba(0, 0, 0, 0.6);
 const FORMATS: usize = 8;

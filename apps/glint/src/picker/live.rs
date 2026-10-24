@@ -14,7 +14,7 @@ use windows::core::{BOOL, w};
 
 use super::pill::{Pill, draw_pill};
 use super::{DIM, RING, rgn};
-use crate::platform::gfx::{Painter, make_glass};
+use glint_shell::gfx::{Painter, make_glass};
 use crate::platform::rect::ring;
 
 const DIM_ALPHA: f32 = (256 - DIM) as f32;

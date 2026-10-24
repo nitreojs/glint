@@ -1166,7 +1166,6 @@ dependencies = [
  "serde_json",
  "toml",
  "windows",
- "windows-numerics",
 ]
 
 [[package]]
@@ -1199,6 +1198,7 @@ dependencies = [
  "glint-core",
  "glint-media",
  "windows",
+ "windows-numerics",
 ]
 
 [[package]]

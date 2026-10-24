@@ -5,7 +5,7 @@ use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use super::Editor;
 use super::marks::{COLORS, TOOLS, Tool, arrow};
 use super::text::Typesetter;
-use crate::platform::gfx::{Canvas, Painter, rgba};
+use glint_shell::gfx::{Canvas, Painter, rgba};
 
 pub(super) const BAR_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.92);
 pub(super) const WHITE: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);

@@ -3,7 +3,7 @@ use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{BitBlt, CAPTUREBLT, GdiFlush, GetDC, ROP_CODE, ReleaseDC, SRCCOPY};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
-use super::gfx::Dib;
+use glint_shell::gfx::Dib;
 use glint_shell::monitors;
 
 const BLACK: u32 = 0xFF00_0000;

@@ -1,7 +1,7 @@
 use glint_core::geom::rect::Rect;
 
 use super::marks::Mark;
-use crate::platform::gfx::Dib;
+use glint_shell::gfx::Dib;
 
 /// Applies a blur / pixelate mark to `dib`, which shows the screen area `sel`.
 pub(super) fn apply_effect(dib: &mut Dib, m: &Mark, sel: Rect, scale: f32) {

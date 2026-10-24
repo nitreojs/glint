@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Gdi::*;
 use super::frozen::Frozen;
 use super::pill::Pill;
 use super::{RING, Screen, State, rgn};
-use crate::platform::gfx::Dib;
+use glint_shell::gfx::Dib;
 
 impl State {
     /// Replaces the selection and, if `label` is Some, the label; invalidates exactly the

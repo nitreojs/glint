@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Gdi::GdiFlush;
 use super::pill::{Pill, render_pill};
 use super::{DIM, Monitor};
 use crate::platform::capture;
-use crate::platform::gfx::{Dib, Painter};
+use glint_shell::gfx::{Dib, Painter};
 
 pub(super) struct Frozen {
     pub(super) bright: Dib,

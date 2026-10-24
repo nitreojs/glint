@@ -8,3 +8,4 @@ repository.workspace = true
 glint-core.workspace = true
 glint-media.workspace = true
 windows.workspace = true
+windows-numerics.workspace = true
