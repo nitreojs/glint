@@ -398,7 +398,9 @@ pub fn slider(
         let (track, mut resp) = ui.allocate_exact_size(vec2(w, 20.0), Sense::click_and_drag());
         let (scale, _) = ui.allocate_exact_size(vec2(w, 14.0), Sense::hover());
 
-        let mut v = *value;
+        // a value outside the range (one the caller is about to replace) shows at its nearer end
+        let mut v = (*value).clamp(min, max);
+        let shown = v;
         if let Some(pos) = resp.interact_pointer_pos()
             && (resp.is_pointer_button_down_on() || resp.clicked())
         {
@@ -420,18 +422,18 @@ pub fn slider(
                 v = max;
             }
         }
-        if v != *value {
+        if v != shown {
             *value = v;
             resp.mark_changed();
         }
 
         let painter = ui.painter();
         let y = readout.center().y;
-        painter.text(pos2(readout.left(), y), Align2::LEFT_CENTER, value.to_string(), mono_medium(12.0), p.t1);
+        painter.text(pos2(readout.left(), y), Align2::LEFT_CENTER, v.to_string(), mono_medium(12.0), p.t1);
         painter.text(pos2(readout.left() + 28.0, y), Align2::LEFT_CENTER, word, sans(13.0), p.t2);
 
         // The thumb glides to clicks, keys and resets, and follows the pointer while dragged.
-        let target = (*value - min) as f32 / (max - min) as f32;
+        let target = (v - min) as f32 / (max - min).max(1) as f32;
         let t = glide(ui, resp.id.with("pos"), target, if resp.dragged() { 0.0 } else { 0.14 });
         let kx = track.left() + t * track.width();
         let line = |x0: f32, x1: f32, c: Color32| {
@@ -550,4 +552,52 @@ pub fn dropdown_detail(
         });
     });
     Dropped { picked, opened, response: resp }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::theme::fonts;
+    use crate::widgets::palette;
+
+    /// Where the slider's thumb is drawn (its centre x) after a frame showing `value`.
+    fn thumb(ctx: &egui::Context, value: u32, time: f64) -> f32 {
+        let look = Look { p: palette(false, [0xE5, 0x40, 0x2F]), keyboard: false };
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(300.0, 100.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |ui| {
+            let mut v = value;
+            slider(ui, &look, &mut v, 4..=60, "", "", "");
+        });
+        out.shapes
+            .iter()
+            .find_map(|c| match &c.shape {
+                Shape::Rect(r) if r.rect.height() >= 16.0 && r.rect.width() <= 8.0 => Some(r.rect.center().x),
+                _ => None,
+            })
+            .expect("the thumb")
+    }
+
+    #[test]
+    fn a_value_below_the_range_rests_at_its_end_and_moves_on_from_there() {
+        let ctx = egui::Context::default();
+        fonts(&ctx);
+        let mut time = 0.0;
+        let mut at = |v| {
+            time += 0.05;
+            thumb(&ctx, v, time)
+        };
+        let start = at(4);
+        for _ in 0..10 {
+            at(0);
+        }
+        assert!((at(0) - start).abs() < 0.5, "0 shows like 4, at the left end");
+        let fifteen = (0..20).map(|_| at(15)).last().unwrap();
+        let width = 300.0 - 2.0 * 8.0;
+        let expected = start + (15.0 - 4.0) / (60.0 - 4.0) * width;
+        assert!((fifteen - expected).abs() < 20.0, "15 lands near {expected}, not at {fifteen}");
+    }
 }

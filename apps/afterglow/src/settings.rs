@@ -237,9 +237,11 @@ impl Settings {
         });
         widgets::reveal(ui, Id::unique("bitrate"), fixed, |ui| {
             row(ui, look, "bitrate", 0.0, |ui| {
-                let mb = self.cfg.bitrate as f64 * 7.5;
-                let word = format!("Mbit/s · ≈ {mb:.0} MB a minute");
-                widgets::slider(ui, look, &mut self.cfg.bitrate, 4..=60, &word, "4 ← smaller", "sharper → 60");
+                // folding away under constant quality, it keeps showing the bitrate it comes back with
+                let mut leaving = self.last_bitrate;
+                let bitrate = if fixed { &mut self.cfg.bitrate } else { &mut leaving };
+                let word = format!("Mbit/s · ≈ {:.0} MB a minute", *bitrate as f64 * 7.5);
+                widgets::slider(ui, look, bitrate, 4..=60, &word, "4 ← smaller", "sharper → 60");
             });
         });
         widgets::reveal(ui, Id::unique("quality"), !fixed, |ui| {
