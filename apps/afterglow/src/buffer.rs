@@ -83,7 +83,8 @@ impl Buffer {
             fps,
             codec: cfg.codec.codec(),
             qp: cfg.quality,
-            effort: 50,
+            // measured at 3440x1440 on an rtx 5060 ti: hevc at 50 manages ~50 fps, at 20 ~350
+            effort: 20,
             keyframe_secs: 1.0,
             bitrate: (cfg.bitrate > 0).then(|| cfg.bitrate * 1_000_000),
             draw_cursor: true,
