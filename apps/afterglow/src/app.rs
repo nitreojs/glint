@@ -13,6 +13,7 @@ use glint_core::wide::wide;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use glint_shell::{autostart, explorer, hotkey, instance, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, NIN_SELECT, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -60,6 +61,8 @@ struct App {
     generation: u64,
     /// Paused from the menu: no buffer, and none comes back on its own.
     paused: bool,
+    /// The session is locked or the PC is going to sleep: nothing to record until it's back.
+    away: bool,
     hotkey: bool,
     /// A save is being written: how long the clip is (seconds).
     saving: Option<f64>,
@@ -91,13 +94,14 @@ impl App {
                 (self.on, format!("afterglow\nbuffering {} of {}{keys}", human_duration(held), human_duration(self.cfg.length as f64)))
             }
             None if self.paused => (self.off, "afterglow\npaused".to_string()),
+            None if self.away => (self.off, "afterglow\nwaiting for you to come back".to_string()),
             None => (self.off, "afterglow\nstarting…".to_string()),
         };
         self.tray.show(icon, &tip);
     }
 
     fn start(&mut self) {
-        if self.buffer.is_some() || self.paused {
+        if self.buffer.is_some() || self.paused || self.away {
             return;
         }
         self.generation += 1;
@@ -158,6 +162,22 @@ impl App {
                 self.notify("afterglow: couldn't save", &e, true);
             }
         }
+    }
+
+    /// Locked, asleep or back: a locked screen or a sleeping PC has nothing to keep, and capture
+    /// can't see the lock screen anyway.
+    fn set_away(&mut self, away: bool) {
+        if self.away == away {
+            return;
+        }
+        self.away = away;
+        log(if away { "away: buffer stopped" } else { "back: buffering again" });
+        if away {
+            self.stop();
+        } else {
+            self.start();
+        }
+        self.refresh_tray();
     }
 
     fn set_paused(&mut self, paused: bool) {
@@ -317,6 +337,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(App::save);
             return LRESULT(0);
         }
+        // WTS_SESSION_LOCK / WTS_SESSION_UNLOCK
+        WM_WTSSESSION_CHANGE if wp.0 == 7 || wp.0 == 8 => {
+            with_app(|a| a.set_away(wp.0 == 7));
+            return LRESULT(0);
+        }
+        WM_POWERBROADCAST if wp.0 == PBT_APMSUSPEND as usize || wp.0 == PBT_APMRESUMEAUTOMATIC as usize => {
+            with_app(|a| a.set_away(wp.0 == PBT_APMSUSPEND as usize));
+            return LRESULT(1);
+        }
         WM_RELOAD => {
             with_app(App::reload);
             return LRESULT(0);
@@ -397,6 +426,9 @@ pub fn run() {
         Err(e) => (Config::default(), Some(e)),
     };
     let hwnd = window::hidden(MAIN_CLASS, "afterglow", Some(wndproc)).expect("main window");
+    unsafe {
+        let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
+    }
     let size = icon_size();
     let (on, off) = (make_icon(size, &icon_pixels(size, true, AMBER)), make_icon(size, &icon_pixels(size, false, GREY)));
     let tray = TrayIcon::new(hwnd, WM_TRAY, off, "afterglow\nstarting…");
@@ -410,6 +442,7 @@ pub fn run() {
         buffer: None,
         generation: 0,
         paused,
+        away: false,
         hotkey: false,
         saving: None,
         last_saved: None,
