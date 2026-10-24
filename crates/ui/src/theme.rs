@@ -21,13 +21,15 @@ pub fn fonts(ctx: &egui::Context) {
     for (name, bytes) in FONTS {
         fonts.font_data.insert(name.into(), Arc::new(FontData::from_static(bytes)));
     }
-    // Segoe UI covers what Plex doesn't (other scripts in folder names, for instance).
+    // Segoe UI covers what Plex doesn't (other scripts in folder names, for instance), Segoe UI
+    // Symbol the symbols neither has (the ♪ by apps that play sound).
     let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".into());
-    let segoe = std::fs::read(Path::new(&windir).join("Fonts").join("segoeui.ttf")).ok();
     let mut fallback: Vec<String> = Vec::new();
-    if let Some(bytes) = segoe {
-        fonts.font_data.insert("segoe".into(), Arc::new(FontData::from_owned(bytes)));
-        fallback.push("segoe".into());
+    for (name, file) in [("segoe", "segoeui.ttf"), ("segoe-symbol", "seguisym.ttf")] {
+        if let Ok(bytes) = std::fs::read(Path::new(&windir).join("Fonts").join(file)) {
+            fonts.font_data.insert(name.into(), Arc::new(FontData::from_owned(bytes)));
+            fallback.push(name.into());
+        }
     }
     fallback.extend(defaults);
     let families = [
