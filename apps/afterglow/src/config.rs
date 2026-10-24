@@ -32,6 +32,8 @@ pub struct Config {
     /// 0: the monitor's refresh rate.
     pub fps: u32,
     pub codec: CodecName,
+    /// Average Mbit/s, which fixes the buffer's size; 0 records at the constant `quality` instead.
+    pub bitrate: u32,
     /// Constant QP, 0-51: lower is sharper and bigger.
     pub quality: u32,
     /// The buffer never holds more than this; it keeps less time instead.
@@ -49,7 +51,8 @@ impl Default for Config {
             output_dir: String::new(),
             monitor: 0,
             fps: 60,
-            codec: CodecName::H264,
+            codec: CodecName::Hevc,
+            bitrate: 15,
             quality: 23,
             max_memory_mb: 1024,
             audio_sources: vec![AudioSource { tracks: vec![1], ..AudioSource::new(SourceKind::Desktop, 0) }],
@@ -91,6 +94,9 @@ impl Config {
         if !(5..=1800).contains(&self.length) {
             return Err(format!("length must be 5-1800 seconds, got {}", self.length));
         }
+        if self.bitrate > 200 {
+            return Err(format!("bitrate must be 0-200 Mbit/s, got {}", self.bitrate));
+        }
         if self.quality > 51 {
             return Err(format!("quality must be 0-51, got {}", self.quality));
         }
@@ -101,6 +107,14 @@ impl Config {
             return Err(format!("max_memory_mb must be at least 64, got {}", self.max_memory_mb));
         }
         Ok(())
+    }
+
+    /// About how many bytes `secs` of recording take, when that's known (a bitrate is set).
+    pub fn bytes_for(&self, secs: u32) -> Option<u64> {
+        // the sound: 192 kbit/s per track
+        let tracks = self.audio_sources.iter().filter(|s| s.enabled).flat_map(|s| s.tracks.iter()).max().copied();
+        let audio = tracks.unwrap_or(0) as u64 * 24_000;
+        (self.bitrate > 0).then(|| (self.bitrate as u64 * 125_000 + audio) * secs as u64)
     }
 
     /// Where saved clips go.
@@ -176,10 +190,13 @@ output_dir = {output_dir}
 # 0 is the primary monitor; 1, 2, … the monitors in the order Windows lists them.
 monitor = {monitor}
 
-# Frames per second (0: the monitor's refresh rate), "h264" or "hevc", and constant quality
-# (QP, 0-51: lower is sharper and bigger).
+# Frames per second (0: the monitor's refresh rate) and "h264" or "hevc" (about 30 % smaller).
 fps = {fps}
 codec = "{codec}"
+
+# Average Mbit/s (a minute takes about 7.5 MB per Mbit/s); 0 uses the constant quality below
+# instead (QP, 0-51: lower is sharper and bigger), whose size depends on what's on screen.
+bitrate = {bitrate}
 quality = {quality}
 
 # The buffer never holds more than this many MB; it keeps less time instead.
@@ -197,6 +214,7 @@ launch_at_startup = {autostart}
             output_dir = q(&self.output_dir),
             monitor = self.monitor,
             fps = self.fps,
+            bitrate = self.bitrate,
             quality = self.quality,
             memory = self.max_memory_mb,
             autostart = self.launch_at_startup,
@@ -231,7 +249,8 @@ mod tests {
             output_dir: r#"D:\clips "best""#.into(),
             monitor: 2,
             fps: 0,
-            codec: CodecName::Hevc,
+            codec: CodecName::H264,
+            bitrate: 0,
             quality: 18,
             max_memory_mb: 4096,
             launch_at_startup: true,
@@ -257,6 +276,13 @@ mod tests {
         cfg.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 2) });
         cfg.set_hears(SourceKind::Desktop, true);
         assert_eq!(cfg.audio_sources[2].tracks, [1, 4], "app sources keep the tracks they were given");
+    }
+
+    #[test]
+    fn a_bitrate_says_how_big_a_save_is() {
+        let cfg = Config { bitrate: 16, ..Config::default() };
+        assert_eq!(cfg.bytes_for(60), Some((2_000_000 + 24_000) * 60), "16 Mbit/s and one sound track");
+        assert_eq!(Config { bitrate: 0, ..cfg }.bytes_for(60), None, "constant quality can't tell");
     }
 
     #[test]

@@ -143,6 +143,7 @@ pub(super) fn video_config(p: &Params) -> VideoConfig {
         qp: p.qp,
         effort: p.effort,
         keyframe_secs: p.keyframe_secs,
+        bitrate: p.bitrate,
     }
 }
 
@@ -222,7 +223,7 @@ impl SinkWriter {
                 Codec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
             };
             // Only a header hint in constant-QP mode (~0.1 bit per pixel).
-            let nominal_bps = ((w as f64 * h as f64 * config.fps) / 10.0).clamp(2e6, 400e6) as u32;
+            let nominal_bps = config.nominal_bps();
             let fps_milli = (config.fps * 1000.0).round() as u32;
             let out_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
             out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
@@ -241,9 +242,19 @@ impl SinkWriter {
 
             let in_t = input_type(w, h, config.fps)?;
             let enc = attributes(4)?;
-            enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_Quality.0 as u32)
-                .ctx("enc")?;
-            enc.SetUINT64(&CODECAPI_AVEncVideoEncodeQP, config.qp.min(51) as u64).ctx("enc")?;
+            match (config.bitrate, config.peak_bps()) {
+                (Some(mean), Some(peak)) => {
+                    let mode = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
+                    enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode).ctx("enc")?;
+                    enc.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, mean).ctx("enc")?;
+                    enc.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, peak).ctx("enc")?;
+                }
+                _ => {
+                    let mode = eAVEncCommonRateControlMode_Quality.0 as u32;
+                    enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode).ctx("enc")?;
+                    enc.SetUINT64(&CODECAPI_AVEncVideoEncodeQP, config.qp.min(51) as u64).ctx("enc")?;
+                }
+            }
             enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, config.effort.min(100)).ctx("enc")?;
             enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, gop(config)).ctx("enc")?;
             writer.SetInputMediaType(stream, &in_t, &enc).ctx("IMFSinkWriter::SetInputMediaType")?;

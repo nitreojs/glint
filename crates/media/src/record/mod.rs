@@ -62,6 +62,8 @@ pub struct Params {
     pub effort: u32,
     /// Seconds between keyframes.
     pub keyframe_secs: f64,
+    /// An average bitrate (bit/s) instead of the constant `qp`.
+    pub bitrate: Option<u32>,
     pub draw_cursor: bool,
     /// Click highlights; `None` = off (no mouse hook).
     pub clicks: Option<ClickHighlights>,

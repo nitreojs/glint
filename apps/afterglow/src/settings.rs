@@ -59,6 +59,8 @@ pub struct Settings {
     licences: bool,
     /// The monitors as the dropdown lists them: (label, number in [`Config::monitor`]).
     monitors: Vec<(String, u32)>,
+    /// The bitrate to go back to after trying constant quality.
+    last_bitrate: u32,
 }
 
 fn length_label(secs: u32) -> String {
@@ -102,7 +104,9 @@ impl Settings {
         let primary = outputs.iter().find(|o| o.rect.contains(0, 0)).map(|o| size(o.rect));
         let mut monitors = vec![(primary.map_or("primary".into(), |s| format!("primary ({s})")), 0)];
         monitors.extend(outputs.iter().enumerate().map(|(i, o)| (format!("{} · {}", i + 1, size(o.rect)), i as u32 + 1)));
-        Settings { saved: cfg.clone(), cfg, error, keys: Recorder::new(release_tray_hotkey), licences: false, monitors }
+        let last_bitrate = if cfg.bitrate > 0 { cfg.bitrate } else { Config::default().bitrate };
+        let keys = Recorder::new(release_tray_hotkey);
+        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, monitors, last_bitrate }
     }
 
     fn general(&mut self, ui: &mut Ui, look: &Look) {
@@ -197,18 +201,58 @@ impl Settings {
         row(ui, look, "codec", 7.0, |ui| {
             let codecs = [(CodecName::H264, "h.264"), (CodecName::Hevc, "hevc")];
             widgets::segmented(ui, look, &mut self.cfg.codec, &codecs, Some(168.0));
-            hint(ui, "h.264 plays everywhere · hevc ~30 % smaller, so more fits in memory", t3);
+            hint(ui, "hevc looks as good at about 30 % less · h.264 plays everywhere, discord included", t3);
         });
-        row(ui, look, "quality", 0.0, |ui| {
-            let word = quality_word(self.cfg.quality);
-            widgets::slider(ui, look, &mut self.cfg.quality, 12..=36, word, "12 ← sharper, bigger", "smaller, softer → 36");
+        let mut fixed = self.cfg.bitrate > 0;
+        row(ui, look, "size", 7.0, |ui| {
+            let modes = [(true, "bitrate"), (false, "constant quality")];
+            if widgets::segmented(ui, look, &mut fixed, &modes, Some(260.0)).changed() {
+                if fixed {
+                    self.cfg.bitrate = self.last_bitrate;
+                } else {
+                    self.last_bitrate = self.cfg.bitrate;
+                    self.cfg.bitrate = 0;
+                }
+            }
+            let text = if fixed {
+                "a known size: busy scenes get softer, calm ones smaller"
+            } else {
+                "the same look always: busy scenes take more memory, up to the cap below"
+            };
+            hint(ui, text, t3);
+        });
+        widgets::reveal(ui, Id::unique("bitrate"), fixed, |ui| {
+            row(ui, look, "bitrate", 0.0, |ui| {
+                let mb = self.cfg.bitrate as f64 * 7.5;
+                let word = format!("Mbit/s · ≈ {mb:.0} MB a minute");
+                widgets::slider(ui, look, &mut self.cfg.bitrate, 4..=60, &word, "4 ← smaller", "sharper → 60");
+            });
+        });
+        widgets::reveal(ui, Id::unique("quality"), !fixed, |ui| {
+            row(ui, look, "quality", 0.0, |ui| {
+                let word = quality_word(self.cfg.quality);
+                widgets::slider(ui, look, &mut self.cfg.quality, 12..=36, word, "12 ← sharper, bigger", "smaller, softer → 36");
+            });
         });
         let caps = with_current(&MEMORY_CAPS, self.cfg.max_memory_mb);
         let labels: Vec<String> = caps.iter().map(|&m| memory_label(m)).collect();
         let options: Vec<(u32, &str)> = caps.iter().copied().zip(labels.iter().map(String::as_str)).collect();
         row(ui, look, "memory", 7.0, |ui| {
             widgets::segmented(ui, look, &mut self.cfg.max_memory_mb, &options, None);
-            hint(ui, "the most the buffer holds; past it, a save covers less time", t3);
+            let text = match self.cfg.bytes_for(self.cfg.length) {
+                Some(b) => {
+                    let mb = b as f64 / 1e6;
+                    let fits = mb <= self.cfg.max_memory_mb as f64 * 1.048_576;
+                    let save = length_label(self.cfg.length);
+                    if fits {
+                        format!("a {save} buffer takes about {mb:.0} MB, and so does each save")
+                    } else {
+                        format!("a {save} buffer needs about {mb:.0} MB: past the cap, saves cover less time")
+                    }
+                }
+                None => "the most the buffer holds; past it, a save covers less time".into(),
+            };
+            hint(ui, text, t3);
         });
     }
 
@@ -281,6 +325,7 @@ impl Settings {
                 n(a.monitor == b.monitor)
                     + n(a.fps == b.fps)
                     + n(a.codec == b.codec)
+                    + n(a.bitrate == b.bitrate)
                     + n(a.quality == b.quality)
                     + n(a.max_memory_mb == b.max_memory_mb)
             }
@@ -340,6 +385,7 @@ impl Pages for Settings {
                 c.monitor = d.monitor;
                 c.fps = d.fps;
                 c.codec = d.codec;
+                c.bitrate = d.bitrate;
                 c.quality = d.quality;
                 c.max_memory_mb = d.max_memory_mb;
             }

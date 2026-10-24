@@ -188,7 +188,7 @@ mod tests {
     const FRAME: i64 = S / 10;
 
     fn video() -> Stream {
-        let config = VideoConfig { codec: Codec::H264, width: 64, height: 64, fps: 10.0, qp: 20, effort: 50, keyframe_secs: 1.0 };
+        let config = VideoConfig { codec: Codec::H264, width: 64, height: 64, fps: 10.0, qp: 20, effort: 50, bitrate: None, keyframe_secs: 1.0 };
         Stream::Video { config, headers: vec![0x67] }
     }
 

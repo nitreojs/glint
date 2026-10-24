@@ -110,7 +110,7 @@ fn frame(gpu: &Gpu, (w, h): (u32, u32), rgba: [f32; 4]) -> IMFSample {
 
 /// `frames` of colour changes at 30 fps and a tone, through the hardware encoders into `sink`.
 fn encode<S: PacketSink>(gpu: &Gpu, codec: Codec, keyframe_secs: f64, frames: i64, sink: S) {
-    let config = VideoConfig { codec, width: 640, height: 360, fps: 30.0, qp: 23, effort: 50, keyframe_secs };
+    let config = VideoConfig { codec, width: 640, height: 360, fps: 30.0, qp: 23, effort: 50, keyframe_secs, bitrate: None };
     let audio = vec![("music".to_string(), AacEncoder::new().unwrap())];
     let mut out = Encoded::new(HwVideoEncoder::new(&gpu.mgr), &config, audio, sink).unwrap();
     let frame_hns = 10_000_000 / 30;
@@ -134,6 +134,73 @@ fn encode<S: PacketSink>(gpu: &Gpu, codec: Codec, keyframe_secs: f64, frames: i6
 
 fn temp_mp4(what: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("glint-{what}-{}.mp4", std::process::id()))
+}
+
+/// A `w`×`h` frame of random pixels: nothing an encoder can squeeze.
+fn noise(gpu: &Gpu, (w, h): (u32, u32), seed: u32) -> IMFSample {
+    let mut x = seed.wrapping_mul(2_654_435_761) | 1;
+    let px: Vec<u32> = (0..w * h)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            x | 0xFF00_0000
+        })
+        .collect();
+    let sample = frame(gpu, (w, h), [0.0; 4]);
+    unsafe {
+        let buf = sample.GetBufferByIndex(0).unwrap();
+        let dx: IMFDXGIBuffer = buf.cast().unwrap();
+        let mut raw = std::ptr::null_mut();
+        dx.GetResource(&ID3D11Texture2D::IID, &mut raw).unwrap();
+        let tex = ID3D11Texture2D::from_raw(raw);
+        gpu.ctx.UpdateSubresource(&tex, 0, None, px.as_ptr() as _, w * 4, 0);
+    }
+    sample
+}
+
+/// Counts what an encoder makes.
+#[derive(Default)]
+struct Bytes(Rc<RefCell<usize>>);
+
+impl PacketSink for Bytes {
+    fn add_stream(&mut self, _: Stream) -> Result<usize, String> {
+        Ok(0)
+    }
+
+    fn write(&mut self, _: usize, packet: Packet) -> Result<(), String> {
+        *self.0.borrow_mut() += packet.data.len();
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "needs a hardware video encoder"]
+fn a_bitrate_target_bounds_the_size_of_even_pure_noise() {
+    let gpu = gpu();
+    let size = |codec, bitrate| {
+        let config = VideoConfig { codec, width: 640, height: 360, fps: 30.0, qp: 18, effort: 50, keyframe_secs: 1.0, bitrate };
+        let bytes = Rc::new(RefCell::new(0));
+        let mut out = Encoded::new(HwVideoEncoder::new(&gpu.mgr), &config, Vec::<(String, AacEncoder)>::new(), Bytes(bytes.clone())).unwrap();
+        let frame_hns = 10_000_000 / 30;
+        for i in 0..90 {
+            out.video(noise(&gpu, (640, 360), i as u32), i * frame_hns, frame_hns).unwrap();
+        }
+        out.finish().unwrap();
+        drop(out);
+        *bytes.borrow()
+    };
+    for codec in [Codec::H264, Codec::Hevc] {
+        // 3 s at 2 Mbit/s is 750 KB
+        let target = size(codec, Some(2_000_000));
+        assert!((375_000..=900_000).contains(&target), "{codec:?} at 2 Mbit/s: {target} bytes");
+        let free = size(codec, None);
+        assert!(free > 4 * target, "{codec:?}: qp 18 on noise should be far bigger ({free} vs {target})");
+    }
 }
 
 /// Two seconds through the packet path into `codec`.mp4.

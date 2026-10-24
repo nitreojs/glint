@@ -176,6 +176,7 @@ impl App {
         }
         self.hotkey = hotkey::register(self.hwnd, SAVE_HOTKEY, &self.cfg.save_hotkey);
         if !self.hotkey {
+            log(&format!("save hotkey {} is taken by another app", self.cfg.save_hotkey));
             let text = format!("{} is already used by another app; the tray icon still saves.", self.cfg.save_hotkey);
             self.notify("afterglow: hotkey unavailable", &text, true);
         }
@@ -187,7 +188,7 @@ impl App {
     fn reload(&mut self) {
         match Config::load() {
             Ok(cfg) => {
-                let recording = |c: &Config| (c.monitor, c.fps, c.codec, c.quality, c.audio_sources.clone());
+                let recording = |c: &Config| (c.monitor, c.fps, c.codec, c.bitrate, c.quality, c.audio_sources.clone());
                 let restart = recording(&cfg) != recording(&self.cfg);
                 let hotkey = cfg.save_hotkey != self.cfg.save_hotkey;
                 self.cfg = cfg;

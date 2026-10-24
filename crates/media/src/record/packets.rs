@@ -35,8 +35,7 @@ fn video_subtype(codec: Codec) -> (windows::core::GUID, u32) {
 unsafe fn video_type(config: &VideoConfig) -> Result<IMFMediaType, String> {
     let (w, h) = (config.width, config.height);
     let (subtype, profile) = video_subtype(config.codec);
-    // Only a header hint in constant-QP mode (~0.1 bit per pixel).
-    let nominal_bps = ((w as f64 * h as f64 * config.fps) / 10.0).clamp(2e6, 400e6) as u32;
+    let nominal_bps = config.nominal_bps();
     let fps_milli = (config.fps * 1000.0).round() as u32;
     unsafe {
         let t = MFCreateMediaType().ctx("MFCreateMediaType")?;
@@ -137,7 +136,8 @@ fn friendly_name(a: &IMFActivate) -> String {
 }
 
 /// The GPU's video encoder MFT, asynchronous, fed D3D11 textures from the device behind `mgr`.
-/// Constant QP like the sink writer path, no B-frames (packets come out in display order, so
+/// Constant QP or a bitrate target like the sink writer path, no B-frames (packets come out in
+/// display order, so
 /// decode time equals presentation time), keyframes as the config says.
 pub struct HwVideoEncoder {
     mgr: IMFDXGIDeviceManager,
@@ -205,9 +205,19 @@ impl HwVideoEncoder {
                 .ctx("MFT_MESSAGE_SET_D3D_MANAGER")?;
             let api: ICodecAPI = mft.cast().ctx("ICodecAPI")?;
             let set = |key: &windows::core::GUID, v: VARIANT, what: &str| api.SetValue(key, &v).ctx(what);
-            let quality = eAVEncCommonRateControlMode_Quality.0 as u32;
-            set(&CODECAPI_AVEncCommonRateControlMode, quality.into(), "rate control")?;
-            set(&CODECAPI_AVEncVideoEncodeQP, (config.qp.min(51) as u64).into(), "qp")?;
+            match (config.bitrate, config.peak_bps()) {
+                (Some(mean), Some(peak)) => {
+                    let mode = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
+                    set(&CODECAPI_AVEncCommonRateControlMode, mode.into(), "rate control")?;
+                    set(&CODECAPI_AVEncCommonMeanBitRate, mean.into(), "bitrate")?;
+                    set(&CODECAPI_AVEncCommonMaxBitRate, peak.into(), "peak bitrate")?;
+                }
+                _ => {
+                    let quality = eAVEncCommonRateControlMode_Quality.0 as u32;
+                    set(&CODECAPI_AVEncCommonRateControlMode, quality.into(), "rate control")?;
+                    set(&CODECAPI_AVEncVideoEncodeQP, (config.qp.min(51) as u64).into(), "qp")?;
+                }
+            }
             // the rest are hints some encoders don't take
             let _ = set(&CODECAPI_AVEncCommonQualityVsSpeed, config.effort.min(100).into(), "effort");
             let _ = set(&CODECAPI_AVEncMPVGOPSize, gop(config).into(), "gop");

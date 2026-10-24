@@ -130,6 +130,21 @@ pub struct VideoConfig {
     pub effort: u32,
     /// Seconds between keyframes: where a cut without re-encoding can start.
     pub keyframe_secs: f64,
+    /// An average bitrate (bit/s, peaks up to a fifth over) instead of the constant `qp`: the
+    /// size is then known up front.
+    pub bitrate: Option<u32>,
+}
+
+impl VideoConfig {
+    /// The bitrate the stream's header announces: the target, or a guess for constant QP.
+    pub fn nominal_bps(&self) -> u32 {
+        self.bitrate.unwrap_or(((self.width as f64 * self.height as f64 * self.fps) / 10.0).clamp(2e6, 400e6) as u32)
+    }
+
+    /// The most a bitrate target lets the encoder spend for a moment.
+    pub fn peak_bps(&self) -> Option<u32> {
+        self.bitrate.map(|b| b.saturating_mul(6) / 5)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

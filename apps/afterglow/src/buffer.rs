@@ -85,6 +85,7 @@ impl Buffer {
             qp: cfg.quality,
             effort: 50,
             keyframe_secs: 1.0,
+            bitrate: (cfg.bitrate > 0).then(|| cfg.bitrate * 1_000_000),
             draw_cursor: true,
             clicks: None,
             keys: None,
