@@ -14,6 +14,10 @@ use crate::record::Ctx;
 /// when given.
 pub(super) struct Processor {
     mft: IMFTransform,
+    /// Frames in so far, and one frame's length at the types' rate: the processor sees a steady
+    /// clock, so it never converts the frame rate itself (the caller has already picked the frames).
+    frames: std::cell::Cell<i64>,
+    frame_hns: i64,
     alloc: Option<IMFVideoSampleAllocatorEx>,
     provides: bool,
     out_bytes: u32,
@@ -83,7 +87,9 @@ impl Processor {
             let frame_bytes = if subtype == MFVideoFormat_RGB32 { out.0 * out.1 * 4 } else { out.0 * out.1 * 3 / 2 };
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).ctx("video processor start")?;
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).ctx("video processor start")?;
-            Ok(Processor { mft, alloc, provides, out_bytes: info.cbSize.max(frame_bytes) })
+            let frame_hns = (10_000_000.0 / fps.max(1.0)).round() as i64;
+            let out_bytes = info.cbSize.max(frame_bytes);
+            Ok(Processor { mft, frames: std::cell::Cell::new(0), frame_hns, alloc, provides, out_bytes })
         }
     }
 
@@ -114,8 +120,12 @@ impl Processor {
     }
 
     /// One frame in, one out; the processor lets go of its input only once asked for more output.
+    /// The input's times are replaced (the caller times the output itself).
     pub(super) fn run(&self, input: &IMFSample) -> Result<IMFSample, String> {
+        let n = self.frames.replace(self.frames.get() + 1);
         unsafe {
+            input.SetSampleTime(n * self.frame_hns).ctx("SetSampleTime")?;
+            input.SetSampleDuration(self.frame_hns).ctx("SetSampleDuration")?;
             self.mft.ProcessInput(0, input, 0).ctx("video processor ProcessInput")?;
         }
         let out = self.output().ctx("video processor ProcessOutput")?;

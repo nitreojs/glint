@@ -378,3 +378,20 @@ fn switching_to_hevc_reencodes_with_it() {
     assert_eq!(facts[..4], ["hevc", "1280", "720", "30/1"], "{facts:?}");
     assert!((duration - 2.0).abs() < 0.08, "{duration}");
 }
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn an_uneven_recording_scales_down_to_a_steady_lower_rate() {
+    // like a game recording: 144 fps with frames missing here and there
+    let uneven = ["-vf", "select='not(mod(n\\,3))+not(mod(n\\,7))',setpts=N/144/TB*1.0", "-fps_mode", "vfr"];
+    let src = fixture("uneven", "1280x720", "144", &uneven);
+    let out = src.with_file_name(format!("glint-clip-uneven-out-{}.mp4", std::process::id()));
+    let secs: f64 = probe(&src, "format=duration")[0].parse().unwrap();
+    let edit = Edit::new((secs * SECOND as f64) as i64, 2);
+    let settings = export::Settings { fps: Some(60), height: Some(360), ..export::Settings::default() };
+    export_to(&src, &edit, &settings, &out);
+    let facts = video_stream_facts(&out);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+    assert_eq!(facts[..4], ["h264", "640", "360", "60/1"], "{facts:?}");
+}
