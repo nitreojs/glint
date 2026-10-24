@@ -150,12 +150,15 @@ pub(super) fn video_config(p: &Params) -> VideoConfig {
 pub(super) fn log_start(p: &Params, encoder: &str, tracks: usize) {
     let c = video_config(p);
     log(&format!(
-        "recording {}x{}@{:.3} {:?} qp={} effort={}{} -> {} [{encoder}]",
+        "recording {}x{}@{:.3} {:?} {} effort={}{} -> {} [{encoder}]",
         c.width,
         c.height,
         c.fps,
         c.codec,
-        c.qp,
+        match c.bitrate {
+            Some(b) => format!("{:.1} Mbit/s", b as f64 / 1e6),
+            None => format!("qp={}", c.qp),
+        },
         c.effort,
         match tracks {
             0 => String::new(),
