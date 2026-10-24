@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,6 +28,9 @@ pub(super) struct Player {
     tx: Option<Sender<Cmd>>,
     rx: Receiver<Result<Shown, String>>,
     queued: Arc<AtomicUsize>,
+    /// Where playback is (`i64::MIN` while it isn't running): frames the decoder can only finish
+    /// after their time has passed are skipped, so a slow machine shows fewer frames, not late ones.
+    clock: Arc<AtomicI64>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -36,19 +39,28 @@ impl Player {
         let (tx, cmds) = mpsc::channel();
         let (out, rx) = mpsc::channel();
         let queued = Arc::new(AtomicUsize::new(0));
-        let q = queued.clone();
+        let clock = Arc::new(AtomicI64::new(i64::MIN));
+        let (q, c) = (queued.clone(), clock.clone());
         let thread = std::thread::spawn(move || {
             let _com = Com::init();
-            let mut w = Worker { size, out, queued: q, ctx, epoch: 0, head: None, head_sent: false };
+            let mut w = Worker { size, out, queued: q, clock: c, ctx, epoch: 0, head: None, head_sent: false };
             if let Err(e) = w.run(&path, &cmds) {
                 let _ = w.out.send(Err(e));
                 w.ctx.request_repaint();
             }
         });
-        Player { tx: Some(tx), rx, queued, thread: Some(thread) }
+        Player { tx: Some(tx), rx, queued, clock, thread: Some(thread) }
+    }
+
+    /// Where playback is now, while it runs.
+    pub(super) fn set_clock(&self, t: i64) {
+        self.clock.store(t, Ordering::Relaxed);
     }
 
     pub(super) fn send(&self, cmd: Cmd) {
+        if matches!(cmd, Cmd::Seek { .. } | Cmd::Play(false)) {
+            self.clock.store(i64::MIN, Ordering::Relaxed);
+        }
         if let Some(tx) = &self.tx {
             let _ = tx.send(cmd);
         }
@@ -76,6 +88,7 @@ struct Worker {
     size: (u32, u32),
     out: Sender<Result<Shown, String>>,
     queued: Arc<AtomicUsize>,
+    clock: Arc<AtomicI64>,
     ctx: egui::Context,
     epoch: u64,
     head: Option<Decoded>,
@@ -126,6 +139,11 @@ impl Worker {
             match self.head.take() {
                 Some(h) if !self.head_sent => self.show(h)?,
                 _ => match media::next_video(&reader)? {
+                    // over before it could be shown: skip the readback and the upload
+                    Some(f) if f.ts + f.dur < self.clock.load(Ordering::Relaxed) => {
+                        self.head = Some(f);
+                        self.head_sent = true;
+                    }
                     Some(f) => self.show(f)?,
                     None => playing = false,
                 },

@@ -576,6 +576,9 @@ impl ClipApp {
             Play::Starting => i64::MIN,
             Play::Paused => i64::MAX,
         };
+        if let (Play::Running { .. }, Some(p)) = (self.play, &self.player) {
+            p.set_clock(now);
+        }
         let mut latest = None;
         while self.queue.front().is_some_and(|s| s.ts <= now) {
             latest = self.queue.pop_front();
