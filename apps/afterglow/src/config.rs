@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use glint_core::config::CodecName;
-use glint_core::config::audio::{AudioSource, SourceKind};
+use glint_core::config::audio::{AudioSource, MAX_TRACKS, SourceKind};
 use glint_core::config::hotkeys::parse_hotkey;
 use glint_core::paths::app_dir_for;
 use serde::Deserialize;
@@ -39,6 +39,8 @@ pub struct Config {
     /// The buffer never holds more than this; it keeps less time instead.
     pub max_memory_mb: u32,
     pub audio_sources: Vec<AudioSource>,
+    /// What players call each track; empty names it after its sources.
+    pub audio_track_names: Vec<String>,
     pub launch_at_startup: bool,
 }
 
@@ -57,6 +59,7 @@ impl Default for Config {
             quality: 23,
             max_memory_mb: 1024,
             audio_sources: vec![AudioSource { tracks: vec![1], ..AudioSource::new(SourceKind::Desktop, 0) }],
+            audio_track_names: vec![String::new(); MAX_TRACKS as usize],
             launch_at_startup: false,
         }
     }
@@ -79,8 +82,9 @@ impl Config {
             }
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let cfg: Config = toml::from_str(&text).map_err(|e| format!("config.toml: {e}"))?;
+        let mut cfg: Config = toml::from_str(&text).map_err(|e| format!("config.toml: {e}"))?;
         cfg.check()?;
+        cfg.audio_track_names.resize(MAX_TRACKS as usize, String::new());
         Ok(cfg)
     }
 
@@ -104,6 +108,9 @@ impl Config {
         if self.fps > 240 {
             return Err(format!("fps must be 0-240, got {}", self.fps));
         }
+        if self.audio_track_names.len() > MAX_TRACKS as usize {
+            return Err(format!("audio_track_names has {} names, at most {MAX_TRACKS} fit", self.audio_track_names.len()));
+        }
         if self.max_memory_mb < 64 {
             return Err(format!("max_memory_mb must be at least 64, got {}", self.max_memory_mb));
         }
@@ -124,30 +131,6 @@ impl Config {
             return PathBuf::from(self.output_dir.trim());
         }
         default_output_dir()
-    }
-
-    /// Whether a source of `kind` is on.
-    pub fn hears(&self, kind: SourceKind) -> bool {
-        self.audio_sources.iter().any(|s| s.kind == kind && s.enabled)
-    }
-
-    /// Turns the default `kind` source (desktop, or the default microphone) on or off. Both on,
-    /// each gets its own track besides the mixed first one.
-    pub fn set_hears(&mut self, kind: SourceKind, on: bool) {
-        let default = |s: &AudioSource| s.kind == kind && (kind != SourceKind::Mic || s.device.is_empty());
-        match self.audio_sources.iter_mut().find(|s| default(s)) {
-            Some(s) => s.enabled = on,
-            None if on => self.audio_sources.push(AudioSource::new(kind, 0)),
-            None => {}
-        }
-        let both = self.hears(SourceKind::Desktop) && self.hears(SourceKind::Mic);
-        for s in self.audio_sources.iter_mut().filter(|s| s.kind != SourceKind::App) {
-            s.tracks = match (both, s.kind) {
-                (true, SourceKind::Desktop) => vec![1, 2],
-                (true, _) => vec![1, 3],
-                (false, _) => vec![1],
-            };
-        }
     }
 
     /// The file, with what each setting does.
@@ -206,8 +189,11 @@ max_memory_mb = {memory}
 # Start afterglow when you sign in to Windows.
 launch_at_startup = {autostart}
 
-# What's heard, as in glint: "desktop" (what your speakers play), "app" (one app, by exe name)
-# or "mic" (a device id, or the default microphone without one).
+# What players call tracks 1-6; an empty name is made from the track's sources.
+audio_track_names = [{names}]
+
+# What's heard, as in glint: "desktop" (what your speakers play, minus an `exclude`d app), "app"
+# (one app by exe name) or "mic" (a device id, or the default microphone without one).
 {sources}"#,
             buffer = self.buffer,
             length = self.length,
@@ -219,6 +205,7 @@ launch_at_startup = {autostart}
             quality = self.quality,
             memory = self.max_memory_mb,
             autostart = self.launch_at_startup,
+            names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
     }
 }
@@ -258,25 +245,11 @@ mod tests {
             buffer: false,
             ..Config::default()
         };
-        edited.set_hears(SourceKind::Mic, true);
+        edited.audio_sources.push(AudioSource { device: "{0.0.1.00000000}.{mic}".into(), ..AudioSource::new(SourceKind::Mic, 1) });
+        edited.audio_track_names[1] = "voice \"chat\"".into();
         edited.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 2) });
         let back: Config = toml::from_str(&edited.render()).unwrap();
         assert_eq!(back, edited);
-    }
-
-    #[test]
-    fn desktop_and_mic_share_the_first_track_and_keep_their_own() {
-        let mut cfg = Config::default();
-        assert!(cfg.hears(SourceKind::Desktop) && !cfg.hears(SourceKind::Mic));
-        cfg.set_hears(SourceKind::Mic, true);
-        let tracks: Vec<_> = cfg.audio_sources.iter().map(|s| (s.kind, s.tracks.clone())).collect();
-        assert_eq!(tracks, [(SourceKind::Desktop, vec![1, 2]), (SourceKind::Mic, vec![1, 3])]);
-        cfg.set_hears(SourceKind::Desktop, false);
-        assert!(!cfg.hears(SourceKind::Desktop) && cfg.hears(SourceKind::Mic));
-        assert!(cfg.audio_sources.iter().all(|s| s.tracks == [1]), "alone, the mic is the first track");
-        cfg.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 2) });
-        cfg.set_hears(SourceKind::Desktop, true);
-        assert_eq!(cfg.audio_sources[2].tracks, [1, 4], "app sources keep the tracks they were given");
     }
 
     #[test]

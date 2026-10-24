@@ -3,12 +3,12 @@
 
 use eframe::egui::{self, Id, RichText, Ui};
 use glint_core::config::CodecName;
-use glint_core::config::audio::SourceKind;
 use glint_core::icon::icon_rgba;
 use glint_core::paths::app_dir_for;
 use glint_media::clip::media::{self, Com};
 use glint_shell::{explorer, monitors, window};
 use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
+use glint_ui::audio::AudioEditor;
 use glint_ui::capture::{Recorder, held_names, key_names};
 use glint_ui::settings::{self as frame, Pages};
 use glint_ui::widgets::{self, HotkeyState, Kind, Look, hint, row};
@@ -65,6 +65,7 @@ pub struct Settings {
     last_bitrate: u32,
     /// Windows can decode hevc: the clips can be played and trimmed here.
     plays_hevc: bool,
+    audio: AudioEditor,
 }
 
 fn length_label(secs: u32) -> String {
@@ -114,7 +115,8 @@ impl Settings {
             let _com = Com::init();
             media::has_decoder(MFVideoFormat_HEVC)
         };
-        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, monitors, last_bitrate, plays_hevc }
+        let audio = AudioEditor::default();
+        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, monitors, last_bitrate, plays_hevc, audio }
     }
 
     fn general(&mut self, ui: &mut Ui, look: &Look) {
@@ -273,33 +275,7 @@ impl Settings {
     }
 
     fn audio(&mut self, ui: &mut Ui, look: &Look) {
-        let t3 = look.p.t3;
-        for (kind, label, about) in [
-            (SourceKind::Desktop, "desktop audio", "what your speakers or headphones play"),
-            (SourceKind::Mic, "microphone", "your default microphone"),
-        ] {
-            row(ui, look, label, 1.0, |ui| {
-                let mut on = self.cfg.hears(kind);
-                let text = if on { "on" } else { "off" };
-                if widgets::toggle(ui, look, &mut on, text).changed() {
-                    self.cfg.set_hears(kind, on);
-                }
-                hint(ui, about, t3);
-            });
-        }
-        let both = self.cfg.hears(SourceKind::Desktop) && self.cfg.hears(SourceKind::Mic);
-        widgets::reveal(ui, Id::unique("both-tracks"), both, |ui| {
-            row(ui, look, "tracks", 0.0, |ui| {
-                hint(ui, "track 1 has both mixed; desktop is also on track 2 and the mic on track 3", t3);
-            });
-        });
-        let others = self.cfg.audio_sources.iter().filter(|s| s.kind == SourceKind::App || !s.device.is_empty()).count();
-        widgets::reveal(ui, Id::unique("other-sources"), others > 0, |ui| {
-            row(ui, look, "more sources", 0.0, |ui| {
-                let s = if others == 1 { "" } else { "s" };
-                hint(ui, format!("{others} more source{s} set in config.toml (apps, other microphones)"), t3);
-            });
-        });
+        self.audio.show(ui, look, &mut self.cfg.audio_sources, &mut self.cfg.audio_track_names);
     }
 
     fn about(&mut self, ui: &mut Ui, look: &Look) {
@@ -345,7 +321,7 @@ impl Settings {
                     + n(a.quality == b.quality)
                     + n(a.max_memory_mb == b.max_memory_mb)
             }
-            Page::Audio => n(a.audio_sources == b.audio_sources),
+            Page::Audio => n(a.audio_sources == b.audio_sources) + n(a.audio_track_names == b.audio_track_names),
             Page::About => 0,
         }
     }
@@ -405,7 +381,10 @@ impl Pages for Settings {
                 c.quality = d.quality;
                 c.max_memory_mb = d.max_memory_mb;
             }
-            Page::Audio => c.audio_sources = d.audio_sources,
+            Page::Audio => {
+                c.audio_sources = d.audio_sources;
+                c.audio_track_names = d.audio_track_names;
+            }
             Page::About => {}
         }
     }
@@ -472,6 +451,7 @@ impl Pages for Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glint_core::config::audio::{AudioSource, SourceKind};
     use eframe::App;
     use eframe::egui::{Rect, pos2, vec2};
     use glint_ui::settings::Frame;
@@ -497,8 +477,9 @@ mod tests {
             let ctx = egui::Context::default();
             fonts(&ctx);
             let mut cfg = Config::default();
-            cfg.set_hears(SourceKind::Mic, true);
-            let mut app = Frame::new(Settings::new(cfg, None), (WINDOW, WINDOW));
+            cfg.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 1) });
+            cfg.audio_sources.push(AudioSource::new(SourceKind::Mic, 2));
+            let mut app = Frame::new(Settings::new(cfg.clone(), None), (WINDOW, WINDOW));
             let mut time = 0.0;
             for page in PAGES {
                 app.go(page);
@@ -512,6 +493,7 @@ mod tests {
                     assert!(l.right() < c.left(), "{at}");
                     assert!(c.right() <= width - CONTENT_X + 0.5, "{at}");
                 }
+                assert_eq!(app.pages.cfg, cfg, "showing a page changes nothing");
             }
         }
     }
@@ -521,7 +503,7 @@ mod tests {
         let mut s = Settings::new(Config::default(), None);
         s.cfg.length = 300;
         s.cfg.quality = 18;
-        s.cfg.set_hears(SourceKind::Mic, true);
+        s.cfg.audio_sources.push(AudioSource::new(SourceKind::Mic, 1));
         let counts: Vec<usize> = PAGES.iter().map(|&p| s.changes(p)).collect();
         assert_eq!(counts, [1, 1, 1, 0]);
         s.reset(Page::Video);

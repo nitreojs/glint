@@ -236,7 +236,7 @@ impl App {
     fn reload(&mut self) {
         match Config::load() {
             Ok(cfg) => {
-                let recording = |c: &Config| (c.monitor, c.fps, c.codec, c.bitrate, c.quality, c.audio_sources.clone());
+                let recording = |c: &Config| (c.monitor, c.fps, c.codec, c.bitrate, c.quality, c.audio_sources.clone(), c.audio_track_names.clone());
                 let restart = recording(&cfg) != recording(&self.cfg);
                 let hotkey = cfg.save_hotkey != self.cfg.save_hotkey;
                 self.cfg = cfg;

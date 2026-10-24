@@ -93,7 +93,7 @@ impl Buffer {
             clicks: None,
             keys: None,
             audio: cfg.audio_sources.clone(),
-            track_names: Vec::new(),
+            track_names: cfg.audio_track_names.clone(),
             // nothing is written there: packets go to the buffer
             path: std::env::temp_dir().join("afterglow-buffer.mp4"),
         };
