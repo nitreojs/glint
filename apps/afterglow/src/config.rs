@@ -51,7 +51,8 @@ impl Default for Config {
             output_dir: String::new(),
             monitor: 0,
             fps: 60,
-            codec: CodecName::Hevc,
+            // hevc needs a decoder windows doesn't ship to be played or trimmed: opt in
+            codec: CodecName::H264,
             bitrate: 15,
             quality: 23,
             max_memory_mb: 1024,
@@ -249,7 +250,7 @@ mod tests {
             output_dir: r#"D:\clips "best""#.into(),
             monitor: 2,
             fps: 0,
-            codec: CodecName::H264,
+            codec: CodecName::Hevc,
             bitrate: 0,
             quality: 18,
             max_memory_mb: 4096,

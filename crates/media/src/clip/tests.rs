@@ -395,3 +395,9 @@ fn an_uneven_recording_scales_down_to_a_steady_lower_rate() {
     let _ = std::fs::remove_file(&out);
     assert_eq!(facts[..4], ["h264", "640", "360", "60/1"], "{facts:?}");
 }
+
+#[test]
+fn windows_always_decodes_h264() {
+    let _com = Com::init();
+    assert!(media::has_decoder(windows::Win32::Media::MediaFoundation::MFVideoFormat_H264));
+}

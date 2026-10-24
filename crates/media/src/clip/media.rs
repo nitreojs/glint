@@ -101,11 +101,22 @@ pub fn open(path: &Path, gpu: Option<&Gpu>) -> Result<IMFSourceReader, String> {
 
 /// Whether windows has an encoder (hardware or software) that writes `subtype`.
 pub fn has_encoder(subtype: GUID) -> bool {
+    any_transform(MFT_CATEGORY_VIDEO_ENCODER, None, Some(subtype))
+}
+
+/// Whether windows can decode `subtype` (hevc needs the "hevc video extensions" from the store).
+pub fn has_decoder(subtype: GUID) -> bool {
+    any_transform(MFT_CATEGORY_VIDEO_DECODER, Some(subtype), None)
+}
+
+fn any_transform(category: GUID, input: Option<GUID>, output: Option<GUID>) -> bool {
+    let info = |g: GUID| MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: g };
+    let (input, output) = (input.map(info), output.map(info));
     unsafe {
-        let out = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype };
         let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
         let (mut list, mut count) = (std::ptr::null_mut(), 0u32);
-        if MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, None, Some(&out), &mut list, &mut count).is_err() {
+        let (i, o) = (input.as_ref().map(|i| i as *const _), output.as_ref().map(|o| o as *const _));
+        if MFTEnumEx(category, flags, i, o, &mut list, &mut count).is_err() {
             return false;
         }
         if !list.is_null() {

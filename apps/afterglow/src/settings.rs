@@ -6,7 +6,9 @@ use glint_core::config::CodecName;
 use glint_core::config::audio::SourceKind;
 use glint_core::icon::icon_rgba;
 use glint_core::paths::app_dir_for;
+use glint_media::clip::media::{self, Com};
 use glint_shell::{explorer, monitors, window};
+use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
 use glint_ui::capture::{Recorder, held_names, key_names};
 use glint_ui::settings::{self as frame, Pages};
 use glint_ui::widgets::{self, HotkeyState, Kind, Look, hint, row};
@@ -61,6 +63,8 @@ pub struct Settings {
     monitors: Vec<(String, u32)>,
     /// The bitrate to go back to after trying constant quality.
     last_bitrate: u32,
+    /// Windows can decode hevc: the clips can be played and trimmed here.
+    plays_hevc: bool,
 }
 
 fn length_label(secs: u32) -> String {
@@ -106,7 +110,11 @@ impl Settings {
         monitors.extend(outputs.iter().enumerate().map(|(i, o)| (format!("{} · {}", i + 1, size(o.rect)), i as u32 + 1)));
         let last_bitrate = if cfg.bitrate > 0 { cfg.bitrate } else { Config::default().bitrate };
         let keys = Recorder::new(release_tray_hotkey);
-        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, monitors, last_bitrate }
+        let plays_hevc = {
+            let _com = Com::init();
+            media::has_decoder(MFVideoFormat_HEVC)
+        };
+        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, monitors, last_bitrate, plays_hevc }
     }
 
     fn general(&mut self, ui: &mut Ui, look: &Look) {
@@ -202,6 +210,12 @@ impl Settings {
             let codecs = [(CodecName::H264, "h.264"), (CodecName::Hevc, "hevc")];
             widgets::segmented(ui, look, &mut self.cfg.codec, &codecs, Some(168.0));
             hint(ui, "hevc looks as good at about 30 % less · h.264 plays everywhere, discord included", t3);
+            let stuck = self.cfg.codec == CodecName::Hevc && !self.plays_hevc;
+            widgets::reveal(ui, Id::unique("no-hevc-decoder"), stuck, |ui| {
+                let text = "this pc can't play hevc back: glint's trimmer and the windows player need \
+                            \"hevc video extensions\" from the microsoft store";
+                hint(ui, text, look.p.warn);
+            });
         });
         let mut fixed = self.cfg.bitrate > 0;
         row(ui, look, "size", 7.0, |ui| {
