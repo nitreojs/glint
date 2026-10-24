@@ -6,6 +6,7 @@ use glint_core::config::Config;
 use glint_core::icon::icon_rgba;
 use glint_core::naming::pattern_problem;
 use glint_core::paths::app_dir;
+use glint_ui::audio::AudioEditor;
 use glint_ui::capture::Recorder;
 use glint_ui::settings::{self as frame, Pages};
 use glint_ui::widgets::Look;
@@ -19,7 +20,6 @@ mod sections;
 
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, release_tray_hotkeys};
-use sections::audio::SourceRows;
 use sections::output::Mover;
 use sections::updates::Updater;
 use sections::uploads::Uploaders;
@@ -54,8 +54,8 @@ struct SettingsApp {
     licences: bool,
     uploaders: Uploaders,
     updater: Updater,
-    audio_devices: Option<sections::audio::Devices>,
-    source_rows: SourceRows,
+    /// The audio page's sources, devices and running apps.
+    audio: AudioEditor,
     mover: Mover,
     /// What's typed in the custom accent field; `cfg.accent` follows it while it's a colour.
     accent_text: String,
@@ -77,8 +77,7 @@ impl SettingsApp {
             licences: false,
             uploaders: Uploaders::load(),
             updater,
-            audio_devices: None,
-            source_rows: SourceRows::default(),
+            audio: AudioEditor::default(),
             mover: Mover::default(),
         }
     }

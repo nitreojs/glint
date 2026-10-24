@@ -7,6 +7,7 @@ repository.workspace = true
 [dependencies]
 eframe.workspace = true
 glint-core.workspace = true
+glint-media.workspace = true
 raw-window-handle.workspace = true
 windows.workspace = true
 

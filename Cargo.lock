@@ -1207,6 +1207,7 @@ version = "0.3.0-beta.1"
 dependencies = [
  "eframe",
  "glint-core",
+ "glint-media",
  "raw-window-handle",
  "windows",
 ]
