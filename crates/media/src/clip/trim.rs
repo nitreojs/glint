@@ -90,7 +90,12 @@ fn video(src: &Path, info: &Info, job: &VideoJob, out: &Path, effort: u32, p: &P
                 Err(e) if !p.cancelled() => {
                     log(&format!("export on the gpu failed, retrying in software: {e}"));
                     let _ = std::fs::remove_file(out);
-                    run(src, info, job, out, effort, p, None)
+                    // software can't always do it (windows has no software hevc encoder): then
+                    // the gpu's reason is the one worth showing
+                    run(src, info, job, out, effort, p, None).map_err(|soft| {
+                        log(&format!("the software export failed too: {soft}"));
+                        e
+                    })
                 }
                 r => r,
             },
