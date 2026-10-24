@@ -49,6 +49,8 @@ pub unsafe fn take<T>(lp: LPARAM) -> T {
 
 pub struct Buffer {
     recorder: Recorder,
+    /// The monitor being kept (desktop coordinates).
+    monitor: Rect,
     replay: ReplaySink,
     /// What a save covers (100 ns units).
     length: i64,
@@ -100,13 +102,17 @@ impl Buffer {
         let sink = replay.clone();
         let starting = start_packets(params, move || Ok(sink), move |r: Result<Outcome, String>| ended.post((generation, r)))?;
         let recorder = starting.wait()?;
-        Ok(Buffer { recorder, replay, length })
+        Ok(Buffer { recorder, monitor: r, replay, length })
     }
 
     /// A new length or memory cap, for what's buffered already.
     pub fn set_limits(&mut self, cfg: &Config) {
         self.length = cfg.length as i64 * SECOND;
         self.replay.lock().set_limits(limits(cfg));
+    }
+
+    pub fn monitor(&self) -> Rect {
+        self.monitor
     }
 
     /// How much the buffer holds now (seconds).

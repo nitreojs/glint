@@ -6,6 +6,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use glint_core::format::human_duration;
+use glint_core::geom::rect::Rect;
+use glint_core::record::replay::Clip;
 use glint_core::icon::icon_pixels;
 use glint_core::log::log;
 use glint_core::record::pipeline::Outcome;
@@ -15,11 +17,13 @@ use glint_shell::{autostart, explorer, hotkey, instance, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
-use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, NIN_SELECT, ShellExecuteW};
+use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::buffer::{self, Buffer, Notify};
+use crate::note::{self, Kind};
 use crate::config::{APP, Config};
 use crate::settings::SETTINGS_ARG;
 
@@ -38,6 +42,7 @@ const WM_ENDED: u32 = WM_APP + 3;
 const SAVE_HOTKEY: i32 = 1;
 const RESTART_TIMER: usize = 1;
 const TIP_TIMER: usize = 2;
+const CLICK_TIMER: usize = 3;
 
 /// afterglow's accent: the tray icon while buffering, the settings window.
 pub const AMBER: [u8; 3] = [0xF5, 0x9E, 0x0B];
@@ -49,6 +54,7 @@ const ID_FOLDER: usize = 3;
 const ID_SETTINGS: usize = 4;
 const ID_LOG: usize = 5;
 const ID_QUIT: usize = 6;
+const ID_LAST: usize = 7;
 
 struct App {
     hwnd: HWND,
@@ -64,8 +70,10 @@ struct App {
     /// The session is locked or the PC is going to sleep: nothing to record until it's back.
     away: bool,
     hotkey: bool,
-    /// A save is being written: how long the clip is (seconds).
-    saving: Option<f64>,
+    /// A save is being written: how long the clip is (seconds), and the monitor it's of.
+    saving: Option<(f64, Rect)>,
+    /// A click on the tray icon cut this clip; it's saved unless the click turns into a double click.
+    clicked: Option<(Clip, Rect)>,
     last_saved: Option<PathBuf>,
     taskbar_created: u32,
     /// Restarts in a row that failed, so the error is announced once.
@@ -135,30 +143,50 @@ impl App {
         }
     }
 
+    /// The last stretch of the buffer, cut now, and the monitor it's of.
+    fn cut(&self) -> Option<(Clip, Rect)> {
+        let b = self.buffer.as_ref()?;
+        Some((b.clip()?, b.monitor()))
+    }
+
     fn save(&mut self) {
+        match self.cut() {
+            Some(cut) => self.write(cut),
+            None => self.nothing_yet(),
+        }
+    }
+
+    fn nothing_yet(&self) {
+        let kept = self.buffer.as_ref().map(Buffer::monitor);
+        let monitor = kept.or_else(|| buffer::monitor(self.cfg.monitor).ok().map(|o| o.rect));
+        if let Some(m) = monitor {
+            note::show(m, Kind::Failed, "nothing to save yet", "the buffer is still empty");
+        }
+    }
+
+    fn write(&mut self, (clip, monitor): (Clip, Rect)) {
         if self.saving.is_some() {
             return;
         }
-        let Some(clip) = self.buffer.as_ref().and_then(Buffer::clip) else {
-            self.notify("afterglow", "nothing to save yet: the buffer is empty", false);
-            return;
-        };
         let secs = clip.duration as f64 / 1e7;
         log(&format!("saving {secs:.1} s"));
-        self.saving = Some(secs);
+        self.saving = Some((secs, monitor));
+        note::show(monitor, Kind::Saving, &format!("saving the last {}", human_duration(secs)), APP);
         buffer::save(clip, self.cfg.output_dir(), Notify::new(self.hwnd, WM_SAVED));
     }
 
     fn saved(&mut self, result: Result<PathBuf, String>) {
-        let secs = self.saving.take().unwrap_or_default();
+        let Some((secs, monitor)) = self.saving.take() else { return };
         match result {
             Ok(path) => {
                 log(&format!("saved {}", path.display()));
-                self.notify(&format!("afterglow: saved the last {}", human_duration(secs)), "click to show it", false);
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                note::show(monitor, Kind::Saved, &format!("saved the last {}", human_duration(secs)), &name);
                 self.last_saved = Some(path);
             }
             Err(e) => {
                 log(&format!("save failed: {e}"));
+                note::show(monitor, Kind::Failed, "couldn't save", "see the notification for why");
                 self.notify("afterglow: couldn't save", &e, true);
             }
         }
@@ -237,10 +265,12 @@ impl App {
     }
 
     /// The menu's labels: save (and whether it can), pause or resume.
-    fn menu_items(&self) -> (String, bool, &'static str) {
+    /// The menu's labels and states: save (and whether it can), pause or resume, and whether a
+    /// clip was saved since launch.
+    fn menu_items(&self) -> (String, bool, &'static str, bool) {
         let save = if self.hotkey { format!("Save replay\t{}", self.cfg.save_hotkey) } else { "Save replay".into() };
         let pause = if self.paused { "Resume buffer" } else { "Pause buffer" };
-        (save, self.buffer.is_some() && self.saving.is_none(), pause)
+        (save, self.buffer.is_some() && self.saving.is_none(), pause, self.last_saved.is_some())
     }
 
     fn command(&mut self, cmd: usize) {
@@ -252,9 +282,10 @@ impl App {
                 let _ = std::fs::create_dir_all(&dir);
                 open(&dir.display().to_string(), None);
             }
-            ID_SETTINGS => {
-                if let Ok(exe) = std::env::current_exe() {
-                    open(&exe.display().to_string(), Some(SETTINGS_ARG));
+            ID_SETTINGS => open_settings(),
+            ID_LAST => {
+                if let Some(p) = &self.last_saved {
+                    explorer::reveal(p);
                 }
             }
             ID_LOG => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
@@ -283,7 +314,7 @@ impl App {
 
 /// The tray menu, run outside the app's borrow: the menu's own message loop dispatches timers.
 fn menu(hwnd: HWND) {
-    let Some((save, can_save, pause)) = with_app(|a| a.menu_items()) else { return };
+    let Some((save, can_save, pause, has_last)) = with_app(|a| a.menu_items()) else { return };
     let (save, pause) = (wide(&save), wide(pause));
     let cmd = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
@@ -291,6 +322,8 @@ fn menu(hwnd: HWND) {
         let _ = AppendMenuW(menu, grayed, ID_SAVE, PCWSTR(save.as_ptr()));
         let _ = AppendMenuW(menu, MF_STRING, ID_PAUSE, PCWSTR(pause.as_ptr()));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+        let last = if has_last { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let _ = AppendMenuW(menu, last, ID_LAST, w!("Show last clip"));
         let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open folder"));
         let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings"));
         let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
@@ -307,6 +340,12 @@ fn menu(hwnd: HWND) {
     with_app(|a| a.command(cmd));
 }
 
+fn open_settings() {
+    if let Ok(exe) = std::env::current_exe() {
+        open(&exe.display().to_string(), Some(SETTINGS_ARG));
+    }
+}
+
 fn open(target: &str, args: Option<&str>) {
     let (t, a) = (wide(target), args.map(wide));
     unsafe {
@@ -319,7 +358,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_TRAY => {
             match (lp.0 & 0xFFFF) as u32 {
-                NIN_SELECT => with_app(App::save),
+                // a click cuts the clip at once, then waits to see whether it's a double click
+                WM_LBUTTONDOWN => with_app(|a| {
+                    match a.cut() {
+                        Some(cut) => a.clicked = Some(cut),
+                        None => a.nothing_yet(),
+                    }
+                    unsafe {
+                        SetTimer(Some(hwnd), CLICK_TIMER, GetDoubleClickTime(), None);
+                    }
+                }),
+                WM_LBUTTONDBLCLK => with_app(|a| {
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), CLICK_TIMER);
+                    }
+                    a.clicked = None;
+                    open_settings();
+                }),
                 WM_CONTEXTMENU => {
                     menu(hwnd);
                     None
@@ -384,6 +439,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(App::start);
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == CLICK_TIMER => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), CLICK_TIMER);
+            }
+            with_app(|a| {
+                if let Some(cut) = a.clicked.take() {
+                    a.write(cut);
+                }
+            });
+            return LRESULT(0);
+        }
         WM_TIMER if wp.0 == TIP_TIMER => {
             with_app(App::refresh_tray);
             return LRESULT(0);
@@ -445,6 +511,7 @@ pub fn run() {
         away: false,
         hotkey: false,
         saving: None,
+        clicked: None,
         last_saved: None,
         taskbar_created: window::taskbar_created(),
         failures: 0,

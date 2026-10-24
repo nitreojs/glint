@@ -3,6 +3,7 @@
 mod app;
 mod buffer;
 mod config;
+mod note;
 mod settings;
 
 fn main() {
