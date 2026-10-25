@@ -64,7 +64,8 @@ enum State {
 /// What clicking the last notification opens.
 enum ClickTarget {
     None,
-    File(PathBuf),
+    /// A saved capture: the gallery opens on it.
+    Capture(PathBuf),
     Link(String),
     Log,
     /// Restart into the update, or download and install it.
@@ -86,6 +87,8 @@ struct App {
     click: ClickTarget,
     exiting: bool,
     update: updates::Updates,
+    /// The file of the recording being made and the app whose window it shows, for its history entry.
+    recording_app: Option<(PathBuf, String)>,
 }
 
 thread_local! {
@@ -268,6 +271,7 @@ impl App {
         };
         let subject = sel.source.as_ref().map_or(Subject::Region, Subject::Window);
         let path = unique_path(&self.cfg, Kind::Recording, subject, "mp4");
+        self.recording_app = subject.app().map(|app| (path.clone(), app.to_string()));
         let params = Params {
             sources: sel
                 .outputs
@@ -418,7 +422,7 @@ impl App {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let title = if copied { "Screenshot copied and saved" } else { "Screenshot saved" };
                 let text = format!("{name}\n{} · {size}", human_size(bytes as u64));
-                self.notify_done(title, &text, ClickTarget::File(path));
+                self.notify_done(title, &text, ClickTarget::Capture(path));
             }
             None if copied => self.notify_done("Screenshot copied", &format!("{size}, ready to paste"), ClickTarget::None),
             None if uploading => {
@@ -482,7 +486,8 @@ impl App {
                 if let Some(why) = &s.stopped_early {
                     text += &format!("\nStopped early: {why}");
                 }
-                history::add(Kind::Recording, Some(&s.path), bytes, None);
+                let app = self.recording_app.take().filter(|(p, _)| *p == s.path).map(|(_, app)| app);
+                history::add(Kind::Recording, Some(&s.path), bytes, None, app.as_deref());
                 let mut upload_failed = false;
                 if self.cfg.recording_upload
                     && let Err(e) = upload::start_file(&self.cfg, Kind::Recording, &s.path, self.hwnd)
@@ -496,9 +501,9 @@ impl App {
                     log(&format!("can't open the trimmer: {e}"));
                 }
                 if s.dropped > 0 || s.stopped_early.is_some() || !s.audio_issues.is_empty() || upload_failed {
-                    self.notify("Recording saved", &text, false, ClickTarget::File(s.path));
+                    self.notify("Recording saved", &text, false, ClickTarget::Capture(s.path));
                 } else {
-                    self.notify_done("Recording saved", &text, ClickTarget::File(s.path));
+                    self.notify_done("Recording saved", &text, ClickTarget::Capture(s.path));
                 }
             }
             Err(e) => {
@@ -517,7 +522,7 @@ impl App {
         }
         match done.result {
             Ok(url) => {
-                history::add(done.kind, done.path.as_deref(), done.size, Some(&url));
+                history::add(done.kind, done.path.as_deref(), done.size, Some(&url), None);
                 let copied = self.cfg.upload_copy_link && {
                     let copied = shot::copy_text(Some(self.hwnd), &url);
                     if let Err(e) = &copied {
@@ -567,7 +572,7 @@ impl App {
             return self.install_update();
         }
         match &self.click {
-            ClickTarget::File(p) => glint_shell::explorer::reveal(p),
+            ClickTarget::Capture(p) => crate::gallery::open(Some(p)),
             ClickTarget::Link(url) => shell(url, ""),
             ClickTarget::Log => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
             ClickTarget::Update | ClickTarget::None => {}
@@ -785,6 +790,7 @@ pub fn run() {
             click: ClickTarget::None,
             exiting: false,
             update: updates::Updates::default(),
+            recording_app: None,
         };
         app.register_hotkeys(None);
         if let Some(old) = &updated_from {

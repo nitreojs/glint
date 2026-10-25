@@ -17,5 +17,9 @@ fn main() {
         glint::clip::run(path.into());
         return;
     }
+    if let Some(i) = args.iter().position(|a| a == glint::gallery::GALLERY_ARG) {
+        glint::gallery::run(args.get(i + 1).map(Into::into));
+        return;
+    }
     glint::app::run();
 }

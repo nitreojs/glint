@@ -15,8 +15,7 @@ mod output;
 pub(crate) mod pin;
 
 use editor::Output;
-use output::ImageFormat;
-pub(crate) use output::{copy_files, copy_text};
+pub(crate) use output::{ImageFormat, copy_files, copy_text, copy_to_clipboard, encode};
 
 /// A finished screenshot as 0xAARRGGBB rows, and what to do with it.
 pub(crate) struct Shot {
@@ -68,7 +67,7 @@ pub(crate) fn deliver(shot: &Shot, cfg: &Config, owner: HWND, subject: Subject) 
                     let path = unique_path(cfg, Kind::Shot, subject, format.extension());
                     match std::fs::write(&path, &bytes) {
                         Ok(()) => {
-                            history::add(Kind::Shot, Some(&path), bytes.len() as u64, None);
+                            history::add(Kind::Shot, Some(&path), bytes.len() as u64, None, subject.app());
                             saved = Some((path, bytes.len()));
                         }
                         Err(e) => errors.push(format!("couldn't save: {}: {e}", path.display())),

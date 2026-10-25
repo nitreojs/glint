@@ -1,5 +1,6 @@
 pub mod app;
 pub mod clip;
+pub mod gallery;
 mod indicator;
 mod picker;
 pub mod platform;

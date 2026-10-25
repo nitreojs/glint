@@ -1157,6 +1157,7 @@ version = "0.3.0-beta.1"
 dependencies = [
  "eframe",
  "embed-resource",
+ "gif",
  "glint-core",
  "glint-media",
  "glint-shell",

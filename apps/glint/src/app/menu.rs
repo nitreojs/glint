@@ -24,6 +24,7 @@ const ID_PAUSE: usize = 107;
 const ID_TRIM: usize = 108;
 const ID_UPDATE: usize = 109;
 const ID_SHOT_MONITOR: usize = 110;
+const ID_GALLERY: usize = 111;
 const ID_RECENT: usize = 1000;
 const ID_CLEAR_HISTORY: usize = 1199;
 const RECENT: usize = 10;
@@ -154,6 +155,7 @@ pub(super) fn show_menu(hwnd: HWND, keyboard: bool) {
     items.push(Item::command(ID_TRIM, "trim last recording").glyph(Glyph::Trim).enabled(last.is_some()));
     let recent_items = if recent.is_empty() { Vec::new() } else { recent_menu(&recent) };
     items.extend([
+        Item::command(ID_GALLERY, "gallery").glyph(Glyph::Gallery),
         Item::submenu("recent", recent_items).glyph(Glyph::Recent),
         Item::command(ID_FOLDER, "open folder").glyph(Glyph::Folder),
         Item::command(ID_SETTINGS, "settings").glyph(Glyph::Settings),
@@ -194,6 +196,7 @@ pub(super) fn show_menu(hwnd: HWND, keyboard: bool) {
             }
         }
         ID_SETTINGS => open_settings(),
+        ID_GALLERY => crate::gallery::open(None),
         ID_LOG => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
         ID_CLEAR_HISTORY => history::clear(),
         c if (ID_RECENT..ID_RECENT + RECENT * ACTIONS).contains(&c) => {
