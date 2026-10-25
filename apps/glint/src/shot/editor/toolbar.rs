@@ -200,12 +200,6 @@ fn summon((x, y): (i32, i32), (w, h): (i32, i32), margin: i32, monitors: &[Rect]
     (Rect { x: fit(x - w / 2, m.x, m.w, w), y: fit(y, m.y, m.h, h), w, h }, m)
 }
 
-pub(super) fn beside((x, y): (i32, i32), (w, h): (i32, i32), off: i32, monitor: Rect) -> Rect {
-    let m = monitor;
-    let fit = |v: i32, lo: i32, room: i32, len: i32| v.clamp(lo, (lo + room - len).max(lo));
-    Rect { x: fit(x + off, m.x, m.w, w), y: fit(y + off, m.y, m.h, h), w, h }
-}
-
 pub(super) fn nearest(monitors: &[Rect], (x, y): (i32, i32)) -> Rect {
     let gap = |m: &&Rect| {
         let dx = (m.x - x).max(x - (m.right() - 1)).max(0) as i64;
@@ -386,12 +380,5 @@ mod tests {
         assert_eq!(at((-1000, 1000)), (Rect { x: -1238, y: 550, w: 556, h: 40 }, MONITORS[1]));
         assert_eq!(at((2000, -5)), (Rect { x: 1367, y: -1430, w: 556, h: 40 }, MONITORS[2]));
         assert_eq!(at((-100, 200)).1, MONITORS[0], "from a gap, the nearest");
-    }
-
-    #[test]
-    fn hints_stay_beside_the_cursor_on_screen() {
-        let m = MONITORS[0];
-        assert_eq!(beside((100, 100), (200, 26), 16, m), Rect { x: 116, y: 116, w: 200, h: 26 });
-        assert_eq!(beside((3430, 1430), (200, 26), 16, m), Rect { x: 3240, y: 1414, w: 200, h: 26 });
     }
 }

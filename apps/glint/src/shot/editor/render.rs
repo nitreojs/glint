@@ -11,8 +11,8 @@ use windows::Win32::Graphics::Gdi::{
 use super::effects::apply_effect;
 use super::marks::{Edges, GRIPS, Mark, draw_mark, edge_point, numbered};
 use super::text::Typesetter;
-use super::toolbar::{BAR_BG, WHITE, beside, nearest};
-use super::{Drag, Editor, HINT, hint_alpha, hull};
+use super::toolbar::{BAR_BG, WHITE};
+use super::{Drag, Editor, hull};
 use crate::picker::DIM;
 use glint_shell::gfx::{Canvas, Dib, Painter, rgba};
 use crate::platform::rect::ring;
@@ -38,16 +38,9 @@ impl Editor {
         Ok(self.render_chrome(painter, font))
     }
 
-    /// Places the hint and the tooltip; returns the pixels that changed.
+    /// Places the tooltip; returns the pixels that changed.
     pub(crate) fn render_chrome(&mut self, painter: &Painter, font: &IDWriteTextFormat) -> Vec<Rect> {
         let mut moved = Vec::new();
-        if self.hint.is_some_and(|(_, r)| r.is_none()) {
-            let (tw, _) = painter.measure(HINT, font);
-            let size = ((tw.ceil() + self.px(20.0)) as i32, self.px(26.0) as i32);
-            let r = beside(self.mouse, size, self.px(16.0) as i32, nearest(&self.monitors, self.mouse));
-            self.hint = self.hint.map(|(at, _)| (at, Some(r)));
-            moved.push(r);
-        }
         let want = self.pill_text();
         if self.pill.as_ref().map(|(_, item, text)| (*item, text)) != want.as_ref().map(|(item, text)| (*item, text)) {
             moved.extend(self.pill.take().map(|(r, ..)| r));
@@ -266,15 +259,6 @@ impl Editor {
             painter.draw_on(dc, local(*r).to_win(), |c| {
                 c.round_rect(0.0, 0.0, w, h, h / 2.0, BAR_BG);
                 c.text(text, font, [pad, 0.0, w - pad, h], WHITE);
-            })?;
-        }
-        if let Some((at, Some(r))) = self.hint
-            && visible(r)
-        {
-            let (w, h, pad, a) = (r.w as f32, r.h as f32, self.px(10.0), hint_alpha(at.elapsed()));
-            painter.draw_on(dc, local(r).to_win(), |c| {
-                c.round_rect(0.0, 0.0, w, h, h / 2.0, D2D1_COLOR_F { a: BAR_BG.a * a, ..BAR_BG });
-                c.text(HINT, font, [pad, 0.0, w - pad, h], D2D1_COLOR_F { a: WHITE.a * a, ..WHITE });
             })?;
         }
         Ok(())

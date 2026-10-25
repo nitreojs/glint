@@ -4,7 +4,7 @@
 //! shot), five colours, three sizes, undo and redo, and copy / save / upload / pin / done / cancel. The
 //! selection keeps handles for resizing (Ctrl moves it instead) and can be dragged while no tool
 //! is active. In canvas mode ([`Editor::canvas`]) there is no selection until one is picked: the
-//! toolbar is docked at the top of the monitor under the mouse (right-click or Tab brings it to
+//! toolbar is docked at the top of the monitor under the mouse (Tab brings it to
 //! the mouse), the whole screen is drawable, and with no drawing tool the region tool is on: the
 //! picker picks, and the picked region is the finished shot (or, with Shift, opens in here).
 //!
@@ -12,7 +12,8 @@
 //! the shot instead of dragging the marks along. Blur and pixelate hide what's on screen, so
 //! they always sit under the drawn shapes. Area tools (rectangle, blur, pixelate, eraser)
 //! highlight the window, client area or UI element under the mouse; a click covers it.
-//! Right-click deletes a mark, or cancels the drag in progress.
+//! Right-click deletes a mark, or cancels the drag in progress; in canvas mode off the marks,
+//! with nothing picked yet, it cancels the shot.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -46,10 +47,6 @@ use typing::Typing;
 const NOTICE: Duration = Duration::from_millis(1200);
 const WHEEL_GROUP: Duration = Duration::from_secs(1);
 const WHEEL_DELTA: i32 = 120;
-const HINT: &str = "drag and release to capture   ·   draw first or hold Shift to edit";
-const HINT_SHOW: Duration = Duration::from_millis(2000);
-const HINT_FADE: Duration = Duration::from_millis(300);
-const FADE_FRAME: Duration = Duration::from_millis(16);
 const VK_TAB: u32 = 0x09;
 const SUMMON_REACH: f32 = 120.0;
 
@@ -121,7 +118,6 @@ struct Look {
     undo: bool,
     redo: bool,
     pill: Option<(Item, String)>,
-    hint: Option<u8>,
 }
 
 pub(crate) struct Frame {
@@ -194,7 +190,6 @@ pub(crate) struct Editor {
     pill: Option<(Rect, Item, String)>,
     /// Canvas mode: the toolbar is at the mouse instead of docked at the top of its monitor.
     summoned: bool,
-    hint: Option<(Instant, Option<Rect>)>,
     windows: Vec<(Rect, Option<Rect>)>,
     element: Option<Rect>,
     pick: Option<Rect>,
@@ -212,9 +207,7 @@ impl Editor {
 
     /// Canvas mode: the whole `screen` is drawable, with a region tool to pick the shot's region later.
     pub(crate) fn canvas(screen: Rect, monitors: Vec<Rect>, scale: f32, cursor: (i32, i32)) -> Editor {
-        let mut ed = Editor::build(screen, screen, None, false, monitors, scale, cursor);
-        ed.hint = Some((Instant::now(), None));
-        ed
+        Editor::build(screen, screen, None, false, monitors, scale, cursor)
     }
 
     fn build(
@@ -265,7 +258,6 @@ impl Editor {
             bar: Rect::default(),
             pill: None,
             summoned: false,
-            hint: None,
             windows: Vec::new(),
             element: None,
             pick: None,
@@ -383,11 +375,10 @@ impl Editor {
         self.sel.inflate(self.px(8.0) as i32)
     }
 
-    /// The toolbar and the pills over everything else.
+    /// The toolbar and the pill over everything else.
     pub(crate) fn chrome(&self) -> Vec<Rect> {
         let mut v = vec![self.bar];
         v.extend(self.pill.as_ref().map(|p| p.0));
-        v.extend(self.hint.and_then(|(_, r)| r));
         v
     }
 
@@ -462,7 +453,6 @@ impl Editor {
             undo: !self.history.is_empty(),
             redo: !self.future.is_empty(),
             pill: self.pill_text(),
-            hint: self.hint.map(|(at, _)| (hint_alpha(at.elapsed()) * 255.0) as u8),
         }
     }
 
@@ -1047,7 +1037,6 @@ impl Editor {
             return Event::None;
         }
         self.summoned = true;
-        self.hint = None;
         self.hover = None;
         self.pick = None;
         self.place_bar();
@@ -1063,7 +1052,7 @@ impl Editor {
     }
 
     /// Right-click: cancels the drag in progress, else deletes the mark under `p`, else in
-    /// canvas mode brings the toolbar to the cursor.
+    /// canvas mode cancels the shot.
     pub(crate) fn right_click(&mut self, p: (i32, i32)) -> Event {
         self.mouse = p;
         if let Some(drag) = self.drag.take() {
@@ -1080,7 +1069,8 @@ impl Editor {
         let on_canvas = self.sel.contains(p.0, p.1) && !self.bar.contains(p.0, p.1);
         match self.mark_at((p.0 as f32, p.1 as f32), true).filter(|_| on_canvas) {
             Some(i) => self.delete_at(i),
-            None => self.summon(),
+            None if !self.selected => Event::Cancel,
+            None => Event::None,
         }
     }
 
@@ -1165,26 +1155,15 @@ impl Editor {
     }
 
     pub(crate) fn next_tick(&self) -> Option<Duration> {
-        let notice = self.notice.as_ref().map(|(_, at)| NOTICE.saturating_sub(at.elapsed()));
-        let hint = self.hint.map(|(at, _)| HINT_SHOW.saturating_sub(at.elapsed()).max(FADE_FRAME));
-        notice.into_iter().chain(hint).min()
+        self.notice.as_ref().map(|(_, at)| NOTICE.saturating_sub(at.elapsed()))
     }
 
     pub(crate) fn tick(&mut self) -> Event {
-        let mut changed = false;
         if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() >= NOTICE) {
             self.notice = None;
-            changed = true;
+            return Event::Repaint;
         }
-        if let Some((at, _)) = self.hint
-            && at.elapsed() >= HINT_SHOW
-        {
-            if at.elapsed() >= HINT_SHOW + HINT_FADE {
-                self.hint = None;
-            }
-            changed = true;
-        }
-        if changed { Event::Repaint } else { Event::None }
+        Event::None
     }
 }
 
@@ -1192,11 +1171,6 @@ fn far(r: Rect, (x, y): (i32, i32), reach: f32) -> bool {
     let dx = (r.x - x).max(x - (r.right() - 1)).max(0) as f32;
     let dy = (r.y - y).max(y - (r.bottom() - 1)).max(0) as f32;
     dx.hypot(dy) > reach
-}
-
-fn hint_alpha(shown: Duration) -> f32 {
-    let fading = shown.saturating_sub(HINT_SHOW).as_secs_f32();
-    (1.0 - fading / HINT_FADE.as_secs_f32()).clamp(0.0, 1.0)
 }
 
 fn pick_ring(r: Rect) -> [RECT; 4] {
@@ -1553,14 +1527,13 @@ mod tests {
         let second = Rect { x: 1920, y: 0, w: 1280, h: 1024 };
         let mut ed = Editor::canvas(screen, vec![screen, second], 1.0, (500, 400));
         let docked = |ed: &Editor, m: Rect| ed.bar.y == m.y + 10 && (ed.bar.x + ed.bar.w / 2 - m.x - m.w / 2).abs() <= 1;
-        assert!(ed.hint.is_some() && shown(&ed) && docked(&ed, screen), "docked at the top from the start");
+        assert!(shown(&ed) && docked(&ed, screen), "docked at the top from the start");
         ed.mouse_move((2500, 600));
         assert!(docked(&ed, second), "it follows the mouse to its monitor");
         ed.mouse_move((960, 600));
-        ed.right_click((960, 500));
-        assert!(ed.hint.is_none(), "right-click retires the hint");
-        assert_eq!((ed.bar.x + ed.bar.w / 2 - 960, ed.bar.y), (0, 510), "and brings the bar");
-        ed.mouse_move((960, 420));
+        ed.key(VK_TAB, false, false);
+        assert_eq!((ed.bar.x + ed.bar.w / 2 - 960, ed.bar.y), (0, 610), "Tab brings the bar");
+        ed.mouse_move((960, 520));
         assert!(!docked(&ed, screen), "still close enough");
         assert!(matches!(ed.mouse_move((960, 300)), Event::Repaint));
         assert!(docked(&ed, screen), "moving away docks it again");
@@ -1578,9 +1551,10 @@ mod tests {
         assert_eq!(ed.tool, Some(Tool::Pen));
         assert!(docked(&ed, screen), "picking a tool docks it");
 
-        ed.right_click((960, 500));
+        ed.key(VK_TAB, false, false);
         assert!(matches!(ed.key(0x1B, false, false), Event::Repaint) && docked(&ed, screen), "Esc docks it first");
         assert!(matches!(ed.key(0x1B, false, false), Event::Cancel));
+        assert!(matches!(ed.right_click((960, 500)), Event::Cancel), "right-click off the marks cancels too");
 
         ed.set_selection(Rect { x: 100, y: 100, w: 400, h: 300 }, None);
         assert!(shown(&ed) && ed.bar.y == 410, "a picked region docks it under the selection");
@@ -1642,14 +1616,6 @@ mod tests {
         assert_eq!(ed.sel.right(), 495, "unless Alt is held");
         ed.right_click((495, 170));
         assert_eq!(ed.sel, Rect { x: 0, y: 0, w: 400, h: 300 }, "cancelling goes back to before the drag");
-    }
-
-    #[test]
-    fn hint_fades_after_two_seconds() {
-        assert_eq!(hint_alpha(Duration::ZERO), 1.0);
-        assert_eq!(hint_alpha(HINT_SHOW), 1.0);
-        assert!((hint_alpha(HINT_SHOW + HINT_FADE / 2) - 0.5).abs() < 1e-3);
-        assert_eq!(hint_alpha(HINT_SHOW + HINT_FADE * 2), 0.0);
     }
 
     #[test]
