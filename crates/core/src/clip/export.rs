@@ -32,6 +32,11 @@ const HEVC_SHARE: f64 = 0.7;
 /// there at ~12 Mbps, so carrying a near-lossless recording's rate any higher only grows the file.
 /// Other sizes and frame rates scale like [`bitrate_scaled`].
 const CEILING_BPS: f64 = 19_000_000.0;
+/// The qp a re-encode holds when nothing asks for a size or a bitrate and the source's rate is under
+/// [`CEILING_BPS`]: a notch above "compress · light", so it looks like the source. Carrying a low
+/// average bitrate over instead starves the frames after a keyframe (a still screen recording at
+/// 1.3 Mbps opened blocky for 0.1 s: SSIM 0.94, at this qp 0.999, and the file came out smaller).
+const KEEP_QP: u32 = 18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -365,13 +370,21 @@ fn carried_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec
     bitrate_scaled(src.video_bps(), pixels.min(1.0), rate.min(1.0)) * share
 }
 
-/// [`carried_bitrate`], never above [`CEILING_BPS`].
-fn default_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> u32 {
+/// [`CEILING_BPS`] for the output's pixels, frame rate and codec.
+fn ceiling(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> f64 {
     let out_pixels = out.0 as f64 * out.1 as f64;
     let out_fps = fps.map_or(src.info.fps, f64::from).max(1.0);
     let codec_share = if codec == Codec::Hevc { HEVC_SHARE } else { 1.0 };
-    let ceiling = bitrate_scaled(CEILING_BPS, out_pixels / (1920.0 * 1080.0), out_fps / 60.0) * codec_share;
-    carried_bitrate(src, out, fps, codec).min(ceiling).clamp(300_000.0, 400e6).round() as u32
+    bitrate_scaled(CEILING_BPS, out_pixels / (1920.0 * 1080.0), out_fps / 60.0) * codec_share
+}
+
+fn sane_bps(bps: f64) -> u32 {
+    bps.clamp(300_000.0, 400e6).round() as u32
+}
+
+/// [`carried_bitrate`], never above [`ceiling`].
+fn default_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> u32 {
+    sane_bps(carried_bitrate(src, out, fps, codec).min(ceiling(src, out, fps, codec)))
 }
 
 fn muxed(payload: u64) -> u64 {
@@ -432,16 +445,21 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
     let out = scaled(base, height);
     let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end }).collect();
     let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn, keys };
-    let bitrate = match (kbps, target, compress) {
-        (Some(k), ..) => k * 1000,
+    // with a qp, `bitrate` is only what the estimate expects
+    let (bitrate, qp) = match (kbps, target, compress) {
+        (Some(k), ..) => (k * 1000, None),
         (None, Some(t), _) => {
             let fit = bitrate_for(t, Job::Video(job.clone()).len(), audio_bytes(&job, src));
-            default_bitrate(src, out, fps, codec).min(fit)
+            (default_bitrate(src, out, fps, codec).min(fit), None)
         }
-        (None, None, Some(c)) => (carried_bitrate(src, out, fps, codec) * c.share()).clamp(300_000.0, 400e6).round() as u32,
-        (None, None, None) => default_bitrate(src, out, fps, codec),
+        (None, None, Some(c)) => (sane_bps(carried_bitrate(src, out, fps, codec) * c.share()), Some(c.qp())),
+        (None, None, None) => {
+            let carried = carried_bitrate(src, out, fps, codec);
+            let cap = ceiling(src, out, fps, codec);
+            if carried > cap { (sane_bps(cap), None) } else { (sane_bps(carried), Some(KEEP_QP)) }
+        }
     };
-    job.video = Video::Encode { crop, size: out, bitrate, fps, codec, qp: compress.map(Compress::qp) };
+    job.video = Video::Encode { crop, size: out, bitrate, fps, codec, qp };
     Job::Video(job)
 }
 
@@ -704,12 +722,13 @@ mod tests {
         assert!(copies(Settings { kbps: Some(50), ..Settings::default() }));
 
         let Job::Video(v) = plan(&e, &Settings { codec: CodecChoice::Hevc, ..Settings::default() }, &source) else { panic!() };
-        assert_eq!(v.video, Video::Encode { crop: None, size: (1920, 1080), bitrate: 8_400_000, fps: None, codec: Codec::Hevc, qp: None });
+        let held = Video::Encode { crop: None, size: (1920, 1080), bitrate: 8_400_000, fps: None, codec: Codec::Hevc, qp: Some(KEEP_QP) };
+        assert_eq!(v.video, held, "under the ceiling a re-encode holds a quality");
         assert_eq!(v.pieces[0].lead, 3 * S);
 
         let Job::Video(v) = plan(&e, &Settings { fps: Some(30), ..Settings::default() }, &source) else { panic!() };
-        let Video::Encode { bitrate, fps, codec, .. } = v.video else { panic!() };
-        assert_eq!((fps, codec), (Some(30), Codec::H264));
+        let Video::Encode { bitrate, fps, codec, qp, .. } = v.video else { panic!() };
+        assert_eq!((fps, codec, qp), (Some(30), Codec::H264, Some(KEEP_QP)));
         assert!(bitrate < 12_000_000 && bitrate > 6_000_000, "{bitrate}");
 
         let custom = Settings { kbps: Some(3000), ..Settings::default() };
@@ -737,7 +756,8 @@ mod tests {
             let Job::Video(v) = plan(&e, &Settings { fps: Some(60), codec: choice, ..Settings::default() }, &source) else {
                 panic!()
             };
-            let Video::Encode { bitrate, .. } = v.video else { panic!() };
+            let Video::Encode { bitrate, qp, .. } = v.video else { panic!() };
+            assert_eq!(qp, None, "over the ceiling it's a bitrate, so it doesn't grow the file");
             bitrate
         };
         // carrying the source over would keep ~50 Mbps: 33 MB for 5 seconds
