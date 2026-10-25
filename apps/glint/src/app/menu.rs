@@ -3,6 +3,7 @@
 
 use glint_core::format::human_size;
 use glint_core::history::{self, Entry, Kind as HistoryKind};
+use glint_shell::clipboard;
 use glint_shell::log::path as log_path;
 use glint_shell::menu::{self, Glyph, Header, Item, Menu};
 use glint_shell::time::local_time;
@@ -10,7 +11,6 @@ use windows::Win32::Foundation::HWND;
 
 use super::{ClickTarget, State, open_settings, shell, with_app};
 use crate::platform::paths::output_dir;
-use crate::shot;
 use crate::upload;
 
 const ID_RECORD: usize = 100;
@@ -82,7 +82,7 @@ fn recent_action(hwnd: HWND, e: &Entry, action: usize) {
         (SHOW, Some(p), _) => glint_shell::explorer::reveal(p),
         (OPEN_LINK, _, Some(u)) => shell(u, ""),
         (COPY_LINK, _, Some(u)) => {
-            if let Err(e) = shot::copy_text(Some(hwnd), u) {
+            if let Err(e) = clipboard::copy_text(Some(hwnd), u) {
                 failed("glint: couldn't copy the link", e);
             }
         }

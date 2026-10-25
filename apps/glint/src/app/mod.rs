@@ -524,7 +524,7 @@ impl App {
             Ok(url) => {
                 history::add(done.kind, done.path.as_deref(), done.size, Some(&url), None);
                 let copied = self.cfg.upload_copy_link && {
-                    let copied = shot::copy_text(Some(self.hwnd), &url);
+                    let copied = glint_shell::clipboard::copy_text(Some(self.hwnd), &url);
                     if let Err(e) = &copied {
                         log(&format!("can't copy the link: {e}"));
                     }
@@ -675,7 +675,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     unsafe {
                         let _ = KillTimer(Some(hwnd), CLICK_TIMER_ID);
                     }
-                    open_settings();
+                    crate::gallery::open(None);
                 }
                 NIN_BALLOONUSERCLICK => {
                     with_app(|a| a.open_click_target());

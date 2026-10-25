@@ -6,7 +6,7 @@ use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
-pub(crate) const IDLE_TIP: &str = "glint\nclick: screenshot · double-click: settings";
+pub(crate) const IDLE_TIP: &str = "glint\nclick: screenshot · double-click: gallery";
 const READY_MARK: &str = " (update ready)";
 
 pub(crate) struct Tray {
@@ -125,7 +125,7 @@ mod tests {
     #[test]
     fn a_waiting_update_shows_in_the_tooltip() {
         assert_eq!(tip_with_mark(IDLE_TIP, false), IDLE_TIP);
-        assert_eq!(tip_with_mark(IDLE_TIP, true), "glint (update ready)\nclick: screenshot · double-click: settings");
+        assert_eq!(tip_with_mark(IDLE_TIP, true), "glint (update ready)\nclick: screenshot · double-click: gallery");
         assert_eq!(tip_with_mark("glint: uploading 40 %", true), "glint: uploading 40 % (update ready)");
     }
 }
