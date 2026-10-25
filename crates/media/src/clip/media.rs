@@ -288,7 +288,28 @@ pub(super) fn set_video_output(reader: &IMFSourceReader, subtype: GUID, size: (u
         {
             return Err("windows has no hevc decoder: install “hevc video extensions” from the microsoft store".into());
         }
-        set.ctx("the video can't be decoded")
+        set.ctx("the video can't be decoded")?;
+        keep_frame_times(reader);
+        Ok(())
+    }
+}
+
+/// Turns off the frame rate conversion of the video processor the reader put after the decoder. Left on, it
+/// resamples a variable-rate recording onto a steady clock at the file's average rate (measured on a 144 fps
+/// game recording averaging 67 fps: every frame at a multiple of 1/67 s, some repeated, others dropped),
+/// so frames would no longer come out at their own times.
+fn keep_frame_times(reader: &IMFSourceReader) {
+    let Ok(ex) = reader.cast::<IMFSourceReaderEx>() else { return };
+    for k in 0.. {
+        let (mut category, mut transform) = (GUID::zeroed(), None);
+        if unsafe { ex.GetTransformForStream(VIDEO, k, Some(&mut category), &mut transform) }.is_err() {
+            return;
+        }
+        let Some(xvp) = transform.filter(|_| category == MFT_CATEGORY_VIDEO_PROCESSOR) else { continue };
+        let off = xvp.cast::<IMFTransform>().and_then(|t| unsafe { t.GetAttributes()?.SetUINT32(&MF_XVP_DISABLE_FRC, 1) });
+        if let Err(e) = off {
+            log(&format!("clip: the video processor keeps converting the frame rate: {e}"));
+        }
     }
 }
 
