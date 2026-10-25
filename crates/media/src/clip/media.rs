@@ -59,7 +59,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    pub(super) fn new() -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> {
         unsafe {
             let mut device = None;
             D3D11CreateDevice(
@@ -130,23 +130,34 @@ fn any_transform(category: GUID, input: Option<GUID>, output: Option<GUID>) -> b
 }
 
 pub fn rgb_reader(src: &Path, size: (u32, u32)) -> Result<IMFSourceReader, String> {
-    let gpu = Gpu::new().and_then(|g| {
-        let r = open(src, Some(&g))?;
+    let gpu = Gpu::new();
+    if let Err(e) = &gpu {
+        log(&format!("decoding in software: {e}"));
+    }
+    rgb_reader_on(src, gpu.as_ref().ok(), size)
+}
+
+/// A reader of `src`'s video as RGB32 frames of `size`, decoding on `gpu` when it can (one device
+/// can serve many readers); in software otherwise.
+pub fn rgb_reader_on(src: &Path, gpu: Option<&Gpu>, size: (u32, u32)) -> Result<IMFSourceReader, String> {
+    let on_gpu = gpu.ok_or_else(String::new).and_then(|g| {
+        let r = open(src, Some(g))?;
         video_only(&r, MFVideoFormat_RGB32, size)?;
         Ok(r)
     });
-    gpu.or_else(|e| {
-        log(&format!("decoding in software: {e}"));
+    on_gpu.or_else(|e| {
+        if !e.is_empty() {
+            log(&format!("decoding in software: {e}"));
+        }
         let r = open(src, None)?;
         video_only(&r, MFVideoFormat_RGB32, size)?;
         Ok(r)
     })
 }
 
-pub fn probe(path: &Path) -> Result<Info, String> {
+/// The picture's size: the display aperture when the coded frame is padded.
+fn display_size(native: &IMFMediaType) -> Result<(u32, u32), String> {
     unsafe {
-        let reader = open(path, None)?;
-        let native = reader.GetNativeMediaType(VIDEO, 0).map_err(|_| "the file has no video".to_string())?;
         let mut size = unpack(native.GetUINT64(&MF_MT_FRAME_SIZE).ctx("frame size")?);
         let mut area = MFVideoArea::default();
         let blob = std::slice::from_raw_parts_mut(&mut area as *mut _ as *mut u8, size_of::<MFVideoArea>());
@@ -156,6 +167,64 @@ pub fn probe(path: &Path) -> Result<Info, String> {
                 break;
             }
         }
+        Ok(size)
+    }
+}
+
+/// How long the file plays, in 100 ns units.
+fn length(reader: &IMFSourceReader) -> Result<i64, String> {
+    unsafe {
+        let mut pv =
+            reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION).ctx("duration")?;
+        let duration = pv.Anonymous.Anonymous.Anonymous.uhVal as i64;
+        let _ = PropVariantClear(&mut pv);
+        Ok(duration)
+    }
+}
+
+/// One frame of a video, for a thumbnail.
+pub struct Still {
+    /// The frame as decoded: `size`, BGRX rows.
+    pub size: (u32, u32),
+    pub bgrx: Vec<u8>,
+    /// The video's own picture size and length (100 ns units).
+    pub native: (u32, u32),
+    pub duration: i64,
+}
+
+/// The frame of `src` shown at `at(length)`, decoded at `fit(native size)` (even sides), on `gpu`
+/// when it can.
+pub fn still(
+    src: &Path,
+    gpu: Option<&Gpu>,
+    at: impl FnOnce(i64) -> i64,
+    fit: impl FnOnce(u32, u32) -> (u32, u32),
+) -> Result<Still, String> {
+    let reader = open(src, None)?;
+    let native = unsafe { reader.GetNativeMediaType(VIDEO, 0) }.map_err(|_| "the file has no video".to_string())?;
+    let native = display_size(&native)?;
+    let duration = length(&reader)?;
+    drop(reader);
+    let size = fit(native.0, native.1);
+    let reader = rgb_reader_on(src, gpu, size)?;
+    let (found, _) = decode_until(&reader, at(duration), None)?;
+    let frame = found.ok_or("the video has no frames")?;
+    let row = size.0 as usize * 4;
+    let bgrx = with_pixels(&frame.sample, size.0, |rows| {
+        let mut px = Vec::with_capacity(row * size.1 as usize);
+        for y in 0..size.1 as usize {
+            px.extend_from_slice(rows.row(y));
+        }
+        px
+    })?;
+    Ok(Still { size, bgrx, native, duration })
+}
+
+pub fn probe(path: &Path) -> Result<Info, String> {
+    unsafe {
+        let reader = open(path, None)?;
+        let native = reader.GetNativeMediaType(VIDEO, 0).map_err(|_| "the file has no video".to_string())?;
+        let size = display_size(&native)?;
         let fps = match native.GetUINT64(&MF_MT_FRAME_RATE).map(unpack) {
             Ok((n, d)) if n > 0 && d > 0 => n as f64 / d as f64,
             _ => 30.0,
@@ -165,10 +234,7 @@ pub fn probe(path: &Path) -> Result<Info, String> {
             Ok(g) if g == MFVideoFormat_HEVC => Some(Codec::Hevc),
             _ => None,
         };
-        let mut pv =
-            reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION).ctx("duration")?;
-        let duration = pv.Anonymous.Anonymous.Anonymous.uhVal as i64;
-        let _ = PropVariantClear(&mut pv);
+        let duration = length(&reader)?;
         let tracks = tracks(path, &reader);
         let clicks = glint_core::record::clicks::load(path).unwrap_or_else(|e| {
             log(&format!("clip: the clicks in {} can't be read: {e}", path.display()));
