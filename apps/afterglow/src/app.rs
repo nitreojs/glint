@@ -16,10 +16,11 @@ use glint_core::record::pipeline::Outcome;
 use glint_core::wide::wide;
 use glint_shell::afterglow::{MAIN_CLASS, WM_NOTE_CAPTURABLE};
 use glint_shell::identity::identify;
+use glint_shell::menu::{Glyph, Header, Item, Menu};
 use glint_shell::time::date_time;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use glint_shell::{autostart, explorer, hotkey, instance, start_menu, window};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -38,7 +39,8 @@ pub const WM_RELOAD: u32 = WM_APP + 20;
 pub const WM_HOTKEY_PAUSE: u32 = WM_APP + 21;
 /// Save the replay now, from another process.
 pub const WM_SAVE_REPLAY: u32 = WM_APP + 30;
-/// The settings window picked where notes go: show a sample at `Place::ALL[WPARAM]`.
+/// The settings window's note picker is hovered: show a sample at `Place::ALL[WPARAM]`, or with
+/// any other WPARAM take the sample away.
 pub const WM_PREVIEW_NOTE: u32 = WM_APP + 22;
 
 const WM_TRAY: u32 = WM_APP + 1;
@@ -104,10 +106,12 @@ struct App {
     away: bool,
     hotkey: bool,
     /// A save is being written: how long the clip is ("0:42 of 1:00" when the memory cap cut
-    /// it short), and the monitor it's of.
-    saving: Option<(String, Rect)>,
+    /// it short), the monitor it's of, and whether the cap cut it.
+    saving: Option<(String, Rect, bool)>,
     /// The memory cap cutting a clip short was explained once already.
     told_cap: bool,
+    /// The note up is the settings window's sample, so the picker may take it away.
+    sample: bool,
     /// A click on the tray icon cut this clip; it's saved unless the click turns into a double click.
     clicked: Option<Cut>,
     last_saved: Option<PathBuf>,
@@ -203,15 +207,23 @@ impl App {
         kept.or_else(|| buffer::monitor(self.cfg.monitor).ok().map(|o| o.rect))
     }
 
-    fn preview_note(&self, place: Place) {
+    fn preview_note(&mut self, place: Place) {
         if let Some(m) = self.recorded_monitor() {
-            note::show(m, place, Kind::Saved, "notes show here", "like this one, when a clip is saved");
+            note::show(m, place, Kind::Info, "notes show here", "like this one, when a clip is saved");
+            self.sample = true;
         }
     }
 
-    fn nothing_yet(&self) {
+    fn hide_sample(&mut self) {
+        if std::mem::take(&mut self.sample) {
+            note::hide();
+        }
+    }
+
+    fn nothing_yet(&mut self) {
+        self.sample = false;
         if let Some(m) = self.recorded_monitor() {
-            note::show(m, self.cfg.note_position, Kind::Failed, "nothing to save yet", "the buffer is still empty");
+            note::show(m, self.cfg.note_position, Kind::Warning, "nothing to save yet", "the buffer is still empty");
         }
     }
 
@@ -220,6 +232,7 @@ impl App {
             return;
         }
         let secs = clip.duration as f64 / 1e7;
+        self.sample = false;
         log(&format!("saving {secs:.1} s"));
         let mut long = human_duration(secs);
         if clip.capped {
@@ -236,17 +249,18 @@ impl App {
             }
         }
         note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
-        self.saving = Some((long, monitor));
+        self.saving = Some((long, monitor, clip.capped));
         buffer::save(clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
     }
 
     fn saved(&mut self, result: Result<PathBuf, String>) {
-        let Some((long, monitor)) = self.saving.take() else { return };
+        let Some((long, monitor, capped)) = self.saving.take() else { return };
         match result {
             Ok(path) => {
                 log(&format!("saved {}", path.display()));
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                note::show(monitor, self.cfg.note_position, Kind::Saved, &format!("saved the last {long}"), &name);
+                let kind = if capped { Kind::Warning } else { Kind::Saved };
+                note::show(monitor, self.cfg.note_position, kind, &format!("saved the last {long}"), &name);
                 self.last_saved = Some(path);
             }
             Err(e) => {
@@ -329,36 +343,36 @@ impl App {
         }
     }
 
-    /// The menu's labels: save (and whether it can), pause or resume.
-    /// The menu's labels and states: save (and whether it can), pause or resume, and whether a
-    /// clip was saved since launch.
-    fn menu_items(&self) -> (String, bool, &'static str, bool) {
-        let save = if self.hotkey { format!("Save replay\t{}", self.cfg.save_hotkey) } else { "Save replay".into() };
-        let pause = if self.paused { "Resume buffer" } else { "Pause buffer" };
-        (save, self.buffer.is_some() && self.saving.is_none(), pause, self.last_saved.is_some())
+    /// What the buffer is doing, for the menu's header.
+    fn status(&self) -> String {
+        match &self.buffer {
+            Some(b) => format!("buffering · {} held", human_duration(b.held().min(self.cfg.length as f64))),
+            None if self.paused => "paused".into(),
+            None if self.away => "away".into(),
+            None => "starting…".into(),
+        }
     }
 
-    fn command(&mut self, cmd: usize) {
-        match cmd {
-            ID_SAVE => self.save(),
-            ID_PAUSE => self.set_paused(!self.paused),
-            ID_FOLDER => {
-                let dir = self.cfg.output_dir();
-                let _ = std::fs::create_dir_all(&dir);
-                open(&dir.display().to_string(), None);
-            }
-            ID_SETTINGS => open_settings(),
-            ID_LAST => {
-                if let Some(p) = &self.last_saved {
-                    explorer::reveal(p);
-                }
-            }
-            ID_LOG => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
-            ID_QUIT => unsafe {
-                let _ = DestroyWindow(self.hwnd);
-            },
-            _ => {}
-        }
+    /// The tray menu as things are now.
+    fn menu(&self) -> Menu {
+        let length = human_duration(self.cfg.length as f64);
+        let key = self.hotkey.then_some(self.cfg.save_hotkey.as_str());
+        let items = vec![
+            Item::command(ID_SAVE, &format!("save last {length}"))
+                .glyph(Glyph::Replay)
+                .accented()
+                .keys(key)
+                .enabled(self.buffer.is_some() && self.saving.is_none()),
+            Item::command(ID_PAUSE, "buffer").glyph(Glyph::Record).checked(!self.paused),
+            Item::separator(),
+            Item::command(ID_LAST, "show last clip").glyph(Glyph::Video).enabled(self.last_saved.is_some()),
+            Item::command(ID_FOLDER, "open folder").glyph(Glyph::Folder),
+            Item::command(ID_SETTINGS, "settings").glyph(Glyph::Settings),
+            Item::command(ID_LOG, "log").glyph(Glyph::Log),
+            Item::separator(),
+            Item::command(ID_QUIT, "quit").glyph(Glyph::Quit),
+        ];
+        Menu { accent: AMBER, header: Some(Header { title: APP.into(), status: self.status() }), items }
     }
 
     /// The recording behind the buffer stopped on its own (a display change, an error): a new one
@@ -377,32 +391,37 @@ impl App {
     }
 }
 
-/// The tray menu, run outside the app's borrow: the menu's own message loop dispatches timers.
+/// The tray menu, run outside the app's borrow: the menu's own message loop dispatches timers,
+/// and so may opening a folder or a file (ShellExecute), so those run outside it too.
 fn menu(hwnd: HWND) {
-    let Some((save, can_save, pause, has_last)) = with_app(|a| a.menu_items()) else { return };
-    let (save, pause) = (wide(&save), wide(pause));
-    let cmd = unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        let grayed = if can_save { MF_STRING } else { MF_STRING | MF_GRAYED };
-        let _ = AppendMenuW(menu, grayed, ID_SAVE, PCWSTR(save.as_ptr()));
-        let _ = AppendMenuW(menu, MF_STRING, ID_PAUSE, PCWSTR(pause.as_ptr()));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let last = if has_last { MF_STRING } else { MF_STRING | MF_GRAYED };
-        let _ = AppendMenuW(menu, last, ID_LAST, w!("Show last clip"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open folder"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, ID_QUIT, w!("Quit"));
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let flags = TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON;
-        let cmd = TrackPopupMenu(menu, flags, pt.x, pt.y, Some(0), hwnd, None).0 as usize;
-        let _ = DestroyMenu(menu);
-        cmd
-    };
-    with_app(|a| a.command(cmd));
+    let Some(m) = with_app(|a| a.menu()) else { return };
+    let Some(cmd) = glint_shell::menu::track(hwnd, &m, false, || with_app(|a| a.status())) else { return };
+    match cmd {
+        ID_SAVE => {
+            with_app(App::save);
+        }
+        ID_PAUSE => {
+            with_app(|a| a.set_paused(!a.paused));
+        }
+        ID_FOLDER => {
+            if let Some(dir) = with_app(|a| a.cfg.output_dir()) {
+                let _ = std::fs::create_dir_all(&dir);
+                open(&dir.display().to_string(), None);
+            }
+        }
+        ID_SETTINGS => open_settings(),
+        ID_LAST => {
+            if let Some(p) = with_app(|a| a.last_saved.clone()).flatten() {
+                explorer::reveal(&p);
+            }
+        }
+        ID_LOG => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
+        // WM_DESTROY takes the app, so not from inside it
+        ID_QUIT => unsafe {
+            let _ = DestroyWindow(hwnd);
+        },
+        _ => {}
+    }
 }
 
 fn open_settings() {
@@ -488,9 +507,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_PREVIEW_NOTE => {
-            if let Some(&place) = Place::ALL.get(wp.0) {
-                with_app(|a| a.preview_note(place));
-            }
+            match Place::ALL.get(wp.0) {
+                Some(&place) => with_app(|a| a.preview_note(place)),
+                None => with_app(App::hide_sample),
+            };
             return LRESULT(0);
         }
         WM_NOTE_CAPTURABLE => return LRESULT(note::set_capturable(wp.0 == 1) as isize),
@@ -584,6 +604,7 @@ pub fn run() {
         hotkey: false,
         saving: None,
         told_cap: false,
+        sample: false,
         clicked: None,
         last_saved: None,
         taskbar_created: window::taskbar_created(),

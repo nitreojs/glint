@@ -62,7 +62,8 @@ impl Default for Config {
             fps: 60,
             // hevc needs a decoder windows doesn't ship to be played or trimmed: opt in
             codec: CodecName::H264,
-            bitrate: 15,
+            // constant quality at glint's "balanced": the memory cap keeps busy scenes in check
+            bitrate: 0,
             quality: 23,
             max_memory_mb: 1024,
             audio_sources: vec![AudioSource { tracks: vec![1], ..AudioSource::new(SourceKind::Desktop, 0) }],
@@ -128,12 +129,19 @@ impl Config {
         Ok(())
     }
 
-    /// About how many bytes `secs` of recording take, when that's known (a bitrate is set).
-    pub fn bytes_for(&self, secs: u32) -> Option<u64> {
+    /// Bytes a second of recording takes on a `w` × `h` monitor refreshing at `hz`: on average and
+    /// in a busy stretch. Exact with a bitrate; with constant quality, [`busy_game_mbps`]'s estimate.
+    pub fn rate(&self, (w, h): (u32, u32), hz: f64) -> (f64, f64) {
         // the sound: 192 kbit/s per track
         let tracks = self.audio_sources.iter().filter(|s| s.enabled).flat_map(|s| s.tracks.iter()).max().copied();
-        let audio = tracks.unwrap_or(0) as u64 * 24_000;
-        (self.bitrate > 0).then(|| (self.bitrate as u64 * 125_000 + audio) * secs as u64)
+        let audio = tracks.unwrap_or(0) as f64 * 192_000.0;
+        if self.bitrate > 0 {
+            let bytes = (self.bitrate as f64 * 1e6 + audio) / 8.0;
+            return (bytes, bytes);
+        }
+        let fps = if self.fps == 0 { hz } else { (self.fps as f64).min(hz) };
+        let video = busy_game_mbps(w as f64 * h as f64, fps, self.codec, self.quality) * 1e6;
+        ((video + audio) / 8.0, (video * BUSY_STRETCH + audio) / 8.0)
     }
 
     /// Where saved clips go.
@@ -161,7 +169,7 @@ impl Config {
                 s.volume,
                 tracks.join(", ")
             );
-            for (key, value) in [("app", &s.app), ("exclude", &s.exclude), ("device", &s.device)] {
+            for (key, value) in [("app", &s.app), ("exclude", &s.exclude), ("name", &s.name), ("device", &s.device)] {
                 if !value.is_empty() {
                     sources += &format!("{key} = {}\n", q(value));
                 }
@@ -212,7 +220,8 @@ note_position = "{place}"
 audio_track_names = [{names}]
 
 # What's heard, as in glint: "desktop" (what your speakers play, minus an `exclude`d app), "app"
-# (one app by exe name) or "mic" (a device id, or the default microphone without one).
+# (one app by exe name) or "mic" (a device id, or the default microphone without one); `name` is
+# what the app is called, else its exe.
 {sources}"#,
             buffer = self.buffer,
             length = self.length,
@@ -229,6 +238,25 @@ audio_track_names = [{names}]
             names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
     }
+}
+
+/// How much busier than its average the stretch a buffer holds can be: the 512 MB cap held 42 s
+/// of 3440 × 1440 game footage at qp 18 (about 102 Mbit/s) where the whole clip averaged 78.
+const BUSY_STRETCH: f64 = 1.3;
+
+/// About how many Mbit/s busy game footage takes at constant quality `qp`: fitted to h.264
+/// recordings of 3440 × 1440 games captured at 144 fps (78 Mbit/s on average at qp 18, about
+/// ×0.89 a qp step up), scaled linearly by the pixels and sub-linearly by the frame rate (60 fps
+/// costs about 0.85× of 144); hevc takes about 0.6× of h.264.
+fn busy_game_mbps(pixels: f64, fps: f64, codec: CodecName, qp: u32) -> f64 {
+    let pixels = pixels / (3440.0 * 1440.0);
+    let fps = (fps.max(1.0) / 144.0).powf(0.186);
+    let qp = 0.89f64.powi(qp as i32 - 18);
+    let codec = match codec {
+        CodecName::H264 => 1.0,
+        CodecName::Hevc => 0.6,
+    };
+    78.0 * pixels * fps * qp * codec
 }
 
 /// A corner, or the middle of the top or bottom edge, of a monitor.
@@ -320,10 +348,29 @@ mod tests {
     }
 
     #[test]
-    fn a_bitrate_says_how_big_a_save_is() {
+    fn a_bitrate_says_exactly_how_big_a_save_is() {
         let cfg = Config { bitrate: 16, ..Config::default() };
-        assert_eq!(cfg.bytes_for(60), Some((2_000_000 + 24_000) * 60), "16 Mbit/s and one sound track");
-        assert_eq!(Config { bitrate: 0, ..cfg }.bytes_for(60), None, "constant quality can't tell");
+        let per_sec = (16_000_000.0 + 192_000.0) / 8.0;
+        assert_eq!(cfg.rate((1920, 1080), 60.0), (per_sec, per_sec), "16 Mbit/s and one sound track");
+    }
+
+    #[test]
+    fn constant_quality_follows_the_measurements() {
+        let near = |a: f64, b: f64| (a / b - 1.0).abs() < 0.05;
+        let mbps = |qp, fps, codec| busy_game_mbps(3440.0 * 1440.0, fps, codec, qp);
+        assert!(near(mbps(18, 144.0, CodecName::H264), 78.0));
+        for (qp, measured) in [(20, 80.0 / 105.0), (21, 0.73), (22, 0.61), (24, 0.49)] {
+            assert!(near(mbps(qp, 144.0, CodecName::H264) / 78.0, measured), "qp {qp}");
+        }
+        assert!(near(mbps(18, 60.0, CodecName::H264) / 78.0, 0.85), "60 fps");
+        assert!(near(mbps(18, 144.0, CodecName::Hevc) / 78.0, 0.6), "hevc");
+        assert!(near(busy_game_mbps(1720.0 * 1440.0, 144.0, CodecName::H264, 18), 39.0), "half the pixels");
+
+        let cfg = Config { bitrate: 0, quality: 18, fps: 0, audio_sources: vec![], ..Config::default() };
+        let (avg, busy) = cfg.rate((3440, 1440), 144.0);
+        assert!(near(avg, 78e6 / 8.0) && busy > avg);
+        assert!(near(512.0 * 1048576.0 / busy, 42.0), "the 512 MB cap held 42 s in a busy stretch");
+        assert_eq!(Config { fps: 240, ..cfg.clone() }.rate((3440, 1440), 144.0), (avg, busy), "frames come at most at the refresh rate");
     }
 
     #[test]
