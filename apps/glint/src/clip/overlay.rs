@@ -223,7 +223,7 @@ impl ClipApp {
         let Some(toast) = &self.toast else { return };
         let life = match toast.note {
             Note::Failed(_) => 6.0,
-            Note::Saved(_) | Note::Uploaded { .. } => 4.0,
+            Note::Saved(..) | Note::Uploaded { .. } | Note::Copied(Some(_)) => 4.0,
             _ => 2.2,
         };
         let age = self.now - toast.at;
@@ -241,14 +241,18 @@ impl ClipApp {
         ctx.request_repaint();
         let Some(toast) = &self.toast else { return };
         let (text, link, color) = match &toast.note {
-            Note::Saved(path) => {
+            Note::Saved(path, saving) => {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                (format!("saved {name} · "), Some("show in folder"), p.t1)
+                let saving = saving.as_ref().map_or(String::new(), |s| format!(" · {s}"));
+                (format!("saved {name}{saving} · "), Some("show in folder"), p.t1)
             }
             Note::Uploaded { url, copied } => {
                 (format!("{} {url} · ", if *copied { "uploaded, link copied:" } else { "uploaded:" }), Some("open"), p.t1)
             }
-            Note::Copied => ("copied, paste it anywhere".into(), None, p.t1),
+            Note::Copied(saving) => {
+                let saving = saving.as_ref().map_or(String::new(), |s| format!(" · {s}"));
+                (format!("copied, paste it anywhere{saving}"), None, p.t1)
+            }
             Note::Info(s) => (s.clone(), None, p.t2),
             Note::Failed(s) => (s.clone(), None, p.warn),
         };
@@ -280,7 +284,7 @@ impl ClipApp {
         });
         if open {
             match note {
-                Note::Saved(path) => super::actions::show_in_folder(&path),
+                Note::Saved(path, _) => super::actions::show_in_folder(&path),
                 Note::Uploaded { url, .. } => super::actions::open_url(&url),
                 _ => {}
             }

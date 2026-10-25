@@ -12,7 +12,7 @@ use glint_core::clip::clicks::Clicks;
 use glint_core::clip::keys::Keys;
 use glint_core::clip::crop::{Aspect, Crop, Grip};
 use glint_core::clip::edit::{Edit, Undo};
-use glint_core::clip::export::{Format, Job, Source};
+use glint_core::clip::export::{Format, Job, Source, Video, VideoJob};
 use glint_core::clip::glide::Glide;
 use glint_core::clip::index::Index;
 use glint_core::clip::info::Info;
@@ -142,6 +142,8 @@ struct Task {
     dest: Option<PathBuf>,
     then: Then,
     copy: bool,
+    /// Compressing: what the exported stretch takes in the source, to compare the result with.
+    before: Option<u64>,
     permille: Arc<AtomicU32>,
     cancel: Arc<AtomicBool>,
     thread: Option<JoinHandle<Result<bool, String>>>,
@@ -157,9 +159,10 @@ struct Upload {
 
 #[derive(Clone, Debug, PartialEq)]
 enum Note {
-    Saved(PathBuf),
+    /// The file, and when compressing how its size compares with the source's.
+    Saved(PathBuf, Option<String>),
     Uploaded { url: String, copied: bool },
-    Copied,
+    Copied(Option<String>),
     Info(String),
     Failed(String),
 }
@@ -645,10 +648,12 @@ impl ClipApp {
         let Some(info) = self.info().cloned() else { return };
         let whole = matches!(&job, Job::Video(v) if v.whole(&info));
         if whole && dest.is_none() && then != Then::Nothing {
-            self.finish(self.path.clone(), then);
+            self.finish(self.path.clone(), then, None);
             return;
         }
         let gif = matches!(job, Job::Gif(_));
+        let compressing = matches!(&job, Job::Video(VideoJob { video: Video::Encode { qp: Some(_), .. }, .. }));
+        let before = self.source().filter(|_| compressing).map(|s| s.bytes_for(job.len()));
         let out = match &dest {
             Some(d) => {
                 let ext = d.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mp4".into());
@@ -671,7 +676,7 @@ impl ClipApp {
             }
         });
         self.toast = None;
-        self.task = Some(Task { out, dest, then, copy: whole, permille, cancel, thread: Some(thread) });
+        self.task = Some(Task { out, dest, then, copy: whole, before, permille, cancel, thread: Some(thread) });
     }
 
     fn poll_task(&mut self, ctx: &egui::Context) {
@@ -712,7 +717,8 @@ impl ClipApp {
                 if task.then == Then::Nothing {
                     self.flash = self.now;
                 }
-                self.finish(path, task.then);
+                let saving = task.before.and_then(|b| export::saving_label(b, size));
+                self.finish(path, task.then, saving);
             }
             Err(e) => {
                 log(&format!("clip: exporting {} failed: {e}", self.path.display()));
@@ -721,12 +727,12 @@ impl ClipApp {
         }
     }
 
-    fn finish(&mut self, path: PathBuf, then: Then) {
+    fn finish(&mut self, path: PathBuf, then: Then, saving: Option<String>) {
         match then {
-            Then::Nothing => self.toast(Note::Saved(path)),
+            Then::Nothing => self.toast(Note::Saved(path, saving)),
             Then::Upload => self.start_upload(path),
             Then::Copy => match crate::shot::copy_files(self.hwnd, std::slice::from_ref(&path)) {
-                Ok(()) => self.toast(Note::Copied),
+                Ok(()) => self.toast(Note::Copied(saving)),
                 Err(e) => self.toast(Note::Failed(format!("couldn't copy the file: {e}"))),
             },
         }

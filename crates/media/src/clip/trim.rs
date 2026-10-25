@@ -303,7 +303,7 @@ fn run(
                 writer.SetInputMediaType(w, native, None).ctx("can't copy the video")?;
                 Target::Remux(w)
             }
-            Video::Encode { crop, size, bitrate, fps, codec } => {
+            Video::Encode { crop, size, bitrate, fps, codec, qp } => {
                 let subtype = if job.burn.is_some() || job.keys.is_some() { MFVideoFormat_RGB32 } else { MFVideoFormat_NV12 };
                 media::set_video_output(&reader, subtype, info.size)?;
                 let rate = fps.map_or(info.fps, f64::from);
@@ -313,7 +313,8 @@ fn run(
                 }
                 burner = job.burn.as_ref().map(|b| Burner::new(b, area, size));
                 key_burner = job.keys.as_ref().map(|k| KeyBurner::new(k, size));
-                Target::Encode(video_stream(&writer, codec, subtype, size, rate, bitrate, effort)?)
+                let enc = encoder_settings(bitrate, qp, effort, rate)?;
+                Target::Encode(video_stream(&writer, codec, subtype, size, rate, bitrate, &enc)?)
             }
         });
         let (silent_rate, silent_channels) = silence_format(&reader, info, job);
@@ -552,6 +553,28 @@ fn copy_of(s: &IMFSample) -> Result<IMFSample, String> {
     }
 }
 
+/// The encoder's rate control: `qp` held at the best quality for the time (compressing), or `bitrate` with
+/// short peaks allowed at `effort`.
+unsafe fn encoder_settings(bitrate: u32, qp: Option<u32>, effort: u32, fps: f64) -> Result<IMFAttributes, String> {
+    unsafe {
+        let enc = attributes(5)?;
+        if let Some(qp) = qp {
+            let mode = eAVEncCommonRateControlMode_Quality.0 as u32;
+            enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode).ctx("enc")?;
+            enc.SetUINT64(&CODECAPI_AVEncVideoEncodeQP, qp.min(51) as u64).ctx("enc")?;
+            enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, 100).ctx("enc")?;
+        } else {
+            let mode = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
+            enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode).ctx("enc")?;
+            enc.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, bitrate).ctx("enc")?;
+            enc.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, bitrate.saturating_mul(6) / 5).ctx("enc")?;
+            enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, effort.min(100)).ctx("enc")?;
+        }
+        enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (fps * 2.0).round() as u32).ctx("enc")?;
+        Ok(enc)
+    }
+}
+
 unsafe fn video_stream(
     writer: &IMFSinkWriter,
     codec: Codec,
@@ -559,7 +582,7 @@ unsafe fn video_stream(
     size: (u32, u32),
     fps: f64,
     bitrate: u32,
-    effort: u32,
+    enc: &IMFAttributes,
 ) -> Result<u32, String> {
     unsafe {
         let (w, h) = size;
@@ -590,14 +613,7 @@ unsafe fn video_stream(
         in_t.SetUINT64(&MF_MT_FRAME_RATE, pack(fps_milli, 1000)).ctx("mt")?;
         in_t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).ctx("mt")?;
 
-        let enc = attributes(5)?;
-        let mode = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
-        enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode).ctx("enc")?;
-        enc.SetUINT32(&CODECAPI_AVEncCommonMeanBitRate, bitrate).ctx("enc")?;
-        enc.SetUINT32(&CODECAPI_AVEncCommonMaxBitRate, bitrate.saturating_mul(6) / 5).ctx("enc")?;
-        enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, effort.min(100)).ctx("enc")?;
-        enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (fps * 2.0).round() as u32).ctx("enc")?;
-        writer.SetInputMediaType(stream, &in_t, &enc).ctx("IMFSinkWriter::SetInputMediaType")?;
+        writer.SetInputMediaType(stream, &in_t, enc).ctx("IMFSinkWriter::SetInputMediaType")?;
         Ok(stream)
     }
 }

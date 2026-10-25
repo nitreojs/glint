@@ -60,19 +60,54 @@ impl CodecChoice {
     }
 }
 
+/// How hard "compress" squeezes: the video is re-encoded at one steady quality (a constant qp) instead of a
+/// bitrate, so every scene keeps the same look and the size is whatever that takes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Compress {
+    Light,
+    #[default]
+    Medium,
+    Strong,
+}
+
+impl Compress {
+    /// The encoder's qp, h.264 and hevc alike (hevc just lands smaller). On a 117 Mbps 3440×1440 game
+    /// recording nvenc's h.264 measured −32 %, −45 % and −56 % at ssim 0.991, 0.989 and 0.986.
+    pub fn qp(self) -> u32 {
+        match self {
+            Compress::Light => 20,
+            Compress::Medium => 22,
+            Compress::Strong => 24,
+        }
+    }
+
+    /// About the share of a near-lossless source's bitrate it keeps (the measurements above); only the
+    /// estimate uses it, a compact source shrinks less.
+    fn share(self) -> f64 {
+        match self {
+            Compress::Light => 0.68,
+            Compress::Medium => 0.55,
+            Compress::Strong => 0.44,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub format: Format,
-    /// A size limit; never set together with `kbps`.
+    /// A size limit; never set together with `kbps` or `compress`.
     pub target_mb: Option<u32>,
     /// Output height after the crop; None keeps it.
     pub height: Option<u32>,
     pub gif_fps: u32,
     /// Video frame rate; None keeps the source's.
     pub fps: Option<u32>,
-    /// A custom video bitrate; never set together with `target_mb`.
+    /// A custom video bitrate; never set together with `target_mb` or `compress`.
     pub kbps: Option<u32>,
+    /// Re-encode at a steady quality; never set together with `target_mb` or `kbps`.
+    pub compress: Option<Compress>,
     pub codec: CodecChoice,
     pub combine: bool,
     pub clicks: ClickLook,
@@ -88,6 +123,7 @@ impl Default for Settings {
             gif_fps: 15,
             fps: None,
             kbps: None,
+            compress: None,
             codec: CodecChoice::Same,
             combine: false,
             clicks: ClickLook::default(),
@@ -97,19 +133,30 @@ impl Default for Settings {
 }
 
 impl Settings {
-    /// A size limit takes over from a custom bitrate.
+    /// A size limit takes over from a custom bitrate and compressing.
     pub fn set_target(&mut self, mb: Option<u32>) {
         self.target_mb = mb;
         if mb.is_some() {
             self.kbps = None;
+            self.compress = None;
         }
     }
 
-    /// A custom bitrate takes over from a size limit; out-of-range values fall back to auto.
+    /// A custom bitrate takes over from a size limit and compressing; out-of-range values fall back to auto.
     pub fn set_kbps(&mut self, kbps: Option<u32>) {
         self.kbps = kbps.filter(|k| KBPS.contains(k));
         if self.kbps.is_some() {
             self.target_mb = None;
+            self.compress = None;
+        }
+    }
+
+    /// Compressing takes over from a size limit and a custom bitrate.
+    pub fn set_compress(&mut self, c: Option<Compress>) {
+        self.compress = c;
+        if c.is_some() {
+            self.target_mb = None;
+            self.kbps = None;
         }
     }
 }
@@ -137,6 +184,12 @@ pub struct Source<'a> {
 impl Source<'_> {
     fn secs(&self) -> f64 {
         (self.info.duration.max(1) as f64 / SECOND as f64).max(0.001)
+    }
+
+    /// The file's bytes in proportion to `len` of it.
+    pub fn bytes_for(&self, len: i64) -> u64 {
+        let share = (len.max(0) as f64 / self.info.duration.max(1) as f64).min(1.0);
+        (self.bytes as f64 * share).round() as u64
     }
 
     fn video_bps(&self) -> f64 {
@@ -170,8 +223,9 @@ pub struct Piece {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Video {
     Copy,
-    /// `fps` None keeps the source's frame timing; otherwise frames land on that grid.
-    Encode { crop: Option<Crop>, size: (u32, u32), bitrate: u32, fps: Option<u32>, codec: Codec },
+    /// `fps` None keeps the source's frame timing; otherwise frames land on that grid. With `qp` the encoder
+    /// holds that constant quality and `bitrate` only estimates the size.
+    Encode { crop: Option<Crop>, size: (u32, u32), bitrate: u32, fps: Option<u32>, codec: Codec, qp: Option<u32> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -298,23 +352,26 @@ fn bitrate_scaled(bps: f64, pixels: f64, rate: f64) -> f64 {
     bps * pixels.powf(0.85) * rate.powf(0.6)
 }
 
-/// The source's bitrate carried over to the output's pixels, frame rate and codec, never above
-/// [`CEILING_BPS`].
-fn default_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> u32 {
+/// The source's bitrate carried over to the output's pixels, frame rate and codec.
+fn carried_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> f64 {
     let size = src.info.size;
-    let out_pixels = out.0 as f64 * out.1 as f64;
-    let pixels = out_pixels / (size.0.max(1) as f64 * size.1.max(1) as f64);
+    let pixels = out.0 as f64 * out.1 as f64 / (size.0.max(1) as f64 * size.1.max(1) as f64);
     let rate = fps.map_or(1.0, |f| f as f64 / src.info.fps.max(1.0));
     let share = match (src.info.codec.unwrap_or(Codec::H264), codec) {
         (Codec::H264, Codec::Hevc) => HEVC_SHARE,
         (Codec::Hevc, Codec::H264) => 1.0 / HEVC_SHARE,
         _ => 1.0,
     };
-    let carried = bitrate_scaled(src.video_bps(), pixels.min(1.0), rate.min(1.0)) * share;
+    bitrate_scaled(src.video_bps(), pixels.min(1.0), rate.min(1.0)) * share
+}
+
+/// [`carried_bitrate`], never above [`CEILING_BPS`].
+fn default_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> u32 {
+    let out_pixels = out.0 as f64 * out.1 as f64;
     let out_fps = fps.map_or(src.info.fps, f64::from).max(1.0);
     let codec_share = if codec == Codec::Hevc { HEVC_SHARE } else { 1.0 };
     let ceiling = bitrate_scaled(CEILING_BPS, out_pixels / (1920.0 * 1080.0), out_fps / 60.0) * codec_share;
-    carried.min(ceiling).clamp(300_000.0, 400e6).round() as u32
+    carried_bitrate(src, out, fps, codec).min(ceiling).clamp(300_000.0, 400e6).round() as u32
 }
 
 fn muxed(payload: u64) -> u64 {
@@ -355,9 +412,16 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
     let height = s.height.filter(|&h| h < base.1);
     let fps = s.fps.filter(|&f| (f as f64) < src.info.fps - 0.01);
     let kbps = s.kbps.filter(|k| KBPS.contains(k));
+    let compress = s.compress.filter(|_| kbps.is_none() && target.is_none());
     let codec = s.codec.resolve(src.info.codec);
     let same_codec = src.info.codec.is_none_or(|c| c == codec);
-    let plain = crop.is_none() && height.is_none() && fps.is_none() && kbps.is_none() && burn.is_none() && keys.is_none();
+    let plain = crop.is_none()
+        && height.is_none()
+        && fps.is_none()
+        && kbps.is_none()
+        && compress.is_none()
+        && burn.is_none()
+        && keys.is_none();
     if src.index.is_some() && plain && same_codec {
         let pieces = kept.iter().map(|r| Piece { lead: lead(src.keys(), r.start), start: r.start, end: r.end }).collect();
         let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target, burn: None, keys: None };
@@ -368,15 +432,16 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
     let out = scaled(base, height);
     let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end }).collect();
     let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn, keys };
-    let bitrate = match (kbps, target) {
-        (Some(k), _) => k * 1000,
-        (None, Some(t)) => {
+    let bitrate = match (kbps, target, compress) {
+        (Some(k), ..) => k * 1000,
+        (None, Some(t), _) => {
             let fit = bitrate_for(t, Job::Video(job.clone()).len(), audio_bytes(&job, src));
             default_bitrate(src, out, fps, codec).min(fit)
         }
-        (None, None) => default_bitrate(src, out, fps, codec),
+        (None, None, Some(c)) => (carried_bitrate(src, out, fps, codec) * c.share()).clamp(300_000.0, 400e6).round() as u32,
+        (None, None, None) => default_bitrate(src, out, fps, codec),
     };
-    job.video = Video::Encode { crop, size: out, bitrate, fps, codec };
+    job.video = Video::Encode { crop, size: out, bitrate, fps, codec, qp: compress.map(Compress::qp) };
     Job::Video(job)
 }
 
@@ -417,6 +482,23 @@ pub fn size_label(bytes: u64) -> String {
     } else {
         format!("{} MB", mb.round())
     }
+}
+
+/// The done message's comparison of a compressed export (`after`) with what that stretch of the source took
+/// (`before`): `412 MB → 190 MB (−54%)`, or plainly that it isn't smaller. None with nothing to compare to.
+pub fn saving_label(before: u64, after: u64) -> Option<String> {
+    if before == 0 {
+        return None;
+    }
+    let sizes = format!("{} → {}", size_label(before), size_label(after));
+    let pct = (before.saturating_sub(after) as f64 * 100.0 / before as f64).round();
+    Some(if after >= before {
+        format!("{sizes}, not smaller: the source was already compact")
+    } else if pct < 1.0 {
+        format!("{sizes}, about the same: the source was already compact")
+    } else {
+        format!("{sizes} (−{pct}%)")
+    })
 }
 
 #[cfg(test)]
@@ -622,7 +704,7 @@ mod tests {
         assert!(copies(Settings { kbps: Some(50), ..Settings::default() }));
 
         let Job::Video(v) = plan(&e, &Settings { codec: CodecChoice::Hevc, ..Settings::default() }, &source) else { panic!() };
-        assert_eq!(v.video, Video::Encode { crop: None, size: (1920, 1080), bitrate: 8_400_000, fps: None, codec: Codec::Hevc });
+        assert_eq!(v.video, Video::Encode { crop: None, size: (1920, 1080), bitrate: 8_400_000, fps: None, codec: Codec::Hevc, qp: None });
         assert_eq!(v.pieces[0].lead, 3 * S);
 
         let Job::Video(v) = plan(&e, &Settings { fps: Some(30), ..Settings::default() }, &source) else { panic!() };
@@ -746,5 +828,58 @@ mod tests {
         assert_eq!(size_label(18_400_000), "18 MB");
         assert_eq!(size_label(9_640_000), "9.6 MB");
         assert_eq!(size_label(420_000), "420 KB");
+    }
+
+    #[test]
+    fn compressing_holds_a_quality_and_never_copies() {
+        assert_eq!(Compress::default(), Compress::Medium);
+        assert_eq!([Compress::Light, Compress::Medium, Compress::Strong].map(Compress::qp), [20, 22, 24]);
+        let (info, idx) = (info(2), index(2));
+        let source = src(&info, Some(&idx));
+        let e = edit(2);
+        let s = Settings { compress: Some(Compress::Medium), ..Settings::default() };
+        let job = plan(&e, &s, &source);
+        let Job::Video(VideoJob { video: Video::Encode { size, bitrate, fps, qp, .. }, .. }) = job else { panic!("{job:?}") };
+        assert_eq!((size, fps, qp), ((1920, 1080), None, Some(22)));
+        assert_eq!(bitrate, 6_600_000, "the 12 Mbps source at its measured share");
+        let half = plan(&e, &Settings { height: Some(540), ..s }, &source);
+        assert!(matches!(half, Job::Video(VideoJob { video: Video::Encode { size: (960, 540), qp: Some(22), .. }, .. })));
+
+        // a size limit or a custom bitrate saved alongside wins, as the setters would have had it
+        let limited = plan(&e, &Settings { target_mb: Some(10), ..s }, &source);
+        assert!(matches!(limited, Job::Video(VideoJob { video: Video::Encode { qp: None, .. }, .. })));
+        let gif = plan(&e, &Settings { format: Format::Gif, ..s }, &source);
+        assert!(matches!(gif, Job::Gif(_)));
+
+        let mut s = Settings { kbps: Some(3000), ..Settings::default() };
+        s.set_compress(Some(Compress::Strong));
+        assert_eq!((s.compress, s.kbps, s.target_mb), (Some(Compress::Strong), None, None));
+        s.set_target(Some(10));
+        assert_eq!((s.compress, s.target_mb), (None, Some(10)));
+        s.set_compress(Some(Compress::Light));
+        assert_eq!((s.compress, s.target_mb), (Some(Compress::Light), None));
+        s.set_kbps(Some(5000));
+        assert_eq!((s.compress, s.kbps), (None, Some(5000)));
+        s.set_compress(Some(Compress::Light));
+        s.set_target(None);
+        s.set_kbps(None);
+        assert_eq!(s.compress, Some(Compress::Light), "clearing the others leaves it alone");
+    }
+
+    #[test]
+    fn the_done_message_compares_with_the_source_stretch() {
+        let info = info(1);
+        let source = src(&info, None);
+        assert_eq!(source.bytes_for(10 * S), 15_500_000);
+        assert_eq!((source.bytes_for(40 * S), source.bytes_for(-S)), (31_000_000, 0));
+
+        assert_eq!(saving_label(412_000_000, 190_000_000).unwrap(), "412 MB → 190 MB (−54%)");
+        assert_eq!(saving_label(9_640_000, 420_000).unwrap(), "9.6 MB → 420 KB (−96%)");
+        let same = saving_label(412_000_000, 410_000_000).unwrap();
+        assert_eq!(same, "412 MB → 410 MB, about the same: the source was already compact");
+        let not = "not smaller: the source was already compact";
+        assert_eq!(saving_label(50_000_000, 50_000_000).unwrap(), format!("50 MB → 50 MB, {not}"));
+        assert_eq!(saving_label(50_000_000, 64_000_000).unwrap(), format!("50 MB → 64 MB, {not}"));
+        assert_eq!(saving_label(0, 1_000), None);
     }
 }

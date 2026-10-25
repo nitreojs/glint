@@ -7,7 +7,7 @@ use eframe::egui::{
 use glint_core::clip::clicks::{ClickColor, ClickSize};
 use glint_core::clip::keys::KeySize;
 use glint_core::clip::crop::Crop;
-use glint_core::clip::export::{self, CodecChoice, Format, Job, MB, TARGETS_MB, Video, VideoJob};
+use glint_core::clip::export::{self, CodecChoice, Compress, Format, Job, MB, TARGETS_MB, Video, VideoJob};
 use glint_core::clip::math::{GIF_FPS, GIF_WARN_BYTES, fmt_short};
 use glint_core::record::Codec;
 use glint_core::record::keys::Position;
@@ -147,14 +147,27 @@ impl ClipApp {
         let formats = [(Format::Video, "video"), (Format::Gif, "gif")];
         widgets::segmented(ui, look, &mut s.format, &formats, Some(width));
         gap(ui);
+        let video = s.format == Format::Video;
 
         label(ui, look, "size");
         let (custom, custom_mbps) = (&mut self.custom_mb, &mut self.custom_mbps);
+        let compressing = video && s.compress.is_some();
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-            if pill(ui, look, "original", s.target_mb.is_none() && custom.is_empty()).clicked() {
+            if pill(ui, look, "original", s.target_mb.is_none() && custom.is_empty() && !compressing).clicked() {
                 s.set_target(None);
+                s.set_compress(None);
                 custom.clear();
+            }
+            if video
+                && pill(ui, look, "compress", compressing)
+                    .on_hover_text("re-encodes at one steady quality: much smaller and hard to tell apart; how much smaller depends on the video")
+                    .clicked()
+                && !compressing
+            {
+                s.set_compress(Some(Compress::default()));
+                custom.clear();
+                custom_mbps.clear();
             }
             for mb in TARGETS_MB {
                 if pill(ui, look, &format!("≤ {mb} MB"), s.target_mb == Some(mb) && custom.is_empty()).clicked() {
@@ -172,6 +185,13 @@ impl ClipApp {
                 }
             }
         });
+        if compressing && let Some(level) = &mut s.compress {
+            gap(ui);
+            label(ui, look, "compression");
+            let levels = [(Compress::Light, "light"), (Compress::Medium, "medium"), (Compress::Strong, "strong")];
+            widgets::segmented(ui, look, level, &levels, Some(width))
+                .on_hover_text("stronger is smaller and loses a little more detail in busy scenes");
+        }
         gap(ui);
 
         let crop = self.edit.crop.filter(|c| !c.is_full(size)).map(|c| c.even(size));
@@ -224,7 +244,6 @@ impl ClipApp {
             widgets::checkbox(ui, look, &mut s.combine, "combine sound into one track")
                 .on_hover_text("mixes the sound you hear into a single track, for players that only play the first one");
         }
-        let video = s.format == Format::Video;
         if let Some(c) = crop {
             gap(ui);
             self.crop_row(ui, look, c);
