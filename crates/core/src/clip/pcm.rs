@@ -3,6 +3,11 @@ use std::collections::VecDeque;
 use super::math::SECOND;
 
 const SLACK: i64 = 2;
+/// Where [`soft_clip`] starts bending: anything quieter passes untouched.
+const KNEE: f32 = 0.9;
+/// How long a gain takes to slide from silence to full: quick enough to feel instant, slow enough
+/// not to click.
+pub const RAMP: i64 = SECOND / 100;
 
 pub fn frames(hns: i64, rate: u32) -> i64 {
     (hns as i128 * rate as i128 + SECOND as i128 / 2).div_euclid(SECOND as i128) as i64
@@ -68,6 +73,41 @@ impl Lane {
         self.buf.drain(..n);
         self.start += out.len() as i64 / 2;
     }
+
+    /// [`Lane::take_into`] with `gain` sliding toward `to` by `step` a frame, so a change while it
+    /// plays fades in over a few milliseconds instead of jumping.
+    pub fn take_ramped(&mut self, out: &mut [f32], gain: &mut f32, to: f32, step: f32) {
+        if *gain == to {
+            return self.take_into(out, to);
+        }
+        let mut src = self.buf.iter();
+        for o in out.chunks_exact_mut(2) {
+            *gain = if *gain < to { (*gain + step).min(to) } else { (*gain - step).max(to) };
+            if let (Some(l), Some(r)) = (src.next(), src.next()) {
+                o[0] += l * *gain;
+                o[1] += r * *gain;
+            }
+        }
+        let n = out.len().min(self.buf.len());
+        self.buf.drain(..n);
+        self.start += out.len() as i64 / 2;
+    }
+}
+
+/// The per-frame step that slides a gain by 1.0 over [`RAMP`].
+pub fn ramp_step(rate: u32) -> f32 {
+    1.0 / frames(RAMP, rate).max(1) as f32
+}
+
+/// `s` as is up to the knee, then bent smoothly toward full scale, so sound boosted (or summed)
+/// past it saturates gently instead of clipping hard.
+pub fn soft_clip(s: f32) -> f32 {
+    let a = s.abs();
+    if a <= KNEE {
+        return s;
+    }
+    let room = 1.0 - KNEE;
+    (KNEE + room * ((a - KNEE) / room).tanh()).copysign(s)
 }
 
 pub fn to_i16(data: &[f32]) -> Vec<u8> {
@@ -119,5 +159,36 @@ mod tests {
         to_stereo(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3, &mut out);
         assert_eq!(out, [1.0, 2.0, 4.0, 5.0]);
         assert_eq!(to_i16(&[2.0, -1.0, 0.0]), [0xFF, 0x7F, 0x01, 0x80, 0, 0]);
+    }
+
+    #[test]
+    fn gain_changes_slide_over_the_ramp() {
+        assert_eq!(ramp_step(48_000), 1.0 / 480.0);
+        let mut lane = Lane::new(0);
+        lane.push(0, &[0.5; 2 * 600]);
+        let (mut out, mut gain) = (vec![0.0; 2 * 600], 1.0);
+        lane.take_ramped(&mut out, &mut gain, 0.0, ramp_step(48_000));
+        assert_eq!(gain, 0.0);
+        let left: Vec<f32> = out.iter().step_by(2).copied().collect();
+        assert!(left.windows(2).all(|w| w[1] <= w[0] && w[0] - w[1] < 0.5 / 400.0), "no step bigger than the ramp's");
+        assert!(left[0] > 0.49 && left[479] < 0.01 && left[480..].iter().all(|&s| s == 0.0));
+        assert_eq!(lane.end(), 600);
+
+        lane.push(600, &[0.5; 8]);
+        let mut out = vec![0.0; 8];
+        lane.take_ramped(&mut out, &mut gain, 0.0, ramp_step(48_000));
+        assert_eq!(out, [0.0; 8], "a settled gain mixes like take_into");
+    }
+
+    #[test]
+    fn soft_clipping_leaves_quiet_sound_alone_and_never_passes_full_scale() {
+        for s in [0.0, 0.3, -0.5, 0.9, -0.9] {
+            assert_eq!(soft_clip(s), s);
+        }
+        let curve: Vec<f32> = (0..=400).map(|i| soft_clip(i as f32 / 100.0)).collect();
+        assert!(curve.windows(2).all(|w| w[1] >= w[0]), "it only bends, never folds back");
+        assert!(curve.iter().all(|&s| s <= 1.0) && curve[400] > 0.999);
+        assert!((soft_clip(0.91) - 0.91).abs() < 1e-4, "smooth at the knee");
+        assert_eq!(soft_clip(-2.0), -soft_clip(2.0));
     }
 }

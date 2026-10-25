@@ -176,6 +176,8 @@ struct Track {
     channels: usize,
     lane: Lane,
     ended: bool,
+    /// The gain it's playing at, sliding toward the one set.
+    gain: f32,
 }
 
 struct Source {
@@ -196,7 +198,7 @@ impl Source {
             .map(|&stream| {
                 unsafe { reader.SetStreamSelection(stream, true).ok()? };
                 match media::float_output(&reader, stream, rate) {
-                    Ok(channels) => Some(Track { stream, channels, lane: Lane::new(0), ended: false }),
+                    Ok(channels) => Some(Track { stream, channels, lane: Lane::new(0), ended: false, gain: 0.0 }),
                     Err(e) => {
                         log(&format!("clip: audio stream {stream}: {e}"));
                         unsafe {
@@ -213,12 +215,16 @@ impl Source {
         Ok(Source { reader, rate, tracks, scratch: Vec::new(), stereo: Vec::new() })
     }
 
-    fn seek(&mut self, t: i64) -> Result<(), String> {
+    /// Starts over at `t`, at the gains as they're set now: nothing is playing to slide from.
+    fn seek(&mut self, t: i64, gains: &Gains) -> Result<(), String> {
         media::seek(&self.reader, t)?;
         let at = pcm::frames(t, self.rate);
-        for tr in self.tracks.iter_mut().flatten() {
-            tr.lane.reset(at);
-            tr.ended = false;
+        for (i, tr) in self.tracks.iter_mut().enumerate() {
+            if let Some(tr) = tr {
+                tr.lane.reset(at);
+                tr.ended = false;
+                tr.gain = gains.get(i);
+            }
         }
         Ok(())
     }
@@ -240,13 +246,14 @@ impl Source {
             }
         }
         out.fill(0.0);
+        let step = pcm::ramp_step(self.rate);
         for (i, tr) in self.tracks.iter_mut().enumerate() {
             if let Some(tr) = tr {
-                tr.lane.take_into(out, gains.get(i));
+                tr.lane.take_ramped(out, &mut tr.gain, gains.get(i), step);
             }
         }
         for s in out.iter_mut() {
-            *s = s.clamp(-1.0, 1.0);
+            *s = pcm::soft_clip(*s);
         }
         Ok(())
     }
@@ -289,7 +296,7 @@ fn run(
             }
             match cmds.try_iter().last().unwrap_or(first) {
                 Cmd::Play { t, epoch } => {
-                    src.seek(t)?;
+                    src.seek(t, gains)?;
                     cursor = pcm::frames(t, src.rate);
                     playing = Some(t);
                     publish(&mut |s| {

@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use glint_core::clip::crop::Crop;
+use glint_core::clip::edit::gain;
 use glint_core::clip::export::{AAC_BYTES_PER_SECOND, Job, Video, VideoJob};
 use glint_core::clip::info::Info;
 use glint_core::clip::math::{Range, SECOND};
@@ -121,13 +122,21 @@ enum Target {
     Encode(u32),
     Remux(u32),
     Copy(u32),
-    Mix(usize),
+    /// Into input `.1` of mixdown `.0`.
+    Mix(usize, usize),
 }
 
+struct Input {
+    channels: usize,
+    lane: Lane,
+    gain: f32,
+}
+
+/// One aac track made from decoded sound: the combined mix, or a single track at a new volume.
 struct Mixdown {
     stream: u32,
     rate: u32,
-    lanes: Vec<(usize, Lane)>,
+    inputs: Vec<Input>,
     written: i64,
     scratch: Vec<f32>,
     stereo: Vec<f32>,
@@ -184,22 +193,22 @@ fn aac_rate(rate: u32) -> bool {
 impl Mixdown {
     unsafe fn new(writer: &IMFSinkWriter, rate: u32) -> Result<Mixdown, String> {
         if !aac_rate(rate) {
-            return Err(format!("audio at {rate} Hz can't be mixed into one track"));
+            return Err(format!("audio at {rate} Hz can't be mixed or have its volume changed"));
         }
         let stream = unsafe { aac_stream(writer, rate, 2, AAC_BYTES_PER_SECOND)? };
-        Ok(Mixdown { stream, rate, lanes: Vec::new(), written: 0, scratch: Vec::new(), stereo: Vec::new() })
+        Ok(Mixdown { stream, rate, inputs: Vec::new(), written: 0, scratch: Vec::new(), stereo: Vec::new() })
     }
 
-    fn push(&mut self, lane: usize, sample: &IMFSample, at: i64, seg: Range, base: i64) -> Result<(), String> {
+    fn push(&mut self, input: usize, sample: &IMFSample, at: i64, seg: Range, base: i64) -> Result<(), String> {
         media::floats(sample, &mut self.scratch)?;
-        let channels = self.lanes[lane].0;
+        let channels = self.inputs[input].channels;
         pcm::to_stereo(&self.scratch, channels, &mut self.stereo);
         let n = self.stereo.len() as i64 / 2;
         let first = pcm::frames(base, self.rate);
         let f0 = pcm::frames(at - seg.start, self.rate);
         let (lo, hi) = ((-f0).max(0), n.min(pcm::frames(base + seg.len(), self.rate) - first - f0));
         if lo < hi {
-            self.lanes[lane].1.push(first + f0 + lo, &self.stereo[lo as usize * 2..hi as usize * 2]);
+            self.inputs[input].lane.push(first + f0 + lo, &self.stereo[lo as usize * 2..hi as usize * 2]);
         }
         Ok(())
     }
@@ -210,8 +219,11 @@ impl Mixdown {
             return Ok(());
         }
         let mut out = vec![0.0; n as usize * 2];
-        for (_, lane) in &mut self.lanes {
-            lane.take_into(&mut out, 1.0);
+        for i in &mut self.inputs {
+            i.lane.take_into(&mut out, i.gain);
+        }
+        for s in &mut out {
+            *s = pcm::soft_clip(*s);
         }
         unsafe { write_pcm(writer, self.stream, self.rate, self.written, upto, &pcm::to_i16(&out))? };
         self.written = upto;
@@ -320,7 +332,8 @@ fn run(
             }
         });
         let (silent_rate, silent_channels) = silence_format(&reader, info, job);
-        let mut mix: Option<Mixdown> = None;
+        let mut mixes: Vec<Mixdown> = Vec::new();
+        let mut combined = None;
         let mut silences = Vec::new();
         let mut names = Vec::with_capacity(job.tracks.len());
         for t in &job.tracks {
@@ -331,24 +344,32 @@ fn run(
             };
             let (i, native) = (source.stream, &streams[source.stream as usize].2);
             reader.SetStreamSelection(i, true).ctx("SetStreamSelection")?;
-            targets[i as usize] = Some(if job.combine {
-                let m = match &mut mix {
-                    Some(m) => m,
-                    None => {
-                        let sources = job.tracks.iter().filter(|t| t.source.is_some());
-                        names.push(sources.map(|t| t.name.as_str()).collect::<Vec<_>>().join(" + "));
-                        mix.insert(Mixdown::new(&writer, media::audio_rate(&reader, i))?)
-                    }
-                };
-                let channels = media::float_output(&reader, i, m.rate)?;
-                m.lanes.push((channels, Lane::new(0)));
-                Target::Mix(m.lanes.len() - 1)
-            } else {
+            targets[i as usize] = Some(if job.copies(t) {
                 reader.SetCurrentMediaType(i, None, native).ctx("audio type")?;
                 let w = writer.AddStream(native).ctx("can't copy the audio")?;
                 writer.SetInputMediaType(w, native, None).ctx("can't copy the audio")?;
                 names.push(t.name.clone());
                 Target::Copy(w)
+            } else {
+                let m = match combined {
+                    Some(m) => m,
+                    None => {
+                        let name = if job.combine {
+                            let sources = job.tracks.iter().filter(|t| t.source.is_some());
+                            sources.map(|t| t.name.as_str()).collect::<Vec<_>>().join(" + ")
+                        } else {
+                            t.name.clone()
+                        };
+                        names.push(name);
+                        mixes.push(Mixdown::new(&writer, media::audio_rate(&reader, i))?);
+                        combined = job.combine.then_some(mixes.len() - 1);
+                        mixes.len() - 1
+                    }
+                };
+                let mix = &mut mixes[m];
+                let channels = media::float_output(&reader, i, mix.rate)?;
+                mix.inputs.push(Input { channels, lane: Lane::new(0), gain: gain(t.volume) });
+                Target::Mix(m, mix.inputs.len() - 1)
             });
         }
         writer.BeginWriting().ctx("IMFSinkWriter::BeginWriting")?;
@@ -398,7 +419,7 @@ fn run(
                 reader.SetStreamSelection(i, true).ctx("SetStreamSelection")?;
             }
             media::seek(&reader, lead)?;
-            let mut open: Vec<bool> = mix.as_ref().map_or(Vec::new(), |m| vec![true; m.lanes.len()]);
+            let mut open: Vec<Vec<bool>> = mixes.iter().map(|m| vec![true; m.inputs.len()]).collect();
             let mut held: Option<Held> = None;
             let mut started = false;
             let mut pending: Option<IMFSample> = None;
@@ -425,7 +446,7 @@ fn run(
                                     started = true;
                                 }
                             }
-                            Some(Target::Mix(l)) => open[l] = false,
+                            Some(Target::Mix(m, l)) => open[m][l] = false,
                             _ => {}
                         }
                         active.retain(|&a| a != i);
@@ -445,22 +466,20 @@ fn run(
                         copied_to[i as usize] = at + media::duration(&sample);
                     }
                     Target::Copy(_) => {}
-                    Target::Mix(l) => {
-                        let m = mix.as_mut().unwrap();
+                    Target::Mix(m, l) => {
+                        let mix = &mut mixes[m];
                         if done {
-                            open[l] = false;
+                            open[m][l] = false;
                         } else {
-                            m.push(l, &sample, ts, seg, base)?;
+                            mix.push(l, &sample, ts, seg, base)?;
                         }
-                        let ready = m
-                            .lanes
-                            .iter()
-                            .zip(&open)
+                        let end = pcm::frames(base + seg.len(), mix.rate);
+                        let ready = (mix.inputs.iter().zip(&open[m]))
                             .filter(|(_, o)| **o)
-                            .map(|((_, lane), _)| lane.end())
+                            .map(|(i, _)| i.lane.end())
                             .min()
-                            .unwrap_or(pcm::frames(base + seg.len(), m.rate));
-                        m.flush(&writer, ready.min(pcm::frames(base + seg.len(), m.rate)))?;
+                            .unwrap_or(end);
+                        mix.flush(&writer, ready.min(end))?;
                     }
                     Target::Remux(w) => {
                         if !done && ts >= seg.start {
@@ -515,12 +534,12 @@ fn run(
             for s in &mut silences {
                 s.fill(&writer, base)?;
             }
-            if let Some(m) = &mut mix {
-                let end = pcm::frames(base, m.rate);
-                for (_, lane) in &mut m.lanes {
-                    lane.pad_to(end);
+            for mix in &mut mixes {
+                let end = pcm::frames(base, mix.rate);
+                for i in &mut mix.inputs {
+                    i.lane.pad_to(end);
                 }
-                m.flush(&writer, end)?;
+                mix.flush(&writer, end)?;
             }
         }
         if !any_video {

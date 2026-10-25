@@ -252,6 +252,33 @@ fn an_empty_track_stays_its_own_next_to_a_combined_mix() {
 
 #[test]
 #[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn track_volumes_change_only_their_tracks_and_keep_the_video_copied() {
+    let src = fixture("volume", "640x360", "30", &["-g", "30"]);
+    let out = src.with_file_name(format!("glint-clip-volume-out-{}.mp4", std::process::id()));
+    let mut edit = Edit::new(3 * SECOND, 2);
+    assert!(edit.set_volume(0, 50) && edit.set_volume(1, 150));
+    let (job, _) = export_to(&src, &edit, &export::Settings::default(), &out);
+    let before = [max_volume(&src, 0), max_volume(&src, 1)];
+    let after = [max_volume(&out, 0), max_volume(&out, 1)];
+    let streams = probe(&out, "stream=codec_type,codec_name");
+    let names = probe(&out, "stream_tags=handler_name");
+    let same_start = first_packet_size(&out, 0.0) == first_packet_size(&src, 0.0);
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+
+    let Job::Video(v) = &job else { panic!("{job:?}") };
+    assert!(v.video == Video::Copy && same_start, "the picture is copied: {job:?}");
+    assert!(v.tracks.iter().all(|t| !v.copies(t)));
+    assert_eq!(streams, ["h264,video", "aac,audio", "aac,audio"]);
+    assert_eq!(names, ["VideoHandler", "desktop", "mic"]);
+    let gained = [after[0] - before[0], after[1] - before[1]];
+    eprintln!("max volume {before:?} dB → {after:?} dB, {gained:?}");
+    assert!((gained[0] + 6.02).abs() < 0.5, "50 % is −6 dB: {gained:?}");
+    assert!((gained[1] - 3.52).abs() < 0.5, "150 % is +3.5 dB: {gained:?}");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
 fn a_10_mb_target_reencodes_the_crop_under_the_limit() {
     let cbr = [
         "-vf", "noise=alls=30:allf=t+u", "-g", "60", "-b:v", "40M", "-minrate", "40M", "-maxrate", "40M", "-bufsize", "4M",
