@@ -22,6 +22,13 @@ fn write(msg: &str) {
     }
 }
 
+/// Starts this run's log empty; the last run's is kept beside it as `<app>.prev.log`, so what led
+/// up to a crash or a restart is still there.
+pub fn start_fresh() {
+    let path = path();
+    let _ = std::fs::rename(&path, path.with_extension("prev.log"));
+}
+
 /// The log file of the app that called [`install`].
 pub fn path() -> PathBuf {
     let app = APP.get().copied().unwrap_or("glint");

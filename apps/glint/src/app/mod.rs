@@ -744,7 +744,7 @@ pub fn run() {
         }
         // a fresh log per run; after an update it goes on from the run that installed it
         if updated_from.is_none() {
-            let _ = std::fs::write(log_path(), "");
+            glint_shell::log::start_fresh();
         }
         update::tidy(updated_from.is_some());
         let (mut cfg, cfg_err) = match Config::load() {

@@ -593,7 +593,7 @@ pub fn run() {
         }
         return;
     }
-    let _ = std::fs::write(glint_shell::log::path(), "");
+    glint_shell::log::start_fresh();
     let (cfg, cfg_err) = match Config::load() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),
