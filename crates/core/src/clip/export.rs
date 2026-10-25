@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use super::clicks::ClickLook;
 use super::crop::Crop;
-use super::edit::Edit;
+use super::edit::{Edit, FULL_VOLUME};
 use super::index::Index;
 use super::info::Info;
 use super::keys::KeyLook;
@@ -237,6 +237,8 @@ pub enum Video {
 pub struct Sound {
     pub source: Option<usize>,
     pub name: String,
+    /// Percent, as the lane's [`crate::clip::edit::Lane::volume`].
+    pub volume: u16,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -301,8 +303,15 @@ impl VideoJob {
             && info.clicks.is_none()
             && info.keys.is_none()
             && self.tracks.len() == info.tracks.len()
-            && (self.tracks.iter().enumerate()).all(|(k, t)| t.source == Some(k) && t.name == info.tracks[k].name)
+            && (self.tracks.iter().enumerate())
+                .all(|(k, t)| t.source == Some(k) && t.name == info.tracks[k].name && self.copies(t))
             && matches!(self.pieces[..], [p] if p.lead <= 0 && p.end >= info.duration)
+    }
+
+    /// `t`'s packets go into the file as they are: a recorded track, not mixed with others, at its own
+    /// volume. Anything else is decoded and encoded again.
+    pub fn copies(&self, t: &Sound) -> bool {
+        t.source.is_some() && !self.combine && t.volume == FULL_VOLUME
     }
 }
 
@@ -310,7 +319,7 @@ impl VideoJob {
 pub(super) fn sounds(edit: &Edit, info: &Info) -> Vec<Sound> {
     (edit.lanes.iter())
         .filter(|l| !l.muted && l.source.is_none_or(|k| k < info.tracks.len()))
-        .map(|l| Sound { source: l.source, name: l.name(&info.tracks).to_string() })
+        .map(|l| Sound { source: l.source, name: l.name(&info.tracks).to_string(), volume: l.volume })
         .collect()
 }
 
@@ -471,7 +480,12 @@ pub(super) fn audio_bytes(job: &VideoJob, src: &Source) -> u64 {
         return per_second(AAC_BYTES_PER_SECOND) + silence;
     }
     let piece = |k: usize| job.pieces.iter().map(|p| src.audio_bytes(k, p.lead, p.end)).sum::<u64>();
-    job.tracks.iter().filter_map(|t| t.source).map(piece).sum::<u64>() + silence
+    let sound = |t: &Sound| match t.source {
+        Some(k) if job.copies(t) => piece(k),
+        Some(_) => per_second(AAC_BYTES_PER_SECOND),
+        None => 0,
+    };
+    job.tracks.iter().map(sound).sum::<u64>() + silence
 }
 
 pub fn estimate(job: &Job, src: &Source) -> u64 {
@@ -588,7 +602,10 @@ mod tests {
         let job = plan(&e, &Settings::default(), &source);
         let Job::Video(v) = &job else { panic!() };
         assert_eq!(v.video, Video::Copy);
-        let want = [Sound { source: None, name: "empty".into() }, Sound { source: Some(1), name: "voice".into() }];
+        let want = [
+            Sound { source: None, name: "empty".into(), volume: FULL_VOLUME },
+            Sound { source: Some(1), name: "voice".into(), volume: FULL_VOLUME },
+        ];
         assert_eq!(v.tracks, want);
         assert!(!v.combine);
         let payload = 13 * 30 * 50_000 + 13 * 4 * 5_000 + 13 * SILENCE_BYTES_PER_SECOND;
@@ -616,6 +633,39 @@ mod tests {
         assert_eq!(sources(v), [Some(0), Some(1), None]);
         let payload = 13 * 30 * 50_000 + 13 * AAC_BYTES_PER_SECOND + 13 * SILENCE_BYTES_PER_SECOND;
         assert_eq!(estimate(&job, &source), muxed(payload));
+    }
+
+    #[test]
+    fn only_the_tracks_whose_volume_changed_get_encoded_again() {
+        let (info, idx) = (info(2), index(2));
+        let source = src(&info, Some(&idx));
+        let mut e = edit(2);
+        assert!(e.set_volume(1, 150));
+        let job = plan(&e, &Settings::default(), &source);
+        let Job::Video(v) = &job else { panic!() };
+        assert_eq!(v.video, Video::Copy, "the picture keeps its fast path");
+        assert_eq!(v.tracks.iter().map(|t| (t.source, t.volume)).collect::<Vec<_>>(), [(Some(0), 100), (Some(1), 150)]);
+        assert_eq!(v.tracks.iter().map(|t| v.copies(t)).collect::<Vec<_>>(), [true, false]);
+        let payload = 13 * 30 * 50_000 + 13 * 4 * 5_000 + 13 * AAC_BYTES_PER_SECOND;
+        assert_eq!(estimate(&job, &source), muxed(payload));
+
+        let small = plan(&e, &Settings { height: Some(540), ..Settings::default() }, &source);
+        let Job::Video(v) = &small else { panic!() };
+        assert!(matches!(v.video, Video::Encode { .. }) && v.copies(&v.tracks[0]) && !v.copies(&v.tracks[1]));
+
+        let combined = plan(&edit(2), &Settings { combine: true, ..Settings::default() }, &source);
+        let Job::Video(v) = &combined else { panic!() };
+        assert!(v.tracks.iter().all(|t| !v.copies(t)), "a mix is always encoded");
+        let mut empty = edit(1);
+        empty.add_empty();
+        let Job::Video(v) = plan(&empty, &Settings::default(), &source) else { panic!() };
+        assert_eq!(v.tracks.iter().map(|t| v.copies(t)).collect::<Vec<_>>(), [true, false], "silence is always encoded");
+
+        let mut whole = Edit::new(20 * S, 2);
+        let is_whole = |e: &Edit| matches!(plan(e, &Settings::default(), &source), Job::Video(v) if v.whole(&info));
+        assert!(whole.set_volume(0, 0) && !is_whole(&whole));
+        assert!(whole.set_volume(0, 100) && is_whole(&whole));
+        assert!(whole.set_volume(1, 101) && !is_whole(&whole));
     }
 
     #[test]

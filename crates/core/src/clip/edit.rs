@@ -18,13 +18,17 @@ pub struct Lane {
     pub source: Option<usize>,
     pub name: Option<String>,
     pub muted: bool,
+    /// Percent of the track's own loudness, 0 to [`MAX_VOLUME`].
+    pub volume: u16,
 }
 
 pub const EMPTY_TRACK: &str = "empty";
+pub const FULL_VOLUME: u16 = 100;
+pub const MAX_VOLUME: u16 = 200;
 
 impl Lane {
     fn of(source: Option<usize>) -> Lane {
-        Lane { source, name: None, muted: false }
+        Lane { source, name: None, muted: false, volume: FULL_VOLUME }
     }
 
     pub fn default_name<'a>(&self, tracks: &'a [Track]) -> &'a str {
@@ -34,6 +38,16 @@ impl Lane {
     pub fn name<'a>(&'a self, tracks: &'a [Track]) -> &'a str {
         self.name.as_deref().unwrap_or_else(|| self.default_name(tracks))
     }
+
+    /// The volume as a factor on the samples.
+    pub fn gain(&self) -> f32 {
+        gain(self.volume)
+    }
+}
+
+/// `volume` percent as a factor on the samples.
+pub fn gain(volume: u16) -> f32 {
+    volume as f32 / FULL_VOLUME as f32
 }
 
 /// The timeline: the trimmed range, its pieces, markers, the sound lanes, and the crop.
@@ -140,6 +154,15 @@ impl Edit {
         let Some(l) = self.lanes.get_mut(lane) else { return false };
         let changed = l.muted != muted;
         l.muted = muted;
+        changed
+    }
+
+    /// Sets a lane's volume, held to 0..=[`MAX_VOLUME`].
+    pub fn set_volume(&mut self, lane: usize, volume: u16) -> bool {
+        let Some(l) = self.lanes.get_mut(lane) else { return false };
+        let volume = volume.min(MAX_VOLUME);
+        let changed = l.volume != volume;
+        l.volume = volume;
         changed
     }
 
@@ -383,7 +406,7 @@ mod tests {
         let before = e.clone();
         assert_eq!(e.add_empty(), 2);
         u.record(before, &e);
-        assert_eq!(e.lanes[2], Lane { source: None, name: None, muted: false });
+        assert_eq!(e.lanes[2], Lane { source: None, name: None, muted: false, volume: FULL_VOLUME });
         assert_eq!(names(&e), ["desktop", "voice", EMPTY_TRACK]);
 
         let before = e.clone();
@@ -413,5 +436,33 @@ mod tests {
         assert_eq!((steps, &back), (5, &fresh));
         assert!(u.redo(&mut back) && u.redo(&mut back) && u.redo(&mut back));
         assert_eq!(names(&back), [EMPTY_TRACK, "desktop", "voice"]);
+    }
+
+    #[test]
+    fn volumes_stay_with_their_lanes_and_undo() {
+        let tracks = [Track { stream: 1, name: "desktop".into() }, Track { stream: 2, name: "mic".into() }];
+        let mut u = Undo::default();
+        let mut e = Edit::new(10 * S, 2);
+        let fresh = e.clone();
+        assert!(e.lanes.iter().all(|l| l.volume == FULL_VOLUME && l.gain() == 1.0));
+
+        let before = e.clone();
+        assert!(e.set_volume(0, 50) && !e.set_volume(0, 50) && !e.set_volume(9, 50));
+        assert!(e.set_volume(1, 999) && e.lanes[1].volume == MAX_VOLUME);
+        u.record(before, &e);
+        assert_eq!((e.lanes[0].gain(), e.lanes[1].gain()), (0.5, 2.0));
+
+        assert!(e.rename(0, "game", &tracks) && e.set_muted(0, true));
+        assert!(e.move_lane(0, 1));
+        assert_eq!(e.lanes.iter().map(|l| (l.source, l.volume)).collect::<Vec<_>>(), [(Some(1), MAX_VOLUME), (Some(0), 50)]);
+        assert_eq!(e.lanes[1].name(&tracks), "game");
+        assert!(!e.set_muted(1, true) && e.lanes[1].volume == 50, "muting keeps the volume");
+        assert!(e.delete_lane(0));
+        assert_eq!(e.add_empty(), 1);
+        assert_eq!(e.lanes.iter().map(|l| (l.source, l.volume)).collect::<Vec<_>>(), [(Some(0), 50), (None, FULL_VOLUME)]);
+
+        assert!(u.undo(&mut e) && e == fresh);
+        assert!(u.redo(&mut e) && e.lanes[0].volume == 50);
+        assert_eq!(gain(0), 0.0);
     }
 }
