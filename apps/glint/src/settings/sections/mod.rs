@@ -61,6 +61,7 @@ impl Section {
                     + n(a.monitor_hotkey == b.monitor_hotkey)
                     + n(a.pause_hotkey == b.pause_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
+                    + n(a.explorer_menu == b.explorer_menu)
                     + n(a.freeze_screen == b.freeze_screen)
                     + n(a.ui_elements == b.ui_elements)
                     + n(a.notify_success == b.notify_success)
@@ -121,6 +122,7 @@ impl Section {
                 cfg.monitor_hotkey = d.monitor_hotkey;
                 cfg.pause_hotkey = d.pause_hotkey;
                 cfg.launch_at_startup = d.launch_at_startup;
+                cfg.explorer_menu = d.explorer_menu;
                 cfg.freeze_screen = d.freeze_screen;
                 cfg.ui_elements = d.ui_elements;
                 cfg.notify_success = d.notify_success;

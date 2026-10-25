@@ -63,6 +63,8 @@ impl SettingsApp {
         self.hotkey_list(ui, look);
         let text = if self.cfg.launch_at_startup { "on" } else { "off" };
         toggle_row(ui, look, "launch at startup", &mut self.cfg.launch_at_startup, text);
+        let text = if self.cfg.explorer_menu { "open in glint editor" } else { "off" };
+        toggle_row(ui, look, "explorer menu", &mut self.cfg.explorer_menu, text);
         row(ui, look, "notifications", 7.0, |ui| {
             let choices = [(true, "all"), (false, "errors only")];
             widgets::segmented(ui, look, &mut self.cfg.notify_success, &choices, Some(200.0));

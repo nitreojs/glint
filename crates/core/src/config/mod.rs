@@ -23,6 +23,8 @@ pub struct Config {
     pub monitor_hotkey: String,
     pub pause_hotkey: String,
     pub launch_at_startup: bool,
+    /// "open in glint editor" in Explorer's right-click menu on videos.
+    pub explorer_menu: bool,
     pub freeze_screen: bool,
     pub ui_elements: UiElements,
     pub notify_success: bool,
@@ -193,6 +195,7 @@ impl Default for Config {
             monitor_hotkey: "Alt+PrintScreen".into(),
             pause_hotkey: "Pause".into(),
             launch_at_startup: false,
+            explorer_menu: true,
             freeze_screen: true,
             ui_elements: UiElements::Shift,
             notify_success: true,
@@ -406,6 +409,9 @@ pause_hotkey = {pause_hotkey}
 # Start glint (in the tray) when you sign in to Windows.
 launch_at_startup = {launch_at_startup}
 
+# "open in glint editor" when you right-click a video in Explorer.
+explorer_menu = {explorer_menu}
+
 # While selecting a region, show a still image of the screen (true) or the live screen,
 # dimmed (false).
 freeze_screen = {freeze_screen}
@@ -533,6 +539,7 @@ update_beta = {update_beta}
             monitor_hotkey = q(&self.monitor_hotkey),
             pause_hotkey = q(&self.pause_hotkey),
             launch_at_startup = self.launch_at_startup,
+            explorer_menu = self.explorer_menu,
             freeze_screen = self.freeze_screen,
             notify_success = self.notify_success,
             output_dir = q(&self.output_dir),
@@ -623,6 +630,7 @@ mod tests {
             monitor_hotkey: "Shift+F12".into(),
             pause_hotkey: "Ctrl+Pause".into(),
             launch_at_startup: true,
+            explorer_menu: false,
             freeze_screen: false,
             ui_elements: UiElements::Always,
             notify_success: false,

@@ -12,7 +12,7 @@ use glint_core::update::notes_url;
 use glint_core::wide::wide;
 use glint_media::record::{self, ClickHighlights, KeyOverlay, Params, Source};
 use glint_shell::log::path as log_path;
-use glint_shell::{autostart, instance, monitors, start_menu, window};
+use glint_shell::{autostart, file_menu, instance, monitors, start_menu, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -120,6 +120,7 @@ impl App {
                     || self.monitor_hotkey.as_deref() != Some(cfg.monitor_hotkey.as_str())
                     || recording && self.pause_hotkey.as_deref() != Some(cfg.pause_hotkey.as_str());
                 let startup_changed = self.cfg.launch_at_startup != cfg.launch_at_startup;
+                let menu_changed = self.cfg.explorer_menu != cfg.explorer_menu;
                 let accent_changed = self.cfg.accent_rgb() != cfg.accent_rgb();
                 let updates_changed =
                     self.cfg.update_mode != cfg.update_mode || self.cfg.update_beta != cfg.update_beta;
@@ -130,6 +131,9 @@ impl App {
                 if startup_changed {
                     self.sync_autostart();
                 }
+                if menu_changed {
+                    self.sync_explorer_menu();
+                }
                 if accent_changed {
                     self.tray.set_accent(self.cfg.accent_rgb());
                 }
@@ -138,6 +142,16 @@ impl App {
                 }
             }
             Err(e) => self.notify("glint: settings error", &e, true, ClickTarget::None),
+        }
+    }
+
+    /// Adds or removes "open in glint editor" on videos in Explorer; adding keeps it pointing at
+    /// this exe.
+    fn sync_explorer_menu(&mut self) {
+        let exts = ["mp4", "mov", "m4v", "mkv"];
+        let on = self.cfg.explorer_menu;
+        if let Err(e) = file_menu::sync("glint.edit", "open in glint editor", &exts, "--clip", on) {
+            self.notify("glint: explorer menu", &e, true, ClickTarget::None);
         }
     }
 
@@ -781,6 +795,7 @@ pub fn run() {
             Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
             None => {
                 app.sync_autostart(); // keeps the entry pointing at this exe
+                app.sync_explorer_menu();
                 let all_held = app.hotkey.is_some()
                     && app.shot_hotkey.is_some()
                     && app.full_hotkey.is_some()

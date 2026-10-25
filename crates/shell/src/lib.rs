@@ -6,6 +6,7 @@
 pub mod afterglow;
 pub mod autostart;
 pub mod explorer;
+pub mod file_menu;
 pub mod gfx;
 pub mod hotkey;
 pub mod icon;
