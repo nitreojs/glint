@@ -3,11 +3,11 @@
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use eframe::egui::{Context, Id, Ui, vec2};
+use eframe::egui::{self, Context, Id, Ui, vec2};
 use glint_core::config::audio::{AudioSource, MAX_TRACKS, MAX_VOLUME, SourceKind};
 use glint_core::record::tracks::plan;
 use glint_media::record::{App, Microphone, microphones, running_apps};
-use crate::widgets::{self, Kind, Look, hint, row};
+use crate::widgets::{self, Kind, Look, hint, mono_medium, row};
 
 struct Devices {
     apps: Vec<App>,
@@ -246,7 +246,11 @@ impl AudioEditor {
             for t in &tracks {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    hint(ui, t.number.to_string(), p.t2);
+                    // as tall as the field beside it, so the number sits on the field's middle
+                    let number = ui.painter().layout_no_wrap(t.number.to_string(), mono_medium(12.0), p.t2);
+                    let (slot, _) = ui.allocate_exact_size(vec2(number.size().x, 32.0), egui::Sense::hover());
+                    let at = egui::pos2(slot.left(), slot.center().y - number.size().y / 2.0);
+                    ui.painter().galley(at, number, p.t2);
                     let field = (ui.available_width() * 0.4).min(220.0);
                     let name = &mut custom[t.number as usize - 1];
                     ui.allocate_ui(vec2(field, 32.0), |ui| widgets::text_field(ui, look, name, &t.auto, false));
