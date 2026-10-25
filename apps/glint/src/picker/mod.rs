@@ -261,6 +261,10 @@ pub(crate) fn open(
             let mut frozen = Frozen::capture(area, &outputs)?;
             if !draw_first {
                 frozen.add_hints(&hints, &hint, &painter, &font)?;
+                // draw-first's editor shows it as a mark from the start
+                if let Some((img, at)) = &shot_cursor {
+                    frozen.show_cursor(img, (at.0 - area.x, at.1 - area.y));
+                }
             }
             Screen::Frozen(frozen)
         } else {
@@ -937,6 +941,11 @@ impl State {
                     return Action::Release;
                 }
                 self.chosen.clear();
+                if let Screen::Frozen(f) = &mut self.screen
+                    && let Some(was) = f.hide_cursor()
+                {
+                    self.invalidate(&[was]);
+                }
                 let mut ed = Editor::new(sel, cutout, self.monitors(), self.painter.scale);
                 self.equip(&mut ed);
                 self.add_cursor(&mut ed);
