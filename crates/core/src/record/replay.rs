@@ -30,6 +30,8 @@ pub struct Replay {
     end: Option<i64>,
     /// The recording that filled the buffer has ended.
     finished: bool,
+    /// The byte limit, not the window, dropped the oldest video last: it holds less than `keep`.
+    capped: bool,
 }
 
 /// A stretch of the buffer in presentation order. Its packets keep the recording's timestamps;
@@ -42,6 +44,8 @@ pub struct Clip {
     pub start: i64,
     /// How long it plays (100 ns units).
     pub duration: i64,
+    /// It's shorter than asked for because the byte limit dropped older video.
+    pub capped: bool,
 }
 
 impl Replay {
@@ -55,6 +59,7 @@ impl Replay {
             bytes: 0,
             end: None,
             finished: false,
+            capped: false,
         }
     }
 
@@ -106,9 +111,11 @@ impl Replay {
     fn trim(&mut self) {
         let Some(end) = self.end else { return };
         while let Some(&next) = self.keys.get(1) {
-            if end - next < self.limits.keep && self.bytes <= self.limits.max_bytes {
+            let old = end - next >= self.limits.keep;
+            if !old && self.bytes <= self.limits.max_bytes {
                 break;
             }
+            self.capped = !old;
             self.keys.pop_front();
             self.drop_before(next);
         }
@@ -131,7 +138,8 @@ impl Replay {
         let mut packets: Vec<(usize, Arc<Packet>)> =
             self.packets.iter().filter(|(_, p)| p.pts >= start && p.pts < end).cloned().collect();
         packets.sort_by_key(|(_, p)| p.pts);
-        Some(Clip { streams: self.streams.clone(), packets, start, duration: end - start })
+        let capped = self.capped && end - start < len;
+        Some(Clip { streams: self.streams.clone(), packets, start, duration: end - start, capped })
     }
 }
 
@@ -231,8 +239,19 @@ mod tests {
         let r = sink.lock();
         assert_eq!(r.held(), 2 * S);
         assert!(r.bytes() <= 2_500);
+        assert!(r.last(60 * S).unwrap().capped, "a minute asked for, 2 s held");
+        assert!(!r.last(S).unwrap().capped, "what's asked for fits");
         let tiny = filled(Limits { keep: 60 * S, max_bytes: 1 }, 5);
         assert_eq!(tiny.lock().held(), S, "the newest keyframe interval always stays");
+    }
+
+    #[test]
+    fn a_buffer_short_of_its_window_only_counts_as_capped_when_bytes_cut_it() {
+        let young = filled(Limits { keep: 60 * S, max_bytes: usize::MAX }, 5);
+        assert!(!young.lock().last(60 * S).unwrap().capped, "still filling: nothing was dropped");
+        let sink = filled(Limits { keep: 60 * S, max_bytes: 2_500 }, 10);
+        sink.lock().set_limits(Limits { keep: S, max_bytes: usize::MAX });
+        assert!(!sink.lock().last(S).unwrap().capped, "the window drops the old video now");
     }
 
     #[test]
