@@ -57,7 +57,7 @@ mod pill;
 use frozen::Frozen;
 use glide::{FLIP_MS, GLIDE_MS, Glide, Ticker, WM_GLIDE};
 use live::Live;
-use pill::{Pill, hint_rects, hint_text, pill_size, render_pill};
+use pill::{Pill, hint_rects, hint_text, label_spot, pill_size, render_pill};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Selection {
@@ -875,18 +875,11 @@ impl State {
             None => pill_size(&self.painter, &self.font, &text),
         };
         let mon = self.label_monitor(near).or_else(|| self.label_monitor(target)).unwrap_or(near);
-        let part = near.intersect(&mon).unwrap_or(mon);
         let gap = self.painter.px(6.0) as i32;
-        let above = near.y - RING - gap - lh;
+        let bar = self.edit.as_ref().map(|e| e.bar);
         // In the editor the toolbar may sit above the shot; the label then goes inside.
-        let bar_above = !self.region && self.edit.as_ref().is_some_and(|e| e.bar.bottom() <= near.y);
-        let (x, y) = if part.y == near.y && above >= mon.y && !bar_above {
-            (near.x - RING, above)
-        } else {
-            (part.x + gap + 2, part.y + gap + 2)
-        };
-        let x = x.clamp(mon.x, (mon.right() - lw).max(mon.x));
-        let y = y.min((mon.bottom() - lh).max(mon.y));
+        let bar_above = !self.region && bar.is_some_and(|b| b.bottom() <= near.y);
+        let (x, y) = label_spot(near, mon, (lw, lh), gap, bar, bar_above);
         if same_text.is_some_and(|l| (l.rect.x, l.rect.y) == (x, y)) {
             return self.set_selection(Some(sel), None); // label unchanged
         }
