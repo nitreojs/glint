@@ -5,7 +5,7 @@ use eframe::egui::{
 use glint_core::config::color::{hsv_to_rgb, rgb_to_hsv, rgb_to_hsv_near};
 use glint_core::config::{DEFAULT_ACCENT, UiElements, hex, parse_hex};
 use glint_ui::capture::{held_names, key_names};
-use glint_ui::widgets::{self, HotkeyState, Look, hint, row};
+use glint_ui::widgets::{self, Hotkey, HotkeyState, Look, hint, row, toggle_row};
 
 use crate::settings::SettingsApp;
 use crate::settings::hotkey_capture::HotkeyField;
@@ -31,24 +31,27 @@ fn color(rgb: [u8; 3]) -> Color32 {
 }
 
 impl SettingsApp {
-    /// One hotkey row: the field, and the reason the last combo can't be used.
-    fn hotkey_row(&mut self, ui: &mut Ui, look: &Look, label: &str, field: HotkeyField) {
-        let keys = key_names(field.of(&mut self.cfg));
+    /// The hotkeys as one compact list; a click on one records a new combo in its place.
+    fn hotkey_list(&mut self, ui: &mut Ui, look: &Look) {
         let held = held_names();
-        let mine = self.keys.listening() && self.listen_for == field;
-        let problem = self.keys.error().filter(|_| mine).cloned();
-        let state = match &problem {
-            Some((keys, _)) => HotkeyState::Error { keys },
-            None if mine => HotkeyState::Listening { held: &held },
-            None => HotkeyState::Idle,
-        };
-        let mut clicked = false;
-        row(ui, look, label, 7.0, |ui| {
-            clicked = widgets::hotkey_field(ui, look, &keys, state).clicked();
-            let error = problem.as_ref().map(|(_, msg)| msg.clone());
-            widgets::reveal_with(ui, Id::unique(("hotkey-error", label)), error, |ui, msg| hint(ui, msg, look.p.warn));
-        });
-        if clicked {
+        let keys: Vec<Vec<String>> = HotkeyField::ALL.iter().map(|f| key_names(f.of(&mut self.cfg))).collect();
+        let problem = self.keys.error().cloned();
+        let lines: Vec<Hotkey> = HotkeyField::ALL
+            .iter()
+            .zip(&keys)
+            .map(|(&field, keys)| {
+                let mine = self.keys.listening() && self.listen_for == field;
+                let state = match &problem {
+                    Some((keys, why)) if mine => HotkeyState::Error { keys, why },
+                    _ if mine => HotkeyState::Listening { held: &held },
+                    _ => HotkeyState::Idle,
+                };
+                Hotkey { action: field.name(), keys, state }
+            })
+            .collect();
+        let clicked = widgets::hotkeys(ui, look, &lines).map(|i| HotkeyField::ALL[i]);
+        if let Some(field) = clicked {
+            let mine = self.keys.listening() && self.listen_for == field;
             self.stop_listening();
             if !mine {
                 self.start_listening(field);
@@ -57,32 +60,27 @@ impl SettingsApp {
     }
 
     pub(in crate::settings) fn general(&mut self, ui: &mut Ui, look: &Look) {
-        self.hotkey_row(ui, look, "record hotkey", HotkeyField::Record);
-        self.hotkey_row(ui, look, "screenshot hotkey", HotkeyField::Screenshot);
-        self.hotkey_row(ui, look, "all screens hotkey", HotkeyField::Fullscreen);
-        self.hotkey_row(ui, look, "monitor hotkey", HotkeyField::Monitor);
-        self.hotkey_row(ui, look, "pause hotkey", HotkeyField::Pause);
-        row(ui, look, "launch at startup", 1.0, |ui| {
-            let text = if self.cfg.launch_at_startup { "on" } else { "off" };
-            widgets::toggle(ui, look, &mut self.cfg.launch_at_startup, text);
-            hint(ui, "glint starts in the tray when you sign in to windows", look.p.t3);
-        });
-        row(ui, look, "freeze screen", 1.0, |ui| {
-            let text = if self.cfg.freeze_screen { "on" } else { "off" };
-            widgets::toggle(ui, look, &mut self.cfg.freeze_screen, text);
-            hint(ui, "while selecting a region, show a still image instead of the live screen", look.p.t3);
-        });
-        row(ui, look, "ui elements", 7.0, |ui| {
-            let modes = [(UiElements::Shift, "hold shift"), (UiElements::Always, "always"), (UiElements::Off, "off")];
-            widgets::segmented(ui, look, &mut self.cfg.ui_elements, &modes, Some(260.0));
-            hint(ui, "hold shift while selecting to pick buttons and panels inside apps", look.p.t3);
-        });
+        self.hotkey_list(ui, look);
+        let text = if self.cfg.launch_at_startup { "on" } else { "off" };
+        toggle_row(ui, look, "launch at startup", &mut self.cfg.launch_at_startup, text);
         row(ui, look, "notifications", 7.0, |ui| {
             let choices = [(true, "all"), (false, "errors only")];
             widgets::segmented(ui, look, &mut self.cfg.notify_success, &choices, Some(200.0));
-            hint(ui, "errors only — no popup after every screenshot or recording", look.p.t3);
         });
         self.accent_row(ui, look);
+        widgets::subheading(ui, look, "while selecting");
+        let text = if self.cfg.freeze_screen { "a still image of the screen" } else { "the live screen" };
+        toggle_row(ui, look, "freeze screen", &mut self.cfg.freeze_screen, text);
+        row(ui, look, "ui elements", 7.0, |ui| {
+            let modes = [(UiElements::Shift, "hold shift"), (UiElements::Always, "always"), (UiElements::Off, "off")];
+            widgets::segmented(ui, look, &mut self.cfg.ui_elements, &modes, Some(260.0));
+            let text = match self.cfg.ui_elements {
+                UiElements::Shift => "shift snaps to buttons and panels inside apps",
+                UiElements::Always => "snaps to buttons and panels inside apps",
+                UiElements::Off => "snaps to whole windows only",
+            };
+            hint(ui, text, look.p.t3);
+        });
     }
 
     fn accent_row(&mut self, ui: &mut Ui, look: &Look) {
@@ -104,7 +102,6 @@ impl SettingsApp {
                 self.pick_accent(ui, rgb);
             }
             self.accent_picker(look, &swatch.inner);
-            hint(ui, "a preset, or your own colour from the last swatch, for these windows and the tray icon", look.p.t3);
         });
     }
 

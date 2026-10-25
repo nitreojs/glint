@@ -22,7 +22,7 @@ pub(super) enum HotkeyField {
 }
 
 impl HotkeyField {
-    const ALL: [HotkeyField; 5] = [
+    pub(super) const ALL: [HotkeyField; 5] = [
         HotkeyField::Record,
         HotkeyField::Screenshot,
         HotkeyField::Fullscreen,
@@ -30,7 +30,7 @@ impl HotkeyField {
         HotkeyField::Pause,
     ];
 
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             HotkeyField::Record => "record",
             HotkeyField::Screenshot => "screenshot",

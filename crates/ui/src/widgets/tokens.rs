@@ -3,7 +3,7 @@ use std::sync::LazyLock;
 use eframe::egui::{Color32, FontFamily, FontId};
 use glint_core::config::color::{contrast, text_on};
 
-pub const WINDOW: [f32; 2] = [680.0, 600.0];
+pub const WINDOW: [f32; 2] = [680.0, 640.0];
 pub const BAR_H: f32 = 40.0;
 pub const SIDEBAR_W: f32 = 168.0;
 pub const FOOTER_H: f32 = 56.0;

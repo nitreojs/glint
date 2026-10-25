@@ -1,22 +1,15 @@
 //! The file name rows of an app's settings: the pattern with an example, and switches that name
-//! files after the window and sort them into a folder per app.
+//! files after the window and sort them into a folder per app. The example shows what either
+//! switch does, so they carry no hints.
 
 use eframe::egui::{self, RichText, Ui};
 use glint_core::history::Kind as HistoryKind;
 use glint_core::naming::{Names, Naming, Source, Subject, pattern_problem};
 use glint_shell::time::date_time;
 
-use crate::widgets::{self, Look, hint, mono, row};
+use crate::widgets::{self, Look, hint, mono, row, toggle_row};
 
-/// What the switches' hints say about this app's captures.
-pub struct About {
-    /// What "name files after the window" does.
-    pub window: &'static str,
-    /// What "sort into folders by app" does.
-    pub folders: &'static str,
-}
-
-pub fn rows(ui: &mut Ui, look: &Look, names: &Names, pattern: &mut String, about: &About) {
+pub fn rows(ui: &mut Ui, look: &Look, names: &Names, pattern: &mut String) {
     let p = look.p;
     let problem = pattern_problem(pattern);
     row(ui, look, "file names", 7.0, |ui| {
@@ -32,23 +25,17 @@ pub fn rows(ui: &mut Ui, look: &Look, names: &Names, pattern: &mut String, about
         });
         match problem {
             Some(msg) => hint(ui, msg, p.warn),
-            None => hint(ui, "{date} {time} {app} {title} {kind} are filled in, / makes folders", p.t3),
+            None => hint(ui, "{date} {time} {app} {title} {kind} · / makes a folder", p.t3),
         }
     });
-    row(ui, look, "name files after the window", 1.0, |ui| {
-        let mut on = names.names_after_window(pattern);
-        let text = if on { "on" } else { "off" };
-        if widgets::toggle(ui, look, &mut on, text).changed() {
-            *pattern = names.with_window_names(pattern, on);
-        }
-        hint(ui, about.window, p.t3);
-    });
-    row(ui, look, "sort into folders by app", 1.0, |ui| {
-        let mut on = names.sorted_by_app(pattern);
-        let text = if on { "on" } else { "off" };
-        if widgets::toggle(ui, look, &mut on, text).changed() {
-            *pattern = names.with_app_folders(pattern, on);
-        }
-        hint(ui, about.folders, p.t3);
-    });
+    let mut on = names.names_after_window(pattern);
+    let text = if on { "on" } else { "off" };
+    if toggle_row(ui, look, "app in the name", &mut on, text).changed() {
+        *pattern = names.with_window_names(pattern, on);
+    }
+    let mut on = names.sorted_by_app(pattern);
+    let text = if on { "on" } else { "off" };
+    if toggle_row(ui, look, "folder per app", &mut on, text).changed() {
+        *pattern = names.with_app_folders(pattern, on);
+    }
 }

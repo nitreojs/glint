@@ -4,7 +4,7 @@ use eframe::egui::{Id, Ui};
 use glint_core::config::{Config, Expiry};
 use glint_core::upload::proxy::{self, Setting};
 use glint_core::upload::{BUILT_IN, custom};
-use glint_ui::widgets::{self, Kind, Look, hint, row};
+use glint_ui::widgets::{self, Kind, Look, hint, row, toggle_row};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
@@ -43,13 +43,14 @@ fn pick_sxcu() -> Vec<PathBuf> {
     paths
 }
 
+/// The picked host in one line: links are public, so that comes first.
 fn about(destination: &str) -> &'static str {
     match destination {
-        "catbox" => "catbox.moe · kept for good · up to 200 MB, gifs up to 20 MB",
-        "litterbox" => "litterbox.catbox.moe · deleted after the time below · up to 1 GB",
-        "uguu" => "uguu.se · deleted after 3 hours · up to 128 MB",
-        "pomf" => "pomf.lain.la · up to 1 GB",
-        _ => "a custom uploader (sharex .sxcu)",
+        "catbox" => "public link · kept for good · up to 200 MB, gifs 20 MB",
+        "litterbox" => "public link · deleted after the time below · up to 1 GB",
+        "uguu" => "public link · deleted after 3 hours · up to 128 MB",
+        "pomf" => "public link · up to 1 GB",
+        _ => "public link · a sharex uploader",
     }
 }
 
@@ -108,7 +109,6 @@ impl SettingsApp {
                 };
             }
             hint(ui, about(&self.cfg.upload_destination), p.t3);
-            hint(ui, "uploads are public: anyone with the link can open the file", p.warn);
         });
         let litterbox = self.cfg.upload_destination == "litterbox";
         widgets::reveal(ui, Id::unique("litterbox-expiry"), litterbox, |ui| {
@@ -123,11 +123,8 @@ impl SettingsApp {
             });
         });
         row(ui, look, "custom uploaders", 1.0, |ui| self.custom_list(ui, look));
-        row(ui, look, "after upload", 1.0, |ui| {
-            ui.spacing_mut().item_spacing.y = 10.0;
-            widgets::toggle(ui, look, &mut self.cfg.upload_copy_link, "copy the link");
-            widgets::toggle(ui, look, &mut self.cfg.recording_upload, "upload every recording once it's saved");
-        });
+        toggle_row(ui, look, "after upload", &mut self.cfg.upload_copy_link, "copy the link");
+        toggle_row(ui, look, "recordings", &mut self.cfg.recording_upload, "upload once saved");
         row(ui, look, "proxy", 7.0, |ui| self.proxy_row(ui, look));
     }
 
@@ -163,12 +160,12 @@ impl SettingsApp {
         });
         match pick {
             ProxyPick::System => hint(ui, self.uploaders.system_proxy.clone(), p.t3),
-            ProxyPick::Direct => hint(ui, "uploads connect straight to the host", p.t3),
+            ProxyPick::Direct => hint(ui, "straight to the host", p.t3),
             ProxyPick::Custom => {
                 let (text, color) = match proxy::parse(&self.cfg.upload_proxy).err() {
                     Some(e) => (e, p.warn),
                     None if self.cfg.upload_proxy.trim().is_empty() => ("empty uses the system proxy".into(), p.t3),
-                    None => ("http proxies only: socks can't carry uploads".into(), p.t3),
+                    None => ("http only: socks can't carry uploads".into(), p.t3),
                 };
                 hint(ui, text, color);
             }
@@ -198,10 +195,6 @@ impl SettingsApp {
                 self.uploaders.listed.folded(&name);
             }
         }
-        let empty = self.uploaders.names.is_empty();
-        widgets::reveal(ui, Id::unique("no-custom-uploaders"), empty, |ui| {
-            hint(ui, "sharex .sxcu files; imported ones show up here", p.t3);
-        });
         if let Some(name) = removed {
             match custom::remove(&name) {
                 Ok(()) => {

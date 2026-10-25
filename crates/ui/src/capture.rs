@@ -219,23 +219,23 @@ impl Recorder {
         }
         // Anything that can't be used keeps recording, so the next combo retries.
         let Some(text) = hotkey_string(mods, vk) else {
-            self.error = Some((Vec::new(), "that key can't be part of a hotkey. try another.".into()));
+            self.error = Some((Vec::new(), "that key can't be in a hotkey".into()));
             return None;
         };
         let keys = key_names(&text);
         let standalone = (0x70..=0x87).contains(&vk) || matches!(vk, 0x13 | 0x2C | 0x91); // F1-F24, Pause, PrtSc, ScrLk
         if mods == 0 && !standalone {
-            let msg = format!("{} alone would fire while you type. add ctrl, alt, shift or win.", keys[0]);
+            let msg = "would fire while you type: add ctrl, alt, shift or win".to_owned();
             self.error = Some((keys, msg));
             return None;
         }
         if !available(mods, vk) {
-            let msg = format!("{} is already used by another app. try a different shortcut.", keys.join(" + "));
+            let msg = "another app already uses it".to_owned();
             self.error = Some((keys, msg));
             return None;
         }
         if let Some((name, _)) = others.iter().find(|(_, combo)| parse_hotkey(combo).is_ok_and(|c| c == (mods, vk))) {
-            let msg = format!("{} is already the {name} hotkey.", keys.join(" + "));
+            let msg = format!("already the {name} hotkey");
             self.error = Some((keys, msg));
             return None;
         }

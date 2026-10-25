@@ -14,6 +14,7 @@ pub(super) mod uploads;
 pub(super) enum Section {
     General,
     Recording,
+    Overlays,
     Audio,
     Screenshots,
     Uploads,
@@ -22,9 +23,10 @@ pub(super) enum Section {
     About,
 }
 
-pub(super) const SECTIONS: [Section; 8] = [
+pub(super) const SECTIONS: [Section; 9] = [
     Section::General,
     Section::Recording,
+    Section::Overlays,
     Section::Audio,
     Section::Screenshots,
     Section::Uploads,
@@ -38,6 +40,7 @@ impl Section {
         match self {
             Section::General => "general",
             Section::Recording => "recording",
+            Section::Overlays => "overlays",
             Section::Audio => "audio",
             Section::Screenshots => "screenshots",
             Section::Uploads => "uploads",
@@ -72,11 +75,13 @@ impl Section {
                     + n(a.indicator_inside == b.indicator_inside)
                     + n(a.draw_cursor == b.draw_cursor)
                     + n(a.open_trimmer == b.open_trimmer)
-                    + n(a.click_highlights == b.click_highlights)
-                    + n(a.clicks == b.clicks)
+            }
+            // "in the video" is one row for both overlays' modes
+            Section::Overlays => {
+                n(a.click_highlights == b.click_highlights)
                     + n(a.keystrokes == b.keystrokes)
                     + n(a.keystroke_position == b.keystroke_position)
-                    + n(a.keystrokes_mode == b.keystrokes_mode)
+                    + n(a.clicks == b.clicks && a.keystrokes_mode == b.keystrokes_mode)
             }
             Section::Audio => {
                 let (x, y) = (&a.audio_sources, &b.audio_sources);
@@ -131,6 +136,8 @@ impl Section {
                 cfg.indicator_inside = d.indicator_inside;
                 cfg.draw_cursor = d.draw_cursor;
                 cfg.open_trimmer = d.open_trimmer;
+            }
+            Section::Overlays => {
                 cfg.click_highlights = d.click_highlights;
                 cfg.clicks = d.clicks;
                 cfg.keystrokes = d.keystrokes;

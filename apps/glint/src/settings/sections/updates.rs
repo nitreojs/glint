@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime};
 use eframe::egui::{Id, RichText, Ui};
 use glint_core::config::UpdateMode;
 use glint_core::update::{RELEASES_PAGE, notes_url};
-use glint_ui::widgets::{self, Kind, Look, hint, row, sans};
+use glint_ui::widgets::{self, Kind, Look, hint, row, sans, toggle_row};
 
 use super::about::open_url;
 use crate::app::ipc::{self, WM_UPDATE_CHECK, WM_UPDATE_INSTALL};
@@ -56,25 +56,17 @@ impl SettingsApp {
         let p = look.p;
         self.updater.poll();
         ui.ctx().request_repaint_after(Duration::from_millis(500));
-        row(ui, look, "version", 0.0, |ui| {
-            let version = concat!("v", env!("CARGO_PKG_VERSION"));
-            ui.label(RichText::new(version).font(widgets::mono_medium(13.0)).color(p.t1));
-        });
         row(ui, look, "updates", 7.0, |ui| {
             let modes = [(UpdateMode::Auto, "auto"), (UpdateMode::Notify, "notify only"), (UpdateMode::Off, "off")];
             widgets::segmented(ui, look, &mut self.cfg.update_mode, &modes, Some(300.0));
             let about = match self.cfg.update_mode {
-                UpdateMode::Auto => "new versions download in the background and install when glint restarts",
-                UpdateMode::Notify => "a notification tells you about new versions; clicking it installs",
-                UpdateMode::Off => "glint never checks on its own",
+                UpdateMode::Auto => "downloads in the background, installs when glint restarts",
+                UpdateMode::Notify => "a notification asks first",
+                UpdateMode::Off => "never checks on its own",
             };
             hint(ui, about, p.t3);
-            hint(ui, "every download is checked against glint's release signature before it's used", p.t3);
         });
-        row(ui, look, "beta updates", 1.0, |ui| {
-            widgets::toggle(ui, look, &mut self.cfg.update_beta, "also take pre-releases");
-            hint(ui, "early builds of the next version; they can be rough", p.t3);
-        });
+        toggle_row(ui, look, "beta updates", &mut self.cfg.update_beta, "also take pre-releases");
         row(ui, look, "status", 7.0, |ui| self.update_status(ui, look));
         row(ui, look, "release notes", 0.0, |ui| {
             let (text, url) = match &self.updater.status.state {
@@ -139,6 +131,6 @@ impl SettingsApp {
             Some(at) => format!("last checked {at}"),
             None => "not checked yet".to_string(),
         };
-        hint(ui, checked, p.t3);
+        hint(ui, format!("{} · {checked}", concat!("v", env!("CARGO_PKG_VERSION"))), p.t3);
     }
 }

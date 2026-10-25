@@ -6,7 +6,7 @@ use glint_core::config::Config;
 use glint_core::history;
 use glint_core::log::log;
 use glint_core::naming::GLINT;
-use glint_ui::naming::{self, About};
+use glint_ui::naming;
 use glint_ui::widgets::{self, Kind, Look, hint, row};
 
 use crate::app::ipc;
@@ -174,7 +174,6 @@ impl Mover {
 
 impl SettingsApp {
     pub(in crate::settings) fn output(&mut self, ui: &mut Ui, look: &Look) {
-        let p = look.p;
         let default_dir = output_dir(&Config { output_dir: String::new(), ..Config::default() });
         let current = output_dir(&self.saved);
         let folder_saved = self.cfg.output_dir == self.saved.output_dir;
@@ -184,7 +183,6 @@ impl SettingsApp {
         let running = self.mover.poll();
         row(ui, look, "folder", 7.0, |ui| {
             widgets::text_field(ui, look, &mut self.cfg.output_dir, &default_dir.display().to_string(), false);
-            ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 if widgets::button(ui, look, "browse…", Kind::Secondary, 28.0, true).clicked()
@@ -192,23 +190,17 @@ impl SettingsApp {
                 {
                     self.cfg.output_dir = dir.display().to_string();
                 }
-                if widgets::button(ui, look, "open folder", Kind::Secondary, 28.0, true).clicked() {
+                if widgets::button(ui, look, "open", Kind::Secondary, 28.0, true).clicked() {
                     let dir = output_dir(&self.cfg);
                     let _ = std::fs::create_dir_all(&dir);
                     let _ = std::process::Command::new("explorer.exe").arg(&dir).spawn();
                 }
             });
-            ui.add_space(2.0);
-            hint(ui, "recordings and screenshots are saved here. leave empty for the default.", p.t3);
         });
         let shown = folder_saved || running.is_some() || self.mover.result.is_some();
         let any = !self.mover.leftovers.is_empty() || running.is_some() || self.mover.result.is_some();
         widgets::reveal(ui, egui::Id::unique("older-captures"), shown && any, |ui| self.move_row(ui, look, &current, running));
-        let about = About {
-            window: "files start with the app you captured, like telegram desktop_…; whole screens are screen_…",
-            folders: "a folder per app; whole screens go to screen, regions to other",
-        };
-        naming::rows(ui, look, &GLINT, &mut self.cfg.file_name, &about);
+        naming::rows(ui, look, &GLINT, &mut self.cfg.file_name);
     }
 
     fn move_row(&mut self, ui: &mut Ui, look: &Look, current: &Path, running: Option<(usize, usize)>) {

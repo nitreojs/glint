@@ -6,8 +6,8 @@ use eframe::egui::{
     pos2, vec2,
 };
 
-use super::motion::{anim, ease, glide, mix};
-use super::tokens::{LABEL_GAP, LABEL_W, Look, Palette, medium, mono, mono_medium, sans, semibold};
+use super::motion::{anim, ease, glide, mix, reveal};
+use super::tokens::{LABEL_GAP, LABEL_W, Look, Palette, medium, mono, mono_medium, sans};
 
 /// 2 px ring in text colour with a 1 px gap, only after keyboard navigation.
 pub(super) fn focus_ring(ui: &Ui, look: &Look, resp: &Response, rect: Rect, radius: f32) {
@@ -51,16 +51,39 @@ thread_local! {
     pub static ROWS: std::cell::RefCell<Vec<(String, Rect, Rect)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// Space above and below a row's content.
+const ROW_PAD: f32 = 11.0;
+/// The same for [`toggle_row`]: a bare switch reads lighter with less air.
+const LIGHT_PAD: f32 = 9.0;
+/// How far a [`nested_row`]'s label steps in.
+const NEST: f32 = 12.0;
+
 /// One settings row: a divider, the label wrapping in its fixed column, the control column.
 /// `label_dy` lines the label's first line up with the control (7 for 32 px controls, 1 for
 /// toggles, 0 for sliders).
 pub fn row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: impl FnOnce(&mut Ui)) {
+    framed_row(ui, look, label, label_dy, ROW_PAD, false, add);
+}
+
+/// A [`row`] that belongs to the one above it, shown only while that one is on (keystrokes'
+/// position): its label steps in and dims.
+pub fn nested_row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: impl FnOnce(&mut Ui)) {
+    framed_row(ui, look, label, label_dy, ROW_PAD, true, add);
+}
+
+/// A [`toggle`] on a lighter row, for switches that need no hint.
+pub fn toggle_row(ui: &mut Ui, look: &Look, label: &str, on: &mut bool, text: &str) -> Response {
+    framed_row(ui, look, label, 1.0, LIGHT_PAD, false, |ui| toggle(ui, look, on, text))
+}
+
+fn framed_row<R>(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, pad: f32, nested: bool, add: impl FnOnce(&mut Ui) -> R) -> R {
     let full = ui.available_rect_before_wrap();
     let top = full.top();
     ui.painter().hline(full.x_range(), top + 0.5, Stroke::new(1.0, look.p.line));
-    let text = ui.painter().layout(label.to_owned(), medium(13.0), look.p.t1, LABEL_W);
-    let label_rect = Rect::from_min_size(pos2(full.left(), top + 15.0 + label_dy), text.size());
-    let column = Rect::from_min_max(pos2(full.left() + LABEL_W + LABEL_GAP, top + 15.0), full.right_bottom());
+    let (indent, color) = if nested { (NEST, look.p.t2) } else { (0.0, look.p.t1) };
+    let text = ui.painter().layout(label.to_owned(), medium(13.0), color, LABEL_W - indent);
+    let label_rect = Rect::from_min_size(pos2(full.left() + indent, top + pad + label_dy), text.size());
+    let column = Rect::from_min_max(pos2(full.left() + LABEL_W + LABEL_GAP, top + pad), full.right_bottom());
     let id = ui.next_auto_id();
     let mut child = ui.new_child(
         UiBuilder::new()
@@ -72,15 +95,16 @@ pub fn row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: impl FnOnc
     );
     child.interact(label_rect, id.with("label"), Sense::hover()).widget_info(|| WidgetInfo::labeled(Role::Label, true, label));
     child.spacing_mut().item_spacing = vec2(8.0, 6.0);
-    add(&mut child);
+    let out = add(&mut child);
     name_inputs(ui, id, label);
-    let bottom = child.min_rect().bottom().max(label_rect.bottom()).max(top + 15.0) + 14.0;
+    let bottom = child.min_rect().bottom().max(label_rect.bottom()).max(top + pad) + pad;
     let rect = Rect::from_min_max(full.left_top(), pos2(full.right(), bottom));
     ui.ctx().accesskit_node_builder(child.unique_id(), |n| n.set_bounds(bounds(rect)));
     #[cfg(feature = "test-rows")]
     ROWS.with_borrow_mut(|rows| rows.push((label.to_owned(), label_rect, child.min_rect())));
-    ui.painter().galley(label_rect.min, text, look.p.t1);
+    ui.painter().galley(label_rect.min, text, color);
     ui.advance_cursor_after_rect(rect);
+    out
 }
 
 /// 12 px hint text under a control, wrapping.
@@ -88,14 +112,23 @@ pub fn hint(ui: &mut Ui, text: impl Into<String>, color: Color32) {
     ui.add(egui::Label::new(RichText::new(text).font(sans(12.0)).color(color).line_height(Some(16.0))).wrap());
 }
 
-/// A heading over the rows that follow it.
-pub fn group(ui: &mut Ui, look: &Look, title: &str) {
-    ui.add_space(26.0);
-    let text = ui.painter().layout_no_wrap(title.to_owned(), semibold(15.0), look.p.t1);
-    let (rect, resp) = ui.allocate_exact_size(text.size(), Sense::hover());
-    ui.painter().galley(rect.min, text, look.p.t1);
+/// A small mono heading over the rows of one group ("while recording").
+pub fn subheading(ui: &mut Ui, look: &Look, title: &str) {
+    ui.add_space(18.0);
+    let text = ui.painter().layout_no_wrap(title.to_owned(), mono_medium(11.0), look.p.t3);
+    let (rect, resp) = ui.allocate_exact_size(vec2(text.size().x, 14.0), Sense::hover());
+    ui.painter().galley(pos2(rect.left(), rect.center().y - text.size().y / 2.0), text, look.p.t3);
     resp.widget_info(|| WidgetInfo::labeled(Role::Heading, true, title));
-    ui.add_space(10.0);
+    ui.add_space(6.0);
+}
+
+/// A line of muted text where a row would be, for what's left out ("more options appear when…").
+pub fn note_row(ui: &mut Ui, look: &Look, text: &str) {
+    let full = ui.available_rect_before_wrap();
+    ui.painter().hline(full.x_range(), full.top() + 0.5, Stroke::new(1.0, look.p.line));
+    ui.add_space(14.0);
+    hint(ui, text, look.p.t3);
+    ui.add_space(14.0);
 }
 
 fn galley(ui: &Ui, text: &str, font: FontId) -> std::sync::Arc<Galley> {
@@ -151,13 +184,17 @@ pub fn button(ui: &mut Ui, look: &Look, text: &str, kind: Kind, height: f32, ena
 
 /// Underlined text link.
 pub fn link(ui: &mut Ui, look: &Look, text: &str) -> Response {
-    let g = galley(ui, text, sans(13.0));
-    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x, 18.0), Sense::click());
+    underlined(ui, look, text, sans(13.0), look.p.t1, 18.0)
+}
+
+fn underlined(ui: &mut Ui, look: &Look, text: &str, font: FontId, color: Color32, height: f32) -> Response {
+    let g = galley(ui, text, font);
+    let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x, height), Sense::click());
     let h = anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
     let top = rect.center().y - g.size().y / 2.0;
     let painter = ui.painter();
     painter.hline(rect.x_range(), (top + g.size().y).round() + 1.5, Stroke::new(1.0, mix(look.p.line3, look.p.t1, h)));
-    painter.galley(pos2(rect.left(), top), g, look.p.t1);
+    painter.galley(pos2(rect.left(), top), g, mix(color, look.p.t1, h));
     focus_ring(ui, look, &resp, rect.expand2(vec2(2.0, 0.0)), 3.0);
     resp.widget_info(|| WidgetInfo::labeled(Role::Link, true, text));
     resp.on_hover_cursor(CursorIcon::PointingHand)
@@ -183,62 +220,128 @@ pub fn keycaps(painter: &Painter, ui: &Ui, p: &Palette, mut x: f32, y: f32, keys
     x
 }
 
+/// How wide [`keycaps`] draws `keys`.
+fn keycaps_width(ui: &Ui, keys: &[String]) -> f32 {
+    let plus = galley(ui, "+", mono(12.0)).size().x;
+    let caps: f32 = keys.iter().map(|k| galley(ui, k, mono_medium(12.0)).size().x + 12.0).sum();
+    caps + keys.len().saturating_sub(1) as f32 * (plus + 10.0)
+}
+
+/// A legend of keyboard shortcuts, wrapping: each "ctrl+c" as keycaps, what it does beside it.
+pub fn shortcuts(ui: &mut Ui, look: &Look, keys: &[(&str, &str)]) {
+    let p = &look.p;
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(16.0, 8.0);
+        for &(combo, what) in keys {
+            let caps: Vec<String> = combo.split('+').map(str::to_owned).collect();
+            let caps_w = keycaps_width(ui, &caps);
+            let text = galley(ui, what, sans(12.0));
+            let (rect, resp) = ui.allocate_exact_size(vec2(caps_w + 6.0 + text.size().x, 20.0), Sense::hover());
+            let painter = ui.painter();
+            let x = keycaps(painter, ui, p, rect.left(), rect.center().y, &caps, false);
+            painter.galley(pos2(x + 1.0, rect.center().y - text.size().y / 2.0), text, p.t2);
+            resp.widget_info(|| WidgetInfo::labeled(Role::Label, true, format!("{combo} {what}")));
+        }
+    });
+}
+
 #[derive(Clone, Copy)]
 pub enum HotkeyState<'a> {
     Idle,
     /// Recording a new combo; `held` are the modifiers down right now.
     Listening { held: &'a [String] },
-    /// The last combo can't be used; still listening for the next one.
-    Error { keys: &'a [String] },
+    /// The last combo (`keys`) can't be used, for reason `why`; still listening for the next one.
+    Error { keys: &'a [String], why: &'a str },
 }
 
-pub fn hotkey_field(ui: &mut Ui, look: &Look, keys: &[String], state: HotkeyState) -> Response {
+/// One line of [`hotkeys`].
+pub struct Hotkey<'a> {
+    /// What it does: "record", "save".
+    pub action: &'a str,
+    pub keys: &'a [String],
+    pub state: HotkeyState<'a>,
+}
+
+/// Height of one [`hotkeys`] line.
+const HOTKEY_H: f32 = 36.0;
+
+/// Hotkeys as a compact table, one line each: the action in the label column, its keycaps flush
+/// right. Clicking a line records a new combo right there (esc cancels); a combo that can't be
+/// used turns red with the reason beside it. Returns the line clicked.
+pub fn hotkeys(ui: &mut Ui, look: &Look, lines: &[Hotkey]) -> Option<usize> {
     let p = &look.p;
-    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    let listening = matches!(state, HotkeyState::Listening { .. });
-    let error = matches!(state, HotkeyState::Error { .. });
-    let h = anim(ui, resp.id.with("hov"), resp.hovered() && !listening && !error, 0.08);
-    let l = ease(anim(ui, resp.id.with("lis"), listening, 0.1));
-    let e = ease(anim(ui, resp.id.with("err"), error, 0.12));
-    let border = mix(mix(mix(p.line2, p.line3, h), p.acc, l), p.warn, e);
-    let painter = ui.painter();
-    painter.rect(rect, 5, mix(p.field, p.ctl, h), Stroke::new(1.0 + l.max(e), border), StrokeKind::Inside);
-    let y = rect.center().y;
-    let right = |text: &str, color: Color32| {
-        painter.text(pos2(rect.right() - 10.0, y), Align2::RIGHT_CENTER, text, mono(11.0), color);
-    };
-    match state {
-        HotkeyState::Idle => {
-            keycaps(painter, ui, p, rect.left() + 6.0, y, keys, false);
-            right("change", mix(p.t3, p.t2, h));
+    let w = ui.available_width();
+    let mut clicked = None;
+    for (i, line) in lines.iter().enumerate() {
+        let (rect, resp) = ui.allocate_exact_size(vec2(w, HOTKEY_H), Sense::click());
+        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+        if resp.clicked() {
+            clicked = Some(i);
         }
-        HotkeyState::Listening { held: [] } => {
-            painter.text(pos2(rect.left() + 10.0, y), Align2::LEFT_CENTER, "press a shortcut…", sans(13.0), p.t2);
-            right("esc to cancel", p.t3);
+        let (listening, why) = match line.state {
+            HotkeyState::Idle => (false, None),
+            HotkeyState::Listening { .. } => (true, None),
+            HotkeyState::Error { why, .. } => (false, Some(why)),
+        };
+        let h = anim(ui, resp.id.with("hov"), resp.hovered() || resp.has_focus(), 0.08);
+        let l = ease(anim(ui, resp.id.with("lis"), listening, 0.1));
+        let e = ease(anim(ui, resp.id.with("err"), why.is_some(), 0.12));
+        let y = rect.center().y;
+        let painter = ui.painter();
+        painter.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, p.line));
+        let name = painter.layout_no_wrap(line.action.to_owned(), medium(13.0), p.t1);
+        let name_rect = Rect::from_min_size(pos2(rect.left(), y - name.size().y / 2.0), name.size());
+        painter.galley(name_rect.min, name, p.t1);
+
+        // The keys sit bare; hovering, recording or a refusal puts them in a field, flush right.
+        let (keys, warn, prompt) = match line.state {
+            HotkeyState::Idle => (line.keys, false, None),
+            HotkeyState::Listening { held: [] } => (&[][..], false, Some("press a shortcut…")),
+            HotkeyState::Listening { held } => (held, false, Some("+ …")),
+            HotkeyState::Error { keys, .. } => (keys, true, None),
+        };
+        let prompt_g = prompt.map(|t| galley(ui, t, if keys.is_empty() { sans(13.0) } else { mono(12.0) }));
+        let gap = if keys.is_empty() { 0.0 } else { 5.0 };
+        let inner = keycaps_width(ui, keys) + prompt_g.as_ref().map_or(0.0, |g| gap + g.size().x);
+        let field = Rect::from_min_max(pos2(rect.right() - inner - 16.0, y - 14.0), pos2(rect.right(), y + 14.0));
+        let shown = h.max(l).max(e);
+        let border = mix(mix(p.line2, p.acc, l), p.warn, e);
+        painter.rect(field, 5, p.field.gamma_multiply(shown), Stroke::new(1.0 + l.max(e), border.gamma_multiply(shown)), StrokeKind::Inside);
+        let x = keycaps(painter, ui, p, field.left() + 8.0, y, keys, warn);
+        if let Some(g) = prompt_g {
+            let at = if keys.is_empty() { field.left() + 8.0 } else { x };
+            painter.galley(pos2(at, y - g.size().y / 2.0), g, p.t2);
         }
-        HotkeyState::Listening { held } => {
-            let x = keycaps(painter, ui, p, rect.left() + 6.0, y, held, false);
-            painter.text(pos2(x, y), Align2::LEFT_CENTER, "+ …", mono(12.0), p.t3);
-            right("esc to cancel", p.t3);
+        // Beside the field: how to back out while recording, or why the combo was refused.
+        let room = field.left() - 12.0 - (name_rect.right() + 16.0);
+        let aside = match why {
+            Some(why) => Some((why, sans(12.0), p.warn)),
+            None if listening => Some(("esc to cancel", mono(11.0), p.t3)),
+            None => None,
+        };
+        if let Some((text, font, color)) = aside.filter(|_| room > 0.0) {
+            let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), font, color);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+            let g = painter.layout_job(job);
+            painter.galley(pos2(field.left() - 12.0 - g.size().x, y - g.size().y / 2.0), g, color);
         }
-        HotkeyState::Error { keys } => {
-            keycaps(painter, ui, p, rect.left() + 6.0, y, keys, true);
-            right("esc to cancel", p.t3);
+        focus_ring(ui, look, &resp, field, 5.0);
+        #[cfg(feature = "test-rows")]
+        ROWS.with_borrow_mut(|rows| rows.push((line.action.to_owned(), name_rect, field)));
+        resp.widget_info(|| {
+            let value = match line.state {
+                HotkeyState::Idle => line.keys.join("+"),
+                HotkeyState::Listening { held: [] } => "press a shortcut…".to_owned(),
+                HotkeyState::Listening { held } => format!("{} + …", held.join("+")),
+                HotkeyState::Error { keys, .. } => keys.join("+"),
+            };
+            WidgetInfo { current_text_value: Some(value), ..WidgetInfo::labeled(Role::Button, true, line.action) }
+        });
+        if let Some(why) = why {
+            ui.ctx().accesskit_node_builder(resp.id, |n| n.set_description(why));
         }
     }
-    focus_ring(ui, look, &resp, rect, 5.0);
-    resp.widget_info(|| {
-        let value = match state {
-            HotkeyState::Idle => keys.join("+"),
-            HotkeyState::Listening { held: [] } => "press a shortcut…".to_owned(),
-            HotkeyState::Listening { held } => format!("{} + …", held.join("+")),
-            HotkeyState::Error { keys } => keys.join("+"),
-        };
-        WidgetInfo { current_text_value: Some(value), ..WidgetInfo::new(Role::Button) }
-    });
-    in_row(ui, resp.id);
-    resp
+    clicked
 }
 
 /// A row of options; `width` None fills the column.
@@ -389,6 +492,39 @@ pub fn slider(
     lo: &str,
     hi: &str,
 ) -> Response {
+    scale_slider(ui, look, None, value, range, word, lo, hi)
+}
+
+/// A [`slider`] whose readout starts with its own `label`, for several in one row (the
+/// fine-tune inset of a [`preset_row`]).
+#[allow(clippy::too_many_arguments)]
+pub fn tuned_slider(
+    ui: &mut Ui,
+    look: &Look,
+    label: &str,
+    value: &mut u32,
+    range: RangeInclusive<u32>,
+    word: &str,
+    lo: &str,
+    hi: &str,
+) -> Response {
+    scale_slider(ui, look, Some(label), value, range, word, lo, hi)
+}
+
+/// Where a [`tuned_slider`]'s value starts, after its label.
+const TUNED_VALUE_X: f32 = 104.0;
+
+#[allow(clippy::too_many_arguments)]
+fn scale_slider(
+    ui: &mut Ui,
+    look: &Look,
+    label: Option<&str>,
+    value: &mut u32,
+    range: RangeInclusive<u32>,
+    word: &str,
+    lo: &str,
+    hi: &str,
+) -> Response {
     let p = look.p;
     let (min, max) = (*range.start(), *range.end());
     ui.scope(|ui| {
@@ -429,8 +565,16 @@ pub fn slider(
 
         let painter = ui.painter();
         let y = readout.center().y;
-        painter.text(pos2(readout.left(), y), Align2::LEFT_CENTER, v.to_string(), mono_medium(12.0), p.t1);
-        painter.text(pos2(readout.left() + 28.0, y), Align2::LEFT_CENTER, word, sans(13.0), p.t2);
+        let x = match label {
+            Some(label) => {
+                painter.text(pos2(readout.left(), y), Align2::LEFT_CENTER, label, medium(12.0), p.t2);
+                readout.left() + TUNED_VALUE_X
+            }
+            None => readout.left(),
+        };
+        let size = if label.is_some() { 12.0 } else { 13.0 };
+        painter.text(pos2(x, y), Align2::LEFT_CENTER, v.to_string(), mono_medium(12.0), p.t1);
+        painter.text(pos2(x + 28.0, y), Align2::LEFT_CENTER, word, sans(size), if label.is_some() { p.t3 } else { p.t2 });
 
         // The thumb glides to clicks, keys and resets, and follows the pointer while dragged.
         let target = (v - min) as f32 / (max - min).max(1) as f32;
@@ -449,7 +593,7 @@ pub fn slider(
         painter.text(scale.left_center(), Align2::LEFT_CENTER, lo, mono(11.0), p.t3);
         painter.text(scale.right_center(), Align2::RIGHT_CENTER, hi, mono(11.0), p.t3);
         focus_ring(ui, look, &resp, track, 3.0);
-        resp.widget_info(|| WidgetInfo::slider(true, *value as f64, ""));
+        resp.widget_info(|| WidgetInfo::slider(true, *value as f64, label.unwrap_or("")));
         ui.ctx().accesskit_node_builder(resp.id, |n| {
             n.set_min_numeric_value(min as f64);
             n.set_max_numeric_value(max as f64);
@@ -460,6 +604,64 @@ pub fn slider(
         resp.on_hover_cursor(CursorIcon::PointingHand)
     })
     .inner
+}
+
+/// A row of presets that each set several values at once (quality and encoder effort), the
+/// current preset's `hint` with a "fine-tune" link beside it, and `fine_tune` (the values
+/// themselves, as [`tuned_slider`]s) in an inset the link opens. `current` is the preset the
+/// values match; `None` adds a selected "custom" segment. Returns the preset picked this frame,
+/// for the caller to apply.
+pub fn preset_row<T: Copy + PartialEq>(
+    ui: &mut Ui,
+    look: &Look,
+    label: &str,
+    current: Option<T>,
+    presets: &[(T, &str)],
+    hint_text: &str,
+    fine_tune: impl FnOnce(&mut Ui),
+) -> Option<T> {
+    let p = look.p;
+    let open_id = Id::unique(("fine-tune", label));
+    let mut open = ui.data(|d| d.get_temp::<bool>(open_id)).unwrap_or(false);
+    let mut picked = None;
+    row(ui, look, label, 7.0, |ui| {
+        let mut options: Vec<(Option<T>, &str)> = presets.iter().map(|&(v, l)| (Some(v), l)).collect();
+        if current.is_none() {
+            options.push((None, "custom"));
+        }
+        let mut value = current;
+        if segmented(ui, look, &mut value, &options, None).changed() {
+            picked = value;
+        }
+        let link_text = if open { "hide details" } else { "fine-tune" };
+        let link_w = galley(ui, link_text, sans(12.0)).size().x;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let left = (ui.available_width() - link_w - 12.0).max(0.0);
+            ui.allocate_ui_with_layout(vec2(left, 16.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(left);
+                hint(ui, hint_text, p.t3);
+            });
+            ui.add_space(12.0);
+            if underlined(ui, look, link_text, sans(12.0), p.t2, 16.0).clicked() {
+                open = !open;
+            }
+        });
+        reveal(ui, open_id.with("inset"), open, |ui| {
+            ui.add_space(5.0);
+            egui::Frame::new()
+                .fill(mix(p.surf, p.field, 0.4))
+                .stroke(Stroke::new(1.0, p.line))
+                .corner_radius(5)
+                .inner_margin(Margin { left: 12, right: 12, top: 10, bottom: 12 })
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 12.0;
+                    fine_tune(ui);
+                });
+        });
+    });
+    ui.data_mut(|d| d.insert_temp(open_id, open));
+    picked
 }
 
 /// 32 px inset text field in mono.

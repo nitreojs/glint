@@ -1,6 +1,6 @@
 use eframe::egui::{Id, Ui};
 use glint_core::config::{ShotFormat, ShotStyle};
-use glint_ui::widgets::{self, Look, hint, row};
+use glint_ui::widgets::{self, Look, hint, row, toggle_row};
 
 use crate::settings::SettingsApp;
 
@@ -19,13 +19,18 @@ impl SettingsApp {
         row(ui, look, "style", 7.0, |ui| {
             let styles = [(ShotStyle::Select, "select first"), (ShotStyle::Sharex, "draw first")];
             widgets::segmented(ui, look, &mut self.cfg.screenshot_style, &styles, Some(220.0));
-            let frozen = if self.cfg.freeze_screen { "" } else { " · the screen freezes anyway" };
-            hint(ui, format!("draw first — like sharex: drag and release to capture; draw before or hold shift to edit{frozen}"), p.t3);
+            let text = match self.cfg.screenshot_style {
+                ShotStyle::Select => "pick an area, then edit it".to_string(),
+                ShotStyle::Sharex => {
+                    let frozen = if self.cfg.freeze_screen { "" } else { " · freezes the screen" };
+                    format!("like sharex: release to capture, hold shift to edit{frozen}")
+                }
+            };
+            hint(ui, text, p.t3);
         });
         row(ui, look, "format", 7.0, |ui| {
             let formats = [(ShotFormat::Png, "png"), (ShotFormat::Jpg, "jpg")];
             widgets::segmented(ui, look, &mut self.cfg.screenshot_format, &formats, Some(168.0));
-            hint(ui, "png — lossless · jpg — smaller files", p.t3);
         });
         // The quality row only matters for jpg.
         let jpg = self.cfg.screenshot_format == ShotFormat::Jpg;
@@ -36,11 +41,8 @@ impl SettingsApp {
                 widgets::slider(ui, look, q, 50..=100, word, "50 ← smaller", "sharper → 100");
             });
         });
-        row(ui, look, "mouse cursor", 1.0, |ui| {
-            let text = if self.cfg.screenshot_cursor { "kept in screenshots" } else { "left out" };
-            widgets::toggle(ui, look, &mut self.cfg.screenshot_cursor, text);
-            hint(ui, "in the editor it's a mark you can move, resize or delete; add more with the cursor tool", p.t3);
-        });
+        let text = if self.cfg.screenshot_cursor { "kept, as a mark you can move" } else { "left out" };
+        toggle_row(ui, look, "mouse cursor", &mut self.cfg.screenshot_cursor, text);
         row(ui, look, "after capture", 1.0, |ui| {
             ui.spacing_mut().item_spacing.y = 10.0;
             widgets::checkbox(ui, look, &mut self.cfg.screenshot_copy, "copy to clipboard");
@@ -50,8 +52,10 @@ impl SettingsApp {
             ui.spacing_mut().item_spacing.y = 6.0;
             widgets::reveal(ui, Id::unique("no-capture-action"), none, |ui| hint(ui, "with all off, enter still copies", p.warn));
         });
-        row(ui, look, "in the editor", 0.0, |ui| {
-            hint(ui, "enter does the above · ctrl+c copies · ctrl+s saves · ctrl+u uploads · esc cancels", p.t3);
+        row(ui, look, "in the editor", 1.0, |ui| {
+            let keys =
+                [("enter", "runs the above"), ("ctrl+c", "copy"), ("ctrl+s", "save"), ("ctrl+u", "upload"), ("esc", "cancel")];
+            widgets::shortcuts(ui, look, &keys);
         });
     }
 }

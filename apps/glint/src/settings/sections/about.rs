@@ -1,6 +1,6 @@
 use eframe::egui::{RichText, Ui};
 use glint_core::config::Config;
-use glint_ui::widgets::{self, Kind, Look, hint, row};
+use glint_ui::widgets::{self, Kind, Look, row};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, w};
@@ -37,7 +37,6 @@ impl SettingsApp {
             if widgets::button(ui, look, "reset everything to defaults", Kind::Secondary, 28.0, any).clicked() {
                 self.cfg = Config::default();
             }
-            hint(ui, "every section at once. nothing changes until you save.", p.t3);
         });
     }
 }

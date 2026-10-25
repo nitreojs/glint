@@ -115,6 +115,7 @@ impl Pages for SettingsApp {
         match page {
             Section::General => self.general(ui, look),
             Section::Recording => self.recording(ui, look),
+            Section::Overlays => self.overlays_page(ui, look),
             Section::Audio => self.audio(ui, look),
             Section::Screenshots => self.screenshots(ui, look),
             Section::Uploads => self.uploads(ui, look),
@@ -163,6 +164,7 @@ impl Pages for SettingsApp {
 
     fn leave(&mut self) {
         self.stop_listening();
+        self.audio.leave();
     }
 
     fn tick(&mut self) {
@@ -170,7 +172,7 @@ impl Pages for SettingsApp {
     }
 
     fn busy(&self) -> bool {
-        self.keys.listening()
+        self.keys.listening() || self.audio.busy()
     }
 
     fn overlays(&mut self, ctx: &egui::Context, look: &Look) -> bool {
@@ -189,9 +191,10 @@ mod tests {
     use eframe::egui::{Color32, Key, Rect, pos2, vec2};
     use glint_ui::settings::Frame;
     use glint_ui::theme::fonts;
-    use glint_ui::widgets::{self, CONTENT_X, WINDOW};
+    use glint_ui::widgets::{self, CONTENT_X, FOOTER_H, WINDOW};
 
-    const TOP: f32 = 118.0;
+    /// Where the first row's label sits: below the title, the row's padding and `label_dy` 7.
+    const TOP: f32 = 114.0;
 
     struct Harness {
         ctx: egui::Context,
@@ -274,17 +277,19 @@ mod tests {
     #[test]
     fn sections_open_at_the_top() {
         let mut h = Harness::new();
-        assert_eq!(h.frame(Vec::new(), "record hotkey"), Some(TOP));
-        h.frame(vec![egui::Event::PointerMoved(pos2(400.0, 300.0))], "record hotkey");
+        // short enough that general scrolls
+        h.screen = vec2(WINDOW[0], 420.0);
+        let top = h.frame(Vec::new(), "record").expect("the record hotkey");
+        h.frame(vec![egui::Event::PointerMoved(pos2(400.0, 300.0))], "record");
         for _ in 0..20 {
-            assert_eq!(h.frame(vec![wheel()], "record hotkey"), Some(TOP));
+            assert_eq!(h.frame(vec![wheel()], "record"), Some(top));
         }
 
-        h.frame(vec![egui::Event::PointerMoved(pos2(420.0, 320.0))], "record hotkey");
+        h.frame(vec![egui::Event::PointerMoved(pos2(420.0, 320.0))], "record");
         for _ in 0..20 {
-            h.frame(vec![wheel()], "record hotkey");
+            h.frame(vec![wheel()], "record");
         }
-        assert!(h.frame(Vec::new(), "record hotkey").is_none_or(|y| y < TOP));
+        assert!(h.frame(Vec::new(), "record").is_none_or(|y| y < top));
 
         // a picked section drops in, then rests at the top
         h.app.go(Section::Recording);
@@ -292,7 +297,16 @@ mod tests {
         assert_eq!(h.frame(Vec::new(), "frame rate"), Some(TOP));
         h.app.go(Section::General);
         h.settle();
-        assert_eq!(h.frame(Vec::new(), "record hotkey"), Some(TOP));
+        assert_eq!(h.frame(Vec::new(), "record"), Some(top));
+    }
+
+    #[test]
+    fn recording_fits_the_window_by_default() {
+        let mut h = Harness::new();
+        h.app.go(Section::Recording);
+        h.settle();
+        let last = h.control("when it stops");
+        assert!(last.bottom() + 9.0 <= WINDOW[1] - FOOTER_H, "{last:?}");
     }
 
     #[test]
@@ -391,6 +405,8 @@ mod tests {
         let mut h = Harness::new();
         h.ctx.enable_accesskit();
         h.app.pages.cfg.upload_destination = "litterbox".into();
+        // the quality row's sliders are in its fine-tune inset
+        h.ctx.data_mut(|d| d.insert_temp(egui::Id::unique(("fine-tune", "quality")), true));
         let named = |tree: &[(egui::accesskit::NodeId, Node)], role: Role, name: &str| {
             tree.iter().filter(|(_, n)| n.role() == role && n.label() == Some(name)).map(|(_, n)| n.clone()).collect::<Vec<_>>()
         };
@@ -417,11 +433,11 @@ mod tests {
             counts.push(format!("{} {} nodes, {groups} rows", section.name(), tree.len()));
 
             if section == Section::General {
-                let hotkey = named(&tree, Role::Button, "record hotkey");
+                let hotkeys: Vec<_> = tree.iter().filter(|(_, n)| n.role() == Role::Button && n.value().is_some()).collect();
+                assert_eq!(hotkeys.len(), 5, "{hotkeys:?}");
+                let hotkey = named(&tree, Role::Button, "record");
                 assert_eq!(hotkey.len(), 1);
                 assert_eq!(hotkey[0].value(), Some("ctrl+alt+printscreen"));
-                let labels = tree.iter().filter(|(_, n)| n.role() == Role::Label && n.value() == Some("record hotkey"));
-                assert_eq!(labels.count(), 1);
                 let startup = named(&tree, Role::CheckBox, "launch at startup");
                 assert!(startup.len() == 1 && startup[0].toggled() == Some(Toggled::False), "{startup:?}");
                 assert_eq!(startup[0].description(), Some("off"));
@@ -445,8 +461,21 @@ mod tests {
                 assert_eq!(named(&tree, Role::RadioButton, "custom colour").len(), 1);
             }
             if section == Section::Recording {
+                let presets = named(&tree, Role::RadioGroup, "quality");
+                assert_eq!(presets.len(), 1);
+                let options: Vec<_> = presets[0]
+                    .children()
+                    .iter()
+                    .filter_map(|id| tree.iter().find(|(i, _)| i == id))
+                    .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
+                    .collect();
+                let on = |name: &str, yes: bool| (name.to_owned(), Some(if yes { Toggled::True } else { Toggled::False }));
+                assert_eq!(options, [on("smaller", false), on("balanced", true), on("sharper", false)]);
                 let quality = named(&tree, Role::Slider, "quality");
                 assert!(quality.len() == 1 && quality[0].numeric_value() == Some(h.app.pages.cfg.quality as f64), "{quality:?}");
+                let effort = named(&tree, Role::Slider, "encoder effort");
+                assert!(effort.len() == 1 && effort[0].numeric_value() == Some(h.app.pages.cfg.effort as f64), "{effort:?}");
+                assert_eq!(named(&tree, Role::Link, "hide details").len(), 1);
             }
         }
         eprintln!("{}", counts.join("\n"));
@@ -475,11 +504,11 @@ mod tests {
             let c = h.control(label);
             h.click(pos2(c.left() + 18.0, c.top() + 10.0));
         };
-        toggle(&mut h, "name files after the window");
+        toggle(&mut h, "app in the name");
         assert_eq!(h.app.pages.cfg.file_name, "{app}_{date}_{time}");
-        toggle(&mut h, "sort into folders by app");
+        toggle(&mut h, "folder per app");
         assert_eq!(h.app.pages.cfg.file_name, "{app}/{app}_{date}_{time}");
-        toggle(&mut h, "name files after the window");
+        toggle(&mut h, "app in the name");
         assert_eq!(h.app.pages.cfg.file_name, "{app}/glint_{date}_{time}");
         assert_eq!(Section::Output.changes(&h.app.pages.cfg, &h.app.pages.saved), 1);
         Section::Output.reset(&mut h.app.pages.cfg);
@@ -529,11 +558,11 @@ mod tests {
         h.app.pages.updater.status = Status { checked: Some("2026-10-21 14:32".into()), state: ready };
         h.settle();
         let tree = std::mem::take(&mut h.tree);
-        assert!(find(&tree, Role::Label, concat!("v", env!("CARGO_PKG_VERSION"))).is_some());
+        let version = concat!("v", env!("CARGO_PKG_VERSION"));
         let check = find(&tree, Role::Button, "check now").expect("check now");
         assert!(!check.is_disabled());
         assert!(find(&tree, Role::Label, "0.2.0 ready ·").is_some() && find(&tree, Role::Link, "restart").is_some());
-        assert!(find(&tree, Role::Label, "last checked 2026-10-21 14:32").is_some());
+        assert!(find(&tree, Role::Label, &format!("{version} · last checked 2026-10-21 14:32")).is_some());
         assert!(find(&tree, Role::Link, "what's new in 0.2.0 ↗").is_some());
         let modes = find(&tree, Role::RadioGroup, "updates").expect("the mode picker");
         let options: Vec<_> = modes
@@ -565,95 +594,121 @@ mod tests {
         h.settle();
         let tree = std::mem::take(&mut h.tree);
         assert!(find(&tree, Role::Button, "check now").expect("check now").is_disabled());
-        assert!(find(&tree, Role::Label, "checking…").is_some() && find(&tree, Role::Label, "not checked yet").is_some());
+        assert!(find(&tree, Role::Label, "checking…").is_some());
+        assert!(find(&tree, Role::Label, &format!("{version} · not checked yet")).is_some());
+    }
+
+    fn find(tree: &[(egui::accesskit::NodeId, egui::accesskit::Node)], role: egui::accesskit::Role, text: &str) -> Option<egui::accesskit::Node> {
+        let named = |n: &egui::accesskit::Node| n.label() == Some(text) || n.value() == Some(text);
+        tree.iter().find(|(_, n)| n.role() == role && named(n)).map(|(_, n)| n.clone())
+    }
+
+    /// A radio group's options as (label, selected).
+    fn options(tree: &[(egui::accesskit::NodeId, egui::accesskit::Node)], group: &str) -> Vec<(String, bool)> {
+        use egui::accesskit::{Role, Toggled};
+        let group = find(tree, Role::RadioGroup, group).expect(group);
+        group
+            .children()
+            .iter()
+            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
+            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled() == Some(Toggled::True)))
+            .collect()
+    }
+
+    fn picks(items: &[(&str, bool)]) -> Vec<(String, bool)> {
+        items.iter().map(|&(l, on)| (l.to_owned(), on)).collect()
     }
 
     #[test]
-    fn click_highlights_reveal_their_mode_and_count_as_changes() {
-        use egui::accesskit::{Node, Role, Toggled};
+    fn overlays_show_only_the_rows_that_apply_and_count_as_changes() {
+        use egui::accesskit::{Role, Toggled};
         use glint_core::config::{ClickMode, Keystrokes};
         use glint_core::record::keys::Position;
-        fn find(tree: &[(egui::accesskit::NodeId, Node)], role: Role, text: &str) -> Option<Node> {
-            let named = |n: &Node| n.label() == Some(text) || n.value() == Some(text);
-            tree.iter().find(|(_, n)| n.role() == role && named(n)).map(|(_, n)| n.clone())
-        }
         let mut h = Harness::new();
         h.ctx.enable_accesskit();
-        h.screen = vec2(WINDOW[0], 1400.0);
-        h.app.go(Section::Recording);
+        h.app.go(Section::Overlays);
         h.settle();
         let tree = std::mem::take(&mut h.tree);
-        assert!(find(&tree, Role::Heading, "overlays").is_some());
         let toggle = find(&tree, Role::CheckBox, "click highlights").expect("the toggle");
         assert_eq!((toggle.toggled(), toggle.description()), (Some(Toggled::False), Some("off")));
-        assert!(find(&tree, Role::RadioGroup, "clicks").is_none());
-        assert!(find(&tree, Role::RadioGroup, "keystrokes").is_some());
-        assert!(find(&tree, Role::RadioGroup, "keystroke position").is_none());
-        assert!(find(&tree, Role::RadioGroup, "keystrokes mode").is_none());
+        assert_eq!(options(&tree, "keystrokes"), picks(&[("off", true), ("shortcuts", false), ("all keys", false)]));
+        assert!(find(&tree, Role::Label, "no keys are shown").is_some());
+        assert!(find(&tree, Role::RadioGroup, "position").is_none());
+        assert!(find(&tree, Role::RadioGroup, "in the video").is_none());
+        assert!(find(&tree, Role::Label, "more options appear when click highlights or keystrokes are on").is_some());
 
         let c = h.control("click highlights");
         h.click(pos2(c.left() + 18.0, c.top() + 10.0));
         assert!(h.app.pages.cfg.click_highlights);
-        h.settle();
         let tree = std::mem::take(&mut h.tree);
         let toggle = find(&tree, Role::CheckBox, "click highlights").expect("the toggle");
         assert_eq!((toggle.toggled(), toggle.description()), (Some(Toggled::True), Some("a ripple on every click")));
-        let modes = find(&tree, Role::RadioGroup, "clicks").expect("the mode picker");
-        let options: Vec<_> = modes
-            .children()
-            .iter()
-            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
-            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
-            .collect();
-        assert_eq!(options, [("editable".to_owned(), Some(Toggled::True)), ("burn in".to_owned(), Some(Toggled::False))]);
-        assert!(find(&tree, Role::Label, "editable clicks can be moved or removed in the trimmer").is_some());
+        assert_eq!(options(&tree, "in the video"), picks(&[("editable", true), ("burn in", false)]));
+        assert!(find(&tree, Role::Label, "clicks can be moved or removed in the trimmer").is_some());
+        assert!(find(&tree, Role::RadioGroup, "position").is_none());
+        assert!(find(&tree, Role::Label, "more options appear when click highlights or keystrokes are on").is_none());
 
-        let picker = h.control("clicks");
+        // one choice sets both overlays' modes
+        let picker = h.control("in the video");
         h.click(pos2(picker.left() + 126.0, picker.top() + 16.0));
-        assert_eq!(h.app.pages.cfg.clicks, ClickMode::BurnIn);
+        assert_eq!((h.app.pages.cfg.clicks, h.app.pages.cfg.keystrokes_mode), (ClickMode::BurnIn, ClickMode::BurnIn));
 
         let keys = h.control("keystrokes");
-        h.click(pos2(keys.left() + 167.0, keys.top() + 16.0));
+        h.click(pos2(keys.left() + 200.0, keys.top() + 16.0));
         assert_eq!(h.app.pages.cfg.keystrokes, Keystrokes::All);
-        h.settle();
         let tree = std::mem::take(&mut h.tree);
-        let levels = find(&tree, Role::RadioGroup, "keystrokes").expect("the level picker");
-        let options: Vec<_> = levels
-            .children()
-            .iter()
-            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
-            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
-            .collect();
-        assert_eq!(
-            options,
-            [
-                ("off".to_owned(), Some(Toggled::False)),
-                ("shortcuts".to_owned(), Some(Toggled::False)),
-                ("all keys".to_owned(), Some(Toggled::True)),
-            ]
-        );
-        assert!(find(&tree, Role::Label, "all keys skips password fields").is_some());
-        assert!(find(&tree, Role::RadioGroup, "keystroke position").is_some());
-        let modes = find(&tree, Role::RadioGroup, "keystrokes mode").expect("the mode picker");
-        let options: Vec<_> = modes
-            .children()
-            .iter()
-            .filter_map(|id| tree.iter().find(|(i, _)| i == id))
-            .map(|(_, n)| (n.label().unwrap_or("").to_owned(), n.toggled()))
-            .collect();
-        assert_eq!(options, [("editable".to_owned(), Some(Toggled::True)), ("burn in".to_owned(), Some(Toggled::False))]);
-        assert!(find(&tree, Role::Label, "editable keystrokes can be moved or removed in the trimmer").is_some());
+        assert!(find(&tree, Role::Label, "everything you type, except password fields").is_some());
+        assert_eq!(options(&tree, "position"), picks(&[("left", false), ("centre", true), ("right", false)]));
+        assert!(find(&tree, Role::Label, "drawn into the video; can't be changed later").is_some());
 
-        let keys = h.control("keystrokes");
-        h.click(pos2(keys.left() + 100.0, keys.top() + 16.0));
-        assert_eq!(h.app.pages.cfg.keystrokes, Keystrokes::Shortcuts);
-        let place = h.control("keystroke position");
+        let place = h.control("position");
         h.click(pos2(place.left() + 33.0, place.top() + 16.0));
         assert_eq!(h.app.pages.cfg.keystroke_position, Position::Left);
-        let mode = h.control("keystrokes mode");
-        h.click(pos2(mode.left() + 126.0, mode.top() + 16.0));
-        assert_eq!(h.app.pages.cfg.keystrokes_mode, ClickMode::BurnIn);
-        assert_eq!(Section::Recording.changes(&h.app.pages.cfg, &h.app.pages.saved), 5);
+        assert_eq!(Section::Overlays.changes(&h.app.pages.cfg, &h.app.pages.saved), 4);
+        assert_eq!(Section::Recording.changes(&h.app.pages.cfg, &h.app.pages.saved), 0);
+
+        // a config whose modes differ says so
+        h.app.pages.cfg.keystrokes_mode = ClickMode::Editable;
+        h.settle();
+        let tree = std::mem::take(&mut h.tree);
+        assert!(find(&tree, Role::Label, "clicks burnt in, keys editable").is_some());
+
+        Section::Overlays.reset(&mut h.app.pages.cfg);
+        assert_eq!(h.app.pages.cfg, h.app.pages.saved);
+    }
+
+    #[test]
+    fn quality_presets_set_both_values_and_fine_tuning_goes_custom() {
+        use egui::accesskit::Role;
+        let mut h = Harness::new();
+        h.ctx.enable_accesskit();
+        h.app.go(Section::Recording);
+        h.settle();
+        let presets = h.control("quality");
+        h.click(pos2(presets.right() - 40.0, presets.top() + 16.0));
+        assert_eq!((h.app.pages.cfg.quality, h.app.pages.cfg.effort), (20, 100));
+        let tree = std::mem::take(&mut h.tree);
+        assert_eq!(options(&tree, "quality"), picks(&[("smaller", false), ("balanced", false), ("sharper", true)]));
+        assert!(find(&tree, Role::Label, "very sharp, larger files, more gpu load").is_some());
+        assert!(find(&tree, Role::Slider, "quality").is_none());
+
+        let link = find(&tree, Role::Link, "fine-tune").and_then(|n| n.bounds()).expect("the fine-tune link");
+        h.click(pos2(((link.x0 + link.x1) / 2.0) as f32, ((link.y0 + link.y1) / 2.0) as f32));
+        let tree = std::mem::take(&mut h.tree);
+        let slider = find(&tree, Role::Slider, "quality").and_then(|n| n.bounds()).expect("the quality slider");
+        assert!(find(&tree, Role::Link, "hide details").is_some());
+        // the track's left end is quality 12
+        h.click(pos2(slider.x0 as f32 + 1.0, ((slider.y0 + slider.y1) / 2.0) as f32));
+        assert_eq!((h.app.pages.cfg.quality, h.app.pages.cfg.effort), (12, 100));
+        let tree = std::mem::take(&mut h.tree);
+        let custom = [("smaller", false), ("balanced", false), ("sharper", false), ("custom", true)];
+        assert_eq!(options(&tree, "quality"), picks(&custom));
+        assert!(find(&tree, Role::Label, "quality 12, effort 100").is_some());
+        assert_eq!(Section::Recording.changes(&h.app.pages.cfg, &h.app.pages.saved), 2);
+
+        let presets = h.control("quality");
+        h.click(pos2(presets.left() + 40.0, presets.top() + 16.0));
+        assert_eq!((h.app.pages.cfg.quality, h.app.pages.cfg.effort), (28, 50));
         Section::Recording.reset(&mut h.app.pages.cfg);
         assert_eq!(h.app.pages.cfg, h.app.pages.saved);
     }
