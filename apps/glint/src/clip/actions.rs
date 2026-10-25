@@ -1,21 +1,16 @@
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use glint_core::clip::export::Settings;
 use glint_core::paths::app_dir;
 use serde::{Deserialize, Serialize};
-use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FileSaveDialog, IFileSaveDialog,
-    IShellItem, SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW, SIGDN_FILESYSPATH, ShellExecuteW,
+    FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH, ShellExecuteW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsIconic, IsZoomed, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNORMAL, SetWindowPos,
-};
-use windows::core::{HSTRING, PCWSTR, w};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+use windows::core::{HSTRING, w};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -61,26 +56,6 @@ impl Saved {
     }
 }
 
-pub(super) fn window_rect(hwnd: HWND) -> Option<[i32; 4]> {
-    unsafe {
-        if IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() {
-            return None;
-        }
-        let mut r = RECT::default();
-        GetWindowRect(hwnd, &mut r).ok()?;
-        Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
-    }
-}
-
-pub(super) fn place(hwnd: HWND, [x, y, w, h]: [i32; 4]) {
-    let r = RECT { left: x, top: y, right: x + w, bottom: y + h };
-    unsafe {
-        if !MonitorFromRect(&r, MONITOR_DEFAULTTONULL).is_invalid() {
-            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
-}
-
 pub(super) fn show_in_folder(path: &Path) {
     glint_shell::explorer::reveal(path);
 }
@@ -88,22 +63,6 @@ pub(super) fn show_in_folder(path: &Path) {
 pub(super) fn open_url(url: &str) {
     unsafe {
         ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
-    }
-}
-
-pub(super) fn recycle(owner: HWND, path: &Path) -> Result<(), String> {
-    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
-    let mut op = SHFILEOPSTRUCTW {
-        hwnd: owner,
-        wFunc: FO_DELETE,
-        pFrom: PCWSTR(from.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as u16,
-        ..Default::default()
-    };
-    match unsafe { SHFileOperationW(&mut op) } {
-        0 if !op.fAnyOperationsAborted.as_bool() => Ok(()),
-        0 => Err("the deletion was cancelled".into()),
-        code => Err(format!("windows couldn't move it to the recycle bin (error {code:#x})")),
     }
 }
 

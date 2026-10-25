@@ -107,7 +107,7 @@ pub fn run(path: PathBuf) {
             };
             let rounded = hwnd.is_some_and(|h| glint_ui::window::frameless(h, true));
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
-                actions::place(h, r);
+                crate::platform::windows::place(h, r);
             }
             let mut app = ClipApp::new(path, info, index, &cfg, saved, accent);
             (app.hwnd, app.rounded, app.live, app.hevc) = (hwnd, rounded, true, hevc);
@@ -713,7 +713,7 @@ impl ClipApp {
         match res {
             Ok(path) => {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                history::add(HistoryKind::Recording, Some(&path), size, None);
+                history::add(HistoryKind::Recording, Some(&path), size, None, None);
                 if task.then == Then::Nothing {
                     self.flash = self.now;
                 }
@@ -765,7 +765,7 @@ impl ClipApp {
         let Some(up) = self.upload.take() else { return };
         let note = match res {
             Ok(url) => {
-                history::add(HistoryKind::Recording, Some(&up.path), up.size, Some(&url));
+                history::add(HistoryKind::Recording, Some(&up.path), up.size, Some(&url), None);
                 let copied = up.copy_link && crate::shot::copy_text(self.hwnd, &url).is_ok();
                 Note::Uploaded { url, copied }
             }
@@ -802,7 +802,7 @@ impl ClipApp {
         self.audio = None;
         self.scan = None;
         self.waves = None;
-        match actions::recycle(self.owner(), &self.path) {
+        match crate::platform::windows::recycle(self.owner(), &self.path) {
             Ok(()) => {
                 self.gone = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1015,7 +1015,7 @@ impl eframe::App for ClipApp {
                 self.keyboard = true;
             }
         });
-        if let Some(r) = self.hwnd.and_then(actions::window_rect) {
+        if let Some(r) = self.hwnd.and_then(crate::platform::windows::window_placement) {
             self.saved.rect = Some(r);
         }
         let look = Look { p, keyboard: self.keyboard };
