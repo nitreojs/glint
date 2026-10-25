@@ -3,6 +3,8 @@
 mod app;
 mod buffer;
 mod config;
+mod gallery;
+mod glint;
 mod note;
 mod settings;
 
@@ -14,6 +16,11 @@ fn main() {
     }
     if std::env::args().any(|a| a == settings::SETTINGS_ARG) {
         settings::run();
+        return;
+    }
+    let args: Vec<_> = std::env::args_os().collect();
+    if let Some(i) = args.iter().position(|a| a == glint_ui::gallery::GALLERY_ARG) {
+        gallery::run(args.get(i + 1).map(Into::into));
         return;
     }
     app::run();

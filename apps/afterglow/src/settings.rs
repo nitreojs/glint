@@ -25,7 +25,7 @@ use crate::app::{AMBER, WM_HOTKEY_PAUSE, WM_PREVIEW_NOTE, WM_RELOAD};
 use crate::config::{APP, Config, LENGTHS, MEMORY_CAPS, NAMES, Place, default_output_dir};
 
 pub const SETTINGS_ARG: &str = "--settings";
-const TITLE: &str = "afterglow settings";
+pub const TITLE: &str = "afterglow settings";
 const REPO_URL: &str = "https://github.com/nitreojs/glint";
 const FPS_PRESETS: [u32; 5] = [0, 30, 60, 120, 144];
 

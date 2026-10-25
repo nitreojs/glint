@@ -1,6 +1,7 @@
 //! afterglow's tray app: a hidden window holding the tray icon and the save hotkey, and the
-//! buffer that runs behind it. Clicking the icon or pressing the hotkey saves the last stretch;
-//! the right-click menu pauses and resumes the buffer, opens the folder and the settings file.
+//! buffer that runs behind it. Clicking the icon or pressing the hotkey saves the last stretch,
+//! a double click opens the gallery; the right-click menu pauses and resumes the buffer, opens
+//! the gallery, the folder and the settings.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -29,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
 use crate::buffer::{self, Buffer, Notify};
+use crate::gallery;
 use crate::note::{self, Kind};
 use crate::config::{APP, Config, NAMES, Place};
 use crate::settings::SETTINGS_ARG;
@@ -52,11 +54,13 @@ const TIP_TIMER: usize = 2;
 const CLICK_TIMER: usize = 3;
 
 /// afterglow's accent: the tray icon while buffering, the settings window.
-/// A clip cut from the buffer, the monitor it shows and its file name below the output folder.
+/// A clip cut from the buffer, the monitor it shows, its file name below the output folder and
+/// the app in front.
 struct Cut {
     clip: Clip,
     monitor: Rect,
     name: PathBuf,
+    app: Option<String>,
 }
 
 /// The app whose window is in front, when that window is on `monitor`; None for the desktop
@@ -90,6 +94,7 @@ const ID_SETTINGS: usize = 4;
 const ID_LOG: usize = 5;
 const ID_QUIT: usize = 6;
 const ID_LAST: usize = 7;
+const ID_GALLERY: usize = 8;
 
 struct App {
     hwnd: HWND,
@@ -106,14 +111,15 @@ struct App {
     away: bool,
     hotkey: bool,
     /// A save is being written: how long the clip is ("0:42 of 1:00" when the memory cap cut
-    /// it short), the monitor it's of, and whether the cap cut it.
-    saving: Option<(String, Rect, bool)>,
+    /// it short), the monitor it's of, whether the cap cut it, and the app it shows.
+    saving: Option<(String, Rect, bool, Option<String>)>,
     /// The memory cap cutting a clip short was explained once already.
     told_cap: bool,
     /// The note up is the settings window's sample, so the picker may take it away.
     sample: bool,
-    /// A click on the tray icon cut this clip; it's saved unless the click turns into a double click.
-    clicked: Option<Cut>,
+    /// A click on the tray icon cut this clip (or found nothing to cut); it's saved (or says so)
+    /// unless the click turns into a double click.
+    clicked: Option<Option<Cut>>,
     last_saved: Option<PathBuf>,
     taskbar_created: u32,
     /// Restarts in a row that failed, so the error is announced once.
@@ -191,7 +197,8 @@ impl App {
         let subject = front.as_ref().map_or(Subject::Screen, Subject::Window);
         let (date, time) = date_time();
         let naming = Naming { date: &date, time: &time, kind: HistoryKind::Recording, subject };
-        Some(Cut { clip, monitor, name: NAMES.expand(&self.cfg.file_name, &naming) })
+        let app = front.as_ref().map(|s| s.app.clone()).filter(|a| !a.trim().is_empty());
+        Some(Cut { clip, monitor, name: NAMES.expand(&self.cfg.file_name, &naming), app })
     }
 
     fn save(&mut self) {
@@ -227,7 +234,7 @@ impl App {
         }
     }
 
-    fn write(&mut self, Cut { clip, monitor, name }: Cut) {
+    fn write(&mut self, Cut { clip, monitor, name, app }: Cut) {
         if self.saving.is_some() {
             return;
         }
@@ -249,15 +256,16 @@ impl App {
             }
         }
         note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
-        self.saving = Some((long, monitor, clip.capped));
+        self.saving = Some((long, monitor, clip.capped, app));
         buffer::save(clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
     }
 
     fn saved(&mut self, result: Result<PathBuf, String>) {
-        let Some((long, monitor, capped)) = self.saving.take() else { return };
+        let Some((long, monitor, capped, app)) = self.saving.take() else { return };
         match result {
             Ok(path) => {
                 log(&format!("saved {}", path.display()));
+                gallery::remember(&path, app.as_deref());
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let kind = if capped { Kind::Warning } else { Kind::Saved };
                 note::show(monitor, self.cfg.note_position, kind, &format!("saved the last {long}"), &name);
@@ -365,6 +373,7 @@ impl App {
                 .enabled(self.buffer.is_some() && self.saving.is_none()),
             Item::command(ID_PAUSE, "buffer").glyph(Glyph::Record).checked(!self.paused),
             Item::separator(),
+            Item::command(ID_GALLERY, "gallery").glyph(Glyph::Gallery),
             Item::command(ID_LAST, "show last clip").glyph(Glyph::Video).enabled(self.last_saved.is_some()),
             Item::command(ID_FOLDER, "open folder").glyph(Glyph::Folder),
             Item::command(ID_SETTINGS, "settings").glyph(Glyph::Settings),
@@ -410,6 +419,7 @@ fn menu(hwnd: HWND) {
             }
         }
         ID_SETTINGS => open_settings(),
+        ID_GALLERY => gallery::open(None),
         ID_LAST => {
             if let Some(p) = with_app(|a| a.last_saved.clone()).flatten() {
                 explorer::reveal(&p);
@@ -444,21 +454,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             match (lp.0 & 0xFFFF) as u32 {
                 // a click cuts the clip at once, then waits to see whether it's a double click
                 WM_LBUTTONDOWN => with_app(|a| {
-                    match a.cut() {
-                        Some(cut) => a.clicked = Some(cut),
-                        None => a.nothing_yet(),
-                    }
+                    a.clicked = Some(a.cut());
                     unsafe {
                         SetTimer(Some(hwnd), CLICK_TIMER, GetDoubleClickTime(), None);
                     }
                 }),
-                WM_LBUTTONDBLCLK => with_app(|a| {
+                WM_LBUTTONDBLCLK => {
                     unsafe {
                         let _ = KillTimer(Some(hwnd), CLICK_TIMER);
                     }
-                    a.clicked = None;
-                    open_settings();
-                }),
+                    with_app(|a| a.clicked = None);
+                    // outside the app's borrow: taking the foreground sends this window messages
+                    // at once. Holding it lets the gallery (or the one already open) come forward.
+                    unsafe {
+                        let _ = SetForegroundWindow(hwnd);
+                    }
+                    gallery::open(None);
+                    None
+                }
                 WM_CONTEXTMENU => {
                     menu(hwnd);
                     None
@@ -536,8 +549,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let _ = KillTimer(Some(hwnd), CLICK_TIMER);
             }
             with_app(|a| {
-                if let Some(cut) = a.clicked.take() {
-                    a.write(cut);
+                match a.clicked.take() {
+                    Some(Some(cut)) => a.write(cut),
+                    Some(None) => a.nothing_yet(),
+                    None => {}
                 }
             });
             return LRESULT(0);
