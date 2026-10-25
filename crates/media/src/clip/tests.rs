@@ -401,3 +401,142 @@ fn windows_always_decodes_h264() {
     let _com = Com::init();
     assert!(media::has_decoder(windows::Win32::Media::MediaFoundation::MFVideoFormat_H264));
 }
+
+// ---- self-made files: only media foundation ---------------------------------------------------------
+
+const UNEVEN_SIZE: u32 = 128;
+
+/// A small h.264 file that only gets a frame when "the screen changed", on a 144 fps clock like a game
+/// recording: frame `i` comes `GAPS[i % 12]` ticks after the one before and shows its number as the grey of its
+/// two halves (ones on the left, twelves on the right).
+fn uneven_file(path: &Path, frames: usize) {
+    use windows::Win32::Media::MediaFoundation::*;
+    const GAPS: [i64; 12] = [1, 2, 1, 3, 6, 1, 4, 2, 5, 1, 1, 7];
+    let n = UNEVEN_SIZE;
+    let video_type = |subtype: &windows::core::GUID| unsafe {
+        let t = MFCreateMediaType().unwrap();
+        t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).unwrap();
+        t.SetGUID(&MF_MT_SUBTYPE, subtype).unwrap();
+        t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32).unwrap();
+        t.SetUINT64(&MF_MT_FRAME_SIZE, media::pack(n, n)).unwrap();
+        t.SetUINT64(&MF_MT_FRAME_RATE, media::pack(144, 1)).unwrap();
+        t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, media::pack(1, 1)).unwrap();
+        t
+    };
+    unsafe {
+        let writer = MFCreateSinkWriterFromURL(&windows::core::HSTRING::from(path.as_os_str()), None, None).unwrap();
+        let out = video_type(&MFVideoFormat_H264);
+        out.SetUINT32(&MF_MT_AVG_BITRATE, 2_000_000).unwrap();
+        let stream = writer.AddStream(&out).unwrap();
+        writer.SetInputMediaType(stream, &video_type(&MFVideoFormat_NV12), None).unwrap();
+        writer.BeginWriting().unwrap();
+        let at = |k: i64| k * SECOND / 144;
+        let mut k = 0;
+        for i in 0..frames {
+            let next = k + GAPS[i % 12];
+            let len = n * n * 3 / 2;
+            let buf = MFCreateMemoryBuffer(len).unwrap();
+            let mut p = std::ptr::null_mut();
+            buf.Lock(&mut p, None, None).unwrap();
+            let pixels = std::slice::from_raw_parts_mut(p, len as usize);
+            let (luma, chroma) = pixels.split_at_mut((n * n) as usize);
+            for row in luma.chunks_mut(n as usize) {
+                let (left, right) = row.split_at_mut(n as usize / 2);
+                left.fill(16 + 18 * (i % 12) as u8);
+                right.fill(16 + 18 * (i / 12) as u8);
+            }
+            chroma.fill(128);
+            buf.Unlock().unwrap();
+            buf.SetCurrentLength(len).unwrap();
+            let sample = MFCreateSample().unwrap();
+            sample.AddBuffer(&buf).unwrap();
+            sample.SetSampleTime(at(k)).unwrap();
+            sample.SetSampleDuration(at(next) - at(k)).unwrap();
+            writer.WriteSample(stream, &sample).unwrap();
+            k = next;
+        }
+        writer.Finalize().unwrap();
+    }
+}
+
+/// Each decoded frame's time and the number [`uneven_file`] painted on it.
+fn numbered_frames(path: &Path) -> Vec<(i64, usize)> {
+    let reader = media::open(path, None).unwrap();
+    media::video_only(&reader, windows::Win32::Media::MediaFoundation::MFVideoFormat_NV12, (UNEVEN_SIZE, UNEVEN_SIZE))
+        .unwrap();
+    let digit = |y: u8| ((y as f64 - 16.0) / 18.0).round() as usize;
+    let mut frames = Vec::new();
+    while let Some(f) = media::next_video(&reader).unwrap() {
+        // the luma plane starts with its top row, whatever the pitch
+        let row = media::with_pixels(&f.sample, UNEVEN_SIZE / 4, |rows| rows.row(0).to_vec()).unwrap();
+        let half = UNEVEN_SIZE as usize / 2;
+        frames.push((f.ts, digit(row[half / 2]) + 12 * digit(row[half + half / 2])));
+    }
+    frames
+}
+
+/// The times media foundation reads straight from the file, before decoding.
+fn packet_times(path: &Path) -> Vec<i64> {
+    let reader = media::open(path, None).unwrap();
+    unsafe {
+        reader.SetStreamSelection(media::ALL, false).unwrap();
+        reader.SetStreamSelection(media::VIDEO, true).unwrap();
+    }
+    let mut times = Vec::new();
+    while let media::Got::Sample { ts, .. } = media::read(&reader, media::VIDEO).unwrap() {
+        times.push(ts);
+    }
+    times.sort_unstable();
+    times
+}
+
+#[test]
+fn uneven_frames_keep_their_own_times_and_a_lower_rate_picks_them_by_time() {
+    let _com = Com::init();
+    let dir = std::env::temp_dir();
+    let src = dir.join(format!("glint-clip-vfr-{}.mp4", std::process::id()));
+    let same_out = dir.join(format!("glint-clip-vfr-same-{}.mp4", std::process::id()));
+    let low_out = dir.join(format!("glint-clip-vfr-30-{}.mp4", std::process::id()));
+    uneven_file(&src, 96);
+    let info = media::probe(&src).unwrap();
+    let index = index::read(&src).unwrap();
+    let source = Source { info: &info, index: Some(&index), bytes: std::fs::metadata(&src).unwrap().len(), accent: ACCENT };
+    let edit = Edit::new(info.duration, 0);
+    let export = |settings: &export::Settings, out: &Path| {
+        let job = export::plan(&edit, settings, &source);
+        let (pm, c) = (AtomicU32::new(0), AtomicBool::new(false));
+        assert_eq!(trim::export_in_software(&src, &info, &job, out, &Progress { permille: &pm, cancel: &c }), Ok(true));
+        job
+    };
+    let compress = Some(export::Compress::Medium);
+    let same = export(&export::Settings { compress, ..export::Settings::default() }, &same_out);
+    let low = export(&export::Settings { fps: Some(30), compress, ..export::Settings::default() }, &low_out);
+    let (decoded, same_frames, low_frames) = (numbered_frames(&src), numbered_frames(&same_out), numbered_frames(&low_out));
+    let packets = packet_times(&src);
+    for f in [&src, &same_out, &low_out] {
+        let _ = std::fs::remove_file(f);
+    }
+
+    assert!(info.fps > 40.0 && info.fps < 60.0, "an average rate: {}", info.fps);
+    // the reader's video processor would resample the frames onto a steady clock at that average rate
+    assert_eq!(decoded.iter().map(|f| f.0).collect::<Vec<_>>(), packets);
+    assert_eq!(decoded.iter().map(|f| f.1).collect::<Vec<_>>(), (0..96).collect::<Vec<_>>());
+
+    assert!(matches!(same, Job::Video(VideoJob { video: Video::Encode { fps: None, .. }, .. })), "{same:?}");
+    assert_eq!(same_frames.len(), decoded.len());
+    let tick = SECOND as f64 / (info.fps * 1000.0).round();
+    for (out, src) in same_frames.iter().zip(&decoded) {
+        assert_eq!(out.1, src.1);
+        let late = (out.0 - src.0) as f64;
+        assert!((0.0..=tick).contains(&late), "frame {} at {} for {}", src.1, out.0, src.0);
+    }
+
+    assert!(matches!(low, Job::Video(VideoJob { video: Video::Encode { fps: Some(30), .. }, .. })), "{low:?}");
+    assert_eq!(low_frames.len() as i64, (info.duration * 30 + SECOND - 1) / SECOND);
+    for (k, &(t, shown)) in low_frames.iter().enumerate() {
+        let grid = k as i64 * SECOND / 30;
+        assert!((t - grid).abs() <= 1, "frame {k} at {t}");
+        let newest = decoded.iter().rev().find(|f| f.0 <= grid).unwrap().1;
+        assert_eq!(shown, newest, "at {grid} the frame shown should be the newest one by then");
+    }
+}
