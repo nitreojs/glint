@@ -12,6 +12,7 @@ pub mod identity;
 pub mod instance;
 pub mod log;
 pub mod monitors;
+pub mod start_menu;
 pub mod time;
 pub mod tray;
 pub mod window;

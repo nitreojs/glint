@@ -12,7 +12,7 @@ use glint_core::update::notes_url;
 use glint_core::wide::wide;
 use glint_media::record::{self, ClickHighlights, KeyOverlay, Params, Source};
 use glint_shell::log::path as log_path;
-use glint_shell::{autostart, instance, monitors, window};
+use glint_shell::{autostart, instance, monitors, start_menu, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -775,6 +775,7 @@ pub fn run() {
         if let Some(old) = &updated_from {
             log(&format!("updated from {old} to {}", update::current()));
         }
+        start_menu::sync("glint", "screen recorder and screenshots");
         match cfg_err {
             Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
             None => {

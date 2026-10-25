@@ -18,7 +18,7 @@ use glint_shell::afterglow::{MAIN_CLASS, WM_NOTE_CAPTURABLE};
 use glint_shell::identity::identify;
 use glint_shell::time::date_time;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
-use glint_shell::{autostart, explorer, hotkey, instance, window};
+use glint_shell::{autostart, explorer, hotkey, instance, start_menu, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
@@ -590,6 +590,7 @@ pub fn run() {
         failures: 0,
     };
     app.grab_hotkey();
+    start_menu::sync(APP, "instant replay: saves the last minute of your screen");
     match cfg_err {
         Some(e) => app.notify("afterglow: settings error (using defaults)", &e, true),
         None => app.sync_autostart(),
