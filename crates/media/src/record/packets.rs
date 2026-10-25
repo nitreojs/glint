@@ -423,8 +423,10 @@ pub struct Mp4Sink {
 impl Mp4Sink {
     pub fn create(path: &Path) -> Result<Mp4Sink, String> {
         unsafe {
-            let attrs = attributes(1)?;
+            let attrs = attributes(2)?;
             attrs.SetUINT32(&MF_SINK_WRITER_DISABLE_THROTTLING, 1).ctx("attr")?;
+            // mp4 whatever the name ends in (afterglow writes `.mp4.part` until a clip is whole)
+            attrs.SetGUID(&MF_TRANSCODE_CONTAINERTYPE, &MFTranscodeContainerType_MPEG4).ctx("attr")?;
             if let Some(dir) = path.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }

@@ -131,8 +131,8 @@ impl Buffer {
 }
 
 /// Writes `clip` to `dir`/`name`.mp4 (or `name_2.mp4`… when taken) on its own thread; `done`
-/// hears the path or the error.
-pub fn save(clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
+/// hears `id` with the path or the error.
+pub fn save(id: u64, clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
     std::thread::spawn(move || {
         let result = unsafe {
             let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
@@ -146,7 +146,7 @@ pub fn save(clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
             }
             r
         };
-        done.post(result);
+        done.post((id, result));
     });
 }
 
@@ -162,9 +162,14 @@ fn write(clip: Clip, stem: &Path) -> Result<PathBuf, String> {
     };
     let path = std::iter::once(named("")).chain((2..).map(|n| named(&format!("_{n}")))).find(|p| !p.exists());
     let path = path.expect("some number is free");
-    let mut sink = Mp4Sink::create(&path)?;
+    // written under another name until it's whole, so a save that dies halfway never looks like a clip
+    let mut part = path.clone().into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let mut sink = Mp4Sink::create(&part)?;
     clip.write(&mut sink).inspect_err(|_| {
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&part);
     })?;
+    std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }

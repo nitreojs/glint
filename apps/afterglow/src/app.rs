@@ -5,6 +5,7 @@
 
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use glint_core::format::human_duration;
 use glint_core::geom::rect::Rect;
@@ -54,6 +55,20 @@ const TIP_TIMER: usize = 2;
 const CLICK_TIMER: usize = 3;
 
 /// afterglow's accent: the tray icon while buffering, the settings window.
+/// A save that hasn't answered in this long is given up on, so it can't hold back the next one.
+const STUCK: Duration = Duration::from_secs(90);
+
+/// A save being written: how long the clip is ("0:42 of 1:00" when the memory cap cut it short),
+/// the monitor it's of, whether the cap cut it, the app it shows, and since when.
+struct Saving {
+    id: u64,
+    long: String,
+    monitor: Rect,
+    capped: bool,
+    app: Option<String>,
+    since: Instant,
+}
+
 /// A clip cut from the buffer, the monitor it shows, its file name below the output folder and
 /// the app in front.
 struct Cut {
@@ -110,9 +125,10 @@ struct App {
     /// The session is locked or the PC is going to sleep: nothing to record until it's back.
     away: bool,
     hotkey: bool,
-    /// A save is being written: how long the clip is ("0:42 of 1:00" when the memory cap cut
-    /// it short), the monitor it's of, whether the cap cut it, and the app it shows.
-    saving: Option<(String, Rect, bool, Option<String>)>,
+    /// The save being written, if one is.
+    saving: Option<Saving>,
+    /// Numbers saves, so a late answer from one given up on isn't taken for the next one's.
+    saves: u64,
     /// The memory cap cutting a clip short was explained once already.
     told_cap: bool,
     /// The note up is the settings window's sample, so the picker may take it away.
@@ -234,13 +250,26 @@ impl App {
         }
     }
 
+    /// A save is being written, and not for so long that it's given up on.
+    fn save_running(&self) -> bool {
+        self.saving.as_ref().is_some_and(|s| s.since.elapsed() < STUCK)
+    }
+
     fn write(&mut self, Cut { clip, monitor, name, app }: Cut) {
-        if self.saving.is_some() {
-            return;
+        if let Some(s) = &self.saving {
+            if s.since.elapsed() < STUCK {
+                log("save asked for while one is still being written");
+                note::show(monitor, self.cfg.note_position, Kind::Warning, "still saving", "the clip before this one");
+                return;
+            }
+            log(&format!("save #{} never finished ({:.0} s): saving anyway", s.id, s.since.elapsed().as_secs_f64()));
         }
         let secs = clip.duration as f64 / 1e7;
         self.sample = false;
-        log(&format!("saving {secs:.1} s"));
+        self.saves += 1;
+        let id = self.saves;
+        let bytes: usize = clip.packets.iter().map(|(_, p)| p.data.len()).sum();
+        log(&format!("save #{id}: {secs:.1} s, {} MB", bytes >> 20));
         let mut long = human_duration(secs);
         if clip.capped {
             let length = human_duration(self.cfg.length as f64);
@@ -256,15 +285,19 @@ impl App {
             }
         }
         note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
-        self.saving = Some((long, monitor, clip.capped, app));
-        buffer::save(clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
+        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, since: Instant::now() });
+        buffer::save(id, clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
     }
 
-    fn saved(&mut self, result: Result<PathBuf, String>) {
-        let Some((long, monitor, capped, app)) = self.saving.take() else { return };
+    fn saved(&mut self, id: u64, result: Result<PathBuf, String>) {
+        if self.saving.as_ref().is_none_or(|s| s.id != id) {
+            log(&format!("save #{id} finished after it was given up on: {result:?}"));
+            return;
+        }
+        let Some(Saving { long, monitor, capped, app, since, .. }) = self.saving.take() else { return };
         match result {
             Ok(path) => {
-                log(&format!("saved {}", path.display()));
+                log(&format!("save #{id} done in {:.1} s: {}", since.elapsed().as_secs_f64(), path.display()));
                 gallery::remember(&path, app.as_deref());
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let kind = if capped { Kind::Warning } else { Kind::Saved };
@@ -272,7 +305,7 @@ impl App {
                 self.last_saved = Some(path);
             }
             Err(e) => {
-                log(&format!("save failed: {e}"));
+                log(&format!("save #{id} failed: {e}"));
                 note::show(monitor, self.cfg.note_position, Kind::Failed, "couldn't save", "see the notification for why");
                 self.notify("afterglow: couldn't save", &e, true);
             }
@@ -370,7 +403,7 @@ impl App {
                 .glyph(Glyph::Replay)
                 .accented()
                 .keys(key)
-                .enabled(self.buffer.is_some() && self.saving.is_none()),
+                .enabled(self.buffer.is_some() && !self.save_running()),
             Item::command(ID_PAUSE, "buffer").glyph(Glyph::Record).checked(!self.paused),
             Item::separator(),
             Item::command(ID_GALLERY, "gallery").glyph(Glyph::Gallery),
@@ -528,8 +561,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_NOTE_CAPTURABLE => return LRESULT(note::set_capturable(wp.0 == 1) as isize),
         WM_SAVED => {
-            let result = unsafe { buffer::take::<Result<PathBuf, String>>(lp) };
-            with_app(|a| a.saved(result));
+            let (id, result) = unsafe { buffer::take::<(u64, Result<PathBuf, String>)>(lp) };
+            with_app(|a| a.saved(id, result));
             return LRESULT(0);
         }
         WM_ENDED => {
@@ -618,6 +651,7 @@ pub fn run() {
         away: false,
         hotkey: false,
         saving: None,
+        saves: 0,
         told_cap: false,
         sample: false,
         clicked: None,
