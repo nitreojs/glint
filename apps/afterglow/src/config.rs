@@ -4,8 +4,10 @@
 use std::path::PathBuf;
 
 use glint_core::config::CodecName;
+use glint_core::geom::rect::Rect;
 use glint_core::config::audio::{AudioSource, MAX_TRACKS, SourceKind};
 use glint_core::config::hotkeys::parse_hotkey;
+use glint_core::naming::{Names, pattern_problem};
 use glint_core::paths::app_dir_for;
 use serde::Deserialize;
 use windows::Win32::System::Com::CoTaskMemFree;
@@ -27,6 +29,8 @@ pub struct Config {
     pub save_hotkey: String,
     /// Empty: Videos\afterglow.
     pub output_dir: String,
+    /// File name pattern without the extension, as in glint; see [`Names::expand`].
+    pub file_name: String,
     /// 0: the primary monitor; n: the nth monitor (1 = the first one Windows lists).
     pub monitor: u32,
     /// 0: the monitor's refresh rate.
@@ -42,6 +46,8 @@ pub struct Config {
     /// What players call each track; empty names it after its sources.
     pub audio_track_names: Vec<String>,
     pub launch_at_startup: bool,
+    /// Where on the recorded monitor notes show.
+    pub note_position: Place,
 }
 
 impl Default for Config {
@@ -51,6 +57,7 @@ impl Default for Config {
             length: 60,
             save_hotkey: "Alt+F10".into(),
             output_dir: String::new(),
+            file_name: NAMES.default.into(),
             monitor: 0,
             fps: 60,
             // hevc needs a decoder windows doesn't ship to be played or trimmed: opt in
@@ -61,6 +68,7 @@ impl Default for Config {
             audio_sources: vec![AudioSource { tracks: vec![1], ..AudioSource::new(SourceKind::Desktop, 0) }],
             audio_track_names: vec![String::new(); MAX_TRACKS as usize],
             launch_at_startup: false,
+            note_position: Place::TopRight,
         }
     }
 }
@@ -98,6 +106,9 @@ impl Config {
         parse_hotkey(&self.save_hotkey).map_err(|e| format!("save_hotkey: {e}"))?;
         if !(5..=1800).contains(&self.length) {
             return Err(format!("length must be 5-1800 seconds, got {}", self.length));
+        }
+        if let Some(problem) = pattern_problem(&self.file_name) {
+            return Err(format!("file_name: {problem}"));
         }
         if self.bitrate > 200 {
             return Err(format!("bitrate must be 0-200 Mbit/s, got {}", self.bitrate));
@@ -171,6 +182,10 @@ save_hotkey = {hotkey}
 # Where clips are saved; empty is Videos\afterglow.
 output_dir = {output_dir}
 
+# Clip names, as in glint: {{date}} {{time}} {{app}} (the app in front when you save) {{title}} and
+# {{kind}} are filled in, / makes folders. "{{app}}/{{app}}_{{date}}_{{time}}" sorts clips by game.
+file_name = {file_name}
+
 # 0 is the primary monitor; 1, 2, … the monitors in the order Windows lists them.
 monitor = {monitor}
 
@@ -189,6 +204,10 @@ max_memory_mb = {memory}
 # Start afterglow when you sign in to Windows.
 launch_at_startup = {autostart}
 
+# Where notes show on the recorded monitor: top_left, top, top_right, bottom_left, bottom or
+# bottom_right.
+note_position = "{place}"
+
 # What players call tracks 1-6; an empty name is made from the track's sources.
 audio_track_names = [{names}]
 
@@ -199,16 +218,62 @@ audio_track_names = [{names}]
             length = self.length,
             hotkey = q(&self.save_hotkey),
             output_dir = q(&self.output_dir),
+            file_name = q(&self.file_name),
             monitor = self.monitor,
             fps = self.fps,
             bitrate = self.bitrate,
             quality = self.quality,
             memory = self.max_memory_mb,
             autostart = self.launch_at_startup,
+            place = self.note_position.name(),
             names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
     }
 }
+
+/// A corner, or the middle of the top or bottom edge, of a monitor.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Place {
+    TopLeft,
+    Top,
+    TopRight,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl Place {
+    pub const ALL: [Place; 6] = [Place::TopLeft, Place::Top, Place::TopRight, Place::BottomLeft, Place::Bottom, Place::BottomRight];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Place::TopLeft => "top_left",
+            Place::Top => "top",
+            Place::TopRight => "top_right",
+            Place::BottomLeft => "bottom_left",
+            Place::Bottom => "bottom",
+            Place::BottomRight => "bottom_right",
+        }
+    }
+
+    /// Where a `w` × `h` box goes in `area`, `margin` in from its edges.
+    pub fn at(self, area: Rect, (w, h): (i32, i32), margin: i32) -> Rect {
+        let x = match self {
+            Place::TopLeft | Place::BottomLeft => area.x + margin,
+            Place::Top | Place::Bottom => area.x + (area.w - w) / 2,
+            Place::TopRight | Place::BottomRight => area.right() - w - margin,
+        };
+        let y = match self {
+            Place::TopLeft | Place::Top | Place::TopRight => area.y + margin,
+            _ => area.bottom() - h - margin,
+        };
+        Rect { x, y, w, h }
+    }
+}
+
+/// afterglow's file naming: `afterglow_<date>_<time>` until a pattern is set.
+pub const NAMES: Names = Names { default: "afterglow_{date}_{time}", fallback: "afterglow" };
 
 pub fn default_output_dir() -> PathBuf {
     videos().unwrap_or_else(|| app_dir_for(APP)).join(APP)
@@ -235,6 +300,7 @@ mod tests {
             length: 300,
             save_hotkey: "Ctrl+Shift+F9".into(),
             output_dir: r#"D:\clips "best""#.into(),
+            file_name: "{app}/{app} {title}_{date}".into(),
             monitor: 2,
             fps: 0,
             codec: CodecName::Hevc,
@@ -242,6 +308,7 @@ mod tests {
             quality: 18,
             max_memory_mb: 4096,
             launch_at_startup: true,
+            note_position: Place::Bottom,
             buffer: false,
             ..Config::default()
         };
@@ -260,10 +327,27 @@ mod tests {
     }
 
     #[test]
+    fn notes_sit_in_their_corner_or_middle() {
+        let area = Rect { x: -1920, y: 0, w: 1920, h: 1040 };
+        let at = |p: Place| p.at(area, (200, 50), 24);
+        assert_eq!(at(Place::TopLeft), Rect { x: -1896, y: 24, w: 200, h: 50 });
+        assert_eq!(at(Place::Top), Rect { x: -1060, y: 24, w: 200, h: 50 });
+        assert_eq!(at(Place::TopRight), Rect { x: -224, y: 24, w: 200, h: 50 });
+        assert_eq!(at(Place::Bottom), Rect { x: -1060, y: 966, w: 200, h: 50 });
+        assert_eq!(at(Place::BottomRight), Rect { x: -224, y: 966, w: 200, h: 50 });
+        for p in Place::ALL {
+            let r = at(p);
+            assert!(r.x >= area.x && r.right() <= area.right() && r.y >= area.y && r.bottom() <= area.bottom(), "{p:?}");
+        }
+    }
+
+    #[test]
     fn bad_values_are_named() {
         let bad = Config { length: 2, ..Config::default() };
         assert!(bad.check().unwrap_err().contains("length"));
         let bad = Config { save_hotkey: "Alt+Nope".into(), ..Config::default() };
         assert!(bad.check().unwrap_err().contains("save_hotkey"));
+        let bad = Config { file_name: "clips/../a:b".into(), ..Config::default() };
+        assert!(bad.check().unwrap_err().contains("file_name"));
     }
 }

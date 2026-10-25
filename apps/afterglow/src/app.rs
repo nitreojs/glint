@@ -9,12 +9,17 @@ use glint_core::format::human_duration;
 use glint_core::geom::rect::Rect;
 use glint_core::record::replay::Clip;
 use glint_core::icon::icon_pixels;
+use glint_core::history::Kind as HistoryKind;
 use glint_core::log::log;
+use glint_core::naming::{Naming, Source, Subject};
 use glint_core::record::pipeline::Outcome;
 use glint_core::wide::wide;
+use glint_shell::afterglow::{MAIN_CLASS, WM_NOTE_CAPTURABLE};
+use glint_shell::identity::identify;
+use glint_shell::time::date_time;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use glint_shell::{autostart, explorer, hotkey, instance, window};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -24,17 +29,17 @@ use windows::core::{PCWSTR, w};
 
 use crate::buffer::{self, Buffer, Notify};
 use crate::note::{self, Kind};
-use crate::config::{APP, Config};
+use crate::config::{APP, Config, NAMES, Place};
 use crate::settings::SETTINGS_ARG;
 
-/// Window class of the hidden main window: glint (or anything) posts [`WM_SAVE_REPLAY`] to it.
-pub const MAIN_CLASS: &str = "afterglow_main";
 /// The settings window saved: re-read config.toml.
 pub const WM_RELOAD: u32 = WM_APP + 20;
 /// WPARAM 1: let go of the save hotkey (the settings window is recording a new one); 0: take it back.
 pub const WM_HOTKEY_PAUSE: u32 = WM_APP + 21;
 /// Save the replay now, from another process.
 pub const WM_SAVE_REPLAY: u32 = WM_APP + 30;
+/// The settings window picked where notes go: show a sample at `Place::ALL[WPARAM]`.
+pub const WM_PREVIEW_NOTE: u32 = WM_APP + 22;
 
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SAVED: u32 = WM_APP + 2;
@@ -45,6 +50,34 @@ const TIP_TIMER: usize = 2;
 const CLICK_TIMER: usize = 3;
 
 /// afterglow's accent: the tray icon while buffering, the settings window.
+/// A clip cut from the buffer, the monitor it shows and its file name below the output folder.
+struct Cut {
+    clip: Clip,
+    monitor: Rect,
+    name: PathBuf,
+}
+
+/// The app whose window is in front, when that window is on `monitor`; None for the desktop
+/// and the taskbar, which name clips after the screen.
+fn front_app(monitor: Rect) -> Option<Source> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(hwnd, &mut class) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"].contains(&class.as_str()) {
+            return None;
+        }
+        let mut r = RECT::default();
+        GetWindowRect(hwnd, &mut r).ok()?;
+        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+        if !monitor.contains(cx, cy) {
+            return None;
+        }
+        identify(hwnd)
+    }
+}
+
 pub const AMBER: [u8; 3] = [0xF5, 0x9E, 0x0B];
 const GREY: [u8; 3] = [0x7A, 0x77, 0x72];
 
@@ -70,10 +103,13 @@ struct App {
     /// The session is locked or the PC is going to sleep: nothing to record until it's back.
     away: bool,
     hotkey: bool,
-    /// A save is being written: how long the clip is (seconds), and the monitor it's of.
-    saving: Option<(f64, Rect)>,
+    /// A save is being written: how long the clip is ("0:42 of 1:00" when the memory cap cut
+    /// it short), and the monitor it's of.
+    saving: Option<(String, Rect)>,
+    /// The memory cap cutting a clip short was explained once already.
+    told_cap: bool,
     /// A click on the tray icon cut this clip; it's saved unless the click turns into a double click.
-    clicked: Option<(Clip, Rect)>,
+    clicked: Option<Cut>,
     last_saved: Option<PathBuf>,
     taskbar_created: u32,
     /// Restarts in a row that failed, so the error is announced once.
@@ -143,10 +179,15 @@ impl App {
         }
     }
 
-    /// The last stretch of the buffer, cut now, and the monitor it's of.
-    fn cut(&self) -> Option<(Clip, Rect)> {
+    /// The last stretch of the buffer, cut now, named after now and the app in front.
+    fn cut(&self) -> Option<Cut> {
         let b = self.buffer.as_ref()?;
-        Some((b.clip()?, b.monitor()))
+        let (clip, monitor) = (b.clip()?, b.monitor());
+        let front = front_app(monitor);
+        let subject = front.as_ref().map_or(Subject::Screen, Subject::Window);
+        let (date, time) = date_time();
+        let naming = Naming { date: &date, time: &time, kind: HistoryKind::Recording, subject };
+        Some(Cut { clip, monitor, name: NAMES.expand(&self.cfg.file_name, &naming) })
     }
 
     fn save(&mut self) {
@@ -156,37 +197,61 @@ impl App {
         }
     }
 
-    fn nothing_yet(&self) {
+    /// The monitor being recorded, or the one that will be.
+    fn recorded_monitor(&self) -> Option<Rect> {
         let kept = self.buffer.as_ref().map(Buffer::monitor);
-        let monitor = kept.or_else(|| buffer::monitor(self.cfg.monitor).ok().map(|o| o.rect));
-        if let Some(m) = monitor {
-            note::show(m, Kind::Failed, "nothing to save yet", "the buffer is still empty");
+        kept.or_else(|| buffer::monitor(self.cfg.monitor).ok().map(|o| o.rect))
+    }
+
+    fn preview_note(&self, place: Place) {
+        if let Some(m) = self.recorded_monitor() {
+            note::show(m, place, Kind::Saved, "notes show here", "like this one, when a clip is saved");
         }
     }
 
-    fn write(&mut self, (clip, monitor): (Clip, Rect)) {
+    fn nothing_yet(&self) {
+        if let Some(m) = self.recorded_monitor() {
+            note::show(m, self.cfg.note_position, Kind::Failed, "nothing to save yet", "the buffer is still empty");
+        }
+    }
+
+    fn write(&mut self, Cut { clip, monitor, name }: Cut) {
         if self.saving.is_some() {
             return;
         }
         let secs = clip.duration as f64 / 1e7;
         log(&format!("saving {secs:.1} s"));
-        self.saving = Some((secs, monitor));
-        note::show(monitor, Kind::Saving, &format!("saving the last {}", human_duration(secs)), APP);
-        buffer::save(clip, self.cfg.output_dir(), Notify::new(self.hwnd, WM_SAVED));
+        let mut long = human_duration(secs);
+        if clip.capped {
+            let length = human_duration(self.cfg.length as f64);
+            log(&format!("the memory cap ({} MB) held {secs:.1} s of {} s", self.cfg.max_memory_mb, self.cfg.length));
+            long = format!("{long} of {length}");
+            if !std::mem::replace(&mut self.told_cap, true) {
+                let text = format!(
+                    "{} MB held only {} of the {length} asked for. raise memory in settings → video, or lower the quality.",
+                    self.cfg.max_memory_mb,
+                    human_duration(secs)
+                );
+                self.notify("afterglow: the memory cap cut the clip short", &text, false);
+            }
+        }
+        note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
+        self.saving = Some((long, monitor));
+        buffer::save(clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
     }
 
     fn saved(&mut self, result: Result<PathBuf, String>) {
-        let Some((secs, monitor)) = self.saving.take() else { return };
+        let Some((long, monitor)) = self.saving.take() else { return };
         match result {
             Ok(path) => {
                 log(&format!("saved {}", path.display()));
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                note::show(monitor, Kind::Saved, &format!("saved the last {}", human_duration(secs)), &name);
+                note::show(monitor, self.cfg.note_position, Kind::Saved, &format!("saved the last {long}"), &name);
                 self.last_saved = Some(path);
             }
             Err(e) => {
                 log(&format!("save failed: {e}"));
-                note::show(monitor, Kind::Failed, "couldn't save", "see the notification for why");
+                note::show(monitor, self.cfg.note_position, Kind::Failed, "couldn't save", "see the notification for why");
                 self.notify("afterglow: couldn't save", &e, true);
             }
         }
@@ -422,6 +487,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(App::save);
             return LRESULT(0);
         }
+        WM_PREVIEW_NOTE => {
+            if let Some(&place) = Place::ALL.get(wp.0) {
+                with_app(|a| a.preview_note(place));
+            }
+            return LRESULT(0);
+        }
+        WM_NOTE_CAPTURABLE => return LRESULT(note::set_capturable(wp.0 == 1) as isize),
         WM_SAVED => {
             let result = unsafe { buffer::take::<Result<PathBuf, String>>(lp) };
             with_app(|a| a.saved(result));
@@ -511,6 +583,7 @@ pub fn run() {
         away: false,
         hotkey: false,
         saving: None,
+        told_cap: false,
         clicked: None,
         last_saved: None,
         taskbar_created: window::taskbar_created(),

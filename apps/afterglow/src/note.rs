@@ -1,6 +1,7 @@
-//! The note over everything when a clip is saved, like nvidia's instant replay: a pill at the
-//! top right of the recorded monitor that fades in, says what happened and fades out. Clicks go
-//! through it, it never takes focus, and it's kept out of capture, so the buffer never has it.
+//! The note over everything when a clip is saved, like nvidia's instant replay: a pill in a
+//! corner (or at the top or bottom middle) of the recorded monitor that fades in, says what happened and fades out. Clicks go
+//! through it, it never takes focus, and it's kept out of capture, so the buffer never has it;
+//! glint's screenshots let it in ([`set_capturable`]).
 //!
 //! It's a DWM glass window (per-pixel alpha from Direct2D) that's also layered, for the fade and
 //! the click-through: capture exclusion refuses windows drawn with `UpdateLayeredWindow`.
@@ -10,8 +11,10 @@ use std::time::{Duration, Instant};
 
 use glint_core::geom::rect::Rect;
 use glint_core::log::log;
+use crate::config::Place;
 use glint_shell::gfx::{Canvas, Painter, make_glass, rgba};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint};
 use windows::Win32::Graphics::Direct2D::ID2D1HwndRenderTarget;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -47,14 +50,29 @@ thread_local! {
     static NOTE: RefCell<Option<Note>> = const { RefCell::new(None) };
 }
 
-/// Shows `title` and `detail` on `monitor` (desktop coordinates), replacing a note already up.
-pub fn show(monitor: Rect, kind: Kind, title: &str, detail: &str) {
-    if let Err(e) = open(monitor, kind, title, detail) {
+/// Lets screen capture see the note that's up (`on`), or keeps it out again; whether one is up.
+pub fn set_capturable(on: bool) -> bool {
+    NOTE.with(|n| match n.borrow().as_ref() {
+        Some(note) => {
+            let affinity = if on { WDA_NONE } else { WDA_EXCLUDEFROMCAPTURE };
+            if let Err(e) = unsafe { SetWindowDisplayAffinity(note.hwnd, affinity) } {
+                log(&format!("note: SetWindowDisplayAffinity failed: {e}"));
+            }
+            true
+        }
+        None => false,
+    })
+}
+
+/// Shows `title` and `detail` at `place` on `monitor` (desktop coordinates), replacing a note
+/// already up.
+pub fn show(monitor: Rect, place: Place, kind: Kind, title: &str, detail: &str) {
+    if let Err(e) = open(monitor, place, kind, title, detail) {
         log(&format!("can't show the note: {e}"));
     }
 }
 
-fn open(monitor: Rect, kind: Kind, title: &str, detail: &str) -> Result<(), String> {
+fn open(monitor: Rect, place: Place, kind: Kind, title: &str, detail: &str) -> Result<(), String> {
     let painter = Painter::new()?;
     let (big, small) = (painter.font(14.0)?, painter.font(11.5)?);
     let s = painter.scale;
@@ -68,7 +86,7 @@ fn open(monitor: Rect, kind: Kind, title: &str, detail: &str) -> Result<(), Stri
     };
     let saving = matches!(kind, Kind::Saving);
     let margin = painter.px(24.0) as i32;
-    let at = Rect { x: monitor.right() - w as i32 - margin, y: monitor.y + margin, w: w as i32, h: h as i32 };
+    let at = place.at(work_area(monitor), (w as i32, h as i32), margin);
 
     // a note already up is replaced in place, without fading in again
     let since = match NOTE.with(|n| n.borrow_mut().take()) {
@@ -107,6 +125,19 @@ fn open(monitor: Rect, kind: Kind, title: &str, detail: &str) -> Result<(), Stri
         SetTimer(Some(hwnd), TIMER, 16, None);
     }
     Ok(())
+}
+
+/// `monitor` without the taskbar, so notes at the bottom clear it.
+fn work_area(monitor: Rect) -> Rect {
+    unsafe {
+        let centre = POINT { x: monitor.x + monitor.w / 2, y: monitor.y + monitor.h / 2 };
+        let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+        if !GetMonitorInfoW(MonitorFromPoint(centre, MONITOR_DEFAULTTONEAREST), &mut info).as_bool() {
+            return monitor;
+        }
+        let r = info.rcWork;
+        Rect::from_points(r.left, r.top, r.right, r.bottom)
+    }
 }
 
 fn draw(

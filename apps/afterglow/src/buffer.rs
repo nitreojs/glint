@@ -130,13 +130,14 @@ impl Buffer {
     }
 }
 
-/// Writes `clip` to a new file in `dir` on its own thread; `done` hears the path or the error.
-pub fn save(clip: Clip, dir: PathBuf, done: Notify) {
+/// Writes `clip` to `dir`/`name`.mp4 (or `name_2.mp4`… when taken) on its own thread; `done`
+/// hears the path or the error.
+pub fn save(clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
     std::thread::spawn(move || {
         let result = unsafe {
             let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
             let mf = MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok();
-            let r = write(clip, &dir);
+            let r = write(clip, &dir.join(name));
             if mf {
                 let _ = MFShutdown();
             }
@@ -149,16 +150,18 @@ pub fn save(clip: Clip, dir: PathBuf, done: Notify) {
     });
 }
 
-fn write(clip: Clip, dir: &Path) -> Result<PathBuf, String> {
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let (date, time) = glint_shell::time::date_time();
-    let mut path = dir.join(format!("afterglow_{date}_{time}.mp4"));
-    for n in 2.. {
-        if !path.exists() {
-            break;
-        }
-        path = dir.join(format!("afterglow_{date}_{time}_{n}.mp4"));
+fn write(clip: Clip, stem: &Path) -> Result<PathBuf, String> {
+    if let Some(dir) = stem.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
+    let named = |suffix: &str| {
+        let mut p = stem.as_os_str().to_owned();
+        p.push(suffix);
+        p.push(".mp4");
+        PathBuf::from(p)
+    };
+    let path = std::iter::once(named("")).chain((2..).map(|n| named(&format!("_{n}")))).find(|p| !p.exists());
+    let path = path.expect("some number is free");
     let mut sink = Mp4Sink::create(&path)?;
     clip.write(&mut sink).inspect_err(|_| {
         let _ = std::fs::remove_file(&path);

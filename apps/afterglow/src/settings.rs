@@ -10,14 +10,17 @@ use glint_shell::{explorer, monitors, window};
 use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
 use glint_ui::audio::AudioEditor;
 use glint_ui::capture::{Recorder, held_names, key_names};
+use glint_ui::naming::{self, About};
 use glint_ui::settings::{self as frame, Pages};
 use glint_ui::widgets::{self, HotkeyState, Kind, Look, hint, row};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_SHOWNORMAL, SetForegroundWindow};
 use windows::core::{HSTRING, w};
 
-use crate::app::{AMBER, MAIN_CLASS, WM_HOTKEY_PAUSE, WM_RELOAD};
-use crate::config::{APP, Config, LENGTHS, MEMORY_CAPS, default_output_dir};
+use glint_shell::afterglow::MAIN_CLASS;
+
+use crate::app::{AMBER, WM_HOTKEY_PAUSE, WM_PREVIEW_NOTE, WM_RELOAD};
+use crate::config::{APP, Config, LENGTHS, MEMORY_CAPS, NAMES, Place, default_output_dir};
 
 pub const SETTINGS_ARG: &str = "--settings";
 const TITLE: &str = "afterglow settings";
@@ -155,10 +158,23 @@ impl Settings {
             ui.add_space(2.0);
             hint(ui, "saved clips go here. leave empty for the default.", t3);
         });
+        let about = About {
+            window: "files start with the app in front when you save, like deadlock_…; the desktop is screen_…",
+            folders: "a folder per game or app; the desktop goes to screen",
+        };
+        naming::rows(ui, look, &NAMES, &mut self.cfg.file_name, &about);
         row(ui, look, "launch at startup", 1.0, |ui| {
             let text = if self.cfg.launch_at_startup { "on" } else { "off" };
             widgets::toggle(ui, look, &mut self.cfg.launch_at_startup, text);
             hint(ui, "afterglow starts in the tray when you sign in to windows", t3);
+        });
+        row(ui, look, "notes", 7.0, |ui| {
+            if let Some(place) = place_picker(ui, look, self.cfg.note_position) {
+                self.cfg.note_position = place;
+                let at = Place::ALL.iter().position(|&p| p == place).unwrap_or(0);
+                window::post(MAIN_CLASS, WM_PREVIEW_NOTE, at);
+            }
+            hint(ui, "where \"saved\" shows on the recorded monitor; a click shows a sample there", t3);
         });
     }
 
@@ -311,6 +327,7 @@ impl Settings {
                     + n(a.length == b.length)
                     + n(a.save_hotkey == b.save_hotkey)
                     + n(a.output_dir == b.output_dir)
+                    + n(a.file_name == b.file_name)
                     + n(a.launch_at_startup == b.launch_at_startup)
             }
             Page::Video => {
@@ -371,6 +388,7 @@ impl Pages for Settings {
                 c.length = d.length;
                 c.save_hotkey = d.save_hotkey;
                 c.output_dir = d.output_dir;
+                c.file_name = d.file_name;
                 c.launch_at_startup = d.launch_at_startup;
             }
             Page::Video => {
@@ -403,7 +421,7 @@ impl Pages for Settings {
     }
 
     fn can_save(&self) -> bool {
-        !self.keys.listening()
+        !self.keys.listening() && glint_core::naming::pattern_problem(&self.cfg.file_name).is_none()
     }
 
     fn save(&mut self) -> bool {
@@ -446,6 +464,35 @@ impl Pages for Settings {
         }
         self.licences
     }
+}
+
+/// A little screen with the six places a note can go; the one clicked, if one was.
+fn place_picker(ui: &mut Ui, look: &Look, current: Place) -> Option<Place> {
+    let p = look.p;
+    let amber = egui::Color32::from_rgb(AMBER[0], AMBER[1], AMBER[2]);
+    let (screen, _) = ui.allocate_exact_size(egui::vec2(150.0, 84.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect(screen, 6.0, p.field, egui::Stroke::new(1.0, p.line2), egui::StrokeKind::Inside);
+    let mut picked = None;
+    for place in Place::ALL {
+        let (w, h, margin) = (34.0, 9.0, 8.0);
+        let area = glint_core::geom::rect::Rect { x: 0, y: 0, w: screen.width() as i32, h: screen.height() as i32 };
+        let at = place.at(area, (w as i32, h as i32), margin as i32);
+        let pill = egui::Rect::from_min_size(screen.min + egui::vec2(at.x as f32, at.y as f32), egui::vec2(w, h));
+        let id = Id::unique(("note-place", place.name()));
+        let r = ui.interact(pill.expand(7.0), id, egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        let on = place == current;
+        let fill = match (on, r.hovered()) {
+            (true, _) => amber,
+            (false, true) => p.t3,
+            (false, false) => p.line3,
+        };
+        ui.painter().rect_filled(pill, h / 2.0, fill);
+        if r.clicked() {
+            picked = Some(place);
+        }
+    }
+    picked
 }
 
 #[cfg(test)]
