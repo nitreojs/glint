@@ -296,6 +296,7 @@ fn run(
         let mut processor = None;
         let mut burner = None;
         let mut key_burner = None;
+        let mut ticks = 0;
         targets[video as usize] = Some(match job.video {
             Video::Copy => {
                 let native = &streams[video as usize].2;
@@ -314,7 +315,8 @@ fn run(
                 burner = job.burn.as_ref().map(|b| Burner::new(b, area, size));
                 key_burner = job.keys.as_ref().map(|k| KeyBurner::new(k, size));
                 let enc = encoder_settings(bitrate, qp, effort, rate)?;
-                Target::Encode(video_stream(&writer, codec, subtype, size, rate, bitrate, &enc)?)
+                ticks = milli(rate);
+                Target::Encode(video_stream(&writer, codec, subtype, size, ticks, bitrate, &enc)?)
             }
         });
         let (silent_rate, silent_channels) = silence_format(&reader, info, job);
@@ -357,6 +359,9 @@ fn run(
                 sample.SetSampleDuration(d).ctx("SetSampleDuration")?;
             }
             writer.WriteSample(stream, sample).ctx("WriteSample")
+        };
+        let encode = |stream: u32, sample: &IMFSample, ts: i64, dur: Option<i64>| {
+            write(stream, sample, up_to_tick(ts, ticks), dur)
         };
         let frame = |s: &IMFSample, t: i64| -> Result<IMFSample, String> {
             let out = match &processor {
@@ -410,13 +415,13 @@ fn run(
                             Some(Target::Encode(w)) => {
                                 if let (Some(fps), Some(prev)) = (grid, &pending) {
                                     tick = on_grid(fps, tick, seg.len(), |t0, t1| {
-                                        write(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0))
+                                        encode(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0))
                                     })?;
                                     started = true;
                                 } else if let Some(h) = held.take() {
                                     let d = media::duration(&h.sample);
                                     let stop = if d > 0 { (h.ts + d).min(seg.end) } else { seg.end };
-                                    write(w, &frame(&h.sample, seg.start)?, base, Some((stop - seg.start).max(1)))?;
+                                    encode(w, &frame(&h.sample, seg.start)?, base, Some((stop - seg.start).max(1)))?;
                                     started = true;
                                 }
                             }
@@ -473,7 +478,7 @@ fn run(
                         if let Some(prev) = &pending {
                             let until = ts.min(seg.end) - seg.start;
                             let before = tick;
-                            tick = on_grid(fps, tick, until, |t0, t1| write(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0)))?;
+                            tick = on_grid(fps, tick, until, |t0, t1| encode(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0)))?;
                             started |= tick > before;
                             p.set(base + until, total);
                         }
@@ -489,13 +494,13 @@ fn run(
                             }
                             started = true;
                             if let Some(h) = held.take() {
-                                write(w, &frame(&h.sample, seg.start)?, base, Some(ts.min(seg.end) - seg.start))?;
+                                encode(w, &frame(&h.sample, seg.start)?, base, Some(ts.min(seg.end) - seg.start))?;
                             }
                         }
                         let dur = media::duration(&sample);
                         done |= seg.end - ts < dur / 2;
                         if !done {
-                            write(w, &frame(&sample, ts)?, out_ts(ts), (dur > 0).then(|| dur.min(seg.end - ts)))?;
+                            encode(w, &frame(&sample, ts)?, out_ts(ts), (dur > 0).then(|| dur.min(seg.end - ts)))?;
                             p.set(out_ts(ts), total);
                         }
                     }
@@ -554,10 +559,11 @@ fn copy_of(s: &IMFSample) -> Result<IMFSample, String> {
 }
 
 /// The encoder's rate control: `qp` held at the best quality for the time (compressing), or `bitrate` with
-/// short peaks allowed at `effort`.
+/// short peaks allowed at `effort`. No b-frames: windows' software h.264 encoder would add them, and the mp4 then
+/// shows every frame at the next one's time (one frame late, and off its own time when the frames come unevenly).
 unsafe fn encoder_settings(bitrate: u32, qp: Option<u32>, effort: u32, fps: f64) -> Result<IMFAttributes, String> {
     unsafe {
-        let enc = attributes(5)?;
+        let enc = attributes(6)?;
         if let Some(qp) = qp {
             let mode = eAVEncCommonRateControlMode_Quality.0 as u32;
             enc.SetUINT32(&CODECAPI_AVEncCommonRateControlMode, mode).ctx("enc")?;
@@ -571,8 +577,24 @@ unsafe fn encoder_settings(bitrate: u32, qp: Option<u32>, effort: u32, fps: f64)
             enc.SetUINT32(&CODECAPI_AVEncCommonQualityVsSpeed, effort.min(100)).ctx("enc")?;
         }
         enc.SetUINT32(&CODECAPI_AVEncMPVGOPSize, (fps * 2.0).round() as u32).ctx("enc")?;
+        enc.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0).ctx("enc")?;
         Ok(enc)
     }
+}
+
+/// The frame rate in thousandths, as the media types carry it. The mp4 sink also counts the track's time in that many
+/// ticks per second (measured).
+fn milli(fps: f64) -> u32 {
+    (fps * 1000.0).round() as u32
+}
+
+/// `t` moved up onto the next of `per_second` ticks. Off a tick the sink can round a frame up to a tick early (seen
+/// on the gpu: 27.774 ms for a frame at 27.778), and a frame a hair early stands in for the one before it to anything
+/// matching frames by time.
+fn up_to_tick(t: i64, per_second: u32) -> i64 {
+    let (s, n) = (SECOND as i128, per_second.max(1) as i128);
+    let k = (t as i128 * n + s - 1).div_euclid(s);
+    (k * s + n - 1).div_euclid(n) as i64
 }
 
 unsafe fn video_stream(
@@ -580,7 +602,7 @@ unsafe fn video_stream(
     codec: Codec,
     input: GUID,
     size: (u32, u32),
-    fps: f64,
+    fps_milli: u32,
     bitrate: u32,
     enc: &IMFAttributes,
 ) -> Result<u32, String> {
@@ -590,7 +612,6 @@ unsafe fn video_stream(
             Codec::H264 => (MFVideoFormat_H264, eAVEncH264VProfile_High.0 as u32),
             Codec::Hevc => (MFVideoFormat_HEVC, eAVEncH265VProfile_Main_420_8.0 as u32),
         };
-        let fps_milli = (fps * 1000.0).round() as u32;
         let out_t = MFCreateMediaType().ctx("MFCreateMediaType")?;
         out_t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video).ctx("mt")?;
         out_t.SetGUID(&MF_MT_SUBTYPE, &subtype).ctx("mt")?;
