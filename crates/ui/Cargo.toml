@@ -8,6 +8,7 @@ repository.workspace = true
 eframe.workspace = true
 glint-core.workspace = true
 glint-media.workspace = true
+glint-shell.workspace = true
 raw-window-handle.workspace = true
 windows.workspace = true
 

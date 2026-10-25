@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::naming::{DEFAULT_PATTERN, pattern_problem};
+use crate::naming::{GLINT, pattern_problem};
 use crate::paths::app_dir;
 use crate::record::Codec;
 use crate::record::keys::Position;
@@ -197,7 +197,7 @@ impl Default for Config {
             ui_elements: UiElements::Shift,
             notify_success: true,
             output_dir: String::new(),
-            file_name: DEFAULT_PATTERN.into(),
+            file_name: GLINT.default.into(),
             fps: 0,
             codec: CodecName::H264,
             quality: 22,

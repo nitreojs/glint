@@ -33,7 +33,15 @@ pub struct Naming<'a> {
     pub subject: Subject<'a>,
 }
 
-pub const DEFAULT_PATTERN: &str = "glint_{date}_{time}";
+/// An app's file naming: the pattern used while none is set, and the name a file falls back to
+/// when its pattern fills in to nothing.
+#[derive(Clone, Copy, Debug)]
+pub struct Names {
+    pub default: &'static str,
+    pub fallback: &'static str,
+}
+
+pub const GLINT: Names = Names { default: "glint_{date}_{time}", fallback: "glint" };
 /// The file part of the pattern "name files after the window" sets.
 pub const WINDOW_NAME: &str = "{app}_{date}_{time}";
 /// The folder "sort into folders by app" puts in front.
@@ -75,23 +83,6 @@ pub fn sanitize(text: &str, max: usize) -> String {
     let words: Vec<&str> = clean.split_whitespace().collect();
     let joined: String = words.join(" ").chars().take(max).collect();
     joined.trim_end_matches(['.', ' ']).trim_start().to_string()
-}
-
-/// The capture's path below the output folder, without the extension: folders from the
-/// pattern's `/`, then the file name.
-pub fn expand(pattern: &str, n: &Naming) -> PathBuf {
-    let pattern = match pattern.trim() {
-        "" => DEFAULT_PATTERN,
-        p => p,
-    };
-    let segments: Vec<&str> = pattern.split('/').map(str::trim).filter(|s| !s.is_empty()).collect();
-    let last = segments.len().saturating_sub(1);
-    let mut path = PathBuf::new();
-    for (i, segment) in segments.iter().enumerate() {
-        let folder = i < last;
-        path.push(finish(&fill(segment, n, folder), if folder { "other" } else { "glint" }));
-    }
-    path
 }
 
 /// The pattern's tokens filled in; unknown `{...}` stays as typed.
@@ -159,36 +150,52 @@ fn split_last(pattern: &str) -> (&str, &str) {
     }
 }
 
-fn or_default(pattern: &str) -> &str {
-    match pattern.trim() {
-        "" => DEFAULT_PATTERN,
-        p => p,
+impl Names {
+    /// The capture's path below the output folder, without the extension: folders from the
+    /// pattern's `/`, then the file name.
+    pub fn expand(&self, pattern: &str, n: &Naming) -> PathBuf {
+        let pattern = self.or_default(pattern);
+        let segments: Vec<&str> = pattern.split('/').map(str::trim).filter(|s| !s.is_empty()).collect();
+        let last = segments.len().saturating_sub(1);
+        let mut path = PathBuf::new();
+        for (i, segment) in segments.iter().enumerate() {
+            let folder = i < last;
+            path.push(finish(&fill(segment, n, folder), if folder { "other" } else { self.fallback }));
+        }
+        path
     }
-}
 
-/// Whether file names are the window's app with the date and time.
-pub fn names_after_window(pattern: &str) -> bool {
-    split_last(or_default(pattern)).1.trim() == WINDOW_NAME
-}
+    fn or_default<'a>(&self, pattern: &'a str) -> &'a str {
+        match pattern.trim() {
+            "" => self.default,
+            p => p,
+        }
+    }
 
-/// `pattern` with its file part named after the window (`on`) or back to the default.
-pub fn with_window_names(pattern: &str, on: bool) -> String {
-    let (folders, _) = split_last(or_default(pattern));
-    format!("{folders}{}", if on { WINDOW_NAME } else { DEFAULT_PATTERN })
-}
+    /// Whether file names are the window's app with the date and time.
+    pub fn names_after_window(&self, pattern: &str) -> bool {
+        split_last(self.or_default(pattern)).1.trim() == WINDOW_NAME
+    }
 
-/// Whether captures go to a folder per app.
-pub fn sorted_by_app(pattern: &str) -> bool {
-    or_default(pattern).starts_with(APP_FOLDER)
-}
+    /// `pattern` with its file part named after the window (`on`) or back to the default.
+    pub fn with_window_names(&self, pattern: &str, on: bool) -> String {
+        let (folders, _) = split_last(self.or_default(pattern));
+        format!("{folders}{}", if on { WINDOW_NAME } else { self.default })
+    }
 
-/// `pattern` with or without the per-app folder in front.
-pub fn with_app_folders(pattern: &str, on: bool) -> String {
-    let pattern = or_default(pattern);
-    match (on, pattern.strip_prefix(APP_FOLDER)) {
-        (true, None) => format!("{APP_FOLDER}{pattern}"),
-        (false, Some(rest)) => rest.to_string(),
-        _ => pattern.to_string(),
+    /// Whether captures go to a folder per app.
+    pub fn sorted_by_app(&self, pattern: &str) -> bool {
+        self.or_default(pattern).starts_with(APP_FOLDER)
+    }
+
+    /// `pattern` with or without the per-app folder in front.
+    pub fn with_app_folders(&self, pattern: &str, on: bool) -> String {
+        let pattern = self.or_default(pattern);
+        match (on, pattern.strip_prefix(APP_FOLDER)) {
+            (true, None) => format!("{APP_FOLDER}{pattern}"),
+            (false, Some(rest)) => rest.to_string(),
+            _ => pattern.to_string(),
+        }
     }
 }
 
@@ -203,7 +210,7 @@ mod tests {
     }
 
     fn named(pattern: &str, kind: Kind, subject: Subject) -> PathBuf {
-        expand(pattern, &Naming { date: "2026-10-20", time: "14-32-07", kind, subject })
+        GLINT.expand(pattern, &Naming { date: "2026-10-20", time: "14-32-07", kind, subject })
     }
 
     fn path(parts: &[&str]) -> PathBuf {
@@ -214,7 +221,7 @@ mod tests {
     fn tokens_fill_in() {
         let tg = telegram();
         let win = Subject::Window(&tg);
-        assert_eq!(named(DEFAULT_PATTERN, Kind::Shot, win), path(&["glint_2026-10-20_14-32-07"]));
+        assert_eq!(named(GLINT.default, Kind::Shot, win), path(&["glint_2026-10-20_14-32-07"]));
         assert_eq!(named("  ", Kind::Shot, win), path(&["glint_2026-10-20_14-32-07"]));
         assert_eq!(named(WINDOW_NAME, Kind::Recording, win), path(&["Telegram Desktop_2026-10-20_14-32-07"]));
         assert_eq!(named("{title} {time} {time}", Kind::Shot, win), path(&["Saved Messages 14-32-07 14-32-07"]));
@@ -275,20 +282,20 @@ mod tests {
 
     #[test]
     fn toggles_edit_the_pattern() {
-        assert!(!names_after_window("") && !sorted_by_app(""));
-        let named = with_window_names("", true);
+        assert!(!GLINT.names_after_window("") && !GLINT.sorted_by_app(""));
+        let named = GLINT.with_window_names("", true);
         assert_eq!(named, WINDOW_NAME);
-        assert!(names_after_window(&named));
-        let sorted = with_app_folders(&named, true);
+        assert!(GLINT.names_after_window(&named));
+        let sorted = GLINT.with_app_folders(&named, true);
         assert_eq!(sorted, "{app}/{app}_{date}_{time}");
-        assert!(sorted_by_app(&sorted) && names_after_window(&sorted));
-        assert_eq!(with_app_folders(&sorted, true), sorted);
-        assert_eq!(with_window_names(&sorted, false), "{app}/glint_{date}_{time}");
-        assert_eq!(with_app_folders(&sorted, false), WINDOW_NAME);
-        assert_eq!(with_window_names("{kind}/mine {time}", true), "{kind}/{app}_{date}_{time}");
-        assert_eq!(with_app_folders("mine {time}", true), "{app}/mine {time}");
-        assert_eq!(with_app_folders("mine {time}", false), "mine {time}");
-        let folders = expand(&sorted, &Naming { date: "d", time: "t", kind: Kind::Shot, subject: Subject::Region });
+        assert!(GLINT.sorted_by_app(&sorted) && GLINT.names_after_window(&sorted));
+        assert_eq!(GLINT.with_app_folders(&sorted, true), sorted);
+        assert_eq!(GLINT.with_window_names(&sorted, false), "{app}/glint_{date}_{time}");
+        assert_eq!(GLINT.with_app_folders(&sorted, false), WINDOW_NAME);
+        assert_eq!(GLINT.with_window_names("{kind}/mine {time}", true), "{kind}/{app}_{date}_{time}");
+        assert_eq!(GLINT.with_app_folders("mine {time}", true), "{app}/mine {time}");
+        assert_eq!(GLINT.with_app_folders("mine {time}", false), "mine {time}");
+        let folders = GLINT.expand(&sorted, &Naming { date: "d", time: "t", kind: Kind::Shot, subject: Subject::Region });
         assert_eq!(folders, Path::new("other").join("screen_d_t"));
     }
 }

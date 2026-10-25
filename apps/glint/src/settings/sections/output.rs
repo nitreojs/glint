@@ -1,19 +1,16 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::{self, RichText, Ui};
+use eframe::egui::{self, Ui};
 use glint_core::config::Config;
-use glint_core::history::{self, Kind as HistoryKind};
+use glint_core::history;
 use glint_core::log::log;
-use glint_core::naming::{
-    DEFAULT_PATTERN, Naming, Source, Subject, expand, names_after_window, pattern_problem, sorted_by_app,
-    with_app_folders, with_window_names,
-};
-use glint_ui::widgets::{self, Kind, Look, hint, mono, row};
+use glint_core::naming::GLINT;
+use glint_ui::naming::{self, About};
+use glint_ui::widgets::{self, Kind, Look, hint, row};
 
 use crate::app::ipc;
 use glint_shell::explorer::pick_folder;
-use glint_shell::time::date_time;
 use crate::platform::paths::{old_default_dir, output_dir, previous_output_dir, unused};
 use crate::settings::{SettingsApp, repaint};
 
@@ -207,40 +204,11 @@ impl SettingsApp {
         let shown = folder_saved || running.is_some() || self.mover.result.is_some();
         let any = !self.mover.leftovers.is_empty() || running.is_some() || self.mover.result.is_some();
         widgets::reveal(ui, egui::Id::unique("older-captures"), shown && any, |ui| self.move_row(ui, look, &current, running));
-        let problem = pattern_problem(&self.cfg.file_name);
-        row(ui, look, "file names", 7.0, |ui| {
-            widgets::text_field(ui, look, &mut self.cfg.file_name, DEFAULT_PATTERN, problem.is_some());
-            let (date, time) = date_time();
-            let sample = Source { exe: "Telegram.exe".into(), app: "Telegram Desktop".into(), title: "Saved Messages".into() };
-            let subject = Subject::Window(&sample);
-            let naming = Naming { date: &date, time: &time, kind: HistoryKind::Recording, subject };
-            let example = format!("{}.mp4", expand(&self.cfg.file_name, &naming).display());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(RichText::new("→").font(mono(12.0)).color(p.t3));
-                ui.add(egui::Label::new(RichText::new(example).font(mono(12.0)).color(p.t2)).truncate());
-            });
-            match problem {
-                Some(msg) => hint(ui, msg, p.warn),
-                None => hint(ui, "{date} {time} {app} {title} {kind} are filled in, / makes folders", p.t3),
-            }
-        });
-        row(ui, look, "name files after the window", 1.0, |ui| {
-            let mut on = names_after_window(&self.cfg.file_name);
-            let text = if on { "on" } else { "off" };
-            if widgets::toggle(ui, look, &mut on, text).changed() {
-                self.cfg.file_name = with_window_names(&self.cfg.file_name, on);
-            }
-            hint(ui, "files start with the app you captured, like telegram desktop_…; whole screens are screen_…", p.t3);
-        });
-        row(ui, look, "sort into folders by app", 1.0, |ui| {
-            let mut on = sorted_by_app(&self.cfg.file_name);
-            let text = if on { "on" } else { "off" };
-            if widgets::toggle(ui, look, &mut on, text).changed() {
-                self.cfg.file_name = with_app_folders(&self.cfg.file_name, on);
-            }
-            hint(ui, "a folder per app; whole screens go to screen, regions to other", p.t3);
-        });
+        let about = About {
+            window: "files start with the app you captured, like telegram desktop_…; whole screens are screen_…",
+            folders: "a folder per app; whole screens go to screen, regions to other",
+        };
+        naming::rows(ui, look, &GLINT, &mut self.cfg.file_name, &about);
     }
 
     fn move_row(&mut self, ui: &mut Ui, look: &Look, current: &Path, running: Option<(usize, usize)>) {

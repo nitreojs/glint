@@ -35,7 +35,7 @@ fn user_folder(name: &str) -> PathBuf {
 /// The capture's file name for the settings' pattern, without its folders.
 pub(crate) fn file_name(cfg: &Config, kind: Kind, subject: Subject, ext: &str) -> String {
     let (date, time) = date_time();
-    let path = naming::expand(&cfg.file_name, &Naming { date: &date, time: &time, kind, subject });
+    let path = naming::GLINT.expand(&cfg.file_name, &Naming { date: &date, time: &time, kind, subject });
     format!("{}.{ext}", path.file_name().unwrap_or_default().to_string_lossy())
 }
 
@@ -43,7 +43,7 @@ pub(crate) fn file_name(cfg: &Config, kind: Kind, subject: Subject, ext: &str) -
 /// folders the pattern makes are created.
 pub(crate) fn unique_path(cfg: &Config, kind: Kind, subject: Subject, ext: &str) -> PathBuf {
     let (date, time) = date_time();
-    let named = naming::expand(&cfg.file_name, &Naming { date: &date, time: &time, kind, subject });
+    let named = naming::GLINT.expand(&cfg.file_name, &Naming { date: &date, time: &time, kind, subject });
     let path = output_dir(cfg).join(format!("{}.{ext}", named.display()));
     if let Some(dir) = path.parent()
         && let Err(e) = std::fs::create_dir_all(dir)

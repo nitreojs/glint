@@ -6,6 +6,7 @@ pub mod autostart;
 pub mod explorer;
 pub mod gfx;
 pub mod hotkey;
+pub mod identity;
 pub mod instance;
 pub mod log;
 pub mod monitors;

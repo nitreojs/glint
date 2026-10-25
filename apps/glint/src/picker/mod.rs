@@ -43,7 +43,7 @@ use windows::core::{BOOL, PCWSTR, w};
 use crate::platform::cursor::{self, CursorImage};
 use crate::platform::elements::Elements;
 use glint_shell::gfx::{Painter, animate};
-use crate::platform::identity::identify;
+use glint_shell::identity::identify;
 use crate::platform::windows::{client_rect, visible_windows};
 use crate::shot::Shot;
 use crate::shot::editor::{self, Editor};

@@ -1,5 +1,6 @@
 pub mod audio;
 pub mod capture;
+pub mod naming;
 pub mod settings;
 pub mod theme;
 pub mod widgets;

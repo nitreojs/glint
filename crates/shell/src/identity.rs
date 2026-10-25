@@ -16,8 +16,8 @@ use windows::core::{BOOL, PCWSTR, PWSTR, w};
 const FRAME_HOST: &str = "ApplicationFrameHost.exe";
 
 /// The app behind `hwnd` (its exe, the exe's description, the window title); None when the
-/// process can't be looked at (gone, or elevated while glint isn't).
-pub(crate) fn identify(hwnd: HWND) -> Option<Source> {
+/// process can't be looked at (gone, or elevated while this app isn't).
+pub fn identify(hwnd: HWND) -> Option<Source> {
     let mut path = image_path(pid_of(hwnd)?)?;
     if file_name(&path).eq_ignore_ascii_case(FRAME_HOST)
         && let Some(hosted) = hosted_app(hwnd)

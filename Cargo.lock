@@ -1208,6 +1208,7 @@ dependencies = [
  "eframe",
  "glint-core",
  "glint-media",
+ "glint-shell",
  "raw-window-handle",
  "windows",
 ]
