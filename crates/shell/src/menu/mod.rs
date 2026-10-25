@@ -64,6 +64,8 @@ pub enum Glyph {
     Video,
     /// A frame with a hill: a screenshot.
     Image,
+    /// Four tiles: every capture.
+    Gallery,
     /// An arrow out of a box: open outside.
     Open,
     /// Two overlapping squares.
