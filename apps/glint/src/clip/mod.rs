@@ -49,7 +49,7 @@ use player::{Cmd, Player, Shown};
 use scan::{Found, Scan};
 use clicklane::ClickDrag;
 use keylane::KeyDrag;
-use timeline::{Drag, View};
+use timeline::{Drag, Nudge, View};
 use wave::Waves;
 
 pub const CLIP_ARG: &str = "--clip";
@@ -237,6 +237,9 @@ struct ClipApp {
     lane_menu: Option<(usize, egui::Pos2, Rect)>,
     renaming: Option<(usize, String)>,
     lane_drag: Option<usize>,
+    /// The lane whose volume slider is open, under the volume pill at that rect.
+    volume_pop: Option<(usize, Rect)>,
+    nudge: Option<Nudge>,
     playhead: Glide,
     trim: [Glide; 2],
     click_sel: Vec<usize>,
@@ -339,6 +342,8 @@ impl ClipApp {
             lane_menu: None,
             renaming: None,
             lane_drag: None,
+            volume_pop: None,
+            nudge: None,
             playhead: Glide::new(0),
             trim: [Glide::new(0), Glide::new(duration)],
             click_sel: Vec::new(),
@@ -397,8 +402,8 @@ impl ClipApp {
         let Some(a) = &self.audio else { return };
         a.gains.set_volume(self.saved.volume);
         for k in 0..self.info().map_or(0, |i| i.tracks.len()) {
-            let heard = self.edit.lanes.iter().any(|l| l.source == Some(k) && !l.muted);
-            a.gains.set_track(k, if heard { 1.0 } else { 0.0 });
+            let heard = self.edit.lanes.iter().filter(|l| l.source == Some(k) && !l.muted);
+            a.gains.set_track(k, heard.map(|l| l.gain()).sum());
         }
     }
 
@@ -470,6 +475,7 @@ impl ClipApp {
     }
 
     fn change(&mut self, f: impl FnOnce(&mut Edit) -> bool) -> bool {
+        self.settle_volume(true);
         let before = self.edit.clone();
         let changed = f(&mut self.edit);
         self.undo.record(before, &self.edit);
@@ -930,9 +936,13 @@ impl ClipApp {
                 _ => {}
             }
         }
+        if undo || redo {
+            self.settle_volume(true);
+        }
         if redo && self.undo.redo(&mut self.edit) || undo && self.undo.undo(&mut self.edit) {
             self.selected = None;
             self.lane_menu = None;
+            self.volume_pop = None;
             self.click_menu = None;
             self.click_sel.clear();
             self.key_menu = None;
@@ -1071,6 +1081,7 @@ impl eframe::App for ClipApp {
         self.panel(ui, &look, side);
         self.menu_popup(&ctx, &look, self.save_rect);
         self.lane_menu_popup(&ctx, &look);
+        self.volume_popup(&ctx, &look);
         self.click_menu_popup(&ctx, &look);
         self.key_menu_popup(&ctx, &look);
         self.keys_sheet(&ctx, &look, body);
@@ -1082,6 +1093,8 @@ impl eframe::App for ClipApp {
                 self.renaming = None;
             } else if self.lane_menu.is_some() {
                 self.lane_menu = None;
+            } else if self.volume_pop.is_some() {
+                self.volume_pop = None;
             } else if self.click_menu.is_some() {
                 self.click_menu = None;
             } else if self.key_menu.is_some() {

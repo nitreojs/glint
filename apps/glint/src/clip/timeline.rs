@@ -2,11 +2,11 @@ use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, Id, Mesh, Order, Painter, Rect, Role, Sense, Shape, Stroke, StrokeKind, Ui,
     WidgetInfo, pos2, vec2,
 };
-use glint_core::clip::edit::snap_to;
+use glint_core::clip::edit::{Edit, FULL_VOLUME, MAX_VOLUME, snap_to};
 use glint_core::clip::export::{self, Job, Video};
 use glint_core::clip::info::Info;
 use glint_core::clip::math::{self, SECOND};
-use glint_ui::widgets::{Look, anim, ease, medium, mix, motion, sans};
+use glint_ui::widgets::{Look, anim, ease, medium, mix, mono, motion, sans};
 
 use super::preview::speaker;
 use super::wave::BUCKET;
@@ -31,6 +31,15 @@ const ITEM_H: f32 = 30.0;
 const HEADER: &str = "sound · muted tracks won't be in the file";
 const MUTED: &str = "· muted, not exported";
 const ADD_TEXT: &str = "+ add empty track";
+const VOLUME_TIP: &str = "volume · drag, scroll or click · double-click for 100%";
+/// How far a drag (in percent, a pixel each) has to pull to leave 100 %.
+const DETENT: f32 = 6.0;
+/// Wheel points per percent: one notch (40 points) is 5 %.
+const WHEEL_PX: f32 = 8.0;
+/// A volume gesture this long at rest becomes one undo step.
+const SETTLE: f64 = 0.6;
+const POP_W: f32 = 240.0;
+const POP_H: f32 = 40.0;
 const SNAP_PX: f64 = 8.0;
 const MARKER: Color32 = Color32::from_rgb(0xF5, 0xC0, 0x4A);
 const WAVES: [Color32; 6] = [
@@ -134,6 +143,37 @@ struct Chip {
     dots: Rect,
     resp: egui::Response,
     more: egui::Response,
+    /// The volume pill opened `shown` of the way to `full`; it takes input once mostly open.
+    vol: Rect,
+    full: Rect,
+    shown: f32,
+    vol_resp: Option<egui::Response>,
+    /// The lane's head, chip to dots: the wheel sets the volume here.
+    zone: Rect,
+}
+
+/// A volume change still in motion (a drag, a run of wheel notches): undo takes it back in one step.
+pub(super) struct Nudge {
+    lane: usize,
+    before: Edit,
+    at: f64,
+    /// The part of the pull that hasn't made a whole percent yet.
+    rest: f32,
+}
+
+/// `vol` pulled by `delta` percent, carrying what doesn't make a whole percent in the returned rest.
+/// `sticky` (a drag) holds 100 % until the pull passes [`DETENT`] and catches a drag passing through it.
+fn step_volume(vol: u16, rest: f32, delta: f32, sticky: bool) -> (u16, f32) {
+    let (pull, full) = (rest + delta, FULL_VOLUME as f32);
+    if sticky && vol == FULL_VOLUME && pull.abs() < DETENT {
+        return (vol, pull);
+    }
+    let target = (vol as f32 + pull).clamp(0.0, MAX_VOLUME as f32);
+    if sticky && (vol as f32 - full) * (target - full) < 0.0 {
+        return (FULL_VOLUME, 0.0);
+    }
+    let v = target.round();
+    (v as u16, target - v)
 }
 
 #[derive(Clone, Copy)]
@@ -213,48 +253,14 @@ impl ClipApp {
         self.view.clamp(dur, min_span);
         let light = self.light == Some(true);
 
-        let blocked = self.sheet || self.menu || self.confirm_delete || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
+        let menus = self.sheet || self.menu || self.confirm_delete || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| area.contains(*at));
-        if let Some(at) = hover
-            && !blocked
-        {
-            let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta()));
-            if zoom != 1.0 {
-                let frac = ((at.x - inner.left()) / inner.width()).clamp(0.0, 1.0) as f64;
-                let anchor = self.view.start + (frac * self.view.span as f64) as i64;
-                self.view.zoom(anchor, frac, zoom as f64, dur, min_span);
-            } else if self.view.span < dur && scroll.x + scroll.y != 0.0 {
-                let shift = (scroll.x + scroll.y) as f64 / inner.width() as f64 * self.view.span as f64;
-                self.view.start -= shift as i64;
-                self.view.clamp(dur, min_span);
-            }
-        }
-
-        let v = self.view;
-        let x_of = move |t: i64| v.x(t, inner.left(), inner.width());
-        let t_raw = move |x: f32| v.start + (((x - inner.left()) / inner.width()) as f64 * v.span as f64) as i64;
-        let t_of = move |x: f32| t_raw(x).clamp(0, dur);
-        let visible = move |x: f32| x >= inner.left() - 6.0 && x <= inner.right() + 6.0;
-        let within = (SNAP_PX / inner.width() as f64 * v.span as f64) as i64;
-        let snapping = !ui.input(|i| i.modifiers.ctrl);
-        let zoomed = v.span < dur;
-        let pieces = match self.job() {
-            Some(Job::Video(j)) if j.video == Video::Copy => Some(j.pieces),
-            _ => None,
-        };
-        let keys: Vec<i64> = if pieces.is_some() { self.index.as_ref().map_or(Vec::new(), |i| i.video.keys.clone()) } else { Vec::new() };
-
+        let ctrl = ui.input(|i| i.modifiers.ctrl);
         let body = ui.interact(Rect::from_min_max(area.min, rows.span.max), Id::unique("clip-track"), Sense::click_and_drag());
-        let markers: Vec<(usize, egui::Response)> = (self.edit.markers.iter().copied().enumerate())
-            .filter(|(_, m)| visible(x_of(*m)))
-            .map(|(i, m)| {
-                let r = Rect::from_center_size(pos2(x_of(m), area.top() + 7.0), vec2(14.0, 14.0));
-                let resp = ui.interact(r, Id::unique(("clip-marker", i)), Sense::click());
-                (i, resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("click jumps here · right-click removes"))
-            })
-            .collect();
         let lanes = self.edit.lanes.clone();
         let renaming = self.renaming.as_ref().map(|(k, _)| *k);
+        let pill_w = ui.painter().layout_no_wrap("200%".into(), mono(11.0), p.t2).size().x + 14.0;
+        let still = self.drag.is_none() && self.lane_drag.is_none() && !menus;
         let chips: Vec<Chip> = (lanes.iter().enumerate())
             .map(|(k, lane)| {
                 let name = lane.name(&info.tracks);
@@ -275,13 +281,68 @@ impl ClipApp {
                 let cursor = if self.lane_drag.is_some() { CursorIcon::Grabbing } else { CursorIcon::PointingHand };
                 let resp = ui.interact(rect, Id::unique(("clip-lane", k)), sense).on_hover_cursor(cursor).on_hover_text(tip);
                 resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, !lane.muted, format!("sound: {name}")));
-                let dots = Rect::from_min_size(pos2(rect.right() + 4.0, rect.top()), vec2(h, h));
+                let zone = Rect::from_min_size(rect.min, vec2(rect.width() + 4.0 + pill_w + 4.0 + h, h));
+                let popped = matches!(self.volume_pop, Some((j, _)) if j == k);
+                let moving = self.nudge.as_ref().is_some_and(|n| n.lane == k);
+                let wanted = lane.volume != FULL_VOLUME || popped || moving || (still && ui.rect_contains_pointer(zone));
+                let shown = ease(anim(ui, Id::unique(("clip-lane-vol", k)), wanted, 0.18));
+                let full = Rect::from_min_size(pos2(rect.right() + 4.0, rect.top()), vec2(pill_w, h));
+                let vol = Rect::from_min_size(full.min, vec2(pill_w * shown, h));
+                let vol_resp = (shown > 0.5 && renaming != Some(k)).then(|| {
+                    let r = ui
+                        .interact(vol, Id::unique(("clip-lane-volume", k)), Sense::click_and_drag())
+                        .on_hover_cursor(CursorIcon::ResizeHorizontal)
+                        .on_hover_text(VOLUME_TIP);
+                    r.widget_info(|| WidgetInfo::slider(true, lane.volume as f64, format!("{name}: volume")));
+                    r
+                });
+                let dots = Rect::from_min_size(pos2(vol.right() + 4.0 * shown, rect.top()), vec2(h, h));
                 let more = ui
                     .interact(dots, Id::unique(("clip-lane-more", k)), Sense::click())
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("rename, move or delete this track");
                 more.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{name}: more")));
-                Chip { rect, dots, resp, more }
+                Chip { rect, dots, resp, more, vol, full, shown, vol_resp, zone }
+            })
+            .collect();
+        let over_head = hover.is_some_and(|at| chips.iter().any(|c| c.zone.contains(at)));
+        if let Some(at) = hover
+            && !menus
+            && !over_head
+            && self.volume_pop.is_none()
+        {
+            let (zoom, scroll) = ui.input(|i| (i.zoom_delta(), i.smooth_scroll_delta()));
+            if zoom != 1.0 {
+                let frac = ((at.x - inner.left()) / inner.width()).clamp(0.0, 1.0) as f64;
+                let anchor = self.view.start + (frac * self.view.span as f64) as i64;
+                self.view.zoom(anchor, frac, zoom as f64, dur, min_span);
+            } else if self.view.span < dur && scroll.x + scroll.y != 0.0 {
+                let shift = (scroll.x + scroll.y) as f64 / inner.width() as f64 * self.view.span as f64;
+                self.view.start -= shift as i64;
+                self.view.clamp(dur, min_span);
+            }
+        }
+
+        let v = self.view;
+        let x_of = move |t: i64| v.x(t, inner.left(), inner.width());
+        let t_raw = move |x: f32| v.start + (((x - inner.left()) / inner.width()) as f64 * v.span as f64) as i64;
+        let t_of = move |x: f32| t_raw(x).clamp(0, dur);
+        let visible = move |x: f32| x >= inner.left() - 6.0 && x <= inner.right() + 6.0;
+        let within = (SNAP_PX / inner.width() as f64 * v.span as f64) as i64;
+        let snapping = !ctrl;
+        let zoomed = v.span < dur;
+        let pieces = match self.job() {
+            Some(Job::Video(j)) if j.video == Video::Copy => Some(j.pieces),
+            _ => None,
+        };
+        let keys: Vec<i64> = if pieces.is_some() { self.index.as_ref().map_or(Vec::new(), |i| i.video.keys.clone()) } else { Vec::new() };
+
+        let markers: Vec<(usize, egui::Response)> = (self.edit.markers.iter().copied().enumerate())
+            .filter(|(_, m)| visible(x_of(*m)))
+            .map(|(i, m)| {
+                let r = Rect::from_center_size(pos2(x_of(m), area.top() + 7.0), vec2(14.0, 14.0));
+                let resp = ui.interact(r, Id::unique(("clip-marker", i)), Sense::click());
+                (i, resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("click jumps here · right-click removes"))
             })
             .collect();
         let all_muted = lanes.iter().all(|l| l.muted);
@@ -360,6 +421,29 @@ impl ClipApp {
             }
             if chip.resp.drag_started() && lanes.len() > 1 {
                 self.lane_drag = Some(k);
+            }
+            if let Some((j, anchor)) = &mut self.volume_pop
+                && *j == k
+            {
+                *anchor = chip.full;
+            }
+            if let Some(r) = &chip.vol_resp {
+                if r.double_clicked() {
+                    self.volume_pop = None;
+                    self.change(|e| e.set_volume(k, FULL_VOLUME));
+                    self.sync_gains();
+                } else if r.clicked() {
+                    let open = matches!(self.volume_pop, Some((j, _)) if j == k);
+                    self.volume_pop = (!open).then_some((k, chip.full));
+                } else if r.dragged() {
+                    self.nudge_volume(k, r.drag_delta().x, true);
+                }
+            }
+            if !menus && !ctrl && ui.rect_contains_pointer(chip.zone) {
+                let wheel = ui.input(|i| i.smooth_scroll_delta.y);
+                if wheel != 0.0 {
+                    self.nudge_volume(k, wheel / WHEEL_PX, false);
+                }
             }
         }
         if link.as_ref().is_some_and(|(_, r)| r.clicked()) {
@@ -568,8 +652,12 @@ impl ClipApp {
             };
             let Some(peaks) = self.peaks.get(source).filter(|v| !v.is_empty()) else { continue };
             let color = WAVES[source % WAVES.len()].gamma_multiply(0.75 * fade);
+            let hot = super::overlay::danger(light).gamma_multiply(0.85 * fade);
+            // the peaks are square roots of the level, so they scale by the gain's
+            let gain = lanes[k].gain().sqrt();
+            let gain = ui.ctx().animate_value_with_time(Id::unique(("clip-lane-gain", source)), gain, if animate { 0.15 } else { 0.0 });
             let mut mesh = Mesh::default();
-            let (cy, room) = (l.center().y, l.height() * 0.8);
+            let (cy, room, top) = (l.center().y, l.height() * 0.8, l.height() - 2.0);
             let mut x = x_start;
             while x < stop {
                 let (b0, b1) = ((t_raw(x).max(0) / BUCKET) as usize, (t_raw(x + 2.0).max(0) / BUCKET) as usize);
@@ -577,8 +665,9 @@ impl ClipApp {
                     break;
                 }
                 let peak = peaks[b0..b1.clamp(b0 + 1, peaks.len())].iter().copied().max().unwrap_or(0);
-                let h = (peak as f32 / 255.0 * room).max(1.0);
-                mesh.add_colored_rect(Rect::from_min_size(pos2(x, cy - h / 2.0), vec2(1.5, h)), color);
+                let level = peak as f32 / 255.0 * gain;
+                let h = (level * room).clamp(1.0, top);
+                mesh.add_colored_rect(Rect::from_min_size(pos2(x, cy - h / 2.0), vec2(1.5, h)), if level > 1.0 { hot } else { color });
                 x += 2.0;
             }
             clip.add(Shape::mesh(mesh));
@@ -646,6 +735,30 @@ impl ClipApp {
             };
             if muted {
                 clip.text(pos2(at.x + nw + 6.0, at.y), egui::Align2::LEFT_CENTER, MUTED, sans(12.0), p.t3);
+            }
+            if chip.shown > 0.01 {
+                let vol = lanes[k].volume;
+                let popped = matches!(self.volume_pop, Some((j, _)) if j == k);
+                let lit = chip.vol_resp.as_ref().map_or(0.0, |r| anim(ui, r.id.with("hov"), r.hovered() || r.dragged() || popped, 0.12));
+                let pill = lane_clip(chip.vol);
+                let a = chip.shown * fade.max(0.55);
+                pill.rect_filled(chip.vol, 5, p.ctl.gamma_multiply(0.85 * fade.max(0.6)));
+                pill.rect_filled(chip.vol, 5, p.line2.gamma_multiply(lit));
+                let gauge = chip.full.height() >= 20.0;
+                let y = chip.full.center().y - if gauge { 2.0 } else { 0.0 };
+                let ink = if vol == FULL_VOLUME { mix(p.t3, p.t2, lit) } else { mix(p.t2, p.t1, lit) };
+                pill.text(pos2(chip.full.center().x, y), egui::Align2::CENTER_CENTER, format!("{vol}%"), mono(11.0), ink.gamma_multiply(a));
+                if gauge {
+                    let level = ui.ctx().animate_value_with_time(
+                        Id::unique(("clip-lane-vol-level", k)),
+                        vol as f32 / MAX_VOLUME as f32,
+                        if animate { 0.15 } else { 0.0 },
+                    );
+                    let line = Rect::from_min_max(pos2(chip.full.left() + 7.0, chip.full.bottom() - 6.0), pos2(chip.full.right() - 7.0, chip.full.bottom() - 4.0));
+                    let fill = lanes[k].source.map_or(p.t2, |s| WAVES[s % WAVES.len()]);
+                    pill.rect_filled(line, 1, p.line2.gamma_multiply(a));
+                    pill.rect_filled(Rect::from_min_max(line.min, pos2(line.left() + line.width() * level, line.bottom())), 1, fill.gamma_multiply(a));
+                }
             }
             let open = matches!(self.lane_menu, Some((j, ..)) if j == k);
             let hd = anim(ui, chip.more.id.with("hov"), chip.more.hovered() || open, 0.12);
@@ -720,6 +833,97 @@ impl ClipApp {
             painter.rect_filled(thumb, CornerRadius::same(2), if lit { p.t3 } else { p.line3 });
         }
         self.rename_field(ui, look, &chips, &info);
+        self.settle_volume(false);
+    }
+
+    /// Moves lane `k`'s volume by `delta` percent, as part of one gesture.
+    fn nudge_volume(&mut self, k: usize, delta: f32, sticky: bool) {
+        let Some(vol) = self.edit.lanes.get(k).map(|l| l.volume) else { return };
+        let rest = self.nudge.as_ref().filter(|n| n.lane == k).map_or(0.0, |n| n.rest);
+        let (v, rest) = step_volume(vol, rest, delta, sticky);
+        self.slide_volume(k, v, rest);
+    }
+
+    /// Sets lane `k`'s volume as part of one gesture, which [`ClipApp::settle_volume`] makes one undo step.
+    fn slide_volume(&mut self, k: usize, v: u16, rest: f32) {
+        if self.nudge.as_ref().is_some_and(|n| n.lane != k) {
+            self.settle_volume(true);
+        }
+        let before = self.nudge.take().map_or_else(|| self.edit.clone(), |n| n.before);
+        if self.edit.set_volume(k, v) {
+            self.sync_gains();
+        }
+        self.nudge = Some(Nudge { lane: k, before, at: self.now, rest });
+    }
+
+    /// Ends a volume gesture as one undo step: once it has rested for [`SETTLE`], or `now`.
+    pub(super) fn settle_volume(&mut self, now: bool) {
+        if self.nudge.as_ref().is_some_and(|n| now || self.now - n.at >= SETTLE)
+            && let Some(n) = self.nudge.take()
+        {
+            self.undo.record(n.before, &self.edit);
+        }
+    }
+
+    /// The open volume slider: 0 to 200 %, catching at 100 % unless ctrl is held.
+    pub(super) fn volume_popup(&mut self, ctx: &egui::Context, look: &Look) {
+        let Some((k, anchor)) = self.volume_pop else { return };
+        let Some(lane) = self.edit.lanes.get(k).cloned() else {
+            self.volume_pop = None;
+            return;
+        };
+        let p = look.p;
+        let screen = ctx.content_rect();
+        let below = anchor.bottom() + 6.0;
+        let y = if below + POP_H > screen.bottom() - 4.0 { anchor.top() - 6.0 - POP_H } else { below };
+        let x = (anchor.center().x - POP_W / 2.0).clamp(screen.left() + 4.0, screen.right() - 4.0 - POP_W);
+        let rect = Rect::from_min_size(pos2(x, y), vec2(POP_W, POP_H));
+        let track = Rect::from_min_max(pos2(rect.left() + 16.0, rect.center().y - 10.0), pos2(rect.right() - 60.0, rect.center().y + 10.0));
+        let full_x = track.left() + track.width() * FULL_VOLUME as f32 / MAX_VOLUME as f32;
+        let (mut set, mut wheel) = (None, 0.0);
+        egui::Area::new(Id::unique("clip-volume-pop")).order(Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+            ui.painter().rect(rect, 8, p.surf, Stroke::new(1.0, p.line2), StrokeKind::Inside);
+            let resp = ui
+                .interact(track, Id::unique("clip-volume-slider"), Sense::click_and_drag())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            resp.widget_info(|| WidgetInfo::slider(true, lane.volume as f64, "track volume"));
+            let ctrl = ui.input(|i| i.modifiers.ctrl);
+            if resp.double_clicked() {
+                set = Some(FULL_VOLUME);
+            } else if (resp.dragged() || resp.clicked())
+                && let Some(at) = resp.interact_pointer_pos()
+            {
+                let v = (((at.x - track.left()) / track.width()).clamp(0.0, 1.0) * MAX_VOLUME as f32).round() as u16;
+                set = Some(if !ctrl && v.abs_diff(FULL_VOLUME) <= 4 { FULL_VOLUME } else { v });
+            }
+            if !ctrl && ui.rect_contains_pointer(rect) {
+                wheel = ui.input(|i| i.smooth_scroll_delta.y);
+            }
+            let lit = anim(ui, resp.id.with("hov"), resp.hovered() || resp.dragged(), 0.1);
+            let painter = ui.painter();
+            let cy = track.center().y;
+            let kx = track.left() + track.width() * lane.volume as f32 / MAX_VOLUME as f32;
+            let line = Rect::from_min_max(pos2(track.left(), cy - 1.5), pos2(track.right(), cy + 1.5));
+            painter.rect_filled(line, 2, p.line2);
+            let fill = lane.source.map_or(p.t2, |s| WAVES[s % WAVES.len()]);
+            painter.rect_filled(Rect::from_min_max(line.min, pos2(kx, line.bottom())), 2, fill);
+            painter.vline(full_x, cy - 5.0..=cy + 5.0, Stroke::new(1.0, p.t3));
+            painter.circle_filled(pos2(kx, cy), 5.5 + lit, p.t1);
+            let label = format!("{}%", lane.volume);
+            painter.text(pos2(rect.right() - 14.0, cy), egui::Align2::RIGHT_CENTER, label, mono(12.0), p.t1);
+        });
+        if let Some(v) = set {
+            self.slide_volume(k, v, 0.0);
+        }
+        if wheel != 0.0 {
+            self.nudge_volume(k, wheel / WHEEL_PX, false);
+        }
+        let outside = ctx.input(|i| {
+            i.pointer.any_click() && i.pointer.interact_pos().is_some_and(|at| !rect.contains(at) && !anchor.contains(at))
+        });
+        if outside {
+            self.volume_pop = None;
+        }
     }
 
     fn rename_field(&mut self, ui: &mut Ui, look: &Look, chips: &[Chip], info: &Info) {
@@ -906,6 +1110,23 @@ mod tests {
         assert!(!g[0].intersects(both.head) && !g[1].intersects(both.head));
         assert_eq!(height(3, 30.0, true, true) - height(3, 30.0, true, false), GAP + KEYS_H);
         assert!(both.add.bottom() <= height(3, 30.0, true, true));
+    }
+
+    #[test]
+    fn volume_pulls_carry_fractions_and_catch_at_full() {
+        let near = |(v, rest): (u16, f32), want: (u16, f32)| v == want.0 && (rest - want.1).abs() < 1e-4;
+        assert_eq!(step_volume(100, 0.0, 5.0, false), (105, 0.0), "a wheel notch");
+        assert!(near(step_volume(50, 0.0, 0.3, false), (50, 0.3)), "a slow scroll adds up");
+        assert!(near(step_volume(50, 0.3, 0.3, false), (51, -0.4)));
+        assert_eq!(step_volume(3, 0.0, -10.0, false), (0, 0.0));
+        assert_eq!(step_volume(195, 0.0, 30.0, false), (MAX_VOLUME, 0.0));
+
+        assert_eq!(step_volume(100, 0.0, 4.0, true), (100, 4.0), "a drag holds at 100 %");
+        assert_eq!(step_volume(100, 4.0, 3.0, true), (107, 0.0));
+        assert_eq!(step_volume(100, -4.0, -3.0, true), (93, 0.0));
+        assert_eq!(step_volume(95, 0.0, 9.0, true), (100, 0.0), "and catches one passing through");
+        assert_eq!(step_volume(95, 0.0, 9.0, false), (104, 0.0));
+        assert_eq!(step_volume(95, 0.0, 5.0, true), (100, 0.0));
     }
 
     #[test]

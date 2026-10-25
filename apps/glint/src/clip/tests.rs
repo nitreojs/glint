@@ -584,3 +584,70 @@ fn files_without_keys_get_no_lane() {
     let chip = h.texts.iter().any(|(t, _)| t.ends_with("keys") && t.chars().next().is_some_and(|c| c.is_ascii_digit()));
     assert!(h.app.edit.keys.is_none() && !h.has("show keys") && !chip);
 }
+
+impl Harness {
+    fn volumes(&self) -> Vec<u16> {
+        self.app.edit.lanes.iter().map(|l| l.volume).collect()
+    }
+
+    fn hover(&mut self, at: Pos2) {
+        self.frame(vec![Event::PointerMoved(at)]);
+        self.settle();
+    }
+
+    fn wheel(&mut self, at: Pos2, notches: f32) {
+        let wheel = Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Line,
+            delta: vec2(0.0, notches),
+            phase: egui::TouchPhase::Move,
+            source: egui::MouseWheelSource::Wheel,
+            modifiers: Modifiers::NONE,
+        };
+        self.frame(vec![Event::PointerMoved(at), wheel]);
+        self.settle();
+    }
+
+    fn undo(&mut self) {
+        self.chord(Key::Z, Modifiers::COMMAND, true);
+        self.settle();
+    }
+}
+
+#[test]
+fn a_lanes_volume_shows_off_100_and_moves_by_wheel_drag_and_slider_one_undo_each() {
+    let mut h = Harness::new(2);
+    assert!(!h.has("100%"), "at 100 % the volume stays out of sight");
+    let name = h.at("spotifast.exe");
+    h.hover(name);
+    assert!(h.has("100%"), "pointing at the lane's head shows it");
+
+    h.wheel(name, 2.0);
+    assert_eq!(h.volumes(), [100, 110]);
+    let Some(Job::Video(v)) = h.app.job() else { panic!() };
+    assert_eq!(v.tracks.iter().map(|t| v.copies(t)).collect::<Vec<_>>(), [true, false], "only the louder track is encoded again");
+    h.hover(pos2(20.0, 20.0));
+    assert!(h.has("110%") && !h.has("100%"), "off 100 % it stays shown");
+    h.undo();
+    assert_eq!(h.volumes(), [100, 100], "two notches, one undo");
+
+    h.hover(name);
+    let pill = h.at("100%");
+    h.drag(pill, pill + vec2(50.0, 0.0));
+    assert!((140..=150).contains(&h.volumes()[1]), "{:?}", h.volumes());
+    h.undo();
+    assert_eq!(h.volumes(), [100, 100]);
+
+    h.hover(name);
+    h.click(h.at("100%"));
+    let label = h.texts.iter().rev().find(|(t, _)| t == "100%").map(|(_, r)| *r).unwrap();
+    let right = label.right() + 14.0;
+    let (left, end) = (right - 240.0 + 16.0, right - 60.0);
+    h.click(pos2(left + (end - left) * 0.25, label.center().y));
+    assert_eq!(h.volumes(), [100, 50]);
+    assert_eq!(h.texts.iter().filter(|(t, _)| t == "50%").count(), 2, "the pill and the slider");
+    h.double_click(h.at("50%"));
+    assert_eq!(h.volumes(), [100, 100]);
+    assert!(h.app.volume_pop.is_none());
+    h.undo();
+    assert_eq!(h.volumes(), [100, 50]);
+}
