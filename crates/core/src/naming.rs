@@ -22,6 +22,16 @@ pub enum Subject<'a> {
     Region,
 }
 
+impl<'a> Subject<'a> {
+    /// The app whose window it is, when it's one app's.
+    pub fn app(self) -> Option<&'a str> {
+        match self {
+            Subject::Window(s) if !s.app.trim().is_empty() => Some(s.app.as_str()),
+            _ => None,
+        }
+    }
+}
+
 /// Everything a file name pattern can refer to.
 #[derive(Clone, Copy, Debug)]
 pub struct Naming<'a> {

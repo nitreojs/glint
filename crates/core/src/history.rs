@@ -23,6 +23,9 @@ pub struct Entry {
     pub url: Option<String>,
     pub size: u64,
     pub time: u64,
+    /// The app whose window was captured, when it was one app's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,16 +40,24 @@ pub struct Local {
 const COMPACT_AT: u64 = 256 * 1024;
 const KEEP: usize = 500;
 
-fn file() -> PathBuf {
+/// The history file (`history.jsonl`).
+pub fn file() -> PathBuf {
     app_dir().join("history.jsonl")
 }
 
-pub fn add(kind: Kind, path: Option<&Path>, size: u64, url: Option<&str>) {
+/// Records a capture; `app` names the app whose window it shows.
+pub fn add(kind: Kind, path: Option<&Path>, size: u64, url: Option<&str>, app: Option<&str>) {
     let time = now();
-    let entry = Entry { kind, path: path.map(Path::to_path_buf), url: url.map(str::to_string), size, time };
+    let (path, url, app) = (path.map(Path::to_path_buf), url.map(str::to_string), app.map(str::to_string));
+    let entry = Entry { kind, path, url, size, time, app };
     if let Err(e) = append(&file(), &entry) {
         log(&format!("history: {e}"));
     }
+}
+
+/// Every entry, oldest first, whether its file is still there or not.
+pub fn all() -> Vec<Entry> {
+    read(&file())
 }
 
 pub fn recent(n: usize) -> Vec<Entry> {
@@ -160,6 +171,9 @@ fn read(file: &Path) -> Vec<Entry> {
                 if e.url.is_some() {
                     old.url = e.url;
                 }
+                if e.app.is_some() {
+                    old.app = e.app;
+                }
             }
             None => entries.push(e),
         }
@@ -185,17 +199,26 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("history.jsonl");
         let _ = std::fs::remove_file(&file);
-        let shot = Entry { kind: Kind::Shot, path: Some(dir.join("a.png")), url: None, size: 1200, time: 10 };
-        let rec = Entry { kind: Kind::Recording, path: Some(dir.join("b.mp4")), url: None, size: 9000, time: 20 };
-        let link = Entry { kind: Kind::Shot, path: None, url: Some("https://x/1.png".into()), size: 5, time: 30 };
-        let uploaded = Entry { url: Some("https://x/a.png".into()), time: 40, ..shot.clone() };
+        let shot = Entry {
+            kind: Kind::Shot,
+            path: Some(dir.join("a.png")),
+            url: None,
+            size: 1200,
+            time: 10,
+            app: Some("Telegram Desktop".into()),
+        };
+        let rec = Entry { kind: Kind::Recording, path: Some(dir.join("b.mp4")), url: None, size: 9000, time: 20, app: None };
+        let link = Entry { kind: Kind::Shot, path: None, url: Some("https://x/1.png".into()), size: 5, time: 30, app: None };
+        let uploaded = Entry { url: Some("https://x/a.png".into()), time: 40, app: None, ..shot.clone() };
         for e in [&shot, &rec, &link, &uploaded] {
             append(&file, e).unwrap();
         }
         std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(b"not json\n").unwrap();
         let back = read(&file);
         assert_eq!(back, vec![Entry { url: Some("https://x/a.png".into()), ..shot }, rec, link]);
-        assert!(std::fs::read_to_string(&file).unwrap().contains(r#""kind":"recording""#));
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains(r#""kind":"recording""#) && text.contains(r#""app":"Telegram Desktop""#));
+        assert_eq!(text.matches(r#""app""#).count(), 1);
         compact(&file).unwrap();
         assert_eq!(read(&file), back);
         let moved = dir.join("sub").join("b.mp4");
