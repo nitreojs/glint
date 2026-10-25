@@ -646,7 +646,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_APP_TRAY => {
             match (lp.0 & 0xFFFF) as u32 {
-                WM_CONTEXTMENU | NIN_KEYSELECT => show_menu(hwnd),
+                WM_CONTEXTMENU => show_menu(hwnd, false),
+                NIN_KEYSELECT => show_menu(hwnd, true),
                 WM_LBUTTONDOWN => unsafe {
                     let _ = SetForegroundWindow(hwnd);
                     SetTimer(Some(hwnd), CLICK_TIMER_ID, GetDoubleClickTime(), None);

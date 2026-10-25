@@ -1,16 +1,18 @@
-//! Drawing helpers shared by the overlay and the recording indicator: 32-bit DIB surfaces,
-//! Direct2D/DirectWrite rendering (anti-aliased pills and text) into DIBs or straight into
-//! DWM glass windows, and vsync-paced fades.
+//! Drawing helpers shared by the overlay, the recording indicator and the tray menu: 32-bit DIB
+//! surfaces, Direct2D/DirectWrite rendering (anti-aliased pills and text) into DIBs or straight
+//! into DWM glass windows, the settings window's typeface, and vsync-paced fades.
 
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::Dwm::DwmFlush;
 
 mod canvas;
 mod dib;
+pub mod fonts;
 mod painter;
 
 pub use canvas::Canvas;
 pub use dib::Dib;
+pub use fonts::Weight;
 pub use painter::{Painter, make_glass};
 
 pub const fn rgba(r: u8, g: u8, b: u8, a: f32) -> D2D1_COLOR_F {

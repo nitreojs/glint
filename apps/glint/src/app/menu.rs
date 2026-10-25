@@ -1,12 +1,14 @@
-use glint_core::history::{self, Entry};
-use glint_core::wide::wide;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, WPARAM};
-use windows::Win32::UI::WindowsAndMessaging::*;
-use windows::core::{PCWSTR, w};
+//! glint's tray menu: capture, the recent captures, the folder, settings and the log, in our own
+//! popup (see `glint_shell::menu`).
+
+use glint_core::format::human_size;
+use glint_core::history::{self, Entry, Kind as HistoryKind};
+use glint_shell::log::path as log_path;
+use glint_shell::menu::{self, Glyph, Header, Item, Menu};
+use glint_shell::time::local_time;
+use windows::Win32::Foundation::HWND;
 
 use super::{ClickTarget, State, open_settings, shell, with_app};
-use glint_shell::time::local_time;
-use glint_shell::log::path as log_path;
 use crate::platform::paths::output_dir;
 use crate::shot;
 use crate::upload;
@@ -33,33 +35,39 @@ const UPLOAD: usize = 4;
 const TRIM: usize = 5;
 const ACTIONS: usize = 8;
 
-unsafe fn recent_menu(entries: &[Entry]) -> HMENU {
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return HMENU::default() };
-        for (i, e) in entries.iter().enumerate() {
-            let Ok(sub) = CreatePopupMenu() else { continue };
+fn recent_menu(entries: &[Entry]) -> Vec<Item> {
+    let mut items: Vec<Item> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
             let id = |action: usize| ID_RECENT + i * ACTIONS + action;
             let exists = e.exists();
+            let mut actions = Vec::new();
             if exists {
-                let _ = AppendMenuW(sub, MF_STRING, id(OPEN), w!("Open"));
-                let _ = AppendMenuW(sub, MF_STRING, id(SHOW), w!("Show in folder"));
+                actions.push(Item::command(id(OPEN), "open").glyph(Glyph::Open));
+                actions.push(Item::command(id(SHOW), "show in folder").glyph(Glyph::Folder));
             }
             if e.url.is_some() {
-                let _ = AppendMenuW(sub, MF_STRING, id(OPEN_LINK), w!("Open link"));
-                let _ = AppendMenuW(sub, MF_STRING, id(COPY_LINK), w!("Copy link"));
+                actions.push(Item::command(id(OPEN_LINK), "open link").glyph(Glyph::Open));
+                actions.push(Item::command(id(COPY_LINK), "copy link").glyph(Glyph::Copy));
             } else if exists {
-                let _ = AppendMenuW(sub, MF_STRING, id(UPLOAD), w!("Upload"));
+                actions.push(Item::command(id(UPLOAD), "upload").glyph(Glyph::Upload));
             }
             if exists && e.is_mp4() {
-                let _ = AppendMenuW(sub, MF_STRING, id(TRIM), w!("Trim…"));
+                actions.push(Item::command(id(TRIM), "trim…").glyph(Glyph::Trim));
             }
-            let label = wide(&e.label(local_time));
-            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(label.as_ptr()));
-        }
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, ID_CLEAR_HISTORY, w!("Clear history"));
-        menu
-    }
+            let glyph = match e.kind {
+                HistoryKind::Shot => Glyph::Image,
+                HistoryKind::Recording => Glyph::Video,
+            };
+            let size = if exists { human_size(e.size) } else { "link".into() };
+            let detail = if e.is_gif() { format!("gif · {size}") } else { size };
+            Item::submenu(&e.when(local_time), actions).glyph(glyph).hint(Some(&detail))
+        })
+        .collect();
+    items.push(Item::separator());
+    items.push(Item::command(ID_CLEAR_HISTORY, "clear history").glyph(Glyph::Clear));
+    items
 }
 
 fn recent_action(hwnd: HWND, e: &Entry, action: usize) {
@@ -91,8 +99,26 @@ fn recent_action(hwnd: HWND, e: &Entry, action: usize) {
     }
 }
 
-pub(super) fn show_menu(hwnd: HWND) {
-    let Some((counting, paused, busy, keys)) = with_app(|a| {
+/// What glint is doing, for the menu's header: the version when there's nothing to say.
+fn status() -> Option<String> {
+    with_app(|a| match &a.state {
+        State::Idle if upload::active() => "uploading…".to_string(),
+        State::Idle => match a.ready_version() {
+            Some(v) => format!("{} → {v}", env!("CARGO_PKG_VERSION")),
+            None => env!("CARGO_PKG_VERSION").to_string(),
+        },
+        State::Selecting(_) => "picking a region".to_string(),
+        State::Countdown { left, .. } => format!("starting in {left}"),
+        State::Recording { rec, size, .. } => {
+            let what = if rec.paused() { "paused" } else { "recording" };
+            format!("{what} · {}×{}", size.0, size.1)
+        }
+        State::Stopping { .. } => "saving…".to_string(),
+    })
+}
+
+pub(super) fn show_menu(hwnd: HWND, keyboard: bool) {
+    let Some((counting, paused, busy, keys, accent)) = with_app(|a| {
         let paused = match &a.state {
             State::Recording { rec, .. } => Some(rec.paused()),
             _ => None,
@@ -100,63 +126,47 @@ pub(super) fn show_menu(hwnd: HWND) {
         let counting = matches!(a.state, State::Countdown { .. });
         let busy = matches!(a.state, State::Stopping { .. } | State::Selecting(_));
         let keys = [&a.hotkey, &a.shot_hotkey, &a.full_hotkey, &a.monitor_hotkey, &a.pause_hotkey].map(Clone::clone);
-        (counting, paused, busy, keys)
+        (counting, paused, busy, keys, a.cfg.accent_rgb())
     }) else {
         return;
     };
     let [hotkey, shot_hotkey, full_hotkey, monitor_hotkey, pause_hotkey] = keys;
-    let with_key = |text: &str, key: Option<String>| match key {
-        Some(k) => format!("{text}\t{k}"),
-        None => text.to_string(),
-    };
     let recording = counting || paused.is_some();
     let record = match (counting, recording) {
-        (true, _) => "Cancel countdown",
-        (false, true) => "Stop recording",
-        (false, false) => "Record region",
+        (true, _) => Item::command(ID_RECORD, "cancel countdown").glyph(Glyph::Clear),
+        (false, true) => Item::command(ID_RECORD, "stop recording").glyph(Glyph::Stop).accented(),
+        (false, false) => Item::command(ID_RECORD, "record region").glyph(Glyph::Record).accented(),
     };
-    let label = with_key(record, hotkey);
-    let pause_label = paused.map(|p| wide(&with_key(if p { "Resume recording" } else { "Pause recording" }, pause_hotkey)));
-    let shot_label = with_key("Take screenshot", shot_hotkey);
-    let full_label = with_key("Screenshot all screens", full_hotkey);
-    let monitor_label = with_key("Screenshot this monitor", monitor_hotkey);
+    let mut items = vec![record.keys(hotkey.as_deref()).enabled(!busy)];
+    if let Some(p) = paused {
+        let pause = if p { Item::command(ID_PAUSE, "resume").glyph(Glyph::Play) } else { Item::command(ID_PAUSE, "pause").glyph(Glyph::Pause) };
+        items.push(pause.keys(pause_hotkey.as_deref()));
+    }
+    let can_shoot = !busy && !recording;
+    items.extend([
+        Item::command(ID_SHOT, "screenshot").glyph(Glyph::Region).keys(shot_hotkey.as_deref()).enabled(can_shoot),
+        Item::command(ID_SHOT_ALL, "all screens").glyph(Glyph::Screens).keys(full_hotkey.as_deref()).enabled(can_shoot),
+        Item::command(ID_SHOT_MONITOR, "this monitor").glyph(Glyph::Monitor).keys(monitor_hotkey.as_deref()).enabled(can_shoot),
+        Item::separator(),
+    ]);
     let last = history::last_recording();
     let recent = history::recent(RECENT);
-    let update_label = with_app(|a| a.ready_version()).flatten().map(|v| wide(&format!("Restart to update to {v}")));
-    let cmd = unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        let (label, shot_label, full_label) = (wide(&label), wide(&shot_label), wide(&full_label));
-        let monitor_label = wide(&monitor_label);
-        let flags = if busy { MF_STRING | MF_GRAYED } else { MF_STRING };
-        let _ = AppendMenuW(menu, flags, ID_RECORD, PCWSTR(label.as_ptr()));
-        if let Some(pause_label) = &pause_label {
-            let _ = AppendMenuW(menu, MF_STRING, ID_PAUSE, PCWSTR(pause_label.as_ptr()));
-        }
-        let shot_flags = if busy || recording { MF_STRING | MF_GRAYED } else { MF_STRING };
-        let _ = AppendMenuW(menu, shot_flags, ID_SHOT, PCWSTR(shot_label.as_ptr()));
-        let _ = AppendMenuW(menu, shot_flags, ID_SHOT_ALL, PCWSTR(full_label.as_ptr()));
-        let _ = AppendMenuW(menu, shot_flags, ID_SHOT_MONITOR, PCWSTR(monitor_label.as_ptr()));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let trim_flags = if last.is_some() { MF_STRING } else { MF_STRING | MF_GRAYED };
-        let _ = AppendMenuW(menu, trim_flags, ID_TRIM, w!("Trim last recording"));
-        let recent_flags = if recent.is_empty() { MF_POPUP | MF_GRAYED } else { MF_POPUP };
-        let _ = AppendMenuW(menu, recent_flags, recent_menu(&recent).0 as usize, w!("Recent"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_FOLDER, w!("Open output folder"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_SETTINGS, w!("Settings…"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_LOG, w!("Open log"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        if let Some(label) = &update_label {
-            let _ = AppendMenuW(menu, MF_STRING, ID_UPDATE, PCWSTR(label.as_ptr()));
-        }
-        let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, w!("Exit"));
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(hwnd);
-        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, None, hwnd, None);
-        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
-        cmd.0 as usize
-    };
+    items.push(Item::command(ID_TRIM, "trim last recording").glyph(Glyph::Trim).enabled(last.is_some()));
+    let recent_items = if recent.is_empty() { Vec::new() } else { recent_menu(&recent) };
+    items.extend([
+        Item::submenu("recent", recent_items).glyph(Glyph::Recent),
+        Item::command(ID_FOLDER, "open folder").glyph(Glyph::Folder),
+        Item::command(ID_SETTINGS, "settings").glyph(Glyph::Settings),
+        Item::command(ID_LOG, "log").glyph(Glyph::Log),
+        Item::separator(),
+    ]);
+    if let Some(v) = with_app(|a| a.ready_version()).flatten() {
+        items.push(Item::command(ID_UPDATE, "restart to update").glyph(Glyph::Update).accented().hint(Some(&v)));
+    }
+    items.push(Item::command(ID_EXIT, "quit").glyph(Glyph::Quit));
+    let header = Header { title: "glint".into(), status: status().unwrap_or_default() };
+    let menu = Menu { accent, header: Some(header), items };
+    let Some(cmd) = menu::track(hwnd, &menu, keyboard, status) else { return };
     match cmd {
         ID_RECORD => {
             with_app(|a| a.toggle(false));

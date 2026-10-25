@@ -4,7 +4,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::format::human_size;
 use crate::log::log;
 use crate::paths::app_dir;
 
@@ -91,21 +90,23 @@ impl Entry {
         self.path.as_deref().and_then(Path::extension).is_some_and(|e| e.eq_ignore_ascii_case("mp4"))
     }
 
-    pub fn label(&self, local: impl Fn(u64) -> Option<Local>) -> String {
-        let what = match (self.kind, self.path.as_deref().and_then(Path::extension)) {
-            (Kind::Shot, _) => "Screenshot",
-            (Kind::Recording, Some(e)) if e.eq_ignore_ascii_case("gif") => "GIF",
-            (Kind::Recording, _) => "Recording",
-        };
-        let when = match (local(self.time), local(now())) {
-            (Some(t), Some(today)) if (t.year, t.month, t.day) == (today.year, today.month, today.day) => {
-                format!("{:02}:{:02}", t.hour, t.minute)
-            }
-            (Some(t), _) => format!("{} {}, {:02}:{:02}", month(t.month), t.day, t.hour, t.minute),
-            (None, _) => String::new(),
-        };
-        let state = if self.exists() { human_size(self.size) } else { "link only".into() };
-        format!("{what} · {when} · {state}")
+    pub fn is_gif(&self) -> bool {
+        self.path.as_deref().and_then(Path::extension).is_some_and(|e| e.eq_ignore_ascii_case("gif"))
+    }
+
+    /// When it was made: `14:02` today, `oct 3, 14:02` before.
+    pub fn when(&self, local: impl Fn(u64) -> Option<Local>) -> String {
+        when(local(self.time), local(now()))
+    }
+}
+
+fn when(at: Option<Local>, today: Option<Local>) -> String {
+    match (at, today) {
+        (Some(t), Some(today)) if (t.year, t.month, t.day) == (today.year, today.month, today.day) => {
+            format!("{:02}:{:02}", t.hour, t.minute)
+        }
+        (Some(t), _) => format!("{} {}, {:02}:{:02}", month(t.month).to_lowercase(), t.day, t.hour, t.minute),
+        (None, _) => String::new(),
     }
 }
 
@@ -169,6 +170,14 @@ fn read(file: &Path) -> Vec<Entry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn when_is_a_time_today_and_a_date_before() {
+        let at = |day, hour, minute| Some(Local { year: 2026, month: 10, day, hour, minute });
+        assert_eq!(when(at(25, 9, 5), at(25, 23, 0)), "09:05");
+        assert_eq!(when(at(3, 14, 2), at(25, 23, 0)), "oct 3, 14:02");
+        assert_eq!(when(None, at(25, 23, 0)), "");
+    }
 
     #[test]
     fn entries_round_trip_and_uploads_update_their_capture() {
