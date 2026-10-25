@@ -1,6 +1,7 @@
 pub mod clip;
 pub mod config;
 pub mod format;
+pub mod gallery;
 pub mod geom;
 pub mod history;
 pub mod icon;
