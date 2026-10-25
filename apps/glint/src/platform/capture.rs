@@ -3,6 +3,7 @@ use windows::Win32::Foundation::POINT;
 use windows::Win32::Graphics::Gdi::{BitBlt, CAPTUREBLT, GdiFlush, GetDC, ROP_CODE, ReleaseDC, SRCCOPY};
 use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
 
+use glint_shell::afterglow::with_note_visible;
 use glint_shell::gfx::Dib;
 use glint_shell::monitors;
 
@@ -46,16 +47,17 @@ fn under(monitors: &[Rect], x: i32, y: i32) -> Option<Rect> {
     monitors.iter().min_by_key(|m| gap(m)).copied()
 }
 
-/// Copies the desktop's `area` into `dib` (sized like `area`); pixels outside `monitors` become black.
+/// Copies the desktop's `area` into `dib` (sized like `area`); pixels outside `monitors` become
+/// black. afterglow's note, kept out of capture otherwise, is in the copy.
 pub(crate) fn grab(dib: &mut Dib, area: Rect, monitors: &[Rect]) -> Result<(), String> {
-    unsafe {
+    with_note_visible(|| unsafe {
         let screen = GetDC(None);
         let copied =
             BitBlt(dib.dc, 0, 0, area.w, area.h, Some(screen), area.x, area.y, ROP_CODE(SRCCOPY.0 | CAPTUREBLT.0));
         ReleaseDC(None, screen);
-        copied.map_err(|e| format!("BitBlt {}x{}: {e}", area.w, area.h))?;
         let _ = GdiFlush();
-    }
+        copied.map_err(|e| format!("BitBlt {}x{}: {e}", area.w, area.h))
+    })?;
     black_outside(dib.pixels_mut(), area, monitors);
     Ok(())
 }
