@@ -388,11 +388,16 @@ pub fn segmented<T: Copy + PartialEq>(
             ui.memory_mut(|m| m.request_focus(resp.id.with(j)));
         }
     }
-    // The selected segment's highlight slides; labels light up as it passes.
+    // The selected segment's highlight slides; labels light up as it passes. It glides as a share
+    // of the row, so a segment coming or going (a preset row's "custom") moves it along the row
+    // instead of from where its old index lands among the new segments.
     let selected = options.iter().position(|(v, _)| *v == *value).unwrap_or(0);
-    let pos = glide(ui, resp.id.with("pos"), selected as f32, 0.16);
+    let left = glide(ui, resp.id.with("left"), selected as f32 / n as f32, 0.16);
+    let share = glide(ui, resp.id.with("share"), 1.0 / n as f32, 0.16);
+    let pos = left * n as f32;
     let painter = ui.painter();
-    let highlight = Rect::from_min_size(pos2(inner.left() + pos * (seg_w + 2.0), inner.top()), vec2(seg_w, 26.0));
+    let step = inner.width() + 2.0;
+    let highlight = Rect::from_min_size(pos2(inner.left() + left * step, inner.top()), vec2(share * step - 2.0, 26.0));
     painter.rect(highlight, 4, p.ctlh, Stroke::new(1.0, p.line2), StrokeKind::Inside);
     for (i, ((v, label), (r, cell))) in options.iter().zip(&cells).enumerate() {
         let near = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
