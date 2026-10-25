@@ -466,7 +466,8 @@ keystrokes_mode = "{keystrokes_mode}"
 # the processes it starts), or "mic" (device = an endpoint id, or none for the default
 # microphone). volume is 0-200 (%); tracks lists which of the video's audio tracks (1-6) it
 # goes to, and a track that gets several sources holds their mix. An app on a track that also
-# has a desktop source (not excluding it) isn't added again: desktop already holds it.
+# has a desktop source (not excluding it) isn't added again: desktop already holds it. name is
+# what the app (or the app a desktop leaves out) is called; without one it's named after its exe.
 {audio_sources}
 # Names players show for tracks 1-6; "" names a track after its sources ("mix", "desktop", ...).
 {audio_track_names}
@@ -639,7 +640,7 @@ mod tests {
             keystrokes_mode: ClickMode::BurnIn,
             audio_sources: vec![
                 AudioSource { exclude: "game.exe".into(), ..AudioSource::new(audio::SourceKind::Desktop, 0) },
-                AudioSource { app: "discord.exe".into(), volume: 80, ..AudioSource::new(audio::SourceKind::App, 1) },
+                AudioSource { app: "discord.exe".into(), name: "Discord".into(), volume: 80, ..AudioSource::new(audio::SourceKind::App, 1) },
                 AudioSource { enabled: false, tracks: vec![4], ..AudioSource::new(audio::SourceKind::Mic, 2) },
             ],
             audio_track_names: ["all", "", "", "voice", "", ""].map(String::from).to_vec(),

@@ -83,11 +83,11 @@ mod tests {
         let t = run(&s, &[]);
         assert_eq!(
             summary(&t),
-            [(1, "mix", &[0, 2][..]), (2, "desktop", &[0][..]), (3, "discord.exe", &[1][..]), (4, "mic", &[2][..])]
+            [(1, "mix", &[0, 2][..]), (2, "desktop", &[0][..]), (3, "discord", &[1][..]), (4, "mic", &[2][..])]
         );
         assert_eq!(t[0].covered, [(1, 0)]);
         let names: Vec<String> = s.iter().map(|s| s.label(None)).collect();
-        assert_eq!(t[0].note(&names).unwrap(), "discord.exe is already in desktop");
+        assert_eq!(t[0].note(&names).unwrap(), "discord is already in desktop");
         assert_eq!(t[1].note(&names), None);
     }
 
@@ -97,14 +97,14 @@ mod tests {
         let t = run(&s, &[]);
         assert_eq!(summary(&t), [(1, "mix", &[0, 1, 3][..])]);
         let names: Vec<String> = s.iter().map(|s| s.label(None)).collect();
-        assert_eq!(t[0].note(&names).unwrap(), "game.exe is already in desktop without spotifast.exe");
+        assert_eq!(t[0].note(&names).unwrap(), "game is already in desktop without spotifast");
     }
 
     #[test]
     fn apps_without_a_desktop_on_the_same_track_are_kept() {
         let s = [src(Desktop, &[1], ""), src(App, &[2], "a.exe"), src(App, &[2], "b.exe")];
         let t = run(&s, &[]);
-        assert_eq!(summary(&t), [(1, "desktop", &[0][..]), (2, "a.exe + b.exe", &[1, 2][..])]);
+        assert_eq!(summary(&t), [(1, "desktop", &[0][..]), (2, "a + b", &[1, 2][..])]);
         assert!(t.iter().all(|t| t.covered.is_empty()));
     }
 

@@ -75,7 +75,7 @@ fn hosted_app(frame: HWND) -> Option<String> {
 }
 
 /// The exe's FileDescription, in the first language its version resource lists.
-fn description(path: &str) -> Option<String> {
+pub fn description(path: &str) -> Option<String> {
     let file = wide(path);
     unsafe {
         let size = GetFileVersionInfoSizeW(PCWSTR(file.as_ptr()), None);

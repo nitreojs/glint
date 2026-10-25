@@ -8,6 +8,7 @@ pub mod autostart;
 pub mod explorer;
 pub mod gfx;
 pub mod hotkey;
+pub mod icon;
 pub mod identity;
 pub mod instance;
 pub mod log;

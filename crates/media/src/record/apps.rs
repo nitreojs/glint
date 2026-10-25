@@ -20,32 +20,19 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{BOOL, Interface, PWSTR};
 
+/// A program with a window, or one playing sound, by exe.
 #[derive(Debug)]
 pub struct App {
     pub exe: String,
+    /// Where its first copy runs from, when it could be looked at.
+    pub path: Option<String>,
+    /// Its biggest window's title.
     pub title: String,
     pub audio: bool,
+    /// Windowless processes it started that play sound, which recording it picks up too.
     pub via: Vec<String>,
+    /// Copies of the exe in different folders; the name matches all of them.
     pub copies: usize,
-}
-
-impl App {
-    pub fn detail(&self) -> String {
-        let mut parts = Vec::new();
-        if self.audio {
-            parts.push("♪".to_string());
-        }
-        if !self.via.is_empty() {
-            parts.push(format!("via {}", self.via.join(", ")));
-        }
-        if !self.title.is_empty() {
-            parts.push(self.title.clone());
-        }
-        if self.copies > 1 {
-            parts.push(format!("{} copies in different folders, the name matches all of them", self.copies));
-        }
-        parts.join(" · ")
-    }
 }
 
 #[derive(Debug)]
@@ -102,7 +89,7 @@ pub(super) fn roots(procs: &[Proc], exe: &str) -> Vec<u32> {
 
 fn entry<'a, 'p>(apps: &'a mut HashMap<&'p str, (App, i64)>, p: &'p Proc) -> &'a mut (App, i64) {
     apps.entry(p.name.as_str()).or_insert_with(|| {
-        let app = App { exe: p.exe.clone(), title: String::new(), audio: false, via: Vec::new(), copies: 1 };
+        let app = App { exe: p.exe.clone(), path: None, title: String::new(), audio: false, via: Vec::new(), copies: 1 };
         (app, i64::MIN)
     })
 }
@@ -134,10 +121,12 @@ fn build(procs: &[Proc], windows: &[Window], audio: &[u32], me: u32, path: impl 
     }
     let mut out: Vec<App> = apps.into_values().map(|(a, _)| a).collect();
     for app in &mut out {
-        let mut folders: Vec<String> = roots(procs, &app.exe).into_iter().filter_map(&path).map(|p| key(&p)).collect();
+        let paths: Vec<String> = roots(procs, &app.exe).into_iter().filter_map(&path).collect();
+        let mut folders: Vec<String> = paths.iter().map(|p| key(p)).collect();
         folders.sort();
         folders.dedup();
         app.copies = folders.len().max(1);
+        app.path = paths.into_iter().next();
     }
     sort(&mut out);
     out
@@ -398,13 +387,13 @@ mod tests {
         assert!(get("Spotify.exe").audio);
         assert_eq!(get("ms-teams.exe").via, ["msedgewebview2.exe"]);
         assert!(!get("ms-teams.exe").audio);
-        assert_eq!(get("ms-teams.exe").detail(), "via msedgewebview2.exe · Teams");
-        assert_eq!(get("Spotify.exe").detail(), "♪ · Spotify Premium");
+        assert_eq!(get("Telegram.exe").path.as_deref(), Some(r"C:\Telegram\Telegram.exe"));
+        assert_eq!(get("Spotify.exe").path, None);
     }
 
     #[test]
     fn sorts_audio_first_then_by_name_ignoring_case() {
-        let app = |exe: &str, audio| App { exe: exe.into(), title: String::new(), audio, via: Vec::new(), copies: 1 };
+        let app = |exe: &str, audio| App { exe: exe.into(), path: None, title: String::new(), audio, via: Vec::new(), copies: 1 };
         let mut apps = vec![app("zed.exe", false), app("Brave.exe", true), app("alpha.exe", false), app("vlc.exe", true)];
         sort(&mut apps);
         let names: Vec<&str> = apps.iter().map(|a| a.exe.as_str()).collect();
