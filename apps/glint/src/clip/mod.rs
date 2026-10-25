@@ -107,7 +107,7 @@ pub fn run(path: PathBuf) {
             };
             let rounded = hwnd.is_some_and(|h| glint_ui::window::frameless(h, true));
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
-                crate::platform::windows::place(h, r);
+                glint_ui::window::place(h, r);
             }
             let mut app = ClipApp::new(path, info, index, &cfg, saved, accent);
             (app.hwnd, app.rounded, app.live, app.hevc) = (hwnd, rounded, true, hevc);
@@ -731,7 +731,7 @@ impl ClipApp {
         match then {
             Then::Nothing => self.toast(Note::Saved(path, saving)),
             Then::Upload => self.start_upload(path),
-            Then::Copy => match crate::shot::copy_files(self.hwnd, std::slice::from_ref(&path)) {
+            Then::Copy => match glint_shell::clipboard::copy_files(self.hwnd, std::slice::from_ref(&path)) {
                 Ok(()) => self.toast(Note::Copied(saving)),
                 Err(e) => self.toast(Note::Failed(format!("couldn't copy the file: {e}"))),
             },
@@ -766,7 +766,7 @@ impl ClipApp {
         let note = match res {
             Ok(url) => {
                 history::add(HistoryKind::Recording, Some(&up.path), up.size, Some(&url), None);
-                let copied = up.copy_link && crate::shot::copy_text(self.hwnd, &url).is_ok();
+                let copied = up.copy_link && glint_shell::clipboard::copy_text(self.hwnd, &url).is_ok();
                 Note::Uploaded { url, copied }
             }
             Err(e) => {
@@ -802,7 +802,7 @@ impl ClipApp {
         self.audio = None;
         self.scan = None;
         self.waves = None;
-        match crate::platform::windows::recycle(self.owner(), &self.path) {
+        match glint_shell::explorer::recycle(self.owner(), &self.path) {
             Ok(()) => {
                 self.gone = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -1015,7 +1015,7 @@ impl eframe::App for ClipApp {
                 self.keyboard = true;
             }
         });
-        if let Some(r) = self.hwnd.and_then(crate::platform::windows::window_placement) {
+        if let Some(r) = self.hwnd.and_then(glint_ui::window::placement) {
             self.saved.rect = Some(r);
         }
         let look = Look { p, keyboard: self.keyboard };

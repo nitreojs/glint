@@ -1,10 +1,11 @@
 //! What a Windows tray app of ours is made of, shared by glint and afterglow: the hidden main
 //! window and its message loop, one instance at a time, the notification-area icon and its
-//! menu, global hotkeys, launch at sign-in, the log file, monitors and local time, and what
-//! glint and afterglow say to each other.
+//! menu, global hotkeys, launch at sign-in, the log file, monitors and local time, the clipboard,
+//! and what glint and afterglow say to each other.
 
 pub mod afterglow;
 pub mod autostart;
+pub mod clipboard;
 pub mod explorer;
 pub mod file_menu;
 pub mod gfx;

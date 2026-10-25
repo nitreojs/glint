@@ -5,15 +5,17 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromRect};
 use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, GWLP_WNDPROC, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT,
-    HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetWindowLongPtrW, SetWindowPos, WM_NCCALCSIZE, WM_NCHITTEST, WNDPROC,
+    CallWindowProcW, FindWindowW, GWLP_WNDPROC, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT,
+    HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsIconic, IsZoomed, SW_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_NCCALCSIZE,
+    WM_NCHITTEST, WNDPROC,
 };
-use windows::core::w;
+use windows::core::{HSTRING, w};
 
 const EDGE: f32 = 5.0;
 const CORNER: f32 = 14.0;
@@ -114,6 +116,44 @@ fn round(hwnd: HWND) -> bool {
         DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const _ as _, size_of_val(&pref) as u32)
     };
     set.is_ok()
+}
+
+/// Where an app window sits as `[x, y, w, h]`, to open there next time; `None` while it's minimized
+/// or maximized.
+pub fn placement(hwnd: HWND) -> Option<[i32; 4]> {
+    unsafe {
+        if IsIconic(hwnd).as_bool() || IsZoomed(hwnd).as_bool() {
+            return None;
+        }
+        let mut r = RECT::default();
+        GetWindowRect(hwnd, &mut r).ok()?;
+        Some([r.left, r.top, r.right - r.left, r.bottom - r.top])
+    }
+}
+
+/// Moves a window back to a [`placement`], unless no monitor shows that place any more.
+pub fn place(hwnd: HWND, [x, y, w, h]: [i32; 4]) {
+    let r = RECT { left: x, top: y, right: x + w, bottom: y + h };
+    unsafe {
+        if !MonitorFromRect(&r, MONITOR_DEFAULTTONULL).is_invalid() {
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+}
+
+/// Brings a window to the front, restored if it was minimized.
+pub fn bring_forward(hwnd: HWND) {
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// The top-level window titled `title`, if one is open.
+pub fn find(title: &str) -> Option<HWND> {
+    unsafe { FindWindowW(None, &HSTRING::from(title)).ok() }
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::HWND;
@@ -5,10 +6,11 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::UI::Shell::{
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, ILCreateFromPathW, ILFree, IShellItem,
-    SHCreateItemFromParsingName, SHOpenFolderAndSelectItems, SIGDN_FILESYSPATH,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
+    FileOpenDialog, IFileOpenDialog, ILCreateFromPathW, ILFree, IShellItem, SHCreateItemFromParsingName,
+    SHFILEOPSTRUCTW, SHFileOperationW, SHOpenFolderAndSelectItems, SIGDN_FILESYSPATH,
 };
-use windows::core::HSTRING;
+use windows::core::{HSTRING, PCWSTR};
 
 /// The folder picked in Windows' folder dialog (opened at `start`, over `owner`); `None` when
 /// cancelled. The calling thread needs COM.
@@ -45,5 +47,22 @@ pub fn reveal(path: &Path) {
         if !shown && let Some(dir) = Path::new(&path).parent() {
             let _ = std::process::Command::new("explorer.exe").arg(dir).spawn();
         }
+    }
+}
+
+/// Moves `path` to the Recycle Bin.
+pub fn recycle(owner: HWND, path: &Path) -> Result<(), String> {
+    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: owner,
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as u16,
+        ..Default::default()
+    };
+    match unsafe { SHFileOperationW(&mut op) } {
+        0 if !op.fAnyOperationsAborted.as_bool() => Ok(()),
+        0 => Err("the deletion was cancelled".into()),
+        code => Err(format!("windows couldn't move it to the recycle bin (error {code:#x})")),
     }
 }

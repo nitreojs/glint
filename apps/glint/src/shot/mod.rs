@@ -5,17 +5,17 @@ use glint_core::geom::rect::Rect;
 use glint_core::history::{self, Kind};
 use glint_core::naming::{Source, Subject};
 use glint_core::upload::Payload;
+use glint_media::image::{ImageFormat, encode};
+use glint_shell::clipboard;
 use windows::Win32::Foundation::HWND;
 
 use crate::platform::paths::{file_name, unique_path};
 use crate::upload;
 
 pub(crate) mod editor;
-mod output;
 pub(crate) mod pin;
 
 use editor::Output;
-pub(crate) use output::{ImageFormat, copy_files, copy_text, copy_to_clipboard, encode};
 
 /// A finished screenshot as 0xAARRGGBB rows, and what to do with it.
 pub(crate) struct Shot {
@@ -51,7 +51,7 @@ pub(crate) fn deliver(shot: &Shot, cfg: &Config, owner: HWND, subject: Subject) 
         Output::Pin => (false, false, false),
     };
     let mut errors = Vec::new();
-    if copy && let Err(e) = output::copy_to_clipboard(Some(owner), &shot.pixels, shot.w, shot.h, shot.alpha) {
+    if copy && let Err(e) = clipboard::copy_image(Some(owner), &shot.pixels, shot.w, shot.h, shot.alpha) {
         errors.push(format!("couldn't copy: {e}"));
     }
     let mut saved = None;
@@ -61,7 +61,7 @@ pub(crate) fn deliver(shot: &Shot, cfg: &Config, owner: HWND, subject: Subject) 
             ShotFormat::Png => ImageFormat::Png,
             ShotFormat::Jpg => ImageFormat::Jpg,
         };
-        match output::encode(&shot.pixels, shot.w, shot.h, shot.alpha, format, cfg.screenshot_quality as u8) {
+        match encode(&shot.pixels, shot.w, shot.h, shot.alpha, format, cfg.screenshot_quality as u8) {
             Ok(bytes) => {
                 if save {
                     let path = unique_path(cfg, Kind::Shot, subject, format.extension());
