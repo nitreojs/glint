@@ -72,6 +72,12 @@ impl Painter {
         }
     }
 
+    /// IBM Plex Sans (the settings window's face) at `size` 96-DPI pixels, single line,
+    /// vertically centered.
+    pub fn plex(&self, weight: super::Weight, size: f32) -> Result<IDWriteTextFormat, String> {
+        super::fonts::format(&self.dwrite, weight, size * self.scale)
+    }
+
     /// Rendered width and line height of `text`.
     pub fn measure(&self, text: &str, font: &IDWriteTextFormat) -> (f32, f32) {
         let s = wide(text);
@@ -98,8 +104,43 @@ impl Painter {
         self.paint(rt, false, 1.0, f)
     }
 
+    /// A software target drawing with per-pixel alpha into DIBs, for layered windows
+    /// (`UpdateLayeredWindow`): unlike [`Painter::window_target`] it has no GPU device to make,
+    /// so a window drawn with it shows at once.
+    pub fn alpha_target(&self) -> Result<ID2D1DCRenderTarget, String> {
+        unsafe {
+            let rt = self
+                .factory
+                .CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
+                    r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                    pixelFormat: D2D1_PIXEL_FORMAT {
+                        format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                        alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
+                    },
+                    dpiX: 96.0,
+                    dpiY: 96.0,
+                    usage: D2D1_RENDER_TARGET_USAGE_NONE,
+                    minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
+                })
+                .map_err(|e| format!("CreateDCRenderTarget: {e}"))?;
+            rt.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+            Ok(rt)
+        }
+    }
+
+    /// Redraws `dib` from transparent through `rt` (an [`Painter::alpha_target`]).
+    pub fn draw_alpha(&self, rt: &ID2D1DCRenderTarget, dib: &Dib, f: impl FnOnce(&Canvas)) -> Result<(), String> {
+        unsafe {
+            rt.BindDC(dib.dc, &RECT { left: 0, top: 0, right: dib.w, bottom: dib.h })
+                .map_err(|e| format!("BindDC: {e}"))?;
+        }
+        self.paint(rt, true, 1.0, f)
+    }
+
     /// A render target drawing straight into `hwnd` with per-pixel alpha. The window must
-    /// be a DWM "glass" window (see [`make_glass`]) for the alpha to show through.
+    /// be a DWM "glass" window (see [`make_glass`]) for the alpha to show through. Drawing
+    /// doesn't wait for the display: callers pace themselves (see [`super::animate`]), and the
+    /// thread is free between frames.
     pub fn window_target(&self, hwnd: HWND, w: i32, h: i32) -> Result<ID2D1HwndRenderTarget, String> {
         unsafe {
             let rt = self
@@ -117,7 +158,7 @@ impl Painter {
                     &D2D1_HWND_RENDER_TARGET_PROPERTIES {
                         hwnd,
                         pixelSize: D2D_SIZE_U { width: w as u32, height: h as u32 },
-                        presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+                        presentOptions: D2D1_PRESENT_OPTIONS_IMMEDIATELY,
                     },
                 )
                 .map_err(|e| format!("CreateHwndRenderTarget: {e}"))?;

@@ -55,6 +55,20 @@ impl Canvas<'_> {
         }
     }
 
+    /// A rounded rectangle's outline, the stroke centred on the edges.
+    pub fn round_rect_outline(&self, [x, y, w, h]: [f32; 4], radius: f32, width: f32, color: D2D1_COLOR_F) {
+        self.color(color);
+        unsafe {
+            let rr = D2D1_ROUNDED_RECT { rect: rect_f(x, y, w, h), radiusX: radius, radiusY: radius };
+            self.rt.DrawRoundedRectangle(&rr, &self.brush, width, None);
+        }
+    }
+
+    /// Moves everything drawn after this by (`dx`, `dy`).
+    pub fn translate(&self, dx: f32, dy: f32) {
+        unsafe { self.rt.SetTransform(&windows_numerics::Matrix3x2::translation(dx, dy)) };
+    }
+
     pub fn fill(&self, x: f32, y: f32, w: f32, h: f32, color: D2D1_COLOR_F) {
         self.color(color);
         unsafe { self.rt.FillRectangle(&rect_f(x, y, w, h), &self.brush) };
