@@ -1,7 +1,9 @@
-//! The gallery, run as `glint.exe --gallery [file]`: every screenshot, recording and gif glint
-//! made, newest first and grouped by day, as a grid of thumbnails. Hovering a tile for half a
-//! second grows it into a bigger preview (recordings and gifs play in it, muted); a click opens it,
-//! the context menu and the keys do the rest.
+//! The gallery both apps open with `--gallery [file]`: every capture the app made, newest first
+//! and grouped by day, as a grid of thumbnails. Hovering a tile for half a second grows it into a
+//! bigger preview (recordings and gifs play in it, muted); a click opens it, the context menu and
+//! the keys do the rest, and the gear opens the app's settings. The app says where its captures
+//! come from and which kinds it makes ([`Setup`]), and what opening one does and which lines of
+//! its own the menu has ([`Host`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -10,23 +12,24 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Event, Id, Key, Modifiers, Pos2, Rect, TextureHandle, Ui, UiBuilder, pos2, vec2};
-use glint_core::config::Config;
 use glint_core::gallery::grid::{Grid, Spec, Step};
 use glint_core::gallery::thumb::{self, Meta};
 use glint_core::gallery::{self, Day, Filter, Item, Kind, path_id};
-use glint_core::history::{self, Kind as HistoryKind, Local};
+use glint_core::history::Local;
 use glint_core::icon::icon_rgba;
 use glint_core::log::log;
-use glint_core::paths::app_dir;
-use glint_core::upload::{Destination, Payload};
+use glint_core::paths::app_dir_for;
+use glint_shell::clipboard;
 use glint_shell::time::local_time;
-use glint_ui::widgets::{self, BAR_H, Look, TitleAction};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, IsIconic, SW_RESTORE, SW_SHOWNORMAL, SetForegroundWindow, ShowWindow};
+use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 use windows::core::{HSTRING, w};
+
+use crate::widgets::{self, BAR_H, Look, TitleAction};
+use crate::window;
 
 mod decode;
 mod library;
@@ -35,16 +38,18 @@ mod play;
 mod thumbs;
 mod view;
 
+pub use library::list;
 use library::Library;
 use play::Playback;
 use thumbs::{Done, Job, Pool};
 use view::Flip;
 
 pub const GALLERY_ARG: &str = "--gallery";
-const TITLE: &str = "glint gallery";
+/// What starts an app's settings window.
+const SETTINGS_ARG: &str = "--settings";
 const WINDOW: [f32; 2] = [1120.0, 760.0];
 const MIN_WINDOW: [f32; 2] = [640.0, 480.0];
-/// The toolbar under the title bar: the filter and the search box.
+/// The toolbar under the title bar: the filter, the search box and the gear.
 const TOOL_H: f32 = 52.0;
 /// Tiles are at least this wide (ctrl+wheel changes it), 16:10.
 const TILE: f32 = 220.0;
@@ -58,6 +63,66 @@ const UPLOADS_PER_FRAME: usize = 3;
 /// Textures kept at least; far-away ones beyond this go.
 const KEEP_TEXTURES: usize = 240;
 
+/// What an app's gallery is made of.
+pub struct Setup {
+    /// The app's name: the window is "<app> gallery", its thumbnails are cached in
+    /// `%LOCALAPPDATA%\<app>\thumbs` and its size is kept in `%APPDATA%\<app>\gallery.json`.
+    pub app: &'static str,
+    pub accent: [u8; 3],
+    /// What the app makes; with more than one, the toolbar filters by kind.
+    pub kinds: &'static [Kind],
+    /// The app's history of captures (`history.jsonl`).
+    pub history: PathBuf,
+    /// The folder captures are saved in and how many folders deep they go; read again whenever
+    /// the window comes back to the front (the settings may have moved it).
+    pub folder: fn() -> (PathBuf, usize),
+    /// The settings window's title: the gear brings it forward, or starts `<exe> --settings`.
+    pub settings: &'static str,
+    /// What an empty gallery says.
+    pub empty: &'static str,
+}
+
+/// A line of the app's own in an item's menu.
+pub struct Extra {
+    pub key: u32,
+    pub name: &'static str,
+    /// Right under the first line; otherwise right above delete.
+    pub top: bool,
+}
+
+/// What work on an item ends with: the toast's text, and a link it offers to open.
+pub struct Note {
+    pub text: String,
+    pub link: Option<String>,
+}
+
+/// Work on one item running in the background (an upload); its tile shows a moving bar until it
+/// ends. An error is the toast's text.
+pub type Work = JoinHandle<Result<Note, String>>;
+
+/// What the app does with its items, on the window's thread.
+pub trait Host {
+    /// The menu's first line for `item`: what a click and enter do.
+    fn open_label(&self, _item: &Item) -> &'static str {
+        "open"
+    }
+
+    fn open(&mut self, item: &Item) -> Result<(), String>;
+
+    /// The app's own lines in `item`'s menu; `busy` while work on it runs.
+    fn extras(&self, _item: &Item, _busy: bool) -> Vec<Extra> {
+        Vec::new()
+    }
+
+    /// The extra `key` was picked on `item`; work it starts runs with a bar on the tile.
+    fn pick(&mut self, _key: u32, _item: &Item, _owner: HWND) -> Result<Option<Work>, String> {
+        Ok(None)
+    }
+
+    /// The window came back to the front: the settings may have changed since.
+    fn refocus(&mut self) {}
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
 struct Saved {
@@ -65,18 +130,14 @@ struct Saved {
     tile: Option<f32>,
 }
 
-fn saved_path() -> PathBuf {
-    app_dir().join("gallery.json")
-}
-
 impl Saved {
-    fn load() -> Saved {
-        serde_json::from_str(&std::fs::read_to_string(saved_path()).unwrap_or_default()).unwrap_or_default()
+    fn load(path: &Path) -> Saved {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap_or_default()).unwrap_or_default()
     }
 
-    fn store(&self) {
+    fn store(&self, path: &Path) {
         if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(saved_path(), text);
+            let _ = std::fs::write(path, text);
         }
     }
 }
@@ -87,79 +148,74 @@ fn open_url(url: &str) {
     }
 }
 
-/// An uploader is set up in the settings.
-fn uploadable() -> bool {
-    Destination::from_config(&Config::load().unwrap_or_default()).is_ok()
-}
-
-fn find() -> Option<HWND> {
-    unsafe { FindWindowW(None, &HSTRING::from(TITLE)).ok() }
-}
-
-fn bring_forward(h: HWND) {
+/// Opens `path` in the app Windows has for it.
+pub fn open_file(path: &Path) {
     unsafe {
-        if IsIconic(h).as_bool() {
-            let _ = ShowWindow(h, SW_RESTORE);
-        }
-        let _ = SetForegroundWindow(h);
+        ShellExecuteW(None, w!("open"), &HSTRING::from(path.as_os_str()), None, None, SW_SHOWNORMAL);
     }
 }
 
-/// Brings the gallery forward, or starts it (on `select`, when given).
-pub(crate) fn open(select: Option<&Path>) {
-    if let Some(h) = find() {
-        return bring_forward(h);
+fn title(app: &str) -> String {
+    format!("{app} gallery")
+}
+
+/// Starts this exe with `arg` (and `file`).
+fn spawn(arg: &str, file: Option<&Path>) -> std::io::Result<()> {
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg(arg);
+    if let Some(p) = file {
+        cmd.arg(p);
     }
-    let spawned = std::env::current_exe().and_then(|exe| {
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg(GALLERY_ARG);
-        if let Some(p) = select {
-            cmd.arg(p);
-        }
-        cmd.spawn()
-    });
-    if let Err(e) = spawned {
+    cmd.spawn().map(|_| ())
+}
+
+/// Brings `app`'s gallery forward, or starts it (on `select`, when given).
+pub fn open(app: &str, select: Option<&Path>) {
+    if let Some(h) = window::find(&title(app)) {
+        return window::bring_forward(h);
+    }
+    if let Err(e) = spawn(GALLERY_ARG, select) {
         log(&format!("can't open the gallery: {e}"));
     }
 }
 
-pub fn run(select: Option<PathBuf>) {
-    if let Some(h) = find() {
-        return bring_forward(h);
+pub fn run(setup: Setup, host: impl Host + 'static, select: Option<PathBuf>) {
+    let title = title(setup.app);
+    if let Some(h) = window::find(&title) {
+        return window::bring_forward(h);
     }
     let started = Instant::now();
     let ctx_cell = Arc::new(OnceLock::new());
     // the list is read while the window comes up
-    let library = Library::start(ctx_cell.clone());
-    let cfg = Config::load().unwrap_or_default();
-    let accent = cfg.accent_rgb();
-    let saved = Saved::load();
+    let library = Library::start(setup.history.clone(), setup.folder, setup.kinds, ctx_cell.clone());
+    let saved_at = app_dir_for(setup.app).join("gallery.json");
+    let saved = Saved::load(&saved_at);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(TITLE)
+            .with_title(&title)
             .with_inner_size(WINDOW)
             .with_min_inner_size(MIN_WINDOW)
             .with_resizable(true)
             .with_decorations(false)
-            .with_icon(egui::IconData { rgba: icon_rgba(64, accent), width: 64, height: 64 }),
+            .with_icon(egui::IconData { rgba: icon_rgba(64, setup.accent), width: 64, height: 64 }),
         centered: saved.rect.is_none(),
         ..Default::default()
     };
     let _ = eframe::run_native(
-        TITLE,
+        &title,
         options,
         Box::new(move |cc| {
-            glint_ui::theme::fonts(&cc.egui_ctx);
+            crate::theme::fonts(&cc.egui_ctx);
             let _ = ctx_cell.set(cc.egui_ctx.clone());
             let hwnd = match cc.window_handle().map(|h| h.as_raw()) {
                 Ok(RawWindowHandle::Win32(h)) => Some(HWND(h.hwnd.get() as _)),
                 _ => None,
             };
-            let rounded = hwnd.is_some_and(|h| glint_ui::window::frameless(h, true));
+            let rounded = hwnd.is_some_and(|h| window::frameless(h, true));
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
-                crate::platform::windows::place(h, r);
+                window::place(h, r);
             }
-            let mut app = Gallery::new(&cc.egui_ctx, library, saved, accent, started);
+            let mut app = Gallery::new(&cc.egui_ctx, setup, Box::new(host), library, saved, saved_at, started);
             (app.hwnd, app.rounded, app.select) = (hwnd, rounded, select.as_deref().map(path_id));
             Ok(Box::new(app))
         }),
@@ -221,14 +277,10 @@ struct Toast {
     warn: bool,
 }
 
-struct Upload {
+/// Work the app runs on an item.
+struct Busy {
     id: u64,
-    path: PathBuf,
-    kind: HistoryKind,
-    size: u64,
-    host: String,
-    copy_link: bool,
-    thread: Option<JoinHandle<Result<String, String>>>,
+    work: Option<Work>,
 }
 
 /// Deleted items waiting for their undo to run out. One undo brings all of them back, so they all
@@ -283,12 +335,16 @@ impl Deletions {
 }
 
 struct Gallery {
+    setup: Setup,
+    host: Box<dyn Host>,
     hwnd: Option<HWND>,
     rounded: bool,
-    accent: [u8; 3],
     light: Option<bool>,
     keyboard: bool,
     saved: Saved,
+    saved_at: PathBuf,
+    /// The thumbnail cache.
+    cache: PathBuf,
     started: Instant,
     /// Open time is logged once the first view has its thumbnails.
     reported: bool,
@@ -336,20 +392,32 @@ struct Gallery {
     menu: Option<Menu>,
     toast: Option<Toast>,
     pending: Deletions,
-    uploads: Vec<Upload>,
+    busy: Vec<Busy>,
     copying: Option<JoinHandle<Result<(), String>>>,
-    uploadable: bool,
 }
 
 impl Gallery {
-    fn new(ctx: &egui::Context, library: Library, saved: Saved, accent: [u8; 3], started: Instant) -> Gallery {
+    fn new(
+        ctx: &egui::Context,
+        setup: Setup,
+        host: Box<dyn Host>,
+        library: Library,
+        saved: Saved,
+        saved_at: PathBuf,
+        started: Instant,
+    ) -> Gallery {
+        let cache = thumbs::cache_dir(setup.app);
         Gallery {
+            pool: Pool::start(ctx, cache.clone()),
+            setup,
+            host,
             hwnd: None,
             rounded: false,
-            accent,
             light: None,
             keyboard: false,
             saved,
+            saved_at,
+            cache,
             started,
             reported: false,
             now: 0.0,
@@ -367,7 +435,6 @@ impl Gallery {
             spec: None,
             dirty: true,
             flip: Flip::default(),
-            pool: Pool::start(ctx),
             tex: HashMap::new(),
             meta: HashMap::new(),
             failed: HashSet::new(),
@@ -384,9 +451,8 @@ impl Gallery {
             menu: None,
             toast: None,
             pending: Deletions::default(),
-            uploads: Vec::new(),
+            busy: Vec::new(),
             copying: None,
-            uploadable: uploadable(),
         }
     }
 
@@ -447,7 +513,8 @@ impl Gallery {
                 loaded.took.as_millis()
             ));
             let live = self.items.iter().map(|i| thumb::key(&i.path, i.size, i.modified)).collect();
-            let _ = std::thread::Builder::new().name("sweep".into()).spawn(move || thumbs::sweep(live));
+            let cache = self.cache.clone();
+            let _ = std::thread::Builder::new().name("sweep".into()).spawn(move || thumbs::sweep(&cache, live));
         }
         if let Some(id) = self.select.filter(|id| self.index(*id).is_some()) {
             self.select = None;
@@ -495,7 +562,7 @@ impl Gallery {
         if uploaded == UPLOADS_PER_FRAME {
             ctx.request_repaint();
         }
-        self.poll_uploads(ctx);
+        self.poll_busy(ctx);
         if let Some(t) = self.copying.take_if(|t| t.is_finished()) {
             match t.join().unwrap_or_else(|_| Err("the copy crashed".into())) {
                 Ok(()) => self.say("copied, paste it anywhere", None, false),
@@ -520,14 +587,8 @@ impl Gallery {
 
     fn open_item(&mut self, id: u64) {
         let Some(item) = self.item(id).cloned() else { return };
-        if item.kind == Kind::Recording {
-            if let Err(e) = crate::clip::spawn(&item.path) {
-                self.say(&format!("can't open the trimmer: {e}"), None, true);
-            }
-            return;
-        }
-        unsafe {
-            ShellExecuteW(None, w!("open"), &HSTRING::from(item.path.as_os_str()), None, None, SW_SHOWNORMAL);
+        if let Err(e) = self.host.open(&item) {
+            self.say(&e, None, true);
         }
     }
 
@@ -535,7 +596,7 @@ impl Gallery {
     fn copy(&mut self, id: u64, file: bool) {
         let Some(item) = self.item(id).cloned() else { return };
         if item.kind != Kind::Shot || file {
-            match crate::shot::copy_files(self.hwnd, std::slice::from_ref(&item.path)) {
+            match clipboard::copy_files(self.hwnd, std::slice::from_ref(&item.path)) {
                 Ok(()) => self.say("copied, paste it anywhere", None, false),
                 Err(e) => self.say(&format!("couldn't copy: {e}"), None, true),
             }
@@ -550,60 +611,49 @@ impl Gallery {
             let wic = decode::Wic::new()?;
             let (px, _) = wic.file(&item.path, |w, h| (w, h))?;
             let alpha = px.alpha();
-            crate::shot::copy_to_clipboard(Some(HWND(owner as _)), &px.argb(), px.w, px.h, alpha)
+            clipboard::copy_image(Some(HWND(owner as _)), &px.argb(), px.w, px.h, alpha)
         }));
     }
 
     fn copy_link(&mut self, url: &str) {
-        match crate::shot::copy_text(self.hwnd, url) {
+        match clipboard::copy_text(self.hwnd, url) {
             Ok(()) => self.say("link copied", None, false),
             Err(e) => self.say(&format!("couldn't copy the link: {e}"), None, true),
         }
     }
 
-    fn upload(&mut self, id: u64) {
+    fn is_busy(&self, id: u64) -> bool {
+        self.busy.iter().any(|b| b.id == id)
+    }
+
+    /// One of the app's own menu lines.
+    fn pick(&mut self, key: u32, id: u64) {
         let Some(item) = self.item(id).cloned() else { return };
-        if self.uploads.iter().any(|u| u.id == id) {
+        if self.is_busy(id) {
             return;
         }
-        let cfg = Config::load().unwrap_or_default();
-        let started = Destination::from_config(&cfg).and_then(|dest| {
-            let payload = Payload::file(&item.path)?;
-            dest.check_size(&payload)?;
-            let (host, size) = (dest.name.clone(), payload.size);
-            let thread = std::thread::spawn(move || crate::upload::upload(&dest, payload).map(|u| u.url));
-            let kind = if item.kind == Kind::Shot { HistoryKind::Shot } else { HistoryKind::Recording };
-            Ok(Upload { id, path: item.path.clone(), kind, size, host, copy_link: cfg.upload_copy_link, thread: Some(thread) })
-        });
-        match started {
-            Ok(u) => self.uploads.push(u),
-            Err(e) => self.say(&format!("couldn't upload: {e}"), None, true),
+        match self.host.pick(key, &item, self.owner()) {
+            Ok(Some(work)) => self.busy.push(Busy { id, work: Some(work) }),
+            Ok(None) => {}
+            Err(e) => self.say(&e, None, true),
         }
     }
 
-    fn poll_uploads(&mut self, ctx: &egui::Context) {
-        if self.uploads.is_empty() {
+    fn poll_busy(&mut self, ctx: &egui::Context) {
+        if self.busy.is_empty() {
             return;
         }
         ctx.request_repaint_after(Duration::from_millis(100));
         let mut i = 0;
-        while i < self.uploads.len() {
-            let Some(thread) = self.uploads[i].thread.take_if(|t| t.is_finished()) else {
+        while i < self.busy.len() {
+            let Some(work) = self.busy[i].work.take_if(|t| t.is_finished()) else {
                 i += 1;
                 continue;
             };
-            let up = self.uploads.remove(i);
-            match thread.join().unwrap_or_else(|_| Err("the upload crashed".into())) {
-                Ok(url) => {
-                    history::add(up.kind, Some(&up.path), up.size, Some(&url), None);
-                    let copied = up.copy_link && crate::shot::copy_text(self.hwnd, &url).is_ok();
-                    let text = if copied { "uploaded, link copied" } else { "uploaded" };
-                    self.say(text, Some(("open", Action::Link(url))), false);
-                }
-                Err(e) => {
-                    log(&format!("gallery: upload to {} failed: {e}", up.host));
-                    self.say(&format!("couldn't upload to {}: {e}", up.host), None, true);
-                }
+            self.busy.remove(i);
+            match work.join().unwrap_or_else(|_| Err("it crashed".into())) {
+                Ok(Note { text, link }) => self.say(&text, link.map(|url| ("open", Action::Link(url))), false),
+                Err(e) => self.say(&e, None, true),
             }
         }
     }
@@ -646,7 +696,7 @@ impl Gallery {
         let paths: Vec<PathBuf> = gone.into_iter().map(|i| i.path).collect();
         let recycle = move || {
             for p in &paths {
-                if let Err(e) = crate::platform::windows::recycle(HWND::default(), p) {
+                if let Err(e) = glint_shell::explorer::recycle(HWND::default(), p) {
                     log(&format!("gallery: can't delete {}: {e}", p.display()));
                 }
             }
@@ -849,12 +899,22 @@ impl Gallery {
             .collect();
         self.pool.want(jobs);
     }
+
+    /// The gear: the app's settings window forward, or started.
+    fn open_settings(&mut self) {
+        if let Some(h) = window::find(self.setup.settings) {
+            return window::bring_forward(h);
+        }
+        if let Err(e) = spawn(SETTINGS_ARG, None) {
+            self.say(&format!("can't open settings: {e}"), None, true);
+        }
+    }
 }
 
 impl Drop for Gallery {
     fn drop(&mut self) {
         self.commit(true);
-        self.saved.store();
+        self.saved.store(&self.saved_at);
     }
 }
 
@@ -864,10 +924,10 @@ impl eframe::App for Gallery {
         self.now = ctx.input(|i| i.time);
         self.frame += 1;
         let light = ctx.system_theme() == Some(egui::Theme::Light);
-        let p = widgets::palette(light, self.accent);
+        let p = widgets::palette(light, self.setup.accent);
         if self.light != Some(light) {
             self.light = Some(light);
-            glint_ui::theme::visuals(&ctx, &p, light);
+            crate::theme::visuals(&ctx, &p, light);
         }
         ctx.input(|i| {
             if i.pointer.any_pressed() {
@@ -876,13 +936,13 @@ impl eframe::App for Gallery {
                 self.keyboard = true;
             }
         });
-        if let Some(r) = self.hwnd.and_then(crate::platform::windows::window_placement) {
+        if let Some(r) = self.hwnd.and_then(window::placement) {
             self.saved.rect = Some(r);
         }
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if focused && !self.focused {
             self.library.refresh();
-            self.uploadable = uploadable();
+            self.host.refocus();
         }
         self.focused = focused;
         self.poll(&ctx);
@@ -896,7 +956,7 @@ impl eframe::App for Gallery {
         let full = ui.max_rect();
         ui.painter().rect_filled(full, radius, p.side);
         let bar = Rect::from_min_size(full.min, vec2(full.width(), BAR_H));
-        match widgets::title_bar(ui, &look, bar, "glint", "gallery", active, radius) {
+        match widgets::title_bar(ui, &look, bar, self.setup.app, "gallery", active, radius) {
             TitleAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
             TitleAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
             TitleAction::None => {}

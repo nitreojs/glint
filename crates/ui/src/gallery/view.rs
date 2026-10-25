@@ -7,16 +7,16 @@ use std::collections::{HashMap, HashSet};
 use eframe::egui::epaint::{RectShape, Shadow};
 use eframe::egui::scroll_area::ScrollSource;
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, Id, Layout, Order, Painter, Rect, Sense, Stroke, StrokeKind,
-    TextureFilter, TextureId, TextureOptions, TextureWrapMode, Ui, UiBuilder, pos2, vec2,
+    self, Align, Align2, Color32, CursorIcon, Id, Layout, Order, Painter, Rect, Response, Role, Sense, Stroke,
+    StrokeKind, TextureFilter, TextureId, TextureOptions, TextureWrapMode, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 use glint_core::format::{human_duration, human_size};
 use glint_core::gallery::grid::{self, Grid, Line, Spec};
 use glint_core::gallery::thumb::Meta;
 use glint_core::gallery::{Filter, Kind};
-use glint_ui::widgets::{self, Look, ease, medium, mono, motion, sans};
 
 use super::{Gallery, Menu, Preview, TILE_RANGE};
+use crate::widgets::{self, Look, anim, ease, medium, mix, mono, motion, sans};
 
 pub(super) const THUMB_OPTIONS: TextureOptions = TextureOptions {
     magnification: TextureFilter::Linear,
@@ -151,21 +151,71 @@ pub(super) fn preview_rect(tile: Rect, meta: Meta, panel: Rect, ppp: f32) -> Rec
     grid::grown(tile, aspect, bounds, 2.6, 520.0f32.min(bounds.width() * 0.8), limit)
 }
 
+/// What the filter calls a kind.
+fn chip(kind: Kind) -> (Filter, &'static str) {
+    match kind {
+        Kind::Shot => (Filter::Shots, "screenshots"),
+        Kind::Recording => (Filter::Recordings, "recordings"),
+        Kind::Gif => (Filter::Gifs, "gifs"),
+    }
+}
+
+/// A square button with a gear in it.
+fn gear(ui: &mut Ui, look: &Look, rect: Rect) -> Response {
+    let p = &look.p;
+    let resp = ui.interact(rect, Id::unique("gallery-settings"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+    resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "settings"));
+    let h = anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
+    let d = anim(ui, resp.id.with("prs"), resp.is_pointer_button_down_on(), 0.08);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 6, p.hov.gamma_multiply(h * (1.0 - d)));
+    painter.rect_filled(rect, 6, p.prs.gamma_multiply(d));
+    let color = mix(p.t2, p.t1, h);
+    let c = rect.center();
+    // turns a little toward the pointer
+    let turn = std::f32::consts::FRAC_PI_8 * ease(h);
+    for k in 0..8 {
+        let a = turn + k as f32 * std::f32::consts::FRAC_PI_4;
+        let dir = vec2(a.cos(), a.sin());
+        painter.line_segment([c + dir * 5.2, c + dir * 7.4], Stroke::new(2.4, color));
+    }
+    painter.circle_stroke(c, 5.0, Stroke::new(1.6, color));
+    painter.circle_stroke(c, 1.8, Stroke::new(1.4, color));
+    if look.keyboard && resp.has_focus() {
+        painter.rect_stroke(rect.expand(2.0), 8.0, Stroke::new(2.0, p.focus), StrokeKind::Middle);
+    }
+    resp.on_hover_text("settings")
+}
+
 impl Gallery {
     pub(super) fn toolbar(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
         let p = look.p;
         let inner = Rect::from_min_max(pos2(rect.left() + 16.0, rect.top() + 4.0), pos2(rect.right() - 16.0, rect.bottom() - 16.0));
         let mut row = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
-        let before = self.filter;
-        let options = [(Filter::All, "all"), (Filter::Shots, "screenshots"), (Filter::Recordings, "recordings"), (Filter::Gifs, "gifs")];
-        widgets::segmented(&mut row, look, &mut self.filter, &options, Some(400.0_f32.min(inner.width() * 0.6)));
-        if self.filter != before {
-            self.refilter();
+        let kinds = self.setup.kinds;
+        if kinds.len() > 1 {
+            let before = self.filter;
+            // "all", then each kind: at most four, so no allocation a frame
+            let mut options = [(Filter::All, "all"); 4];
+            for (slot, &k) in options[1..].iter_mut().zip(kinds) {
+                *slot = chip(k);
+            }
+            let options = &options[..(kinds.len() + 1).min(4)];
+            let width = (100.0 * options.len() as f32).min(inner.width() * 0.6);
+            widgets::segmented(&mut row, look, &mut self.filter, options, Some(width));
+            if self.filter != before {
+                self.refilter();
+            }
         }
         row.with_layout(Layout::right_to_left(Align::Center), |row| {
-            let search_w = 240.0_f32.min((row.available_width() - 8.0).max(120.0));
+            let right = row.max_rect().right();
+            let gear_rect = Rect::from_center_size(pos2(right - 16.0, inner.center().y), vec2(32.0, 32.0));
+            if gear(row, look, gear_rect).clicked() {
+                self.open_settings();
+            }
+            let search_w = 240.0_f32.min((row.available_width() - 48.0).max(120.0));
             let mut field = row.new_child(UiBuilder::new().max_rect(Rect::from_min_size(
-                pos2(row.max_rect().right() - search_w, inner.center().y - 16.0),
+                pos2(gear_rect.left() - 8.0 - search_w, inner.center().y - 16.0),
                 vec2(search_w, 32.0),
             )));
             let before = self.query.clone();
@@ -174,7 +224,7 @@ impl Gallery {
             if self.query != before {
                 self.refilter();
             }
-            row.add_space(search_w + 14.0);
+            row.add_space(32.0 + 8.0 + search_w + 14.0);
             if self.loaded && !self.shown.is_empty() {
                 let bytes: u64 = self.shown.iter().map(|&i| self.items[i].size).sum();
                 let text = format!("{} · {}", self.shown.len(), human_size(bytes));
@@ -192,7 +242,7 @@ impl Gallery {
         let ctx = ui.ctx().clone();
         let panel = ui.max_rect();
         if self.loaded && self.shown.is_empty() && self.pending.is_empty() {
-            let text = if self.items.is_empty() { "nothing captured yet" } else { "nothing matches" };
+            let text = if self.items.is_empty() { self.setup.empty } else { "nothing matches" };
             ui.painter().text(panel.center(), Align2::CENTER_CENTER, text, sans(13.0), p.t3);
             self.drawn.clear();
             self.flip.last.clear();
@@ -389,7 +439,7 @@ impl Gallery {
             let text = format!("{:02}:{:02} · {}", local.hour, local.minute, human_size(item.size));
             badge(painter, r, &text, false, h * shown);
         }
-        if self.uploads.iter().any(|u| u.id == id) {
+        if self.is_busy(id) {
             let t = (self.now * 0.8).fract() as f32;
             let bar = Rect::from_min_size(pos2(r.left() + (r.width() - 40.0) * t, r.bottom() - 3.0), vec2(40.0, 3.0));
             painter.rect_filled(bar.intersect(r), 1, p.acc);

@@ -6,10 +6,13 @@ repository.workspace = true
 
 [dependencies]
 eframe.workspace = true
+gif.workspace = true
 glint-core.workspace = true
 glint-media.workspace = true
 glint-shell.workspace = true
 raw-window-handle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 windows.workspace = true
 
 [features]

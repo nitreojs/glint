@@ -1,5 +1,5 @@
 //! Thumbnails made off the UI thread: a few workers take what's in view first, read it from the
-//! disk cache (`%LOCALAPPDATA%\glint\thumbs`) or make it (WIC for pictures, Media Foundation on the
+//! disk cache (`%LOCALAPPDATA%\<app>\thumbs`) or make it (WIC for pictures, Media Foundation on the
 //! GPU for recordings) and cache it. Screenshot previews decode at their shown size the same way,
 //! ahead of every thumbnail.
 
@@ -14,10 +14,10 @@ use glint_core::gallery::Kind;
 use glint_core::gallery::thumb::{self, Meta};
 use glint_core::log::log;
 use glint_media::clip::media::{self, Com, Gpu};
+use glint_media::image::{ImageFormat, encode};
 
 use super::decode::{Pixels, Wic};
 use super::play;
-use crate::shot::{ImageFormat, encode};
 
 /// A thumbnail's shorter side and the most its longer side gets, in pixels.
 const SHORT: u32 = 280;
@@ -61,14 +61,13 @@ pub(super) struct Pool {
     asked: Vec<u64>,
 }
 
-pub(super) fn cache_dir() -> PathBuf {
+pub(super) fn cache_dir(app: &str) -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("glint").join("thumbs")
+    base.join(app).join("thumbs")
 }
 
 impl Pool {
-    pub fn start(ctx: &egui::Context) -> Pool {
-        let dir = cache_dir();
+    pub fn start(ctx: &egui::Context, dir: PathBuf) -> Pool {
         if let Err(e) = std::fs::create_dir_all(&dir) {
             log(&format!("gallery: no thumbnail cache at {}: {e}", dir.display()));
         }
@@ -249,10 +248,9 @@ fn store(dir: &Path, key: u64, pixels: &Pixels, meta: Meta) {
     }
 }
 
-/// Deletes cached thumbnails of files that aren't there any more (or changed since).
-pub(super) fn sweep(live: HashSet<u64>) {
-    let dir = cache_dir();
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+/// Deletes cached thumbnails in `dir` of files that aren't there any more (or changed since).
+pub(super) fn sweep(dir: &Path, live: HashSet<u64>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
     let names: Vec<String> = entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
     let stale = thumb::stale(names.iter().map(String::as_str), &live);
     for name in &stale {

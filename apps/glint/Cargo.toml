@@ -6,7 +6,6 @@ repository.workspace = true
 
 [dependencies]
 eframe.workspace = true
-gif.workspace = true
 glint-core.workspace = true
 glint-media.workspace = true
 glint-shell.workspace = true

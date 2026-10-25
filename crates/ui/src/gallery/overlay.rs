@@ -5,9 +5,9 @@ use eframe::egui::{
     vec2,
 };
 use glint_core::gallery::Kind;
-use glint_ui::widgets::{self, Look, anim, ease, keycaps, mix, sans};
 
 use super::{Action, Gallery};
+use crate::widgets::{self, Look, anim, ease, keycaps, mix, sans};
 
 const MENU_W: f32 = 220.0;
 const ITEM_H: f32 = 32.0;
@@ -20,7 +20,8 @@ enum Entry {
     CopyFile,
     CopyLink,
     Folder,
-    Upload,
+    /// One of the app's own, by its key.
+    Extra(u32),
     Delete,
 }
 
@@ -31,9 +32,11 @@ fn danger(light: bool) -> Color32 {
 impl Gallery {
     fn entries(&self, id: u64) -> Vec<Option<(Entry, &'static str, &'static str)>> {
         let Some(item) = self.item(id) else { return Vec::new() };
-        let shot = item.kind == Kind::Shot;
-        let mut out = vec![Some((Entry::Open, if item.kind == Kind::Recording { "trim…" } else { "open" }, "enter"))];
-        if shot {
+        let extras = self.host.extras(item, self.is_busy(id));
+        let extra = |top: bool| extras.iter().filter(move |e| e.top == top).map(|e| Some((Entry::Extra(e.key), e.name, "")));
+        let mut out = vec![Some((Entry::Open, self.host.open_label(item), "enter"))];
+        out.extend(extra(true));
+        if item.kind == Kind::Shot {
             out.push(Some((Entry::Copy, "copy image", "ctrl+c")));
             out.push(Some((Entry::CopyFile, "copy file", "")));
         } else {
@@ -43,9 +46,7 @@ impl Gallery {
             out.push(Some((Entry::CopyLink, "copy link", "")));
         }
         out.push(Some((Entry::Folder, "show in folder", "")));
-        if self.uploadable && !self.uploads.iter().any(|u| u.id == id) {
-            out.push(Some((Entry::Upload, "upload", "")));
-        }
+        out.extend(extra(false));
         out.push(None);
         out.push(Some((Entry::Delete, "delete", "del")));
         out
@@ -134,7 +135,7 @@ impl Gallery {
                     glint_shell::explorer::reveal(&p);
                 }
             }
-            Entry::Upload => self.upload(id),
+            Entry::Extra(key) => self.pick(key, id),
             Entry::Delete => self.delete(id),
         }
     }

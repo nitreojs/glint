@@ -47,17 +47,22 @@ pub fn file() -> PathBuf {
 
 /// Records a capture; `app` names the app whose window it shows.
 pub fn add(kind: Kind, path: Option<&Path>, size: u64, url: Option<&str>, app: Option<&str>) {
+    add_to(&file(), kind, path, size, url, app);
+}
+
+/// Records a capture in the history `file` (another app's than glint's).
+pub fn add_to(file: &Path, kind: Kind, path: Option<&Path>, size: u64, url: Option<&str>, app: Option<&str>) {
     let time = now();
     let (path, url, app) = (path.map(Path::to_path_buf), url.map(str::to_string), app.map(str::to_string));
     let entry = Entry { kind, path, url, size, time, app };
-    if let Err(e) = append(&file(), &entry) {
+    if let Err(e) = append(file, &entry) {
         log(&format!("history: {e}"));
     }
 }
 
-/// Every entry, oldest first, whether its file is still there or not.
-pub fn all() -> Vec<Entry> {
-    read(&file())
+/// Every entry in the history `file`, oldest first, whether its file is still there or not.
+pub fn all_in(file: &Path) -> Vec<Entry> {
+    read(file)
 }
 
 pub fn recent(n: usize) -> Vec<Entry> {
