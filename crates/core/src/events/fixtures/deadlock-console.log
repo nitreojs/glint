@@ -1,0 +1,70 @@
+﻿10/26 18:53:30 [RenderSystem] Determined driver version for graphics adapter 0 [output 0] '': 32.0.16.1714
+10/26 18:53:30 [RenderSystem] Loaded video settings config from 'cfg\video.txt'
+10/26 18:53:31 [RenderSystem] Successfully created dx11 swap chain [FlipDiscard | AllowTear]
+10/26 18:53:31 [CommandLine] command line arguments:
+10/26 18:53:31 [CommandLine] -steam -console -dx11 -condebug
+10/26 18:53:34 Loading map "dl_hideout"
+10/26 18:53:40 [SignonState] Client 0 'player' signon state SIGNONSTATE_NONE -> SIGNONSTATE_CONNECTED
+10/26 18:53:41 Initializing bot for player slot 2: k_ECitadelBotDifficulty_Easy
+10/26 18:53:41 CGameParticleManager::SetParticleControlEnt: Unable to lookup attachment "ability_apply" on model "" for entity "player"
+10/26 18:53:41 unknown respawned
+10/26 18:53:41 [Server] [Bot0] cl_interp_ratio='1.0', LerpTime=0
+10/26 18:53:41 CreateCitadelBot: Successfully created bot Bot0
+10/26 18:53:41 Created bot 495/hero_inferno/hero_inferno at location 11877.875000 -8048.000000 -311.404175
+10/26 18:53:41 ClientPutInServer create new player controller [Bot1]
+10/26 18:53:41 Initializing bot for player slot 3: k_ECitadelBotDifficulty_Easy
+10/26 18:53:41 CGameParticleManager::SetParticleControlEnt: Unable to lookup attachment "ability_apply" on model "" for entity "player"
+10/26 18:53:41 unknown respawned
+10/26 18:53:41 [Server] [Bot1] cl_interp_ratio='1.0', LerpTime=0
+10/26 18:53:41 Created bot 497/hero_gigawatt/hero_gigawatt at location 11685.875000 -8528.000000 -347.000000
+10/26 18:53:41 Warning: citadel_hideout_button 'nocooldown_punch_button' failed to parse curve string - Unable to determine buffer encoding.CCitadelGameRules::PostSpawnGroupLoad: Marking map entities as spawned
+10/26 18:53:41 [Server] SV:  31 player server started
+10/26 18:53:41 ChangeGameState: WaitingForPlayersToJoin (2)
+10/26 18:53:41 RollCorruptedPenalties: seed 1847861453
+10/26 18:53:41 Citadel HLTV Director, Entering game state: 2 (WaitingForPlayersToJoin)  (no HLTV server found)
+10/26 18:53:41 [SignonState] Client 0 'player' signon state SIGNONSTATE_SPAWN -> SIGNONSTATE_FULL
+10/26 18:53:41 CGameParticleManager::SetParticleControlEnt: Unable to lookup attachment "ability_apply" on model "" for entity "player"
+10/26 18:53:41 unknown respawned
+10/26 18:53:41 ChangeGameState: HeroSelection (3)
+10/26 18:53:41 Citadel HLTV Director, Entering game state: 3 (HeroSelection)  (no HLTV server found)
+10/26 18:53:41 [Server] SV:  Sending full update to client player (reason:  initial update)
+10/26 18:53:41 ChangeGameState: MatchIntro (4)
+10/26 18:53:41 Citadel HLTV Director, Entering game state: 4 (MatchIntro)  (no HLTV server found)
+10/26 18:53:41 ChangeGameState: WaitForMapToLoad (5)
+10/26 18:53:41 Citadel HLTV Director, Entering game state: 5 (WaitForMapToLoad)  (no HLTV server found)
+10/26 18:53:41 ChangeGameState: PreGameWait (6)
+10/26 18:53:41 ChangeGameState: GameInProgress (7)
+10/26 18:53:41 CGameParticleManager::SetParticleControlEnt: Unable to lookup attachment "ability_apply" on model "" for entity "player"
+10/26 18:53:41 hero_hornet respawned
+10/26 18:53:41 CGameParticleManager::SetParticleControlEnt: Unable to lookup attachment "ability_apply" on model "" for entity "player"
+10/26 18:53:41 hero_inferno respawned
+10/26 18:53:41 CGameParticleManager::SetParticleControlEnt: Unable to lookup attachment "ability_apply" on model "" for entity "player"
+10/26 18:53:41 OnGameStateChanged: HeroSelection (3)
+10/26 18:53:41 [Prediction] Added prediction for player slot 0 (player)
+10/26 18:53:41 OnGameStateChanged: GameInProgress (7)
+10/26 18:53:42 C_BasePlayerPawn::OnPostPredictionError( ) visual prediction distance 0.000 - teleporting
+10/26 18:53:42 [Server] Loaded hero 499/hero_hornet
+10/26 18:53:42 hero_hornet respawned
+10/26 18:53:42 hero_hornet respawned
+10/26 18:53:42 C_BasePlayerPawn::OnPostPredictionError( ) visual prediction distance 0.000 - teleporting
+10/26 18:53:42 C_BasePlayerPawn::OnPostPredictionError( ) visual prediction distance 0.281 - teleporting
+10/26 18:53:42 [Server] Loaded hero 495/hero_inferno
+10/26 18:53:42 hero_inferno respawned
+10/26 18:53:42 [Server] Loaded hero 497/hero_atlas
+10/26 18:54:41 	Idle Time <3.00ms - 3840 frames (100.0%), Longest Run - 3840, Avg Run: 3840.0
+10/26 18:55:05 [Client] Camera Pose Node "near_01" has a noticeable height overshoot vs the standing pivot ( -1.343993 ), which can result in bad game feel. Zeroing.
+ Camera Pose Node "near_02" has a noticeable height overshoot vs the standing pivot ( 6.719997 ), which can result in bad game feel. Zeroing.
+ VMDL Camera Pose Success! "models/heroes_staging/hornet_v3/hornet.vmdl" has loaded camera poses from vmdl:  "near_" Poses: 3, "far_" Poses: 3 ,"gunaim_" Poses:  3
+10/26 18:55:05 [Client] Camera Pose Node "near_01" has a noticeable height overshoot vs the standing pivot ( -1.343993 ), which can result in bad game feel. Zeroing.
+ Camera Pose Node "near_02" has a noticeable height overshoot vs the standing pivot ( 6.719997 ), which can result in bad game feel. Zeroing.
+ VMDL Camera Pose Success! "models/heroes_staging/hornet_v3/hornet.vmdl" has loaded camera poses from vmdl:  "near_" Poses: 3, "far_" Poses: 3 ,"gunaim_" Poses:  3
+10/26 18:55:31 GameTime: 1.8, Base Bounty: 291, Total Bounty: 416, VictimValue: 600
+10/26 18:55:31 Comeback Inactive
+10/26 18:55:31 Killer: hero_hornet, Dying: hero_atlas, Number of Assisters: 1
+10/26 18:55:31 Cannot apply Ragdoll impulse, body part root_motion is not physicalized
+10/26 18:55:35 hero_atlas respawned
+10/26 18:55:41 Avg Frame: 15.70ms, Avg Idle: 0.00ms - 3840 frames
+10/26 18:55:41 	Performant - 0 frames (0.0%), Longest Run - 0, Avg Run: 0.0
+10/26 18:55:41 	Frame Time >17.50ms - 1807 frames (47.1%), Longest Run - 4, Avg Run: 1.5
+10/26 18:55:41 	Idle Time <3.00ms - 3840 frames (100.0%), Longest Run - 3840, Avg Run: 3840.0
+10/26 18:56:41 Avg Frame: 15.63ms, Avg Idle: 0.00ms - 3840 frames

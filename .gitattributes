@@ -1,2 +1,3 @@
 apps/glint/src/update/fixtures/* -text
 crates/core/src/update/fixtures/* -text
+crates/core/src/events/fixtures/* -text
