@@ -526,7 +526,7 @@ accent = {accent}
 # The colour last picked with the custom swatch, remembered while a preset is in use.
 {accent_custom}
 
-# Updates from github.com/nitreojs/glint, checked at start and every 6 hours, signature-checked
+# Updates from github.com/nitreojs/glint, checked at start and every hour, signature-checked
 # before they're used: "auto" downloads them in the background and installs on the next start
 # (or when you click the notification), "notify" only tells you, "off" never checks.
 update_mode = "{update_mode}"

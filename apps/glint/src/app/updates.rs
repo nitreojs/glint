@@ -14,7 +14,7 @@ pub(super) const CHECK_TIMER_ID: usize = 9;
 pub(super) const IDLE_TIMER_ID: usize = 10;
 /// The first check waits a little so start-up stays fast.
 pub(super) const FIRST_CHECK_MS: u32 = 30_000;
-const CHECK_EVERY_MS: u32 = 6 * 60 * 60 * 1000;
+const CHECK_EVERY_MS: u32 = 60 * 60 * 1000;
 const IDLE_RETRY_MS: u32 = 2_000;
 
 /// WPARAM bits of [`crate::app::ipc::WM_UPDATE_CHECK`].
