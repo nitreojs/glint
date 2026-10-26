@@ -2,14 +2,17 @@
 
 use std::path::Path;
 
+use glint_core::geom::rect::Rect;
 use glint_core::naming::Source;
 use glint_core::wide::wide;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, TRUE};
+use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetWindowTextW, GetWindowThreadProcessId};
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumChildWindows, GetClassNameW, GetForegroundWindow, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId,
+};
 use windows::core::{BOOL, PCWSTR, PWSTR, w};
 
 /// Store apps' windows belong to this host; the app itself owns a child window.
@@ -27,7 +30,27 @@ pub fn identify(hwnd: HWND) -> Option<Source> {
     let exe = file_name(&path).to_string();
     let stem = Path::new(&exe).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
     let app = description(&path).filter(|d| !d.trim().is_empty()).unwrap_or(stem);
-    Some(Source { exe, app: app.trim().to_string(), title: title(hwnd) })
+    Some(Source { exe, app: app.trim().to_string(), title: title(hwnd), path })
+}
+
+/// The window in front and where it is, unless it's the desktop or the taskbar (which no app's
+/// capture is of).
+pub fn front_window() -> Option<(HWND, Rect)> {
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        if hwnd.is_invalid() {
+            return None;
+        }
+        let mut class = [0u16; 32];
+        let n = GetClassNameW(hwnd, &mut class) as usize;
+        let class = String::from_utf16_lossy(&class[..n]);
+        if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"].contains(&class.as_str()) {
+            return None;
+        }
+        let mut r = RECT::default();
+        GetWindowRect(hwnd, &mut r).ok()?;
+        Some((hwnd, Rect::from_points(r.left, r.top, r.right, r.bottom)))
+    }
 }
 
 fn file_name(path: &str) -> &str {

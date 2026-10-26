@@ -6,11 +6,32 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::UI::Shell::{
-    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS,
-    FileOpenDialog, IFileOpenDialog, ILCreateFromPathW, ILFree, IShellItem, SHCreateItemFromParsingName,
-    SHFILEOPSTRUCTW, SHFileOperationW, SHOpenFolderAndSelectItems, SIGDN_FILESYSPATH,
+    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOLDERID_Documents, FOLDERID_Videos,
+    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, ILCreateFromPathW, ILFree, IShellItem,
+    KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW, SHGetKnownFolderPath,
+    SHOpenFolderAndSelectItems, SIGDN_FILESYSPATH,
 };
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{GUID, HSTRING, PCWSTR};
+
+/// One of the user's known folders (Documents, Videos…).
+pub fn known_folder(id: &GUID) -> Option<PathBuf> {
+    unsafe {
+        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
+        let s = p.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(p.0 as _));
+        (!s.is_empty()).then(|| PathBuf::from(s))
+    }
+}
+
+/// The user's Documents folder.
+pub fn documents() -> Option<PathBuf> {
+    known_folder(&FOLDERID_Documents)
+}
+
+/// The user's Videos folder.
+pub fn videos() -> Option<PathBuf> {
+    known_folder(&FOLDERID_Videos)
+}
 
 /// The folder picked in Windows' folder dialog (opened at `start`, over `owner`); `None` when
 /// cancelled. The calling thread needs COM.
