@@ -3,7 +3,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 
 use super::{Editor, hull};
-use super::marks::{COLORS, TOOLS, Tool, arrow};
+use super::marks::{Ink, PALETTE, TOOLS, Tool, arrow};
 use super::text::Typesetter;
 use glint_shell::gfx::{Canvas, Painter, rgba};
 
@@ -17,6 +17,14 @@ pub(super) enum Item {
     Region,
     Tool(Tool),
     Color(usize),
+    /// A custom colour picked lately (an index into the editor's customs).
+    Custom(usize),
+    /// The palette's last swatch: opens the colour picker.
+    Picker,
+    /// The picker's saturation / brightness square, hue strip and hex field.
+    Sv,
+    Hue,
+    Hex,
     Size(usize),
     Undo,
     Redo,
@@ -35,6 +43,7 @@ pub(super) enum Item {
     Underline,
     Strike,
     Align,
+    VAlign,
     Back,
     /// A family in the font list (an index into what the search found).
     FontRow(usize),
@@ -48,6 +57,9 @@ impl Item {
             Item::Region => "region  ·  Q",
             Item::Tool(t) => TOOLS.iter().find(|(tool, ..)| *tool == t).map(|(_, tip, ..)| *tip)?,
             Item::Color(i) => COLOR_TIPS[i],
+            Item::Custom(_) => "custom colour",
+            Item::Picker => "pick a colour",
+            Item::Hex => "hex  ·  type it",
             Item::Size(_) => "size  ·  [ ]",
             Item::Undo => "undo  ·  Ctrl+Z",
             Item::Redo => "redo  ·  Ctrl+Y",
@@ -65,18 +77,21 @@ impl Item {
             Item::Underline => "underline  ·  Ctrl+U",
             Item::Strike => "strikethrough",
             Item::Align => "align",
+            Item::VAlign => "top · middle · bottom",
             Item::Back => "backdrop",
-            Item::FontRow(_) | Item::Recent(_) => return None,
+            Item::FontRow(_) | Item::Recent(_) | Item::Sv | Item::Hue => return None,
         })
     }
 }
 
-/// Toolbar groups, left to right; a separator goes between groups. `region`: canvas mode's region tool.
-fn groups(region: bool) -> Vec<Vec<Item>> {
+/// Toolbar groups, left to right; a separator goes between groups. `region`: canvas mode's region
+/// tool; `customs`: how many custom colours sit between the palette and the picker swatch.
+fn groups(region: bool, customs: usize) -> Vec<Vec<Item>> {
     let mut groups = if region { vec![vec![Item::Region]] } else { Vec::new() };
+    let colours = (0..PALETTE.len()).map(Item::Color).chain((0..customs).map(Item::Custom)).chain([Item::Picker]);
     groups.extend([
         TOOLS.iter().map(|(t, ..)| Item::Tool(*t)).collect(),
-        (0..COLORS.len()).map(Item::Color).collect(),
+        colours.collect(),
         (0..3).map(Item::Size).collect(),
         vec![Item::Undo, Item::Redo],
         vec![Item::Copy, Item::Save, Item::Upload, Item::Pin, Item::Done, Item::Close],
@@ -89,7 +104,7 @@ impl Editor {
     /// no selection, docked at the top of the monitor under the mouse, or summoned to the mouse.
     pub(super) fn place_bar(&mut self) {
         let (cell, pad, gap) = (self.px(32.0) as i32, self.px(4.0) as i32, self.px(9.0) as i32);
-        let groups = groups(self.region);
+        let groups = groups(self.region, self.customs.len());
         let n: i32 = groups.iter().map(|g| g.len() as i32).sum();
         let w = pad * 2 + n * cell + gap * (groups.len() as i32 - 1);
         let h = cell + pad * 2;
@@ -147,9 +162,9 @@ impl Editor {
 
     pub(super) fn draw_bar(&self, c: &Canvas) {
         let (b, s) = (self.bar, self.scale);
-        let (pressed, size, color) = (self.pressed(), self.current(), self.shown_color());
+        let (pressed, size, color) = (self.pressed(), self.current(), self.shown_ink());
         let (can_undo, can_redo) = (!self.history.is_empty(), !self.future.is_empty());
-        let groups = groups(self.region);
+        let groups = groups(self.region, self.customs.len());
         let (w, h) = (b.w as f32, b.h as f32);
         c.round_rect(0.0, 0.0, w, h, 10.0 * s, BAR_BG);
         // Separators between groups.
@@ -167,6 +182,7 @@ impl Editor {
                 Item::Region => self.picks_region(),
                 Item::Tool(t) => self.tool == Some(t),
                 Item::Size(n) => size.is_some_and(|(_, s, v)| s.presets[n] == v),
+                Item::Picker => self.picker.is_some(),
                 _ => false,
             };
             let bg = if pressed == Some(item) {
@@ -188,7 +204,7 @@ impl Editor {
                 _ => true,
             };
             let ink = if enabled { WHITE } else { rgba(255, 255, 255, 0.3) };
-            draw_icon(c, item, (x + cw / 2.0, y + ch / 2.0), s, ink, color, &self.fonts);
+            draw_icon(c, item, (x + cw / 2.0, y + ch / 2.0), s, ink, (color, &self.customs), &self.fonts);
         }
     }
 }
@@ -240,7 +256,7 @@ pub(super) fn nearest(monitors: &[Rect], (x, y): (i32, i32)) -> Rect {
     *monitors.iter().min_by_key(gap).expect("at least one monitor")
 }
 
-fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR_F, color: usize, fonts: &Typesetter) {
+fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR_F, (color, customs): (Ink, &[Ink]), fonts: &Typesetter) {
     let p = |dx: f32, dy: f32| (x + dx * s, y + dy * s);
     match item {
         Item::Region => {
@@ -303,10 +319,34 @@ fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR
             c.round_rect(x - 3.0 * s, y - 7.5 * s, 6.0 * s, 3.5 * s, 1.0 * s, ink);
             c.polygon(&[p(-3.5, 5.0), p(-0.5, 1.0), p(1.5, 3.0), p(2.5, 2.0), p(3.5, 5.0)], ink);
         }
-        Item::Color(i) => {
-            c.circle((x, y), 6.0 * s, COLORS[i]);
-            if i == color {
+        Item::Color(_) | Item::Custom(_) => {
+            let swatch = match item {
+                Item::Color(i) => PALETTE[i],
+                Item::Custom(i) => customs[i],
+                _ => unreachable!(),
+            };
+            c.circle((x, y), 6.0 * s, swatch.d2d());
+            if swatch == color {
                 c.ring((x, y), 9.0 * s, 1.5 * s, ink);
+            }
+        }
+        Item::Picker => {
+            // a ring of every hue around the colour shown, when it's none of the swatches
+            let r = 6.5 * s;
+            for k in 0..24 {
+                let (a0, a1) = (k as f32 / 24.0, (k + 1) as f32 / 24.0);
+                let at = |t: f32| {
+                    let a = t * std::f32::consts::TAU;
+                    (x + r * a.cos(), y + r * a.sin())
+                };
+                let [cr, cg, cb] = glint_core::config::color::hsv_to_rgb([a0, 0.8, 1.0]);
+                c.polyline(&[at(a0), at(a1)], 2.6 * s, rgba(cr, cg, cb, ink.a));
+            }
+            let custom = !PALETTE.contains(&color) && !customs.contains(&color);
+            let centre = if custom { color.d2d() } else { rgba(255, 255, 255, 0.9 * ink.a) };
+            c.circle((x, y), 3.4 * s, centre);
+            if custom {
+                c.ring((x, y), 9.5 * s, 1.5 * s, ink);
             }
         }
         Item::Size(i) => c.circle((x, y), [1.5, 3.0, 5.0][i] * s, ink),
@@ -354,9 +394,13 @@ fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR
         | Item::Underline
         | Item::Strike
         | Item::Align
+        | Item::VAlign
         | Item::Back
         | Item::FontRow(_)
-        | Item::Recent(_) => {}
+        | Item::Recent(_)
+        | Item::Sv
+        | Item::Hue
+        | Item::Hex => {}
     }
 }
 

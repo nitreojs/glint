@@ -2,6 +2,8 @@
 //! strikethrough, alignment, backdrop) with its searchable font list, and the clipboard strip
 //! (see `paste.rs`). Panels slide out of the toolbar on the side away from the selection.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -9,8 +11,9 @@ use glint_core::geom::rect::Rect;
 use glint_shell::gfx::{Canvas, ease_out, rgba};
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 
-use super::marks::{COLORS, LIGHT, Mark, STEP_INK, Tool};
-use super::text::{Align, Back, Style, search};
+use super::marks::{Ink, Mark, Tool};
+use super::fonts;
+use super::text::{Align, Back, Style, VAlign};
 use super::toolbar::{BAR_BG, Item, WHITE};
 use super::{Editor, Event};
 
@@ -30,16 +33,21 @@ pub(super) enum Panel {
     Strip,
 }
 
-/// The font list under the text bar: what's been typed to search it, how far it's scrolled.
+/// The font list under the text bar: what's been typed to search it, how far it's scrolled, and
+/// what the search found (kept until the query or the families change).
 pub(super) struct FontPicker {
     pub(super) query: String,
     pub(super) scroll: usize,
     pub(super) since: Instant,
+    found: RefCell<Option<Found>>,
 }
+
+/// A search, how many families it ran over, and where the matches sit among them.
+type Found = (String, usize, Rc<Vec<usize>>);
 
 impl FontPicker {
     pub(super) fn new() -> FontPicker {
-        FontPicker { query: String::new(), scroll: 0, since: Instant::now() }
+        FontPicker { query: String::new(), scroll: 0, since: Instant::now(), found: RefCell::default() }
     }
 }
 
@@ -52,11 +60,13 @@ pub(super) fn faded(c: D2D1_COLOR_F, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { a: c.a * a, ..c }
 }
 
-/// The font list's parts: its box, the search row, the rows (with the families they show).
+/// The font list's parts: its box, the search row, the rows (with the families they show and
+/// where those sit among all of them), and whether the families are still being read.
 pub(super) struct FontList {
     pub(super) rect: Rect,
     pub(super) search: Rect,
-    pub(super) rows: Vec<(Item, Rect, Arc<str>)>,
+    pub(super) rows: Vec<(Item, Rect, Arc<str>, usize)>,
+    pub(super) loading: bool,
 }
 
 impl Editor {
@@ -118,7 +128,7 @@ impl Editor {
     fn text_bar(&self) -> (Rect, Vec<(Item, Rect)>) {
         let (cell, pad, gap) = (self.px(32.0) as i32, self.px(4.0) as i32, self.px(9.0) as i32);
         let (font_w, size_w) = (self.px(148.0) as i32, self.px(30.0) as i32);
-        let w = 2 * pad + font_w + 2 * cell + size_w + 4 * cell + 2 * cell + 3 * gap;
+        let w = 2 * pad + font_w + 2 * cell + size_w + 4 * cell + 3 * cell + 3 * gap;
         let rect = self.place_panel((w, cell + 2 * pad));
         let (mut x, y) = (rect.x + pad, rect.y + pad);
         let mut cells = Vec::with_capacity(9);
@@ -137,14 +147,25 @@ impl Editor {
         }
         x += gap;
         put(Item::Align, cell, &mut x);
+        put(Item::VAlign, cell, &mut x);
         put(Item::Back, cell, &mut x);
         (rect, cells)
     }
 
-    /// The families the font list's search finds.
-    fn found_fonts(&self) -> Vec<Arc<str>> {
-        let query = self.fonts_open.as_ref().map_or("", |f| f.query.as_str());
-        search(&self.fonts.families(), query)
+    /// All the families, and where the ones the font list's search finds sit among them.
+    fn found_fonts(&self) -> (Arc<Vec<Arc<str>>>, Rc<Vec<usize>>) {
+        let names = fonts::names().unwrap_or_default();
+        let Some(picker) = &self.fonts_open else { return (names, Rc::default()) };
+        let mut cache = picker.found.borrow_mut();
+        if let Some((query, n, found)) = &*cache
+            && *query == picker.query
+            && *n == names.len()
+        {
+            return (names, found.clone());
+        }
+        let found = Rc::new(fonts::search(&names, &picker.query));
+        *cache = Some((picker.query.clone(), names.len(), found.clone()));
+        (names, found)
     }
 
     /// The font list, under (or over) the text bar's font button, while it's open.
@@ -152,9 +173,9 @@ impl Editor {
         let picker = self.fonts_open.as_ref()?;
         let (Panel::Text, panel, cells) = self.panel_layout()? else { return None };
         let font = cells.iter().find(|(i, _)| *i == Item::Font).map(|(_, r)| *r)?;
-        let found = self.found_fonts();
+        let (names, found) = self.found_fonts();
         let (pad, row, search_h) = (self.px(5.0) as i32, self.px(28.0) as i32, self.px(32.0) as i32);
-        let shown: Vec<Arc<str>> = found.into_iter().skip(picker.scroll).take(ROWS).collect();
+        let shown: Vec<usize> = found.iter().copied().skip(picker.scroll).take(ROWS).collect();
         let (w, h) = (self.px(250.0) as i32, 2 * pad + search_h + row * (shown.len().max(1) as i32));
         let (m, gap) = (self.bar_monitor, self.px(6.0) as i32);
         let below = panel.y >= self.bar.y;
@@ -170,26 +191,41 @@ impl Editor {
         let rows = shown
             .into_iter()
             .enumerate()
-            .map(|(i, name)| {
+            .map(|(i, family)| {
                 let r = Rect { x: x + pad, y: search.bottom() + i as i32 * row, w: w - 2 * pad, h: row };
-                (Item::FontRow(picker.scroll + i), r, name)
+                (Item::FontRow(picker.scroll + i), r, names[family].clone(), family)
             })
             .collect();
-        Some(FontList { rect, search, rows })
+        Some(FontList { rect, search, rows, loading: fonts::names().is_none() })
+    }
+
+    /// The font list shows rows whose families are still loading (or none yet): it repaints
+    /// until they're there.
+    pub(super) fn fonts_pending(&self) -> bool {
+        self.font_list().is_some_and(|l| l.loading || l.rows.iter().any(|r| fonts::ready(r.3).is_none()))
+    }
+
+    /// How many of the font list's rows show their own face (for repaints as they come in).
+    pub(super) fn fonts_shown(&self) -> usize {
+        self.font_list().map_or(0, |l| l.rows.iter().filter(|r| fonts::ready(r.3).is_some()).count())
     }
 
     /// The boxes panels cover: the panel and the font list.
     pub(super) fn panel_rects(&self) -> Vec<Rect> {
         let mut v: Vec<Rect> = self.panel_layout().map(|(_, r, _)| r).into_iter().collect();
         v.extend(self.font_list().map(|l| l.rect));
+        v.extend(self.picker_layout().map(|l| l.rect));
         v
     }
 
-    /// Every button: the toolbar's, the panel's and the font list's rows.
+    /// Every button: the toolbar's, the panel's, the font list's rows and the colour picker's parts.
     pub(super) fn all_cells(&self) -> Vec<(Item, Rect)> {
         let mut v = self.cells.clone();
         v.extend(self.panel_layout().into_iter().flat_map(|(_, _, cells)| cells));
-        v.extend(self.font_list().into_iter().flat_map(|l| l.rows.into_iter().map(|(i, r, _)| (i, r))));
+        v.extend(self.font_list().into_iter().flat_map(|l| l.rows.into_iter().map(|(i, r, ..)| (i, r))));
+        if let Some(l) = self.picker_layout() {
+            v.extend([(Item::Sv, l.square), (Item::Hue, l.strip), (Item::Hex, l.hex)]);
+        }
         v
     }
 
@@ -218,7 +254,8 @@ impl Editor {
                 Event::Repaint
             }
             Item::FontRow(i) => {
-                let Some(name) = self.found_fonts().get(i).cloned() else { return Event::None };
+                let (names, found) = self.found_fonts();
+                let Some(name) = found.get(i).map(|&f| names[f].clone()) else { return Event::None };
                 self.fonts_open = None;
                 self.restyle(|s| s.font = name)
             }
@@ -237,6 +274,7 @@ impl Editor {
             Item::Underline => self.restyle(|s| s.underline = !s.underline),
             Item::Strike => self.restyle(|s| s.strike = !s.strike),
             Item::Align => self.restyle(|s| s.align = s.align.next()),
+            Item::VAlign => self.restyle(|s| s.valign = s.valign.next()),
             Item::Back => self.restyle(|s| s.back = s.back.next()),
             _ => Event::None,
         }
@@ -260,7 +298,7 @@ impl Editor {
 
     /// Scrolls the font list by `rows`.
     pub(super) fn scroll_fonts(&mut self, rows: i32) -> Event {
-        let n = self.found_fonts().len();
+        let n = self.found_fonts().1.len();
         let Some(picker) = self.fonts_open.as_mut() else { return Event::None };
         let max = n.saturating_sub(ROWS);
         let to = (picker.scroll as i64 + rows as i64).clamp(0, max as i64) as usize;
@@ -296,7 +334,7 @@ impl Editor {
         let (w, h) = (rect.w as f32, rect.h as f32);
         c.round_rect(0.0, slide, w, h, 10.0 * s, faded(BAR_BG, a));
         let (style, size) = self.shown_style();
-        let color = COLORS[self.shown_color()];
+        let color = self.shown_ink();
         let pressed = self.pressed();
         for &(item, r) in cells {
             let (x, y) = ((r.x - rect.x) as f32, (r.y - rect.y) as f32 + slide);
@@ -370,6 +408,19 @@ impl Editor {
                         c.polyline(&[p(x0, yy), p(x0 + len, yy)], 1.5 * s, ink);
                     }
                 }
+                Item::VAlign => {
+                    // a box, with the lines at its top, middle or bottom
+                    c.round_rect_outline([mid.0 - 7.0 * s, mid.1 - 7.0 * s, 14.0 * s, 14.0 * s], 2.0 * s, 1.2 * s, faded(WHITE, 0.55 * a));
+                    let y0 = match style.valign {
+                        VAlign::Top => -4.0,
+                        VAlign::Middle => -1.5,
+                        VAlign::Bottom => 1.0,
+                    };
+                    for (i, len) in [8.0, 5.0].into_iter().enumerate() {
+                        let yy = y0 + i as f32 * 3.0;
+                        c.polyline(&[p(-4.0, yy), p(-4.0 + len, yy)], 1.5 * s, ink);
+                    }
+                }
                 Item::Back => self.draw_back_icon(c, style.back, mid, s, a, color),
                 _ => {}
             }
@@ -377,7 +428,7 @@ impl Editor {
     }
 
     /// A little "A" in backdrop `back`.
-    fn draw_back_icon(&self, c: &Canvas, back: Back, mid: (f32, f32), s: f32, a: f32, color: D2D1_COLOR_F) {
+    fn draw_back_icon(&self, c: &Canvas, back: Back, mid: (f32, f32), s: f32, a: f32, color: Ink) {
         let look = Style::default();
         let px = 14.0 * s;
         let (w, h) = (17.0 * s, 15.0 * s);
@@ -395,10 +446,8 @@ impl Editor {
                 self.fonts.draw_glyph(c, "A", &look, px, mid, faded(WHITE, a));
             }
             Back::Tag => {
-                pill(faded(color, a));
-                let light = COLORS.iter().position(|k| *k == color).is_some_and(|i| LIGHT[i]);
-                let ink = if light { STEP_INK } else { WHITE };
-                self.fonts.draw_glyph(c, "A", &look, px, mid, faded(ink, a));
+                pill(faded(color.d2d(), a));
+                self.fonts.draw_glyph(c, "A", &look, px, mid, faded(color.ink_on(), a));
             }
             Back::None => self.fonts.draw_glyph(c, "A", &look, px, mid, faded(WHITE, 0.75 * a)),
         }
@@ -428,24 +477,30 @@ impl Editor {
             let x = text_box[0] + self.fonts.measure(query, 13.0 * s) + 1.0 * s;
             c.fill(x, sy + sh * 0.27, 1.5 * s, sh * 0.46, faded(WHITE, a));
         }
+        let empty = if list.loading { "reading fonts…" } else { "no such font" };
         if list.rows.is_empty() {
             let r = [sx, sy + sh, sw, h - sh - sy * 2.0];
-            self.fonts.draw_line(c, "no such font", &ui, 13.0 * s, [r[0] + 10.0 * s, r[1], r[2], r[3]], rgba(255, 255, 255, 0.45 * a));
+            self.fonts.draw_line(c, empty, &ui, 13.0 * s, [r[0] + 10.0 * s, r[1], r[2], r[3]], rgba(255, 255, 255, 0.45 * a));
         }
         let current = self.shown_style().0.font;
-        for (item, r, name) in &list.rows {
+        for (item, r, name, family) in &list.rows {
             let [x, y, rw, rh] = local(*r);
             if self.hover == Some(*item) {
                 c.round_rect(x, y + 1.0 * s, rw, rh - 2.0 * s, 6.0 * s, rgba(255, 255, 255, 0.10 * a));
             }
-            // symbol fonts would spell their own name in pictures
-            let font = if self.fonts.is_symbol(name) { Arc::from("Segoe UI") } else { name.clone() };
-            let face = Style { font, bold: false, ..Style::default() };
-            self.fonts.draw_line(c, name, &face, 15.0 * s, [x + 10.0 * s, y, rw - 34.0 * s, rh], faded(WHITE, a));
+            // in its own face once that's loaded (symbol fonts would spell their name in pictures)
+            let own = fonts::ready(*family) == Some(false);
+            self.fonts.draw_preview(c, name, own, 15.0 * s, [x + 10.0 * s, y, rw - 34.0 * s, rh], faded(WHITE, a));
             if **name == *current {
                 let (cx, cy) = (x + rw - 14.0 * s, y + rh / 2.0);
                 c.polyline(&[(cx - 4.5 * s, cy), (cx - 1.5 * s, cy + 3.0 * s), (cx + 4.5 * s, cy - 3.5 * s)], 1.6 * s, faded(WHITE, a));
             }
+        }
+        // the next page starts loading before it's scrolled to
+        let (_, found) = self.found_fonts();
+        let scroll = self.fonts_open.as_ref().map_or(0, |f| f.scroll);
+        for &family in found.iter().skip(scroll + ROWS).take(ROWS) {
+            fonts::ready(family);
         }
     }
 }

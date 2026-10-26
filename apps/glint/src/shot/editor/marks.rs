@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use glint_core::config::color::contrast;
 use glint_core::geom::rect::Rect;
 use glint_shell::paste::Image;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
@@ -70,15 +71,30 @@ impl Tool {
     }
 }
 
-pub(super) const COLORS: [D2D1_COLOR_F; 5] = [
-    rgba(0xE5, 0x40, 0x2F, 1.0),
-    rgba(0xFF, 0xD6, 0x0A, 1.0),
-    rgba(0x34, 0xC7, 0x59, 1.0),
-    rgba(0x0A, 0x84, 0xFF, 1.0),
-    rgba(0xFF, 0xFF, 0xFF, 1.0),
-];
-/// Palette entries a white number can't sit on.
-pub(super) const LIGHT: [bool; 5] = [false, true, false, false, true];
+/// A mark's colour: one of the palette's, or a custom one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Ink(pub(super) [u8; 3]);
+
+impl Ink {
+    pub(super) fn d2d(self) -> D2D1_COLOR_F {
+        let [r, g, b] = self.0;
+        rgba(r, g, b, 1.0)
+    }
+
+    /// Too light for white letters (a step's number, a tag's text) to sit on.
+    pub(super) fn light(self) -> bool {
+        contrast([255; 3], self.0) < 2.0
+    }
+
+    /// The letters that sit on it.
+    pub(super) fn ink_on(self) -> D2D1_COLOR_F {
+        if self.light() { STEP_INK } else { rgba(255, 255, 255, 1.0) }
+    }
+}
+
+/// Red, yellow, green, blue, white.
+pub(super) const PALETTE: [Ink; 5] =
+    [Ink([0xE5, 0x40, 0x2F]), Ink([0xFF, 0xD6, 0x0A]), Ink([0x34, 0xC7, 0x59]), Ink([0x0A, 0x84, 0xFF]), Ink([0xFF, 0xFF, 0xFF])];
 pub(super) const STEP_INK: D2D1_COLOR_F = rgba(20, 20, 24, 1.0);
 const HIGHLIGHTER_ALPHA: f32 = 0.4;
 pub(super) const MIN_SIDE: i32 = 3;
@@ -125,18 +141,27 @@ fn keep_aspect(r: Rect, e: Edges, aspect: f32) -> Rect {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Mark {
-    Stroke { highlight: bool, points: Vec<(f32, f32)>, color: usize, width: f32 },
-    Arrow { from: (f32, f32), to: (f32, f32), color: usize, width: f32 },
-    Rectangle { rect: Rect, color: usize, width: f32 },
+    Stroke { highlight: bool, points: Vec<(f32, f32)>, color: Ink, width: f32 },
+    Arrow { from: (f32, f32), to: (f32, f32), color: Ink, width: f32 },
+    Rectangle { rect: Rect, color: Ink, width: f32 },
     Blur { rect: Rect, radius: f32 },
     Pixelate { rect: Rect, block: f32 },
     Eraser { rect: Rect, fill: u32 },
     /// `at` is the top-left corner of its box; `extent` is the box's laid-out size in physical
-    /// pixels, padding included. `width` is the wrap width (physical pixels, text only), none
-    /// for lines broken only at newlines.
-    Text { at: (f32, f32), text: String, color: usize, size: f32, style: Style, width: Option<f32>, extent: (f32, f32) },
+    /// pixels, padding included. `width` is the wrap width and `height` the box's height inside the
+    /// padding (physical pixels; never less than the text's), none for a box fitting the text.
+    Text {
+        at: (f32, f32),
+        text: String,
+        color: Ink,
+        size: f32,
+        style: Style,
+        width: Option<f32>,
+        height: Option<f32>,
+        extent: (f32, f32),
+    },
     /// A numbered disc of diameter `size` (radius `r` in physical pixels), with an arrow to `tail`.
-    Step { at: (f32, f32), tail: Option<(f32, f32)>, color: usize, size: f32, r: f32 },
+    Step { at: (f32, f32), tail: Option<(f32, f32)>, color: Ink, size: f32, r: f32 },
     /// A cursor picture with its hotspot at `at`, drawn at `size` percent.
     Cursor { at: (f32, f32), sprite: Sprite, size: f32 },
     /// The frozen screen's `src` (client coordinates) shown at `rect`.
@@ -153,7 +178,7 @@ pub(super) enum Grip {
 }
 
 impl Mark {
-    pub(super) fn new(tool: Tool, (x, y): (i32, i32), color: usize, strength: f32) -> Mark {
+    pub(super) fn new(tool: Tool, (x, y): (i32, i32), color: Ink, strength: f32) -> Mark {
         let (at, rect) = ((x as f32, y as f32), Rect { x, y, w: 0, h: 0 });
         match tool {
             Tool::Pen | Tool::Highlighter => {
@@ -171,6 +196,7 @@ impl Mark {
                 size: strength,
                 style: Style::default(),
                 width: None,
+                height: None,
                 extent: (0.0, 0.0),
             },
             Tool::Step => Mark::Step { at, tail: None, color, size: strength, r: 0.0 },
@@ -222,7 +248,7 @@ impl Mark {
         }
     }
 
-    pub(super) fn color(&self) -> Option<usize> {
+    pub(super) fn color(&self) -> Option<Ink> {
         match self {
             Mark::Stroke { color, .. }
             | Mark::Arrow { color, .. }
@@ -238,7 +264,7 @@ impl Mark {
         }
     }
 
-    pub(super) fn color_mut(&mut self) -> Option<&mut usize> {
+    pub(super) fn color_mut(&mut self) -> Option<&mut Ink> {
         match self {
             Mark::Stroke { color, .. }
             | Mark::Arrow { color, .. }
@@ -521,8 +547,9 @@ pub(super) const GRIPS: [Edges; 8] = {
     ]
 };
 
-/// A text's grips: its corners scale it, its sides set the width it wraps at.
-pub(super) const TEXT_GRIPS: [Edges; 6] = [GRIPS[0], GRIPS[2], GRIPS[3], GRIPS[4], GRIPS[5], GRIPS[7]];
+/// A text's grips: its corners scale it, its sides set the width it wraps at, its top and bottom
+/// the height of its box.
+pub(super) const TEXT_GRIPS: [Edges; 8] = GRIPS;
 
 fn ink_width(width: f32, scale: f32) -> f32 {
     (width * scale).round().max(1.0)
@@ -557,23 +584,22 @@ pub(super) fn draw_mark(
         Mark::Stroke { highlight, points, color, width } => {
             let pts: Vec<(f32, f32)> = points.iter().map(|&p| at(p)).collect();
             let a = if *highlight { HIGHLIGHTER_ALPHA } else { 1.0 };
-            c.polyline(&pts, ink_width(*width, scale), D2D1_COLOR_F { a, ..COLORS[*color] });
+            c.polyline(&pts, ink_width(*width, scale), D2D1_COLOR_F { a, ..color.d2d() });
         }
         Mark::Arrow { from, to, color, width } => {
-            arrow(c, at(*from), at(*to), ink_width(*width, scale), COLORS[*color])
+            arrow(c, at(*from), at(*to), ink_width(*width, scale), color.d2d())
         }
         Mark::Rectangle { rect, color, width } => {
             let (x, y) = at((rect.x as f32, rect.y as f32));
-            c.rect_outline(x, y, rect.w as f32, rect.h as f32, ink_width(*width, scale), COLORS[*color]);
+            c.rect_outline(x, y, rect.w as f32, rect.h as f32, ink_width(*width, scale), color.d2d());
         }
         Mark::Eraser { rect, fill } => {
             let (x, y) = at((rect.x as f32, rect.y as f32));
             let rgb = rgba((fill >> 16) as u8, (fill >> 8) as u8, *fill as u8, 1.0);
             c.fill(x, y, rect.w as f32, rect.h as f32, rgb);
         }
-        Mark::Text { at: corner, text, color, size, style, width, .. } => {
-            let ink = if LIGHT[*color] { STEP_INK } else { COLORS[4] };
-            fonts.draw(c, text, style, size * scale, *width, at(*corner), COLORS[*color], ink);
+        Mark::Text { at: corner, text, color, size, style, width, height, .. } => {
+            fonts.draw(c, text, style, size * scale, (*width, *height), at(*corner), color.d2d(), color.ink_on());
         }
         Mark::Step { at: centre, tail, color, r, .. } => {
             let o = at(*centre);
@@ -582,11 +608,11 @@ pub(super) fn draw_mark(
                 let len = dist(o, t);
                 if len > *r {
                     let from = (o.0 + (t.0 - o.0) * r / len, o.1 + (t.1 - o.1) * r / len);
-                    arrow(c, from, t, tail_width(*r), COLORS[*color]);
+                    arrow(c, from, t, tail_width(*r), color.d2d());
                 }
             }
-            c.circle(o, *r, COLORS[*color]);
-            let ink = if LIGHT[*color] { STEP_INK } else { COLORS[4] };
+            c.circle(o, *r, color.d2d());
+            let ink = color.ink_on();
             fonts.draw_centred(c, &step.to_string(), r * 1.15, o, ink);
         }
         Mark::Cursor { at: hot, sprite, size } => {
@@ -650,14 +676,14 @@ mod tests {
 
     #[test]
     fn marks_are_hit_on_their_ink() {
-        let arrow = Mark::Arrow { from: (0.0, 0.0), to: (100.0, 0.0), color: 0, width: 4.0 };
+        let arrow = Mark::Arrow { from: (0.0, 0.0), to: (100.0, 0.0), color: PALETTE[0], width: 4.0 };
         assert!(arrow.hit((50.0, 5.0), 1.0));
         assert!(!arrow.hit((50.0, 20.0), 1.0));
         assert!(arrow.hit((82.0, 9.0), 1.0), "the head is wider than the shaft");
         assert!(!arrow.hit((20.0, 9.0), 1.0));
 
         let area = Rect { x: 100, y: 100, w: 200, h: 100 };
-        let rect = Mark::Rectangle { rect: area, color: 0, width: 4.0 };
+        let rect = Mark::Rectangle { rect: area, color: PALETTE[0], width: 4.0 };
         assert!(rect.hit((100.0, 150.0), 1.0));
         assert!(rect.hit((95.0, 150.0), 1.0));
         assert!(!rect.hit((200.0, 150.0), 1.0));

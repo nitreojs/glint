@@ -9,7 +9,7 @@ use glint_shell::paste::Image;
 
 use super::paste::tests::Fake;
 use super::paste::{Full, Recent};
-use super::text::{Align, Back};
+use super::text::{Align, Back, VAlign};
 use super::*;
 
 const VK_BACK: u32 = 0x08;
@@ -29,6 +29,14 @@ fn editor() -> (Editor, Rc<Fake>) {
 fn picture(w: u32, h: u32) -> Image {
     let px = (0..w * h).map(|i| 0xFF00_0000 | (i * 2_654_435_761) >> 8).collect();
     Image { w, h, px }
+}
+
+/// Held by tests that change what editors remember between shots (the last text style, the
+/// custom colours), so they don't see each other's.
+static MEMORY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn memory() -> std::sync::MutexGuard<'static, ()> {
+    MEMORY.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn drag(ed: &mut Editor, from: (i32, i32), to: (i32, i32)) {
@@ -300,6 +308,7 @@ fn texts_move_reopen_and_resize() {
 
 #[test]
 fn styles_apply_round_trip_and_carry_over() {
+    let _memory = memory();
     let (mut ed, _) = editor();
     ed.key(0x54, false, false);
     click(&mut ed, (100, 100));
@@ -322,7 +331,7 @@ fn styles_apply_round_trip_and_carry_over() {
 
     ed.activate(Item::Font);
     assert!(ed.font_list().is_some(), "the font button opens the list");
-    let families = ed.fonts.families();
+    let families = families();
     let target = families.last().cloned().unwrap();
     for c in target.chars() {
         ed.char(c as u16);
@@ -398,6 +407,9 @@ fn review_shots() {
         if let Some(f) = ed.fonts_open.as_mut() {
             f.since = Instant::now() - Duration::from_secs(1);
         }
+        if let Some(p) = ed.picker.as_mut() {
+            p.since = Instant::now() - Duration::from_secs(1);
+        }
         for (_, at) in &mut ed.recents {
             *at = Instant::now() - Duration::from_secs(1);
         }
@@ -472,7 +484,7 @@ fn review_shots() {
         let mut style = Style::default();
         f(&mut style);
         ed.text_style = style;
-        ed.color = color;
+        ed.color = PALETTE[color];
         ed.tool = Some(Tool::Text);
         let at = (190 + (i as i32 % 2) * 470, 110 + (i as i32 / 2) * 95);
         ed.start_typing(at);
@@ -486,14 +498,169 @@ fn review_shots() {
     ed.key(0x25, true, true);
     shoot(&mut ed, "text-styles", Rect { x: 120, y: 60, w: 1040, h: 740 });
 
-    // the font list
+    // the font list: at once in the UI's face, then each family in its own as it loads
     ed.activate(Item::Font);
     ed.char('s' as u16);
     ed.char('e' as u16);
     let list = ed.font_list().unwrap();
     let (_, panel, _) = ed.panel_layout().unwrap();
     let area = hull(hull(ed.bar, panel), list.rect).inflate(16);
+    shoot(&mut ed, "text-bar-fonts-opening", area);
+    let until = Instant::now() + Duration::from_secs(5);
+    while ed.fonts_pending() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     shoot(&mut ed, "text-bar-fonts", area);
+
+    // text boxes taller than their text, aligned top / middle / bottom, one picked
+    let mut ed = new();
+    for (i, (valign, back, color)) in
+        [(VAlign::Top, Back::Shade, 4), (VAlign::Middle, Back::Tag, 3), (VAlign::Bottom, Back::Tag, 1)].into_iter().enumerate()
+    {
+        ed.text_style = Style { valign, back, ..Style::default() };
+        ed.color = PALETTE[color];
+        ed.tool = Some(Tool::Text);
+        ed.start_typing((200 + i as i32 * 300, 200));
+        ed.insert(["top", "middle\nof the box", "bottom"][i]);
+        ed.commit();
+        if let Mark::Text { height, width, .. } = &mut ed.marks[i] {
+            (*height, *width) = (Some(180.0), Some(220.0));
+        }
+        let mut m = ed.marks[i].clone();
+        ed.refit(&mut m);
+        ed.marks[i] = m;
+    }
+    ed.picked = Some(1);
+    ed.touch();
+    shoot(&mut ed, "text-box-heights", Rect { x: 120, y: 60, w: 1040, h: 640 });
+
+    // the colour picker over a picked rectangle, then its colours kept on the palette
+    let mut ed = new();
+    ed.marks.push(Mark::Rectangle { rect: Rect { x: 300, y: 180, w: 420, h: 260 }, color: PALETTE[0], width: 6.0 });
+    ed.marks.push(Mark::Arrow { from: (820.0, 480.0), to: (700.0, 380.0), color: PALETTE[3], width: 6.0 });
+    ed.picked = Some(0);
+    ed.toggle_picker();
+    let l = ed.picker_layout().unwrap();
+    let drag = ed.grab_picker(Part::Strip, (l.strip.x + l.strip.w * 78 / 100, l.strip.y + 4));
+    ed.drag_picker(Part::Square, (l.square.x + l.square.w * 7 / 10, l.square.y + l.square.h / 5));
+    if let Drag::Color { before, .. } = drag {
+        ed.drop_picker(before);
+    }
+    ed.hover = Some(Item::Picker);
+    let area = hull(hull(ed.bar, l.rect), Rect { x: 280, y: 160, w: 560, h: 340 }).inflate(16);
+    shoot(&mut ed, "colour-picker", area);
+    ed.close_picker();
+    ed.set_ink(Ink([0x10, 0xE0, 0xD0]));
+    ed.toggle_picker();
+    ed.close_picker();
+    ed.hover = None;
+    let area = ed.bar.inflate(16);
+    shoot(&mut ed, "colour-customs", area);
+}
+
+#[test]
+fn text_boxes_take_a_height_and_align_inside_it() {
+    let _memory = memory();
+    let (mut ed, _) = editor();
+    ed.key(0x54, false, false);
+    // high up: the box grows down, and mustn't reach the toolbar under the selection
+    click(&mut ed, (100, 40));
+    type_text(&mut ed, "box");
+    let b = ed.marks[0].bbox();
+    let lines = b.h;
+    // the bottom handle sits on the dashed outline, under the middle of the text
+    let o = ed.outline(&ed.marks[0]);
+    let bottom = (o.x + o.w / 2, o.bottom());
+    drag(&mut ed, bottom, (bottom.0, bottom.1 + 100));
+    let tall = ed.marks[0].bbox();
+    assert_eq!((tall.y, tall.h), (b.y, lines + 100), "the bottom handle makes the box taller");
+    assert!(matches!(ed.marks[0], Mark::Text { height: Some(_), .. }));
+    let caret = ed.caret_rect().unwrap();
+    assert!(caret.y < b.y + lines, "top-aligned: the text stays at the top");
+
+    ed.activate(Item::VAlign);
+    let middle = ed.caret_rect().unwrap();
+    assert!((middle.y - (caret.y + 50)).abs() <= 1, "middle: {} vs {}", middle.y, caret.y);
+    ed.activate(Item::VAlign);
+    assert!((ed.caret_rect().unwrap().y - (caret.y + 100)).abs() <= 1, "bottom");
+
+    let o = ed.outline(&ed.marks[0]);
+    let top = (o.x + o.w / 2, o.y);
+    drag(&mut ed, top, (top.0, top.1 + 400));
+    let fitted = ed.marks[0].bbox();
+    assert_eq!(fitted.h, lines, "never shorter than the text: it fits it again");
+    assert!(matches!(ed.marks[0], Mark::Text { height: None, .. }));
+    assert_eq!(fitted.bottom(), tall.bottom(), "the bottom stayed put");
+
+    let o = ed.outline(&ed.marks[0]);
+    let bottom = (o.x + o.w / 2, o.bottom());
+    drag(&mut ed, bottom, (bottom.0, bottom.1 + 30));
+    let h = ed.marks[0].bbox().h;
+    type_text(&mut ed, "\r2\r3\r4\r5");
+    assert!(ed.marks[0].bbox().h > h, "typing past the box grows it");
+
+    let size = ed.marks[0].strength().unwrap();
+    let o = ed.outline(&ed.marks[0]);
+    ed.set_mods(true, false, false);
+    drag(&mut ed, (o.right(), o.bottom()), (o.right() + 60, o.bottom() + 60));
+    ed.set_mods(false, false, false);
+    assert_eq!(ed.marks[0].strength(), Some(size), "Ctrl+corner sizes the box, not the font");
+    assert!(matches!(ed.marks[0], Mark::Text { width: Some(_), height: Some(_), .. }));
+    let o = ed.outline(&ed.marks[0]);
+    drag(&mut ed, (o.right(), o.bottom()), (o.right() + 60, o.bottom() + 60));
+    assert!(ed.marks[0].strength().unwrap() > size, "a plain corner scales the font");
+}
+
+#[test]
+fn the_picker_recolours_marks_and_keeps_custom_colours() {
+    let _memory = memory();
+    let (mut ed, _) = editor();
+    ed.marks.push(Mark::Rectangle { rect: Rect { x: 50, y: 50, w: 200, h: 100 }, color: PALETTE[0], width: 4.0 });
+    ed.picked = Some(0);
+    let swatch = ed.cells.iter().find(|(i, _)| *i == Item::Picker).unwrap().1;
+    click(&mut ed, (swatch.x + swatch.w / 2, swatch.y + swatch.h / 2));
+    let l = ed.picker_layout().expect("the swatch opens the picker");
+    assert!(l.rect.y > ed.bar.bottom(), "under the bar");
+
+    // a drag on the strip and the square recolours the picked mark live, as one undo step
+    let steps = ed.history.len();
+    ed.mouse_down((l.strip.x + l.strip.w / 3, l.strip.y + 3), 0);
+    ed.mouse_up((l.strip.x + l.strip.w / 3, l.strip.y + 3));
+    ed.mouse_down((l.square.right() - 1, l.square.y), 0);
+    ed.mouse_move((l.square.right() - 1, l.square.y + 1));
+    ed.mouse_up((l.square.right() - 1, l.square.y + 1));
+    let picked = ed.marks[0].color().unwrap();
+    assert_ne!(picked, PALETTE[0]);
+    let [r, g, b] = picked.0;
+    assert!(g > 240 && r < 20 && b < 20, "a third of the way round: green, {picked:?}");
+    assert_eq!(ed.history.len(), steps + 2, "one step per press");
+    ed.undo();
+    ed.undo();
+    assert_eq!(ed.marks[0].color(), Some(PALETTE[0]));
+    ed.redo();
+    ed.redo();
+
+    // the hex field: six digits make the colour
+    for c in "#1a2b3c".chars() {
+        ed.char(c as u16);
+    }
+    assert_eq!(ed.marks[0].color(), Some(Ink([0x1A, 0x2B, 0x3C])));
+    ed.key(0x41, false, false); // A: a hex digit, not the arrow tool
+    assert_eq!(ed.tool, None);
+    assert!(matches!(ed.key(0x1B, false, false), Event::Repaint));
+    assert!(ed.picker.is_none(), "Esc puts the picker away first");
+    assert_eq!(ed.customs[0], Ink([0x1A, 0x2B, 0x3C]), "and its colour joins the palette");
+    assert!(ed.cells.iter().any(|(i, _)| *i == Item::Custom(0)));
+    let fresh = editor().0;
+    assert!(fresh.customs.contains(&Ink([0x1A, 0x2B, 0x3C])), "next shot too");
+
+    // a custom swatch colours what's drawn next
+    ed.picked = None;
+    let custom = ed.cells.iter().find(|(i, _)| *i == Item::Custom(0)).unwrap().1;
+    click(&mut ed, (custom.x + custom.w / 2, custom.y + custom.h / 2));
+    ed.key(0x4E, false, false); // N: steps
+    click(&mut ed, (300, 200));
+    assert_eq!(ed.marks[1].color(), Some(Ink([0x1A, 0x2B, 0x3C])));
 }
 
 /// Frame time while dragging a pasted 4K picture across a 3440x1440 selection: the event, the
@@ -533,4 +700,74 @@ fn picture_drag_latency() {
     times.sort_by(f64::total_cmp);
     let n = times.len();
     println!("dragging a 4K picture: median {:.2} ms, p90 {:.2} ms, max {:.2} ms", times[n / 2], times[n * 9 / 10], times[n - 1]);
+}
+
+/// Opening the font list (first time in the process: the system fonts aren't known yet) and
+/// scrolling it through every installed family: the event plus the composed paint of what changed.
+#[test]
+#[ignore = "timing: cargo test --release -- --ignored --nocapture font_list_latency"]
+fn font_list_latency() {
+    let painter = Painter::new().unwrap();
+    let font = painter.font(13.0).unwrap();
+    let screen = Rect { x: 0, y: 0, w: 3440, h: 1440 };
+    let bright = Dib::new(screen.w, screen.h).unwrap();
+    let (dim, window) = (Dib::new(screen.w, screen.h).unwrap(), Dib::new(screen.w, screen.h).unwrap());
+    let t0 = Instant::now();
+    let mut ed = Editor::new(Rect { x: 600, y: 300, w: 2000, h: 700 }, None, vec![screen], 1.0);
+    let names = families();
+    let read = t0.elapsed().as_secs_f64() * 1000.0;
+    ed.activate(Item::Tool(Tool::Text));
+    ed.render(&bright, &painter, &font).unwrap();
+    ed.paint(window.dc, screen, &dim, &painter, &font).unwrap();
+    let step = |ed: &mut Editor, f: &mut dyn FnMut(&mut Editor) -> Event| {
+        let t0 = Instant::now();
+        let before = ed.frame();
+        f(ed);
+        let damage = ed.damage(&before);
+        ed.render(&bright, &painter, &font).unwrap();
+        if let Some(rp) = damage.iter().copied().reduce(hull) {
+            ed.paint(window.dc, rp, &dim, &painter, &font).unwrap();
+        }
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::GdiFlush();
+        }
+        t0.elapsed().as_secs_f64() * 1000.0
+    };
+    let open = step(&mut ed, &mut |e| e.activate(Item::Font));
+    // the rows swap into their own faces as the font thread loads them
+    let shown = Instant::now();
+    let mut swaps = 0;
+    while ed.fonts_pending() && shown.elapsed() < Duration::from_secs(5) {
+        std::thread::sleep(Duration::from_millis(2));
+        swaps += 1;
+        step(&mut ed, &mut |e| e.tick());
+    }
+    let faces = shown.elapsed().as_secs_f64() * 1000.0;
+    let mut frames = Vec::new();
+    let families = names.len();
+    for _ in 0..families {
+        frames.push(step(&mut ed, &mut |e| e.scroll_fonts(1)));
+    }
+    frames.sort_by(f64::total_cmp);
+    let n = frames.len().max(1);
+    println!(
+        "font list: families read in the background in {read:.0} ms; open {open:.1} ms, own faces after {faces:.0} ms ({swaps} ticks); scrolling {families} families: median {:.2} ms, p90 {:.2} ms, max {:.2} ms, total {:.0} ms",
+        frames[n / 2],
+        frames[n * 9 / 10],
+        frames[n - 1],
+        frames.iter().sum::<f64>()
+    );
+}
+
+/// The installed families, once the font thread has read them.
+fn families() -> Arc<Vec<Arc<str>>> {
+    fonts::start();
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(names) = fonts::names() {
+            return names;
+        }
+        assert!(Instant::now() < until, "the font families never arrived");
+        std::thread::sleep(Duration::from_millis(2));
+    }
 }

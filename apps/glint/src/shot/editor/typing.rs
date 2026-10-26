@@ -48,23 +48,27 @@ impl Editor {
     /// Brings a mark's measured geometry up to date with its text, style and size.
     pub(super) fn refit(&self, m: &mut Mark) {
         match m {
-            Mark::Text { text, size, style, width, extent, .. } => {
+            Mark::Text { text, size, style, width, height, extent, .. } => {
                 let px = *size * self.scale;
                 let (w, h) = self.fonts.extent(text, style, px, *width);
                 let (pad_x, pad_y) = padding(style.back, px);
-                *extent = (w + 2.0 * pad_x, h + 2.0 * pad_y);
+                // the box never gets shorter than its text: it grows with it
+                *extent = (w + 2.0 * pad_x, h.max(height.unwrap_or(0.0)) + 2.0 * pad_y);
             }
             Mark::Step { size, r, .. } => *r = *size * self.scale / 2.0,
             _ => {}
         }
     }
 
-    /// Where a text mark's letters start (its corner inside the padding), client coordinates.
+    /// Where a text mark's letters start (its corner inside the padding, moved down by its
+    /// vertical alignment in a taller box), client coordinates.
     pub(super) fn text_origin(&self, m: &Mark) -> (f32, f32) {
         match m {
-            Mark::Text { at, size, style, .. } => {
-                let (pad_x, pad_y) = padding(style.back, size * self.scale);
-                (at.0 + pad_x, at.1 + pad_y)
+            Mark::Text { at, text, size, style, width, height, .. } => {
+                let px = size * self.scale;
+                let (pad_x, pad_y) = padding(style.back, px);
+                let lines = self.fonts.extent(text, style, px, *width).1;
+                (at.0 + pad_x, at.1 + pad_y + text::valign_offset(style.valign, lines, *height))
             }
             _ => (0.0, 0.0),
         }
@@ -364,7 +368,7 @@ impl Editor {
 
     /// A WM_CHAR code unit. IME composition isn't shown; its result arrives here as characters.
     pub(crate) fn char(&mut self, unit: u16) -> Event {
-        if self.typing.is_none() && self.fonts_open.is_none() {
+        if self.typing.is_none() && self.fonts_open.is_none() && self.picker.is_none() {
             return Event::None;
         }
         let c = match unit {
@@ -378,6 +382,12 @@ impl Editor {
             },
             _ => char::from_u32(unit as u32),
         };
+        if self.hex_typing() {
+            return match c {
+                Some(c) => self.hex_char(c),
+                None => Event::None,
+            };
+        }
         if self.fonts_open.is_some() {
             return match c {
                 Some(c) if !c.is_control() => self.font_query(Some(c)),
@@ -414,25 +424,37 @@ impl Editor {
             .collect()
     }
 
-    /// `from` (a text mark) with grip `e` dragged by `d`: the corners scale the font, the sides
-    /// set the width it wraps at. The opposite corner or side stays put.
-    pub(super) fn resize_text(&self, from: &Mark, e: Edges, (dx, dy): (i32, i32)) -> Mark {
+    /// `from` (a text mark) with grip `e` dragged by `d`: the corners scale the font (with Ctrl,
+    /// they size the box instead), the sides set the width it wraps at, the top and bottom the
+    /// height of its box, never shorter than the text. The opposite corner or side stays put.
+    pub(super) fn resize_text(&self, from: &Mark, e: Edges, (dx, dy): (i32, i32), boxed: bool) -> Mark {
         let mut m = from.clone();
         let b = from.bbox();
-        let Mark::Text { size, style, width, at, .. } = &mut m else { return m };
+        let Mark::Text { text, size, style, width, height, at, .. } = &mut m else { return m };
         let spec = Tool::Text.strength().expect("text has sizes");
         let px = *size * self.scale;
-        let (pad_x, _) = padding(style.back, px);
+        let (pad_x, pad_y) = padding(style.back, px);
         let grow_x = if e.l { -dx } else { dx } as f32;
-        if (e.l || e.r) && (e.t || e.b) {
-            let grow_y = if e.t { -dy } else { dy } as f32;
+        let grow_y = if e.t { -dy } else { dy } as f32;
+        let sides = e.l || e.r;
+        let ends = e.t || e.b;
+        if sides && ends && !boxed {
             let k = ((b.w as f32 + grow_x) / b.w.max(1) as f32).max((b.h as f32 + grow_y) / b.h.max(1) as f32);
             let new = (*size * k).clamp(spec.min, spec.max);
             let k = new / *size;
             *size = (new * 2.0).round() / 2.0;
             *width = width.map(|w| w * k);
+            *height = height.map(|h| h * k);
         } else {
-            *width = Some((b.w as f32 - 2.0 * pad_x + grow_x).max(px));
+            if sides {
+                *width = Some((b.w as f32 - 2.0 * pad_x + grow_x).max(px));
+            }
+            if ends {
+                let lines = self.fonts.extent(text, style, px, *width).1;
+                let want = b.h as f32 - 2.0 * pad_y + grow_y;
+                // as short as the text: the box fits it again (and grows with it)
+                *height = (want > lines + 0.5).then_some(want.round());
+            }
         }
         let corner = *at;
         self.refit(&mut m);

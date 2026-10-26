@@ -272,6 +272,11 @@ impl Editor {
         {
             painter.draw_on(dc, local(list.rect).to_win(), |c| self.draw_font_list(c, &list))?;
         }
+        if let Some(l) = self.picker_layout()
+            && visible(l.rect)
+        {
+            painter.draw_on(dc, local(l.rect).to_win(), |c| self.draw_picker(c, &l))?;
+        }
         if let Some((r, _, text)) = &self.pill
             && visible(*r)
         {
@@ -288,6 +293,8 @@ impl Editor {
     /// meaningful (a cutout: transparent outside the windows); otherwise the top byte is garbage.
     pub(crate) fn pixels(&mut self, bright: &Dib, painter: &Painter) -> Result<(Vec<u32>, Rect, bool), String> {
         self.commit();
+        // a colour still in the picker joins the custom swatches
+        self.close_picker();
         self.drag = None;
         self.render_view(bright, painter, None)?;
         let v = self.view.as_ref().expect("rendered above");

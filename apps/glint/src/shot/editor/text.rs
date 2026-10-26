@@ -1,5 +1,6 @@
 use std::cell::RefCell;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::*;
@@ -11,25 +12,10 @@ const SHADE: D2D1_COLOR_F = rgba(0, 0, 0, 0.6);
 const PILL: D2D1_COLOR_F = rgba(12, 12, 16, 0.62);
 const FORMATS: usize = 32;
 const LAYOUTS: usize = 24;
+/// Font list rows kept laid out; past this the cache starts over.
+const PREVIEWS: usize = 256;
 /// Wider than any text: lines are only broken at newlines unless a mark has a width.
 const UNBOUNDED: f32 = 100_000.0;
-
-/// Families offered first, when they're installed.
-const FAVOURITES: [&str; 13] = [
-    "Segoe UI",
-    "Segoe UI Variable Display",
-    "Arial",
-    "Calibri",
-    "Bahnschrift",
-    "Georgia",
-    "Times New Roman",
-    "Consolas",
-    "Cascadia Code",
-    "Comic Sans MS",
-    "Impact",
-    "Segoe Print",
-    "Ink Free",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub(super) enum Align {
@@ -46,6 +32,35 @@ impl Align {
             Align::Centre => Align::Right,
             Align::Right => Align::Left,
         }
+    }
+}
+
+/// Where the lines sit in a text box taller than they are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub(super) enum VAlign {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
+impl VAlign {
+    pub(super) fn next(self) -> VAlign {
+        match self {
+            VAlign::Top => VAlign::Middle,
+            VAlign::Middle => VAlign::Bottom,
+            VAlign::Bottom => VAlign::Top,
+        }
+    }
+}
+
+/// How far down a box `height` tall (none: as tall as the text) its `lines` tall text starts.
+pub(super) fn valign_offset(valign: VAlign, lines: f32, height: Option<f32>) -> f32 {
+    let room = (height.unwrap_or(lines) - lines).max(0.0);
+    match valign {
+        VAlign::Top => 0.0,
+        VAlign::Middle => (room / 2.0).round(),
+        VAlign::Bottom => room,
     }
 }
 
@@ -82,6 +97,7 @@ pub(super) struct Style {
     pub(super) underline: bool,
     pub(super) strike: bool,
     pub(super) align: Align,
+    pub(super) valign: VAlign,
     pub(super) back: Back,
 }
 
@@ -94,6 +110,7 @@ impl Default for Style {
             underline: false,
             strike: false,
             align: Align::Left,
+            valign: VAlign::Top,
             back: Back::Outline,
         }
     }
@@ -228,13 +245,19 @@ pub(super) struct Typesetter {
     dwrite: IDWriteFactory,
     formats: RefCell<Vec<(FormatKey, IDWriteTextFormat)>>,
     layouts: RefCell<Vec<Laid>>,
+    /// Font list rows: each family's name laid out in its own face, or the UI's.
+    previews: RefCell<HashMap<PreviewKey, IDWriteTextLayout>>,
 }
+
+/// A font list row: the family, whether it's in its own face, and the size and box (their bits).
+type PreviewKey = (Arc<str>, bool, [u32; 3]);
 
 impl Typesetter {
     pub(super) fn new() -> Typesetter {
         // the shared factory is a process singleton the picker's painter has already created
         let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.expect("DirectWrite shared factory");
-        Typesetter { dwrite, formats: RefCell::new(Vec::new()), layouts: RefCell::new(Vec::new()) }
+        let (formats, layouts, previews) = Default::default();
+        Typesetter { dwrite, formats, layouts, previews }
     }
 
     fn format(&self, font: &Arc<str>, bold: bool, italic: bool, px: f32) -> Option<IDWriteTextFormat> {
@@ -365,7 +388,8 @@ impl Typesetter {
         .unwrap_or_default()
     }
 
-    /// Draws a text mark's box at `at`: its backing, then the letters.
+    /// Draws a text mark's box at `at`: its backing (filling the box `height` tall, when it's
+    /// taller than the text), then the letters, placed in it by the style's vertical alignment.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &self,
@@ -373,15 +397,17 @@ impl Typesetter {
         text: &str,
         style: &Style,
         px: f32,
-        width: Option<f32>,
+        (width, height): (Option<f32>, Option<f32>),
         at: (f32, f32),
         color: D2D1_COLOR_F,
         ink_on_color: D2D1_COLOR_F,
     ) {
         let (pad_x, pad_y) = padding(style.back, px);
-        let origin = (at.0 + pad_x, at.1 + pad_y);
         self.laid(text, style, px, width, |layout, (w, h)| {
-            let pill = |fill| c.round_rect(at.0, at.1, w + 2.0 * pad_x, h + 2.0 * pad_y, (h + 2.0 * pad_y) * 0.3, fill);
+            let origin = (at.0 + pad_x, at.1 + pad_y + valign_offset(style.valign, h, height));
+            let (bw, bh) = (w + 2.0 * pad_x, h.max(height.unwrap_or(0.0)) + 2.0 * pad_y);
+            let filled = !text.is_empty() || height.is_some();
+            let pill = |fill| c.round_rect(at.0, at.1, bw, bh, (bh * 0.3).min(px * 0.6), fill);
             match style.back {
                 Back::Outline => {
                     let reach = outline(px);
@@ -392,16 +418,16 @@ impl Typesetter {
                     c.text_layout(layout, origin, color);
                 }
                 Back::Shade => {
-                    if !text.is_empty() {
+                    if filled {
                         pill(PILL);
                     }
                     c.text_layout(layout, origin, color);
                 }
                 Back::Tag => {
-                    if !text.is_empty() {
+                    if filled {
                         pill(color);
                     }
-                    c.text_layout(layout, origin, if text.is_empty() { color } else { ink_on_color });
+                    c.text_layout(layout, origin, if filled { ink_on_color } else { color });
                 }
                 Back::None => c.text_layout(layout, origin, color),
             }
@@ -449,87 +475,34 @@ impl Typesetter {
         self.extent(text, &style, px, None).0
     }
 
-    /// The installed font families: the favourites first, then the rest alphabetically.
-    pub(super) fn families(&self) -> Arc<Vec<Arc<str>>> {
-        FAMILIES.0.clone()
-    }
-
-    /// Whether family `name` draws pictures instead of letters (icons, dingbats).
-    pub(super) fn is_symbol(&self, name: &str) -> bool {
-        FAMILIES.1.iter().any(|s| s == name)
-    }
-}
-
-/// The installed families in the order the font list shows them, and the symbol fonts among them.
-type Families = (Arc<Vec<Arc<str>>>, Vec<String>);
-
-/// The installed font families, read once.
-static FAMILIES: LazyLock<Families> = LazyLock::new(|| {
-    let found = match unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) } {
-        Ok(dwrite) => system_families(&dwrite),
-        Err(_) => Vec::new(),
-    };
-    let symbols = found.iter().filter(|(_, symbol)| *symbol).map(|(n, _)| n.clone()).collect();
-    (Arc::new(ordered(found.into_iter().map(|(n, _)| n).collect())), symbols)
-});
-
-/// `names` with the favourites that are there first, then the rest alphabetically.
-fn ordered(mut names: Vec<String>) -> Vec<Arc<str>> {
-    names.sort_by_key(|n| n.to_lowercase());
-    names.dedup();
-    let mut out: Vec<Arc<str>> = FAVOURITES.iter().filter(|f| names.iter().any(|n| n == *f)).map(|f| Arc::from(*f)).collect();
-    out.extend(names.iter().filter(|n| !FAVOURITES.contains(&n.as_str())).map(|n| Arc::from(n.as_str())));
-    out
-}
-
-/// The families in `names` matching `query` (any case, anywhere in the name), in order; names
-/// starting with it come first.
-pub(super) fn search(names: &[Arc<str>], query: &str) -> Vec<Arc<str>> {
-    let q = query.trim().to_lowercase();
-    if q.is_empty() {
-        return names.to_vec();
-    }
-    let (mut starts, mut inside) = (Vec::new(), Vec::new());
-    for n in names {
-        let lower = n.to_lowercase();
-        if lower.starts_with(&q) {
-            starts.push(n.clone());
-        } else if lower.contains(&q) {
-            inside.push(n.clone());
-        }
-    }
-    starts.extend(inside);
-    starts
-}
-
-/// Every installed family's name, and whether it's a symbol font.
-fn system_families(dwrite: &IDWriteFactory) -> Vec<(String, bool)> {
-    let mut names = Vec::new();
-    unsafe {
-        let mut collection = None;
-        if dwrite.GetSystemFontCollection(&mut collection, false).is_err() {
-            return names;
-        }
-        let Some(collection) = collection else { return names };
-        for i in 0..collection.GetFontFamilyCount() {
-            let Ok(family) = collection.GetFontFamily(i) else { continue };
-            let Ok(localized) = family.GetFamilyNames() else { continue };
-            let (mut index, mut exists) = (0, BOOL(0));
-            let _ = localized.FindLocaleName(w!("en-us"), &mut index, &mut exists);
-            if !exists.as_bool() {
-                index = 0;
+    /// A font list row: `name` left-aligned and vertically centred in `[x, y, w, h]`, cut off at the
+    /// box's right edge, in its own face when `own` (the family is loaded) and the UI's otherwise.
+    /// Rows are laid out once and kept.
+    pub(super) fn draw_preview(&self, c: &Canvas, name: &Arc<str>, own: bool, px: f32, [x, y, w, h]: [f32; 4], color: D2D1_COLOR_F) {
+        let key = (name.clone(), own, [px.to_bits(), w.to_bits(), h.to_bits()]);
+        let cached = self.previews.borrow().get(&key).cloned();
+        let layout = match cached {
+            Some(l) => l,
+            None => {
+                let face = if own { name.clone() } else { Arc::from("Segoe UI") };
+                let Some(format) = self.format(&face, false, false, px) else { return };
+                let s: Vec<u16> = name.encode_utf16().collect();
+                let Ok(layout) = (unsafe { self.dwrite.CreateTextLayout(&s, &format, w.max(1.0), h.max(1.0)) }) else { return };
+                unsafe {
+                    let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                    let trim = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, ..Default::default() };
+                    let _ = layout.SetTrimming(&trim, None);
+                }
+                let mut previews = self.previews.borrow_mut();
+                if previews.len() >= PREVIEWS {
+                    previews.clear();
+                }
+                previews.insert(key, layout.clone());
+                layout
             }
-            let Ok(len) = localized.GetStringLength(index) else { continue };
-            let mut buf = vec![0u16; len as usize + 1];
-            if localized.GetString(index, &mut buf).is_ok() {
-                let symbol = family
-                    .GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL)
-                    .is_ok_and(|f| f.IsSymbolFont().as_bool());
-                names.push((String::from_utf16_lossy(&buf[..len as usize]), symbol));
-            }
-        }
+        };
+        c.text_layout(&layout, (x, y), color);
     }
-    names
 }
 
 #[cfg(test)]
@@ -574,15 +547,13 @@ mod tests {
     }
 
     #[test]
-    fn font_search_puts_favourites_and_prefixes_first() {
-        let names = ordered(["Zapf", "Arial", "Segoe UI", "Consolas", "Segoe Script", "Calibri Light"].map(String::from).to_vec());
-        let names: Vec<&str> = names.iter().map(|n| &**n).collect();
-        assert_eq!(names, ["Segoe UI", "Arial", "Consolas", "Calibri Light", "Segoe Script", "Zapf"]);
-        let all = ordered(["Segoe UI", "Consolas", "Segoe Script", "Calibri"].map(String::from).to_vec());
-        let found: Vec<String> = search(&all, "SC").iter().map(|n| n.to_string()).collect();
-        assert_eq!(found, ["Segoe Script"]);
-        let found: Vec<String> = search(&all, "c").iter().map(|n| n.to_string()).collect();
-        assert_eq!(found, ["Calibri", "Consolas", "Segoe Script"], "prefix matches first");
+    fn lines_sit_in_a_taller_box_as_aligned() {
+        assert_eq!(valign_offset(VAlign::Top, 30.0, Some(100.0)), 0.0);
+        assert_eq!(valign_offset(VAlign::Middle, 30.0, Some(100.0)), 35.0);
+        assert_eq!(valign_offset(VAlign::Bottom, 30.0, Some(100.0)), 70.0);
+        assert_eq!(valign_offset(VAlign::Bottom, 30.0, None), 0.0, "a box as tall as its text");
+        assert_eq!(valign_offset(VAlign::Middle, 120.0, Some(100.0)), 0.0, "text taller than the box grows it");
+        assert_eq!(VAlign::Top.next().next().next(), VAlign::Top);
     }
 
     #[test]

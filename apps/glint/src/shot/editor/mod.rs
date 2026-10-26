@@ -2,7 +2,8 @@
 //! it: pen, highlighter, arrow, rectangle, blur, pixelate, smart eraser, text, step markers,
 //! cursors, grabs (a piece of the frozen screen, from anywhere on it, as a picture in the
 //! shot) and the clipboard (pictures pasted with Ctrl+V or picked from a strip of recent ones),
-//! five colours, three sizes, undo and redo, and copy / save / upload / pin / done / cancel. The
+//! five colours plus a picker for any other (the last few picked stay as swatches), three sizes,
+//! undo and redo, and copy / save / upload / pin / done / cancel. The
 //! selection keeps handles for resizing (Ctrl moves it instead) and can be dragged while no tool
 //! is active. In canvas mode ([`Editor::canvas`]) there is no selection until one is picked: the
 //! toolbar is docked at the top of the monitor under the mouse (Tab brings it to
@@ -17,10 +18,12 @@
 //! with nothing picked yet, it cancels the shot.
 //!
 //! Texts are objects: a click places one (or, on an existing one, types into it), a drag moves
-//! it, its corners scale it and its sides set the width it wraps at. While typing, it edits like a
-//! text box (selection, Ctrl+A / C / X / V, word jumps, its own undo). The text bar beside the
-//! toolbar sets the font, size, bold / italic / underline / strikethrough, alignment and backdrop
-//! of the whole text; new texts start in the last style used. Typing repaints only the text.
+//! it, its corners scale it (with Ctrl they size its box), its sides set the width it wraps at and
+//! its top and bottom the height of its box, which never gets shorter than the text. While typing,
+//! it edits like a text box (selection, Ctrl+A / C / X / V, word jumps, its own undo). The text bar
+//! beside the toolbar sets the font, size, bold / italic / underline / strikethrough, alignment
+//! (across and down the box) and backdrop of the whole text; new texts start in the last style
+//! used. Typing repaints only the text.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -43,7 +46,9 @@ use crate::platform::rect::ring;
 #[cfg(test)]
 mod checks;
 mod effects;
+mod fonts;
 mod marks;
+mod palette;
 mod paste;
 mod render;
 mod text;
@@ -51,7 +56,8 @@ mod textbar;
 mod toolbar;
 mod typing;
 
-use marks::{COLORS, Edges, Grip, MIN_SIDE, Mark, Sprite, Strength, TOOLS, Tool, dist, resize, shift_within};
+use marks::{Edges, Grip, Ink, MIN_SIDE, Mark, PALETTE, Sprite, Strength, TOOLS, Tool, dist, resize, shift_within};
+use palette::{Part, Picker};
 use paste::{Clip, Load};
 pub(crate) use paste::{Recent, load_recents};
 use text::{Style, Typesetter};
@@ -127,6 +133,9 @@ enum Drag {
     Select,
     /// A picture in the clipboard strip is held: a click pastes it, a drag pulls it out.
     Recent { index: usize, press: (i32, i32) },
+    /// The colour picker's square or strip is held; `before` is the picked mark it recolours, as
+    /// it was.
+    Color { part: Part, before: Option<(usize, Mark)> },
 }
 
 #[derive(PartialEq)]
@@ -134,7 +143,7 @@ struct Look {
     hover: Option<Item>,
     pressed: Option<Item>,
     tool: Option<Tool>,
-    color: usize,
+    color: Ink,
     size: Option<(Tool, f32)>,
     undo: bool,
     redo: bool,
@@ -143,8 +152,11 @@ struct Look {
     /// How far the running animations have come, in steps (255 once none runs).
     anim: u8,
     style: (Style, u32),
-    fonts: Option<(String, usize)>,
+    /// The font list's search, scroll, and how many of its rows show their own face.
+    fonts: Option<(String, usize, usize)>,
     recents: (usize, Load),
+    /// The picker's colour (its bits), the hex being typed, and whether the field has the keys.
+    picker: Option<([u32; 3], String, bool)>,
 }
 
 pub(crate) struct Frame {
@@ -192,7 +204,11 @@ pub(crate) struct Editor {
     wheel_group: Option<(usize, Instant)>,
     wheel_acc: i32,
     tool: Option<Tool>,
-    color: usize,
+    color: Ink,
+    /// The custom colours on the palette, newest first.
+    customs: Vec<Ink>,
+    /// The colour picker, while it's open.
+    picker: Option<Picker>,
     strength: [f32; TOOLS.len()],
     drag: Option<Drag>,
     typing: Option<Typing>,
@@ -263,6 +279,8 @@ impl Editor {
         scale: f32,
         mouse: (i32, i32),
     ) -> Editor {
+        // the font list's families are read in the background, before it's opened
+        fonts::start();
         let (text_style, text_size) = text::last_style().unwrap_or((Style::default(), 24.0));
         let mut strength = TOOLS.map(|(t, ..)| t.strength().map_or(0.0, |s| s.presets[1]));
         strength[Tool::Text as usize] = text_size;
@@ -286,7 +304,9 @@ impl Editor {
             wheel_group: None,
             wheel_acc: 0,
             tool: None,
-            color: 0,
+            color: PALETTE[0],
+            customs: palette::recent_customs(),
+            picker: None,
             strength,
             drag: None,
             typing: None,
@@ -447,6 +467,11 @@ impl Editor {
             times.push(self.panel_t());
         }
         times.extend(self.fonts_open.as_ref().map(|f| textbar::progress(f.since, textbar::PANEL_MS)));
+        times.extend(self.picker.as_ref().map(|p| textbar::progress(p.since, textbar::PANEL_MS)));
+        if self.fonts_pending() {
+            // rows swap into their own faces as those load
+            times.push(0.0);
+        }
         if self.panel() == Some(Panel::Strip) {
             times.extend(self.recents.iter().map(|(_, at)| textbar::progress(*at, textbar::PANEL_MS)));
         }
@@ -531,7 +556,7 @@ impl Editor {
             hover: self.hover,
             pressed: self.pressed(),
             tool: self.tool,
-            color: self.shown_color(),
+            color: self.shown_ink(),
             size: self.current().map(|(t, _, v)| (t, v)),
             undo: !self.history.is_empty(),
             redo: !self.future.is_empty(),
@@ -542,8 +567,9 @@ impl Editor {
                 let (style, size) = self.shown_style();
                 (style, size.to_bits())
             },
-            fonts: self.fonts_open.as_ref().map(|f| (f.query.clone(), f.scroll)),
+            fonts: self.fonts_open.as_ref().map(|f| (f.query.clone(), f.scroll, self.fonts_shown())),
             recents: (self.recents.len(), self.recents_load),
+            picker: self.picker.as_ref().map(|p| (p.hsv.map(f32::to_bits), p.hex.clone(), p.hex_focus)),
         }
     }
 
@@ -557,10 +583,6 @@ impl Editor {
 
     fn picked_mark(&self) -> Option<&Mark> {
         self.picked.map(|i| &self.marks[i])
-    }
-
-    fn shown_color(&self) -> usize {
-        self.picked_mark().and_then(Mark::color).unwrap_or(self.color)
     }
 
     fn current(&self) -> Option<(Tool, Strength, f32)> {
@@ -682,6 +704,7 @@ impl Editor {
             Some(Drag::Mark { .. }) => return IDC_CROSS,
             Some(Drag::Edit { grip, .. }) => return grip_cursor(*grip),
             Some(Drag::Select) => return IDC_IBEAM,
+            Some(Drag::Color { .. }) => return IDC_CROSS,
             _ => {}
         }
         match self.hit(p) {
@@ -758,6 +781,14 @@ impl Editor {
         let hit = self.hit(p);
         let double = self.double_click(p);
         let typing = self.typing.as_ref().map(|t| t.index);
+        // a press off the picker and the bar puts the picker away
+        let on_picker = self.picker_layout().is_some_and(|l| l.rect.contains(p.0, p.1));
+        if !on_picker && !matches!(hit, Hit::Bar(_)) {
+            self.close_picker();
+        }
+        if let Some(p_) = self.picker.as_mut() {
+            p_.hex_focus = matches!(hit, Hit::Bar(Item::Hex));
+        }
         match hit {
             Hit::Typing if double => return self.select_word(p),
             Hit::Typing => {
@@ -787,6 +818,8 @@ impl Editor {
         }
         self.drag = match hit {
             Hit::Bar(Item::Recent(index)) => Some(Drag::Recent { index, press: p }),
+            Hit::Bar(Item::Sv) => Some(self.grab_picker(Part::Square, p)),
+            Hit::Bar(Item::Hue) => Some(self.grab_picker(Part::Strip, p)),
             Hit::Bar(item) => Some(Drag::Bar(item)),
             Hit::Grip(grip) => self.picked.map(|index| self.grab(index, Some(grip), p, false)),
             Hit::Mark(index) => {
@@ -882,7 +915,7 @@ impl Editor {
                 let d = (p.0 - grab.0, p.1 - grab.1);
                 let (from, grip, i) = (from.clone(), *grip, *index);
                 let mark = match grip {
-                    Some(Grip::Edge(e)) if matches!(from, Mark::Text { .. }) => self.resize_text(&from, e, d),
+                    Some(Grip::Edge(e)) if matches!(from, Mark::Text { .. }) => self.resize_text(&from, e, d, self.ctrl),
                     Some(grip) => from.resized(grip, d, b, self.shift),
                     None => {
                         let (dx, dy) = shift_within(from.bbox(), d, b);
@@ -915,6 +948,7 @@ impl Editor {
                 self.set_sel(snap_resized(resized, edges, p, snap, th))
             }
             Some(Drag::Bar(_)) => Event::None,
+            &mut Some(Drag::Color { part, .. }) => self.drag_picker(part, p),
             &mut Some(Drag::Recent { index, press }) => self.drag_recent(index, press, p),
             Some(Drag::Select) => self.place_caret(p, true),
             None => {
@@ -956,6 +990,7 @@ impl Editor {
                 Hit::Bar(at) if at == item => self.activate(item),
                 _ => Event::Repaint,
             },
+            Some(Drag::Color { before, .. }) => self.drop_picker(before),
             Some(Drag::Recent { index, .. }) => match self.hit(p) {
                 Hit::Bar(Item::Recent(at)) if at == index => self.paste_recent(index, None),
                 _ => Event::Repaint,
@@ -1067,6 +1102,10 @@ impl Editor {
         if self.fonts_open.take().is_some() {
             return Event::Repaint;
         }
+        if self.picker.is_some() {
+            self.close_picker();
+            return Event::Repaint;
+        }
         if self.panel() == Some(Panel::Strip) && self.picked.is_none() {
             self.strip_open = false;
             return Event::Repaint;
@@ -1128,23 +1167,10 @@ impl Editor {
                 }
                 self.pick = self.hover_pick(self.mouse);
             }
-            Item::Color(c) => {
-                self.color = c;
-                if let Some(i) = self.picked
-                    && self.marks[i].color().is_some_and(|old| old != c)
-                {
-                    let was = self.marks[i].clone();
-                    if self.typing_into(i) {
-                        self.typing_checkpoint(i, was);
-                    } else {
-                        self.remember();
-                    }
-                    if let Some(slot) = self.marks[i].color_mut() {
-                        *slot = c;
-                    }
-                    self.touch();
-                }
-            }
+            Item::Color(c) => return self.set_ink(PALETTE[c]),
+            Item::Custom(c) => return self.set_ink(self.customs[c]),
+            Item::Picker => return self.toggle_picker(),
+            Item::Sv | Item::Hue | Item::Hex => {}
             Item::Size(n) => {
                 if let Some((_, s, _)) = self.current() {
                     return self.set_strength(s.presets[n], false);
@@ -1168,6 +1194,7 @@ impl Editor {
             | Item::Underline
             | Item::Strike
             | Item::Align
+            | Item::VAlign
             | Item::Back => return self.activate_text(item),
         }
         Event::Repaint
@@ -1265,6 +1292,12 @@ impl Editor {
                 self.set_sel(start);
             }
             Drag::Bar(_) | Drag::Select | Drag::Recent { .. } => {}
+            Drag::Color { before, .. } => {
+                if let Some((i, was)) = before {
+                    self.marks[i] = was;
+                    self.touch();
+                }
+            }
         }
         self.pick = self.hover_pick(self.mouse);
         Event::Repaint
@@ -1291,6 +1324,16 @@ impl Editor {
             return self.escape();
         }
         if self.drag.is_some() {
+            return Event::None;
+        }
+        if self.hex_typing()
+            && !ctrl
+            && let Some(event) = self.hex_key(vk)
+        {
+            return event;
+        }
+        // hex digits arrive as characters; they don't switch tools or colours meanwhile
+        if self.hex_typing() && !ctrl && matches!(vk, 0x30..=0x39 | 0x41..=0x46 | 0x60..=0x69) {
             return Event::None;
         }
         if self.fonts_open.is_some() && !ctrl {
@@ -1320,7 +1363,7 @@ impl Editor {
             (VK_OEM_6, false) => self.nudge(1),
             (0x51, false) if self.region => self.activate(Item::Region), // Q
             (_, false) if shift => match vk.checked_sub(VK_1) {
-                Some(i) if (i as usize) < COLORS.len() => self.activate(Item::Color(i as usize)),
+                Some(i) if (i as usize) < PALETTE.len() => self.activate(Item::Color(i as usize)),
                 _ => Event::None,
             },
             (_, false) => match TOOLS.iter().find(|(_, _, letter, digit)| tool_key(vk, *digit, *letter)) {
@@ -1496,7 +1539,7 @@ mod tests {
     #[test]
     fn double_click_retypes_a_text() {
         let mut ed = editor();
-        ed.marks.push(Mark::new(Tool::Text, (100, 100), 0, 24.0));
+        ed.marks.push(Mark::new(Tool::Text, (100, 100), PALETTE[0], 24.0));
         let mut m = ed.marks[0].clone();
         if let Mark::Text { text, .. } = &mut m {
             *text = "abc".into();
@@ -1523,9 +1566,9 @@ mod tests {
     fn shift_digits_pick_colours() {
         let mut ed = editor();
         ed.key(0x33, false, true);
-        assert_eq!((ed.color, ed.tool), (2, None));
+        assert_eq!((ed.color, ed.tool), (PALETTE[2], None));
         ed.key(0x33, false, false);
-        assert_eq!((ed.color, ed.tool), (2, Some(Tool::Arrow)));
+        assert_eq!((ed.color, ed.tool), (PALETTE[2], Some(Tool::Arrow)));
         ed.key(0x38, false, false);
         assert_eq!(ed.tool, Some(Tool::Step));
         ed.key(0x39, false, false);
@@ -1605,7 +1648,7 @@ mod tests {
         let screen = Rect { x: 0, y: 0, w: 1920, h: 1080 };
         let mut ed = Editor::new(screen, None, vec![screen], 1.0);
         assert_eq!(screen.intersect(&ed.bar), Some(ed.bar), "a full-screen shot keeps the bar inside");
-        ed.marks.push(Mark::Rectangle { rect: Rect { x: 100, y: 100, w: 200, h: 100 }, color: 0, width: 4.0 });
+        ed.marks.push(Mark::Rectangle { rect: Rect { x: 100, y: 100, w: 200, h: 100 }, color: PALETTE[0], width: 4.0 });
         ed.mouse_down((100, 150), 0);
         for x in 101..140 {
             let before = ed.frame();
@@ -1621,7 +1664,7 @@ mod tests {
     fn tools_pick_only_their_own_kind() {
         let mut ed = editor();
         ed.marks.push(Mark::Blur { rect: Rect { x: 50, y: 50, w: 200, h: 150 }, radius: 8.0 });
-        ed.marks.push(Mark::Arrow { from: (60.0, 100.0), to: (240.0, 100.0), color: 0, width: 4.0 });
+        ed.marks.push(Mark::Arrow { from: (60.0, 100.0), to: (240.0, 100.0), color: PALETTE[0], width: 4.0 });
         let (on_arrow, on_blur) = ((150, 100), (150, 170));
         assert!(matches!(ed.hit(on_arrow), Hit::Mark(1)));
         assert!(matches!(ed.hit(on_blur), Hit::Mark(0)));
@@ -1636,7 +1679,7 @@ mod tests {
     fn undo_restores_moved_and_resized_marks() {
         let mut ed = editor();
         let start = Rect { x: 100, y: 100, w: 100, h: 80 };
-        ed.marks.push(Mark::Rectangle { rect: start, color: 0, width: 4.0 });
+        ed.marks.push(Mark::Rectangle { rect: start, color: PALETTE[0], width: 4.0 });
         let area = |ed: &Editor| match &ed.marks[0] {
             Mark::Rectangle { rect, .. } => *rect,
             _ => unreachable!(),
@@ -1997,7 +2040,7 @@ mod tests {
         let window = Dib::new(screen.w, screen.h).unwrap();
         let mut ed = Editor::new(screen, None, vec![screen], 1.0);
         ed.marks.push(Mark::Blur { rect: Rect { x: 200, y: 200, w: 900, h: 600 }, radius: 8.0 });
-        ed.marks.push(Mark::Rectangle { rect: Rect { x: 1500, y: 300, w: 900, h: 700 }, color: 0, width: 4.0 });
+        ed.marks.push(Mark::Rectangle { rect: Rect { x: 1500, y: 300, w: 900, h: 700 }, color: PALETTE[0], width: 4.0 });
         ed.activate(Item::Tool(Tool::Text));
         click(&mut ed, (1700, 700));
         ed.render(&bright, &painter, &font).unwrap();
