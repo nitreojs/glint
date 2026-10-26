@@ -3,6 +3,7 @@
 
 use eframe::egui::{self, Id, RichText, Ui};
 use glint_core::config::CodecName;
+use glint_core::events::addon::State;
 use glint_core::format::human_duration;
 use glint_core::geom::monitor::Output;
 use glint_core::icon::icon_rgba;
@@ -21,6 +22,7 @@ use windows::core::{HSTRING, w};
 
 use glint_shell::afterglow::MAIN_CLASS;
 
+use crate::addon::{self, Status};
 use crate::app::{AMBER, WM_HOTKEY_PAUSE, WM_PREVIEW_NOTE, WM_RELOAD};
 use crate::config::{APP, Config, LENGTHS, MEMORY_CAPS, NAMES, Place, default_output_dir};
 
@@ -69,6 +71,8 @@ pub struct Settings {
     /// Windows can decode hevc: the clips can be played and trimmed here.
     plays_hevc: bool,
     audio: AudioEditor,
+    /// The Deadlock addon as it stood when the window opened or last saved.
+    addon: Status,
 }
 
 /// A monitor the buffer can keep: what the dropdown calls it, its number in [`Config::monitor`],
@@ -160,7 +164,7 @@ impl Settings {
             media::has_decoder(MFVideoFormat_HEVC)
         };
         let audio = AudioEditor::default();
-        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, screens, last_bitrate, plays_hevc, audio }
+        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, screens, last_bitrate, plays_hevc, audio, addon: addon::status() }
     }
 
     /// The monitor the buffer keeps: the chosen one, or the primary one it falls back to.
@@ -188,6 +192,38 @@ impl Settings {
         widgets::toggle_row(ui, look, "with windows", &mut self.cfg.launch_at_startup, text);
         let text = if self.cfg.buffer { "right away" } else { "waits for resume in the tray" };
         widgets::toggle_row(ui, look, "buffering", &mut self.cfg.buffer, text);
+        widgets::subheading(ui, look, "games");
+        row(ui, look, "deadlock events", 1.0, |ui| {
+            if widgets::toggle(ui, look, &mut self.cfg.deadlock_addon, "markers for your kills, deaths and assists").changed() && self.cfg.deadlock_addon {
+                self.cfg.game_events = true;
+            }
+            let (text, warn) = self.addon_hint();
+            hint(ui, text, if warn { look.p.warn } else { t3 });
+        });
+    }
+
+    /// The line under "deadlock events": what turning it on takes, or where the addon stands.
+    fn addon_hint(&self) -> (&'static str, bool) {
+        let (want, saved) = (self.cfg.deadlock_addon, self.saved.deadlock_addon);
+        let installed = matches!(&self.addon, Status::State { state: State::Current(_) | State::Outdated(_), .. });
+        let running = matches!(self.addon, Status::State { running: true, .. });
+        if !want {
+            return match (installed, saved) {
+                (true, true) => ("the addon comes out when you save", false),
+                (true, false) if running => ("the addon comes out when deadlock closes", false),
+                _ => ("afterglow puts an addon into deadlock that tells them", false),
+            };
+        }
+        match &self.addon {
+            Status::NoGame => ("deadlock isn't installed through steam on this pc", true),
+            Status::NoAddons => ("deadlock loads no addons: its gameinfo.gi names no addons folder", true),
+            Status::NoLog => ("add -condebug to deadlock's launch options in steam", true),
+            Status::State { state: State::Off, .. } => ("turned off in deadlock mod manager", true),
+            Status::State { state: State::Current(_), .. } => ("the addon is in: every match is followed", false),
+            Status::State { .. } if !saved => ("the addon goes in when you save", false),
+            Status::State { running: true, .. } => ("the addon goes in when deadlock closes", false),
+            Status::State { .. } => ("the addon goes in while afterglow runs", false),
+        }
     }
 
     /// The save hotkey as a one-line hotkey list; a click records a new combo in its place.
@@ -365,6 +401,8 @@ impl Settings {
                     + n(a.save_hotkey == b.save_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
                     + n(a.note_position == b.note_position)
+                    + n(a.deadlock_addon == b.deadlock_addon)
+                    + n(a.game_events == b.game_events)
             }
             Page::Video => {
                 n(a.monitor == b.monitor)
@@ -427,6 +465,8 @@ impl Pages for Settings {
                 c.save_hotkey = d.save_hotkey;
                 c.launch_at_startup = d.launch_at_startup;
                 c.note_position = d.note_position;
+                c.deadlock_addon = d.deadlock_addon;
+                c.game_events = d.game_events;
             }
             Page::Video => {
                 c.monitor = d.monitor;
@@ -470,6 +510,8 @@ impl Pages for Settings {
         match self.cfg.save() {
             Ok(()) => {
                 window::post(MAIN_CLASS, WM_RELOAD, 0);
+                addon::poke();
+                self.addon = addon::status();
                 self.saved = self.cfg.clone();
                 self.error = None;
                 true
@@ -650,5 +692,36 @@ mod tests {
         assert_eq!((s.cfg.note_position, s.cfg.output_dir.as_str()), (Place::TopRight, r"D:\clips"), "the note goes back, the folder stays");
         assert_eq!(s.resettable(Page::Output), Some(true));
         assert_eq!(s.resettable(Page::About), None);
+    }
+
+    #[test]
+    fn the_deadlock_hint_says_what_stands_in_the_way() {
+        let mut s = Settings::new(Config::default(), None);
+        let installed = |running| Status::State { state: State::Current("pak99_dir.vpk".into()), running };
+        let missing = |running| Status::State { state: State::Missing, running };
+        let hint = |s: &mut Settings, want: bool, saved: bool, status: Status| {
+            s.cfg.deadlock_addon = want;
+            s.saved.deadlock_addon = saved;
+            s.addon = status;
+            s.addon_hint()
+        };
+        assert!(!hint(&mut s, false, false, missing(false)).1, "off: what it does");
+        assert_eq!(hint(&mut s, true, false, missing(false)).0, "the addon goes in when you save");
+        assert_eq!(hint(&mut s, true, true, missing(true)).0, "the addon goes in when deadlock closes");
+        assert_eq!(hint(&mut s, true, true, installed(true)).0, "the addon is in: every match is followed");
+        assert_eq!(hint(&mut s, false, true, installed(false)).0, "the addon comes out when you save");
+        assert_eq!(hint(&mut s, false, false, installed(true)).0, "the addon comes out when deadlock closes");
+        assert_eq!(hint(&mut s, true, true, Status::NoLog), ("add -condebug to deadlock's launch options in steam", true));
+        assert!(hint(&mut s, true, true, Status::NoGame).1);
+        assert!(hint(&mut s, true, true, Status::State { state: State::Off, running: false }).1);
+
+        s.saved = Config::default();
+        s.cfg = Config::default();
+        assert_eq!(s.changes(Page::General), 0);
+        s.cfg.deadlock_addon = true;
+        s.cfg.game_events = true;
+        assert_eq!(s.changes(Page::General), 2, "both are general's");
+        s.reset(Page::General);
+        assert!(!s.cfg.deadlock_addon && !s.cfg.game_events);
     }
 }

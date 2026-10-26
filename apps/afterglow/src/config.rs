@@ -49,6 +49,9 @@ pub struct Config {
     /// Follow a supported game's events and save those in a clip with it, as markers for the
     /// trimmer.
     pub game_events: bool,
+    /// Keep afterglow's addon installed in Deadlock, which tells the local player's kills,
+    /// deaths and assists ([`crate::addon`]).
+    pub deadlock_addon: bool,
 }
 
 impl Default for Config {
@@ -72,6 +75,7 @@ impl Default for Config {
             launch_at_startup: false,
             note_position: Place::TopRight,
             game_events: false,
+            deadlock_addon: false,
         }
     }
 }
@@ -219,8 +223,14 @@ launch_at_startup = {autostart}
 note_position = "{place}"
 
 # Follow a supported game (Deadlock, launched with -condebug) and save what happens in it (match
-# phases; kills and respawns where the game logs them) with each clip, as markers for the trimmer.
+# phases; kills and respawns where the game logs them, and every match's with deadlock_addon)
+# with each clip, as markers for the trimmer.
 game_events = {game_events}
+
+# Keep afterglow's addon installed in Deadlock: it tells your own kills, deaths and assists, the
+# kill feed and objectives, in every match. Installed beside your other mods (Deadlock Mod Manager
+# lists it), only while the game is closed; false takes it out again.
+deadlock_addon = {deadlock_addon}
 
 # What players call tracks 1-6; an empty name is made from the track's sources.
 audio_track_names = [{names}]
@@ -242,6 +252,7 @@ audio_track_names = [{names}]
             autostart = self.launch_at_startup,
             place = self.note_position.name(),
             game_events = self.game_events,
+            deadlock_addon = self.deadlock_addon,
             names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
     }

@@ -1,5 +1,6 @@
 #![windows_subsystem = "windows"]
 
+mod addon;
 mod app;
 mod buffer;
 mod config;
@@ -24,5 +25,6 @@ fn main() {
         gallery::run(args.get(i + 1).map(Into::into));
         return;
     }
+    addon::start();
     app::run();
 }
