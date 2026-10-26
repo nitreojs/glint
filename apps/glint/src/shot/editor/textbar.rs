@@ -199,8 +199,8 @@ impl Editor {
         Some(FontList { rect, search, rows, loading: fonts::names().is_none() })
     }
 
-    /// The font list shows rows whose families are still loading (or none yet): it repaints
-    /// until they're there.
+    /// The font list shows rows whose families are still loading (or none yet).
+    #[cfg(test)]
     pub(super) fn fonts_pending(&self) -> bool {
         self.font_list().is_some_and(|l| l.loading || l.rows.iter().any(|r| fonts::ready(r.3).is_none()))
     }
@@ -456,6 +456,7 @@ impl Editor {
     /// The font list, drawn onto `c` (which shows its box).
     pub(super) fn draw_font_list(&self, c: &Canvas, list: &FontList) {
         let s = self.scale;
+        self.fonts.begin_previews();
         let a = self.fonts_open.as_ref().map_or(1.0, |f| progress(f.since, PANEL_MS));
         let o = (list.rect.x, list.rect.y);
         let local = |r: Rect| [(r.x - o.0) as f32, (r.y - o.1) as f32, r.w as f32, r.h as f32];

@@ -106,6 +106,8 @@ const DWELL_TIMER: usize = 0x6E02;
 const WM_ELEMENTS: u32 = WM_APP + 41;
 /// Posted by the clipboard strip's loader as its pictures come in.
 const WM_RECENTS: u32 = WM_APP + 42;
+/// Posted by the editor's font thread when the font list's families arrive or one is ready.
+const WM_FONTS: u32 = WM_APP + 43;
 
 enum Screen {
     Frozen(Frozen),
@@ -184,6 +186,8 @@ struct State {
     /// once per display refresh.
     last_paint: Cell<Instant>,
     frame: Duration,
+    /// When the editor's tick timer is due, if it's set: asking again doesn't put it off.
+    tick_due: Cell<Option<Instant>>,
     /// Screenshots: the cursor as it was when the picker opened (hotspot in client coordinates),
     /// for the editor to start with.
     shot_cursor: Option<(Arc<CursorImage>, (i32, i32))>,
@@ -204,6 +208,7 @@ impl Drop for State {
             if let Some(t) = &self.ticker {
                 t.run.store(false, Ordering::Relaxed);
             }
+            editor::unwake_fonts(self.hwnd);
         }
     }
 }
@@ -364,10 +369,17 @@ pub(crate) fn open(
                 done: false,
                 last_paint: Cell::new(Instant::now()),
                 frame,
+                tick_due: Cell::new(None),
                 shot_cursor: shot_cursor.map(|(img, at)| (Arc::new(img), (at.0 - area.x, at.1 - area.y))),
                 arrow,
                 recents: None,
             };
+            if shot {
+                // the font list's families are read before it's ever opened, and it repaints as
+                // its fonts load, input or not
+                editor::start_fonts();
+                editor::wake_on_fonts(hwnd, WM_FONTS);
+            }
             if elements == UiElements::Always {
                 st.start_elements();
             }
@@ -381,7 +393,7 @@ pub(crate) fn open(
                 let mut ed = Editor::canvas(screen, st.monitors(), st.painter.scale, st.cursor);
                 st.equip(&mut ed);
                 st.add_cursor(&mut ed);
-                schedule_tick(hwnd, &ed);
+                schedule_tick(hwnd, &st.tick_due, &ed);
                 st.edit = Some(ed);
                 st.sync_mode();
             } else {
@@ -660,6 +672,7 @@ impl State {
 
     fn equip(&self, ed: &mut Editor) {
         ed.set_snap(self.snap_edges().offset(-self.origin.0, -self.origin.1));
+        ed.set_frame(self.frame);
         let windows = self.windows.iter().zip(&self.clients).filter_map(|(w, c)| {
             window_pick(w.1, &self.outputs).map(|r| (self.to_client(r), c.map(|c| self.to_client(c))))
         });
@@ -987,7 +1000,7 @@ impl State {
         let before = ed.frame();
         let event = call(ed);
         let wants_recents = ed.take_recents_request();
-        schedule_tick(self.hwnd, ed);
+        schedule_tick(self.hwnd, &self.tick_due, ed);
         if wants_recents {
             self.load_recents();
         }
@@ -1228,7 +1241,12 @@ impl State {
         }
         if msg == WM_TIMER && wp.0 == EDITOR_TIMER {
             let _ = unsafe { KillTimer(Some(self.hwnd), EDITOR_TIMER) };
+            self.tick_due.set(None);
             return self.edit_event(|e| e.tick());
+        }
+        if msg == WM_FONTS {
+            editor::fonts_seen(self.hwnd);
+            return self.edit_event(|e| e.fonts_changed());
         }
         if msg == WM_TIMER && wp.0 == DWELL_TIMER {
             let _ = unsafe { KillTimer(Some(self.hwnd), DWELL_TIMER) };
@@ -1430,10 +1448,16 @@ fn finish(result: Option<Picked>) {
     }
 }
 
-fn schedule_tick(hwnd: HWND, ed: &Editor) {
-    if let Some(left) = ed.next_tick() {
-        unsafe { SetTimer(Some(hwnd), EDITOR_TIMER, left.as_millis() as u32 + 1, None) };
+/// Sets the editor's tick timer for when it next wants a tick, unless it's already due sooner:
+/// input arriving faster than frames mustn't keep putting an animation's next frame off.
+fn schedule_tick(hwnd: HWND, due: &Cell<Option<Instant>>, ed: &Editor) {
+    let Some(left) = ed.next_tick() else { return };
+    let at = Instant::now() + left;
+    if due.get().is_some_and(|d| d <= at) {
+        return;
     }
+    due.set(Some(at));
+    unsafe { SetTimer(Some(hwnd), EDITOR_TIMER, left.as_millis() as u32 + 1, None) };
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {

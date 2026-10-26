@@ -59,6 +59,7 @@ mod typing;
 use marks::{Edges, Grip, Ink, MIN_SIDE, Mark, PALETTE, Sprite, Strength, TOOLS, Tool, dist, resize, shift_within};
 use palette::{Part, Picker};
 use paste::{Clip, Load};
+pub(crate) use fonts::{start as start_fonts, unwake as unwake_fonts, wake as wake_on_fonts, woken as fonts_seen};
 pub(crate) use paste::{Recent, load_recents};
 use text::{Style, Typesetter};
 use textbar::{FRAME, FontPicker, Panel};
@@ -149,11 +150,14 @@ struct Look {
     redo: bool,
     pill: Option<(Item, String)>,
     panel: Option<Panel>,
-    /// How far the running animations have come, in steps (255 once none runs).
-    anim: u8,
+    /// An animation is running: every frame repaints the chrome.
+    animating: bool,
+    /// Bumped when font list rows left in the UI's face for lack of time get their own.
+    previews: u64,
     style: (Style, u32),
-    /// The font list's search, scroll, and how many of its rows show their own face.
-    fonts: Option<(String, usize, usize)>,
+    /// The font list's search, scroll, how many of its rows show their own face, and whether the
+    /// families are still being read.
+    fonts: Option<(String, usize, usize, bool)>,
     recents: (usize, Load),
     /// The picker's colour (its bits), the hex being typed, and whether the field has the keys.
     picker: Option<([u32; 3], String, bool)>,
@@ -243,6 +247,12 @@ pub(crate) struct Editor {
     rev: u64,
     /// Bumped by every change to the marks, however little of the view it repaints.
     marks_rev: u64,
+    /// How often a running animation asks for its next frame.
+    frame: Duration,
+    /// Bumped by a tick that finds font list rows waiting to be laid out in their own face.
+    previews: u64,
+    /// The last damage found an animation running.
+    animated: Cell<bool>,
     back: Option<Dib>,
     /// Toolbar cells (client coordinates).
     cells: Vec<(Item, Rect)>,
@@ -329,6 +339,9 @@ impl Editor {
             patch: None,
             rev: 0,
             marks_rev: 0,
+            frame: FRAME,
+            previews: 0,
+            animated: Cell::new(false),
             back: None,
             cells: Vec::new(),
             bar: Rect::default(),
@@ -460,22 +473,35 @@ impl Editor {
         v
     }
 
-    /// How far the slowest running animation has come (0 to 1), if one is running.
-    fn animation(&self) -> Option<f32> {
+    /// How far each running animation has come (0 to 1, eased): the panel sliding out, the font
+    /// list and the colour picker fading in, the strip's pictures fading in as they arrive.
+    fn animations(&self) -> Vec<f32> {
         let mut times = Vec::new();
         if self.panel().is_some() {
             times.push(self.panel_t());
         }
         times.extend(self.fonts_open.as_ref().map(|f| textbar::progress(f.since, textbar::PANEL_MS)));
         times.extend(self.picker.as_ref().map(|p| textbar::progress(p.since, textbar::PANEL_MS)));
-        if self.fonts_pending() {
-            // rows swap into their own faces as those load
-            times.push(0.0);
-        }
         if self.panel() == Some(Panel::Strip) {
             times.extend(self.recents.iter().map(|(_, at)| textbar::progress(*at, textbar::PANEL_MS)));
         }
-        times.into_iter().filter(|t| *t < 1.0).reduce(f32::min)
+        times.retain(|t| *t < 1.0);
+        times
+    }
+
+    /// How far the slowest running animation has come (0 to 1), if one is running.
+    fn animation(&self) -> Option<f32> {
+        self.animations().into_iter().reduce(f32::min)
+    }
+
+    /// How often animations ask for a frame: once per display refresh.
+    pub(crate) fn set_frame(&mut self, frame: Duration) {
+        self.frame = frame.max(Duration::from_millis(4));
+    }
+
+    /// The font thread read the families or loaded one: the font list shows them.
+    pub(crate) fn fonts_changed(&self) -> Event {
+        if self.fonts_open.is_some() { Event::Repaint } else { Event::None }
     }
 
     /// What the dragged mark and the text being typed can repaint; editing an effect reorders the
@@ -544,7 +570,10 @@ impl Editor {
                 v.extend(pick_ring(r).iter().map(Rect::from_win));
             }
         }
-        if now.chrome != before.chrome || now.look != before.look {
+        // a running animation moves with time, not with the call: every frame repaints the chrome
+        // it runs in, and so does the first frame after it ended (however it ended between them)
+        let animated = self.animated.replace(now.look.animating);
+        if now.chrome != before.chrome || now.look != before.look || now.look.animating || animated {
             v.extend(&before.chrome);
             v.extend(&now.chrome);
         }
@@ -562,12 +591,13 @@ impl Editor {
             redo: !self.future.is_empty(),
             pill: self.pill_text(),
             panel: self.panel(),
-            anim: self.animation().map_or(255, |t| (t * 64.0) as u8),
+            animating: self.animation().is_some(),
+            previews: self.previews,
             style: {
                 let (style, size) = self.shown_style();
                 (style, size.to_bits())
             },
-            fonts: self.fonts_open.as_ref().map(|f| (f.query.clone(), f.scroll, self.fonts_shown())),
+            fonts: self.fonts_open.as_ref().map(|f| (f.query.clone(), f.scroll, self.fonts_shown(), fonts::names().is_none())),
             recents: (self.recents.len(), self.recents_load),
             picker: self.picker.as_ref().map(|p| (p.hsv.map(f32::to_bits), p.hex.clone(), p.hex_focus)),
         }
@@ -1389,17 +1419,22 @@ impl Editor {
         }
     }
 
+    /// When the editor wants [`Editor::tick`]: the notice going, or the next frame of an animation
+    /// (or of font list rows still to be laid out), until they've all settled.
     pub(crate) fn next_tick(&self) -> Option<Duration> {
         let notice = self.notice.as_ref().map(|(_, at)| NOTICE.saturating_sub(at.elapsed()));
-        let anim = self.animation().map(|_| FRAME);
-        notice.into_iter().chain(anim).min()
+        let frame = (self.animation().is_some() || self.fonts.previews_deferred()).then_some(self.frame);
+        notice.into_iter().chain(frame).min()
     }
 
     /// A timer from [`Editor::next_tick`] fired: the notice may be due to go, an animation has its
-    /// next frame (or, just after its last, settles).
+    /// next frame (or, just after its last, settles), rows the last paint had no time for get theirs.
     pub(crate) fn tick(&mut self) -> Event {
         if self.notice.as_ref().is_some_and(|(_, at)| at.elapsed() >= NOTICE) {
             self.notice = None;
+        }
+        if self.fonts.take_deferred() {
+            self.previews += 1;
         }
         Event::Repaint
     }

@@ -562,6 +562,9 @@ fn review_shots() {
 fn text_boxes_take_a_height_and_align_inside_it() {
     let _memory = memory();
     let (mut ed, _) = editor();
+    // a known look, whatever other tests left remembered
+    ed.text_style = Style::default();
+    ed.strength[Tool::Text as usize] = 24.0;
     ed.key(0x54, false, false);
     // high up: the box grows down, and mustn't reach the toolbar under the selection
     click(&mut ed, (100, 40));
@@ -596,18 +599,18 @@ fn text_boxes_take_a_height_and_align_inside_it() {
     let bottom = (o.x + o.w / 2, o.bottom());
     drag(&mut ed, bottom, (bottom.0, bottom.1 + 30));
     let h = ed.marks[0].bbox().h;
-    type_text(&mut ed, "\r2\r3\r4\r5");
+    type_text(&mut ed, "\r2\r3");
     assert!(ed.marks[0].bbox().h > h, "typing past the box grows it");
 
     let size = ed.marks[0].strength().unwrap();
     let o = ed.outline(&ed.marks[0]);
     ed.set_mods(true, false, false);
-    drag(&mut ed, (o.right(), o.bottom()), (o.right() + 60, o.bottom() + 60));
+    drag(&mut ed, (o.right(), o.bottom()), (o.right() + 30, o.bottom() + 20));
     ed.set_mods(false, false, false);
     assert_eq!(ed.marks[0].strength(), Some(size), "Ctrl+corner sizes the box, not the font");
     assert!(matches!(ed.marks[0], Mark::Text { width: Some(_), height: Some(_), .. }));
     let o = ed.outline(&ed.marks[0]);
-    drag(&mut ed, (o.right(), o.bottom()), (o.right() + 60, o.bottom() + 60));
+    drag(&mut ed, (o.right(), o.bottom()), (o.right() + 30, o.bottom() + 20));
     assert!(ed.marks[0].strength().unwrap() > size, "a plain corner scales the font");
 }
 
@@ -770,4 +773,186 @@ fn families() -> Arc<Vec<Arc<str>>> {
         assert!(Instant::now() < until, "the font families never arrived");
         std::thread::sleep(Duration::from_millis(2));
     }
+}
+
+/// Whether the list painted at opacity `painted` now looks stale at `now`: off by more than an
+/// alpha step or two, or short of fully opaque once the fade is over.
+fn stale(painted: f32, now: f32) -> bool {
+    painted < 1.0 && (now == 1.0 || ((now - painted) * 255.0) >= 2.0)
+}
+
+/// Whether `damage` repaints all of the font list.
+fn repaints_list(ed: &Editor, damage: &[Rect]) -> bool {
+    let list = ed.font_list().unwrap().rect;
+    damage.iter().any(|r| r.intersect(&list) == Some(list))
+}
+
+/// The editor painted off-screen the way the picker's WM_PAINT paints it.
+struct Offscreen {
+    painter: Painter,
+    font: windows::Win32::Graphics::DirectWrite::IDWriteTextFormat,
+    screen: Rect,
+    bright: Dib,
+    dim: Dib,
+    window: Dib,
+}
+
+impl Offscreen {
+    fn new(screen: Rect) -> Offscreen {
+        let painter = Painter::new().unwrap();
+        let font = painter.font(13.0).unwrap();
+        let dib = || Dib::new(screen.w, screen.h).unwrap();
+        Offscreen { painter, font, screen, bright: dib(), dim: dib(), window: dib() }
+    }
+
+    /// Runs `f` on the editor and paints what it damaged; returns the damage and how long the UI
+    /// thread spent on it all (ms).
+    fn show(&self, ed: &mut Editor, f: impl FnOnce(&mut Editor) -> Event) -> (Vec<Rect>, f64) {
+        let t0 = Instant::now();
+        let before = ed.frame();
+        f(ed);
+        let damage = ed.damage(&before);
+        ed.render(&self.bright, &self.painter, &self.font).unwrap();
+        if let Some(rp) = damage.iter().copied().reduce(hull) {
+            ed.paint(self.window.dc, rp, &self.dim, &self.painter, &self.font).unwrap();
+        }
+        unsafe {
+            let _ = windows::Win32::Graphics::Gdi::GdiFlush();
+        }
+        (damage, t0.elapsed().as_secs_f64() * 1000.0)
+    }
+
+    fn paint_all(&self, ed: &mut Editor) {
+        ed.render(&self.bright, &self.painter, &self.font).unwrap();
+        ed.paint(self.window.dc, self.screen, &self.dim, &self.painter, &self.font).unwrap();
+    }
+}
+
+fn list_opacity(ed: &Editor) -> f32 {
+    ed.fonts_open.as_ref().map_or(0.0, |f| textbar::progress(f.since, textbar::PANEL_MS))
+}
+
+#[test]
+fn the_font_list_fades_in_without_input() {
+    let screen = Rect { x: 0, y: 0, w: 1280, h: 800 };
+    let off = Offscreen::new(screen);
+    let mut ed = Editor::new(Rect { x: 140, y: 80, w: 1000, h: 520 }, None, vec![screen], 1.0);
+    ed.activate(Item::Tool(Tool::Text));
+    off.paint_all(&mut ed);
+    off.show(&mut ed, |e| e.activate(Item::Font));
+    let mut painted = list_opacity(&ed);
+    assert!(painted < 1.0, "it fades in");
+    // nothing but the ticks the editor asks for, as the picker's timer gives them
+    let mut frames = 0;
+    while let Some(wait) = ed.next_tick() {
+        assert!(wait <= Duration::from_millis(16), "a frame at a time: {wait:?}");
+        std::thread::sleep(wait);
+        let (damage, _) = off.show(&mut ed, |e| e.tick());
+        let now = list_opacity(&ed);
+        if repaints_list(&ed, &damage) {
+            painted = now;
+        }
+        assert!(!stale(painted, now), "frame {frames}: the list shows {painted} but is at {now}");
+        frames += 1;
+        assert!(frames < 300, "it never settles");
+    }
+    assert_eq!(painted, 1.0, "painted fully opaque with no input at all");
+    assert!(frames >= 5, "{frames} frames");
+}
+
+/// The font list opening on a cold start, in a test process of its own (a fresh font thread
+/// and DirectWrite), with the font thread slowed down like a cold font cache.
+#[test]
+fn the_font_list_never_waits_for_a_cold_start() {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--ignored", "--exact", "shot::editor::checks::font_list_cold_child", "--nocapture", "--test-threads=1"])
+        .env("GLINT_TEST_COLD_FONTS", "1")
+        .env("GLINT_TEST_FONT_DELAY_MS", "600")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    print!("{stdout}");
+    eprint!("{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.status.success(), "the cold start failed");
+    assert!(stdout.contains("1 passed"), "the cold start didn't run");
+}
+
+#[test]
+#[ignore = "run by the_font_list_never_waits_for_a_cold_start in a process of its own"]
+fn font_list_cold_child() {
+    if std::env::var_os("GLINT_TEST_COLD_FONTS").is_none() {
+        return;
+    }
+    const WM_FONTS: u32 = 0x8000 + 43;
+    let probe = fonts::probe::window();
+    fonts::wake(probe, WM_FONTS);
+    let screen = Rect { x: 0, y: 0, w: 1280, h: 800 };
+    let off = Offscreen::new(screen);
+    let t0 = Instant::now();
+    let mut ed = Editor::new(Rect { x: 140, y: 80, w: 1000, h: 520 }, None, vec![screen], 1.0);
+    ed.activate(Item::Tool(Tool::Text));
+    off.paint_all(&mut ed);
+    let built = t0.elapsed().as_secs_f64() * 1000.0;
+    assert!(fonts::names().is_none(), "the font thread is slowed: no families yet");
+
+    let opened = Instant::now();
+    let (_, open) = off.show(&mut ed, |e| e.activate(Item::Font));
+    let list = ed.font_list().expect("the list opens at once");
+    assert!(list.loading && list.rows.is_empty(), "showing that it's reading fonts");
+    let mut painted = list_opacity(&ed);
+    let since = |at: Instant| at.duration_since(opened).as_secs_f64() * 1000.0;
+
+    let (mut worst, mut wakes, mut ticks) = (open, 0, 0);
+    let (mut opaque, mut names, mut faces) = (None, None, None);
+    let mut due = ed.next_tick().map(|w| Instant::now() + w);
+    let until = Instant::now() + Duration::from_secs(10);
+    while faces.is_none() && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(1));
+        let mut step = None;
+        if fonts::probe::count(probe, WM_FONTS) > 0 {
+            fonts::woken(probe);
+            wakes += 1;
+            step = Some(off.show(&mut ed, |e| e.fonts_changed()));
+        } else if due.is_some_and(|d| Instant::now() >= d) {
+            ticks += 1;
+            step = Some(off.show(&mut ed, |e| e.tick()));
+        }
+        if let Some((damage, _)) = &step {
+            let now = list_opacity(&ed);
+            if repaints_list(&ed, damage) {
+                painted = now;
+            }
+            assert!(!stale(painted, now), "tick {ticks}: the list shows {painted} but is at {now}");
+        }
+        let Some((_, ms)) = step else { continue };
+        worst = worst.max(ms);
+        // like the picker's timer: asking again never puts a pending tick off
+        let next = ed.next_tick().map(|w| Instant::now() + w);
+        due = match (due, next) {
+            (Some(d), Some(n)) if d > Instant::now() => Some(d.min(n)),
+            (_, n) => n,
+        };
+        if opaque.is_none() && painted == 1.0 {
+            opaque = Some(Instant::now());
+        }
+        if names.is_none() && fonts::names().is_some() {
+            names = Some(Instant::now());
+        }
+        if names.is_some() && !ed.fonts_pending() {
+            faces = Some(Instant::now());
+        }
+    }
+    let (opaque, names, faces) = (opaque.expect("never opaque"), names.expect("no families"), faces.expect("no faces"));
+    assert!(opaque < names, "the list was painted fully opaque while the fonts were still being read");
+    assert!(wakes >= 2, "the font thread woke the window: {wakes}");
+    assert!(open < 50.0 && worst < 50.0, "the UI thread never waits: open {open:.1} ms, slowest step {worst:.1} ms");
+    println!(
+        "cold start, font thread slowed by 600 ms: editor up in {built:.0} ms; list open in {open:.1} ms (reading fonts…); \
+         fully opaque after {:.0} ms with no input ({ticks} ticks); families after {:.0} ms and own faces after {:.0} ms \
+         ({wakes} wake messages); slowest UI step {worst:.1} ms",
+        since(opaque),
+        since(names),
+        since(faces)
+    );
+    fonts::probe::close(probe);
 }

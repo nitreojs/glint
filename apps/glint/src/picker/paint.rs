@@ -171,6 +171,10 @@ impl State {
             }
             let _ = EndPaint(self.hwnd, &ps);
         }
+        // a paint can leave font list rows for the next frame
+        if let Some(ed) = &self.edit {
+            super::schedule_tick(self.hwnd, &self.tick_due, ed);
+        }
     }
 }
 

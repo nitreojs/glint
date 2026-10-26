@@ -1,11 +1,16 @@
 //! The installed font families the font list offers. They're read on a thread of their own as
 //! soon as an editor opens, and each family's font is loaded there too once its row is about to
 //! show, so the list opens and scrolls without waiting on font files: until a family is ready
-//! its row shows the name in the UI's face.
+//! its row shows the name in the UI's face. Windows that asked to be woken ([`wake`]) get a
+//! message whenever the families arrive or another family is ready, so they repaint without
+//! waiting for input.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, Once, OnceLock};
 
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::Graphics::DirectWrite::*;
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 use windows::core::{BOOL, HSTRING, w};
 
 /// Families offered first, when they're installed.
@@ -46,13 +51,65 @@ static CATALOG: LazyLock<Catalog> =
 static START: Once = Once::new();
 
 /// Starts reading the families (once per process).
-pub(super) fn start() {
+pub(crate) fn start() {
     START.call_once(|| {
         let spawned = std::thread::Builder::new().name("glint fonts".into()).spawn(work);
         if let Err(e) = spawned {
             glint_core::log::log(&format!("font list: {e}"));
         }
     });
+}
+
+/// A window to post `msg` to when the families change; `posted` until it says it's seen it.
+struct Waker {
+    hwnd: isize,
+    msg: u32,
+    posted: AtomicBool,
+}
+
+static WAKERS: Mutex<Vec<Arc<Waker>>> = Mutex::new(Vec::new());
+
+/// From now on `hwnd` gets `msg` posted when the families arrive or a family is ready; one
+/// message at a time, the next once it calls [`woken`].
+pub(crate) fn wake(hwnd: HWND, msg: u32) {
+    if let Ok(mut wakers) = WAKERS.lock() {
+        wakers.retain(|w| w.hwnd != hwnd.0 as isize);
+        wakers.push(Arc::new(Waker { hwnd: hwnd.0 as isize, msg, posted: AtomicBool::new(false) }));
+    }
+}
+
+/// `hwnd` handled its message: the next change posts another.
+pub(crate) fn woken(hwnd: HWND) {
+    if let Ok(wakers) = WAKERS.lock() {
+        wakers.iter().filter(|w| w.hwnd == hwnd.0 as isize).for_each(|w| w.posted.store(false, Ordering::Release));
+    }
+}
+
+/// `hwnd` no longer wants the messages (it's going away).
+pub(crate) fn unwake(hwnd: HWND) {
+    if let Ok(mut wakers) = WAKERS.lock() {
+        wakers.retain(|w| w.hwnd != hwnd.0 as isize);
+    }
+}
+
+/// Tells the windows that asked that the families changed.
+fn notify() {
+    let Ok(wakers) = WAKERS.lock() else { return };
+    for w in wakers.iter() {
+        if !w.posted.swap(true, Ordering::AcqRel) {
+            let _ = unsafe { PostMessageW(Some(HWND(w.hwnd as _)), w.msg, WPARAM(0), LPARAM(0)) };
+        }
+    }
+}
+
+/// Tests stand in for a cold font cache: `GLINT_TEST_FONT_DELAY_MS` slows the font thread.
+fn test_delay(part: u32) {
+    #[cfg(test)]
+    if let Some(ms) = std::env::var("GLINT_TEST_FONT_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        std::thread::sleep(std::time::Duration::from_millis(ms / part as u64));
+    }
+    #[cfg(not(test))]
+    let _ = part;
 }
 
 /// The installed families, favourites first, then the rest alphabetically; `None` while they're
@@ -79,14 +136,19 @@ pub(super) fn ready(i: usize) -> Option<bool> {
 }
 
 fn work() {
+    // the families are read through a factory of the thread's own, so reading them never holds up
+    // the UI thread's text; the fonts are laid out once through the shared one, which keeps them
     let Ok(dwrite) = (unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) }) else { return };
-    let Some((collection, found)) = enumerate(&dwrite) else { return };
+    let Ok(own) = (unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_ISOLATED) }) else { return };
+    test_delay(1);
+    let Some((collection, found)) = enumerate(&own) else { return };
     let families = ordered(found);
     let names: Vec<Arc<str>> = families.iter().map(|(n, _)| n.clone()).collect();
     if let Ok(mut state) = CATALOG.state.lock() {
         state.0 = vec![Load::Unknown; names.len()];
     }
     let _ = CATALOG.names.set(Arc::new(names));
+    notify();
     loop {
         let i = {
             let Ok(mut state) = CATALOG.state.lock() else { return };
@@ -98,10 +160,12 @@ fn work() {
                 state = next;
             }
         };
+        test_delay(20);
         let symbol = load(&dwrite, &collection, &families[i]);
         if let Ok(mut state) = CATALOG.state.lock() {
             state.0[i] = Load::Ready { symbol };
         }
+        notify();
     }
 }
 
@@ -228,5 +292,53 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(ready(i), Some(false), "not a symbol font");
+    }
+
+    #[test]
+    fn changes_post_once_until_seen() {
+        const MSG: u32 = 0x8000 + 77;
+        let hwnd = probe::window();
+        wake(hwnd, MSG);
+        notify();
+        notify();
+        assert_eq!(probe::count(hwnd, MSG), 1, "one message until it's seen");
+        woken(hwnd);
+        notify();
+        assert_eq!(probe::count(hwnd, MSG), 1, "seen: the next change posts again");
+        unwake(hwnd);
+        notify();
+        assert_eq!(probe::count(hwnd, MSG), 0, "gone: no more");
+        probe::close(hwnd);
+    }
+}
+
+/// A message-only window for tests to be woken through: never shown, never focused.
+#[cfg(test)]
+pub(super) mod probe {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, HWND_MESSAGE, MSG, PM_REMOVE, PeekMessageW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    };
+    use windows::core::w;
+
+    pub(in super::super) fn window() -> HWND {
+        unsafe {
+            CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), None, WINDOW_STYLE(0), 0, 0, 0, 0, Some(HWND_MESSAGE), None, None, None)
+        }
+        .expect("a message-only window")
+    }
+
+    /// How many `msg`s were waiting for `hwnd` (taken off its queue).
+    pub(in super::super) fn count(hwnd: HWND, msg: u32) -> usize {
+        let mut n = 0;
+        let mut m = MSG::default();
+        while unsafe { PeekMessageW(&mut m, Some(hwnd), msg, msg, PM_REMOVE) }.as_bool() {
+            n += 1;
+        }
+        n
+    }
+
+    pub(in super::super) fn close(hwnd: HWND) {
+        let _ = unsafe { DestroyWindow(hwnd) };
     }
 }

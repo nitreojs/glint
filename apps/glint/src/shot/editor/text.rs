@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -14,6 +14,9 @@ const FORMATS: usize = 32;
 const LAYOUTS: usize = 24;
 /// Font list rows kept laid out; past this the cache starts over.
 const PREVIEWS: usize = 256;
+/// How long one paint may spend laying font list rows out in their own faces; the rest wait for
+/// the next frame, in the UI's face meanwhile.
+const PREVIEW_BUDGET: std::time::Duration = std::time::Duration::from_millis(4);
 /// Wider than any text: lines are only broken at newlines unless a mark has a width.
 const UNBOUNDED: f32 = 100_000.0;
 
@@ -247,6 +250,9 @@ pub(super) struct Typesetter {
     layouts: RefCell<Vec<Laid>>,
     /// Font list rows: each family's name laid out in its own face, or the UI's.
     previews: RefCell<HashMap<PreviewKey, IDWriteTextLayout>>,
+    /// When this paint's font list started, and whether it left rows for the next frame.
+    preview_frame: Cell<Option<std::time::Instant>>,
+    deferred: Cell<bool>,
 }
 
 /// A font list row: the family, whether it's in its own face, and the size and box (their bits).
@@ -256,8 +262,8 @@ impl Typesetter {
     pub(super) fn new() -> Typesetter {
         // the shared factory is a process singleton the picker's painter has already created
         let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.expect("DirectWrite shared factory");
-        let (formats, layouts, previews) = Default::default();
-        Typesetter { dwrite, formats, layouts, previews }
+        let (formats, layouts, previews, preview_frame, deferred) = Default::default();
+        Typesetter { dwrite, formats, layouts, previews, preview_frame, deferred }
     }
 
     fn format(&self, font: &Arc<str>, bold: bool, italic: bool, px: f32) -> Option<IDWriteTextFormat> {
@@ -475,14 +481,33 @@ impl Typesetter {
         self.extent(text, &style, px, None).0
     }
 
+    /// A paint of the font list starts: its rows get [`PREVIEW_BUDGET`] to lay out new faces.
+    pub(super) fn begin_previews(&self) {
+        self.preview_frame.set(Some(std::time::Instant::now()));
+    }
+
+    /// The last paint left font list rows in the UI's face for lack of time.
+    pub(super) fn previews_deferred(&self) -> bool {
+        self.deferred.get()
+    }
+
+    /// [`Typesetter::previews_deferred`], and forget it: the next paint tries those rows again.
+    pub(super) fn take_deferred(&self) -> bool {
+        self.deferred.replace(false)
+    }
+
     /// A font list row: `name` left-aligned and vertically centred in `[x, y, w, h]`, cut off at the
     /// box's right edge, in its own face when `own` (the family is loaded) and the UI's otherwise.
-    /// Rows are laid out once and kept.
+    /// Rows are laid out once and kept; a paint that has used its time leaves new faces for later.
     pub(super) fn draw_preview(&self, c: &Canvas, name: &Arc<str>, own: bool, px: f32, [x, y, w, h]: [f32; 4], color: D2D1_COLOR_F) {
         let key = (name.clone(), own, [px.to_bits(), w.to_bits(), h.to_bits()]);
         let cached = self.previews.borrow().get(&key).cloned();
         let layout = match cached {
             Some(l) => l,
+            None if own && self.preview_frame.get().is_some_and(|at| at.elapsed() >= PREVIEW_BUDGET) => {
+                self.deferred.set(true);
+                return self.draw_preview(c, name, false, px, [x, y, w, h], color);
+            }
             None => {
                 let face = if own { name.clone() } else { Arc::from("Segoe UI") };
                 let Some(format) = self.format(&face, false, false, px) else { return };
