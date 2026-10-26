@@ -87,13 +87,19 @@ mod tests {
     const APP: Shortcut = Shortcut { name: "glint", args: "", description: "screen recorder" };
     const EDITOR: Shortcut = Shortcut { name: "glint editor", args: "--clip", description: "trim videos" };
 
-    /// The shortcut at `lnk`: its target and arguments.
+    /// The shortcut at `lnk`: its target and arguments. Paths are resolved, so an 8.3 short
+    /// temp folder (a runner's `RUNNER~1`) and the long one the link stores compare equal.
     fn load(lnk: &Path) -> (PathBuf, String) {
-        unsafe {
+        let (target, args) = unsafe {
             let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).unwrap();
             link.cast::<IPersistFile>().unwrap().Load(&HSTRING::from(lnk), STGM_READ).unwrap();
             read(&link).unwrap()
-        }
+        };
+        (real(&target), args)
+    }
+
+    fn real(p: &Path) -> PathBuf {
+        std::fs::canonicalize(p).unwrap()
     }
 
     #[test]
@@ -110,11 +116,11 @@ mod tests {
         for s in [APP, EDITOR] {
             write(&dir, &exe, &s).unwrap();
         }
-        assert_eq!(load(&dir.join("glint.lnk")), (exe.clone(), String::new()));
-        assert_eq!(load(&dir.join("glint editor.lnk")), (exe, "--clip".to_string()));
+        assert_eq!(load(&dir.join("glint.lnk")), (real(&exe), String::new()));
+        assert_eq!(load(&dir.join("glint editor.lnk")), (real(&exe), "--clip".to_string()));
 
         write(&dir, &moved, &EDITOR).unwrap();
-        assert_eq!(load(&dir.join("glint editor.lnk")), (moved, "--clip".to_string()));
+        assert_eq!(load(&dir.join("glint editor.lnk")), (real(&moved), "--clip".to_string()));
         let _ = std::fs::remove_dir_all(&dir);
         if com {
             unsafe { CoUninitialize() };
