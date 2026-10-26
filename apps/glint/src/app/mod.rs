@@ -432,7 +432,7 @@ impl App {
     /// Copies / saves / uploads `shot`; `subject` names its file when it isn't one app's window.
     fn finish_shot(&mut self, shot: Shot, subject: Subject) {
         if shot.output == Output::Pin {
-            if let Err(e) = shot::pin::open(shot, self.hwnd, WM_APP_PIN) {
+            if let Err(e) = shot::pin::open(shot, self.hwnd, WM_APP_PIN, self.cfg.accent_rgb()) {
                 log(&format!("pin: {e}"));
                 self.notify("glint: couldn't pin the screenshot", &e, true, ClickTarget::Log);
             }

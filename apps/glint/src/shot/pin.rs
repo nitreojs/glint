@@ -1,6 +1,6 @@
 //! Pinned screenshots: borderless topmost windows showing a shot where it was taken. Drag to
-//! move, wheel to zoom (Ctrl+wheel: opacity), double-click or Esc to close, right-click for a
-//! menu. Pins live on the thread that opens them; copy and save go back to the owner.
+//! move, wheel to zoom (Ctrl+wheel: opacity), double-click or Esc to close, right-click for
+//! glint's menu. Pins live on the thread that opens them; copy and save go back to the owner.
 
 use std::cell::RefCell;
 
@@ -15,6 +15,7 @@ use windows::core::w;
 use super::Shot;
 use super::editor::Output;
 use glint_shell::gfx::Dib;
+use glint_shell::menu::{self, Glyph, Item, Menu};
 
 const BORDER: i32 = 1;
 /// Palette blue, opaque.
@@ -40,6 +41,8 @@ struct Pin {
     opacity: f32,
     owner: HWND,
     msg: u32,
+    /// The app's colour, for the menu.
+    accent: [u8; 3],
 }
 
 thread_local! {
@@ -168,9 +171,9 @@ impl Pin {
     }
 }
 
-/// Pins `shot` over the desktop where it was taken. Copy and save from its menu post a
-/// `Box<Shot>` (output `Copy` / `Save`) in LPARAM of `msg` to `owner`.
-pub(crate) fn open(shot: Shot, owner: HWND, msg: u32) -> Result<(), String> {
+/// Pins `shot` over the desktop where it was taken. Copy and save from its menu (in `accent`)
+/// post a `Box<Shot>` (output `Copy` / `Save`) in LPARAM of `msg` to `owner`.
+pub(crate) fn open(shot: Shot, owner: HWND, msg: u32, accent: [u8; 3]) -> Result<(), String> {
     unsafe {
         let hinst = GetModuleHandleW(None).map_err(|e| e.to_string())?;
         let class = w!("glint_pin");
@@ -200,7 +203,7 @@ pub(crate) fn open(shot: Shot, owner: HWND, msg: u32) -> Result<(), String> {
         .map_err(|e| format!("CreateWindowEx: {e}"))?;
         let premul = shot.pixels.iter().map(|&p| premultiply(p, shot.alpha)).collect();
         let pos = (shot.at.x - BORDER, shot.at.y - BORDER);
-        let pin = Pin { hwnd, shot, premul, zoom: 1.0, opacity: 1.0, owner, msg };
+        let pin = Pin { hwnd, shot, premul, zoom: 1.0, opacity: 1.0, owner, msg, accent };
         if let Err(e) = pin.show(pos) {
             let _ = DestroyWindow(hwnd);
             return Err(e);
@@ -223,27 +226,29 @@ fn close(hwnd: HWND) {
     }
 }
 
-fn menu(hwnd: HWND, at: POINT) {
-    unsafe {
-        let Ok(menu) = CreatePopupMenu() else { return };
-        let _ = AppendMenuW(menu, MF_STRING, ID_COPY, w!("Copy"));
-        let _ = AppendMenuW(menu, MF_STRING, ID_SAVE, w!("Save"));
-        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let _ = AppendMenuW(menu, MF_STRING, ID_CLOSE, w!("Close"));
-        let _ = SetForegroundWindow(hwnd);
-        let flags = TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY;
-        let picked = TrackPopupMenu(menu, flags, at.x, at.y, None, hwnd, None).0 as usize;
-        let _ = DestroyMenu(menu);
-        match picked {
-            ID_COPY => {
-                with_pin(hwnd, |p| p.send(Output::Copy));
-            }
-            ID_SAVE => {
-                with_pin(hwnd, |p| p.send(Output::Save));
-            }
-            ID_CLOSE => close(hwnd),
-            _ => {}
+/// The pin's menu, glint's own like the tray's.
+fn items() -> Vec<Item> {
+    vec![
+        Item::command(ID_COPY, "copy").glyph(Glyph::Copy),
+        Item::command(ID_SAVE, "save").glyph(Glyph::Save),
+        Item::separator(),
+        Item::command(ID_CLOSE, "close").glyph(Glyph::Clear).keys(Some("Esc")),
+    ]
+}
+
+/// Shows the pin's menu at the cursor; `keyboard`: opened with the menu key or Shift+F10.
+fn menu(hwnd: HWND, keyboard: bool) {
+    let Some(accent) = with_pin(hwnd, |p| p.accent) else { return };
+    let m = Menu { accent, header: None, items: items() };
+    match menu::track(hwnd, &m, keyboard, || None) {
+        Some(ID_COPY) => {
+            with_pin(hwnd, |p| p.send(Output::Copy));
         }
+        Some(ID_SAVE) => {
+            with_pin(hwnd, |p| p.send(Output::Save));
+        }
+        Some(ID_CLOSE) => close(hwnd),
+        _ => {}
     }
 }
 
@@ -258,17 +263,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCLBUTTONDBLCLK => close(hwnd),
         WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => close(hwnd),
         WM_NCRBUTTONDOWN => {}
-        WM_NCRBUTTONUP => {
-            let at = screen_point(lp);
-            menu(hwnd, POINT { x: at.0, y: at.1 });
-        }
-        WM_CONTEXTMENU => {
-            let at = match screen_point(lp) {
-                (-1, -1) => with_pin(hwnd, |p| p.origin()).unwrap_or_default(),
-                at => at,
-            };
-            menu(hwnd, POINT { x: at.0, y: at.1 });
-        }
+        WM_NCRBUTTONUP => menu(hwnd, false),
+        WM_CONTEXTMENU => menu(hwnd, screen_point(lp) == (-1, -1)),
         WM_MOUSEWHEEL => {
             let notches = ((wp.0 >> 16) & 0xFFFF) as i16 as f32 / WHEEL_DELTA;
             let ctrl = wp.0 & MK_CONTROL != 0;

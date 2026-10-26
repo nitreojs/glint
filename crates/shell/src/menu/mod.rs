@@ -72,6 +72,8 @@ pub enum Glyph {
     Copy,
     /// An arrow up from a line.
     Upload,
+    /// An arrow down onto a line: save to a file.
+    Save,
     /// A cross.
     Clear,
 }
