@@ -172,7 +172,8 @@ fn open(game: &'static Game, pid: u32) -> Option<Running> {
     let exe = image(process.0)?;
     let (mut created, mut exited, mut kernel, mut user) = (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
     unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) }.ok()?;
-    let source = (game.open)(&exe, unix_ms(created))?;
+    let player = crate::addon::steam_root().and_then(|steam| glint_core::events::steam::persona(&steam));
+    let source = (game.open)(&exe, unix_ms(created), player.as_deref())?;
     Some(Running { game, process, source, failing: false })
 }
 

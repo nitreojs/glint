@@ -33,9 +33,13 @@ pub const ADDON_TAG: &str = "[AFTERGLOW]";
 pub const ADDON_VERSION: u32 = 1;
 /// How far the addon's own clock may be from the line's stamp and still be believed (ms).
 const CLIENT_SLACK_MS: i64 = 3_000;
+/// A feed entry naming the player and the addon's own kill or death for it come this close (ms).
+const SAME_MS: i64 = 3_000;
 
-fn open(exe: &Path, started: i64) -> Option<Box<dyn Source>> {
-    Some(Box::new(LogSource::new(log_path(exe)?, started)))
+fn open(exe: &Path, started: i64, player: Option<&str>) -> Option<Box<dyn Source>> {
+    let mut source = LogSource::new(log_path(exe)?, started);
+    source.session.player = player.map(str::to_string);
+    Some(Box::new(source))
 }
 
 /// The console log of the game started from `exe` (`…\Deadlock\game\bin\win64\deadlock.exe`).
@@ -92,8 +96,14 @@ impl Addon {
     }
 
     /// What it says, as an event; `None` for what isn't one (`hello`, the local player's own feed
-    /// entries, which come as `kill` and `death` too).
-    fn event(self) -> Option<Event> {
+    /// entries, which come as `kill` and `death` too). A feed entry naming `player` is theirs
+    /// even when the addon couldn't tell (the hideout has no top bar to find them on).
+    fn event(self, player: Option<&str>) -> Option<(Event, bool)> {
+        let named = |who: &Option<String>| who.as_deref().zip(player).is_some_and(|(w, p)| w.trim().eq_ignore_ascii_case(p.trim()));
+        if self.event == "feed" && self.me.is_none() && (named(&self.killer) || named(&self.victim)) {
+            let kind = if named(&self.victim) { Kind::Death } else { Kind::Kill };
+            return Some((Event { killer: self.killer, victim: self.victim, assists: self.assists, mine: Some(true), ..Event::new(NAME, kind) }, true));
+        }
         let kind = match self.event.as_str() {
             "kill" => Kind::Kill,
             "death" => Kind::Death,
@@ -108,7 +118,7 @@ impl Addon {
             Kind::Kill if self.event == "feed" => Some(false),
             _ => Some(true),
         };
-        Some(Event { killer: self.killer, victim: self.victim, assists: self.assists, mine, ..Event::new(NAME, kind) })
+        Some((Event { killer: self.killer, victim: self.victim, assists: self.assists, mine, ..Event::new(NAME, kind) }, false))
     }
 }
 
@@ -170,6 +180,11 @@ pub struct Session {
     bounty: Option<(Stamp, u32)>,
     /// The addon was heard from in this run of the game.
     addon: bool,
+    /// The name the local player plays under, from Steam.
+    player: Option<String>,
+    /// The local player's recent kills and deaths (unix ms, and whether a feed entry told it),
+    /// so one told by both the addon's counters and a feed entry naming them counts once.
+    own: [Vec<(i64, bool)>; 2],
 }
 
 impl Session {
@@ -188,10 +203,26 @@ impl Session {
             Line::Addon(addon) => {
                 self.addon = true;
                 let at = addon.t.filter(|t| (t - at).abs() <= CLIENT_SLACK_MS).unwrap_or(at);
-                return addon.event().map(|event| GameEvent { at, event });
+                let (event, by_feed) = addon.event(self.player.as_deref())?;
+                let slot = match (&event.kind, event.mine) {
+                    (Kind::Kill, Some(true)) => Some(0),
+                    (Kind::Death, Some(true)) => Some(1),
+                    _ => None,
+                };
+                if let Some(i) = slot {
+                    // one told the other way a moment ago is this one; two told the same way are two
+                    let own = &mut self.own[i];
+                    own.retain(|(t, _)| at - t <= SAME_MS);
+                    if let Some(k) = own.iter().position(|&(_, feed)| feed != by_feed) {
+                        own.remove(k);
+                        return None;
+                    }
+                    own.push((at, by_feed));
+                }
+                return Some(GameEvent { at, event });
             }
             Line::Map(_) => {
-                *self = Session { addon: self.addon, ..Session::default() };
+                *self = Session { addon: self.addon, player: self.player.take(), ..Session::default() };
                 return None;
             }
             Line::Bot(id) => {
@@ -368,6 +399,30 @@ mod tests {
         assert_eq!((theirs.kind, theirs.mine, theirs.killer.as_deref(), theirs.assists), (Kind::Kill, Some(false), Some("Carl"), Some(1)));
         let own = r#"{"v":1,"event":"feed","killer":"alexx","victim":"Bob","assists":0,"me":"killer","tags":["enemyDied"],"t":1761494405000}"#;
         assert_eq!(event(&mut s, own), None, "the local player's own entries come as kill and death");
+
+        // a session where Steam told the player's name; each line arrives when it says it happened
+        let mut p = Session { player: Some("memories".into()), ..Session::default() };
+        let mut told = |t: i64, json: String| p.feed(stamp(19, 0, 5), t, &format!("[PanoramaScript] [AFTERGLOW]{json}")).map(|e| e.event);
+        let fed = |killer: &str, victim: &str, t: i64| format!(r#"{{"v":1,"event":"feed","killer":"{killer}","victim":"{victim}","assists":1,"t":{t}}}"#);
+        let counted = |t: i64| format!(r#"{{"v":1,"event":"kill","src":"kda","t":{t}}}"#);
+        let base = 1_761_494_400_000;
+
+        let hideout = told(base, fed("MEMORIES", "ABRAMS", base)).unwrap();
+        assert_eq!((hideout.kind, hideout.mine, hideout.victim.as_deref()), (Kind::Kill, Some(true), Some("ABRAMS")), "found by name, any case");
+        assert_eq!(told(base + 900, counted(base + 900)), None, "the counter telling the same kill a moment later");
+        let died = told(base + 10_000, fed("Bob", " memories ", base + 10_000)).unwrap();
+        assert_eq!((died.kind, died.mine, died.killer.as_deref()), (Kind::Death, Some(true), Some("Bob")));
+
+        let double = base + 20_000;
+        let both = [
+            told(double, counted(double)).is_some(),
+            told(double + 400, counted(double + 400)).is_some(),
+            told(double + 600, fed("memories", "X", double + 600)).is_some(),
+            told(double + 900, fed("memories", "Y", double + 900)).is_some(),
+        ];
+        assert_eq!(both, [true, true, false, false], "a double kill told both ways is two kills");
+        let later = told(base + 40_000, fed("MEMORIES", "Dan", base + 40_000)).unwrap();
+        assert_eq!((later.kind, later.mine), (Kind::Kill, Some(true)), "the next kill is a new one");
 
         let message = event(&mut s, r#"{"v":1,"event":"objective","text":"Your team destroyed the Guardian","good":true,"t":1761494405000}"#).unwrap();
         assert_eq!(message.kind, Kind::Objective("Your team destroyed the Guardian".into()));

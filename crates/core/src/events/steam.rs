@@ -169,6 +169,19 @@ pub fn launch_options(steam: &Path, app: u32) -> Option<String> {
     Some(app.get("LaunchOptions").and_then(Value::text).unwrap_or("").to_string())
 }
 
+/// The name the account that signed in to Steam last plays under (`config\loginusers.vdf`), as
+/// Deadlock's kill feed shows it.
+pub fn persona(steam: &Path) -> Option<String> {
+    let Some(Value::Block(users)) = read(&steam.join("config").join("loginusers.vdf")).as_ref().and_then(|v| v.get("users")).cloned() else {
+        return None;
+    };
+    let field = |user: &Value, key: &str| user.get(key).and_then(Value::text).map(str::to_string);
+    let stamp = |user: &Value| field(user, "Timestamp").and_then(|t| t.parse::<u64>().ok()).unwrap_or(0);
+    let recent = |user: &Value| field(user, "MostRecent").as_deref() == Some("1");
+    let user = users.iter().map(|(_, u)| u).max_by_key(|u| (recent(u), stamp(u)))?;
+    field(user, "PersonaName").filter(|n| !n.trim().is_empty())
+}
+
 /// Whether launch options hold `-condebug`, which makes Deadlock write its console log.
 pub fn has_condebug(options: &str) -> bool {
     options.split_whitespace().any(|o| o.eq_ignore_ascii_case("-condebug"))
@@ -224,6 +237,11 @@ mod tests {
         assert!(!has_condebug("-dx11 -condebugger"));
         write(steam.join("userdata").join("2").join("config").join("localconfig.vdf"), config(""));
         assert_eq!(launch_options(&steam, DEADLOCK).as_deref(), Some(""), "none set");
+
+        assert_eq!(persona(&steam), None, "nobody signed in yet");
+        let users = "\"users\"\n{\n\"1\" { \"PersonaName\" \"old\" \"MostRecent\" \"0\" \"Timestamp\" \"900\" }\n\"2\" { \"PersonaName\" \"memories\" \"MostRecent\" \"1\" \"Timestamp\" \"100\" }\n}\n";
+        write(steam.join("config").join("loginusers.vdf"), users.into());
+        assert_eq!(persona(&steam).as_deref(), Some("memories"), "the account marked most recent, whatever its stamp");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

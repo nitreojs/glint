@@ -154,10 +154,13 @@ pub struct Game {
     pub name: &'static str,
     /// The executable's file name, any case.
     pub exe: &'static str,
-    /// The source for the game running from `exe`, started at `started` (unix ms); `None`
-    /// when this install can't give events.
-    pub open: fn(exe: &Path, started: i64) -> Option<Box<dyn Source>>,
+    /// The source for the game running from `exe`, started at `started` (unix ms), played by
+    /// `player` (the name others see, when known); `None` when this install can't give events.
+    pub open: Open,
 }
+
+/// [`Game::open`].
+pub type Open = fn(exe: &Path, started: i64, player: Option<&str>) -> Option<Box<dyn Source>>;
 
 /// Every game a watcher looks for.
 pub const GAMES: &[Game] = &[deadlock::GAME];

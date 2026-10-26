@@ -151,7 +151,7 @@ fn game() -> Option<PathBuf> {
 }
 
 /// Steam's folder, as it registers it (`HKCU\Software\Valve\Steam`, `SteamPath`).
-fn steam_root() -> Option<PathBuf> {
+pub(crate) fn steam_root() -> Option<PathBuf> {
     let key = HSTRING::from(r"Software\Valve\Steam");
     let name = HSTRING::from("SteamPath");
     let mut bytes = 0u32;
