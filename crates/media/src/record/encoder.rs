@@ -236,7 +236,7 @@ pub(super) unsafe fn sink_writer(
         }
         Err(failed) => {
             log_tried(&failed.tried);
-            Err(failed.explain(config.codec, &gpu.adapter.name))
+            Err(failed.explain(&config, &gpu.adapter.name))
         }
     }
 }

@@ -6,6 +6,7 @@
 //! worked.
 
 use super::Codec;
+use super::pipeline::VideoConfig;
 
 /// The frame format the encoder is fed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -208,8 +209,10 @@ pub fn negotiate<T>(
 }
 
 impl Failed {
-    /// The error the user sees: what was tried on `adapter` and why each didn't work.
-    pub fn explain(&self, codec: Codec, adapter: &str) -> String {
+    /// The error the user sees: what was tried on `adapter` for `config`'s frames and why each
+    /// didn't work. The size and rate are in it: encoders refuse some (odd sides, high rates).
+    pub fn explain(&self, config: &VideoConfig, adapter: &str) -> String {
+        let codec = config.codec;
         if let Some(Tried { why: Refusal::Fatal(e), .. }) = self.tried.last() {
             return e.clone();
         }
@@ -220,7 +223,8 @@ impl Failed {
         let mut text = if missing {
             format!("{adapter} can't encode {}:", codec.name())
         } else {
-            format!("no encoder took the frames for {} on {adapter}:", codec.name())
+            let fps = if config.fps.fract().abs() < 0.01 { format!("{:.0}", config.fps) } else { format!("{:.2}", config.fps) };
+            format!("no encoder took {}×{} {} at {fps} fps on {adapter}:", config.width, config.height, codec.name())
         };
         for t in &self.tried {
             let (Refusal::Format(why) | Refusal::Missing(why) | Refusal::Fatal(why)) = &t.why;
@@ -244,6 +248,10 @@ mod tests {
     const HW_NV12: Route = Route { engine: Engine::Hardware, input: Input::Nv12 };
     const SW_NV12: Route = Route { engine: Engine::Software, input: Input::Nv12 };
     const SW_ARGB: Route = Route { engine: Engine::Software, input: Input::Argb };
+
+    fn config(codec: Codec) -> VideoConfig {
+        VideoConfig { codec, width: 2560, height: 1440, fps: 165.0, qp: 20, effort: 50, keyframe_secs: 1.0, bitrate: None }
+    }
 
     /// An encoder that takes only `takes`, logging what it was offered.
     struct Fake {
@@ -339,7 +347,7 @@ mod tests {
             Err(Refusal::Fatal("MFCreateSinkWriterFromURL: access denied".into()))
         });
         assert_eq!(offered, 1);
-        assert_eq!(r.unwrap_err().explain(Codec::H264, "GPU"), "MFCreateSinkWriterFromURL: access denied");
+        assert_eq!(r.unwrap_err().explain(&config(Codec::H264), "GPU"), "MFCreateSinkWriterFromURL: access denied");
     }
 
     #[test]
@@ -348,8 +356,8 @@ mod tests {
         let failed = negotiate(&routes(Force::default(), true), |r| enc.try_route(r)).unwrap_err();
         assert_eq!(failed.tried.len(), 4);
         assert_eq!(
-            failed.explain(Codec::H264, "Intel(R) UHD Graphics"),
-            "no encoder took the frames for H.264 on Intel(R) UHD Graphics:\n\
+            failed.explain(&config(Codec::H264), "Intel(R) UHD Graphics"),
+            "no encoder took 2560×1440 H.264 at 165 fps on Intel(R) UHD Graphics:\n\
              · ARGB32 frames: refused ARGB32 (0xC00D36B4)\n\
              · NV12 frames: refused NV12 (0xC00D36B4)\n\
              · NV12 frames: refused NV12 (0xC00D36B4)\n\
@@ -363,7 +371,7 @@ mod tests {
         let failed = negotiate(&routes(Force::default(), true), |r| enc.try_route(r)).unwrap_err();
         assert_eq!(enc.offered, [HW_ARGB, SW_NV12]);
         assert_eq!(
-            failed.explain(Codec::Hevc, "Intel(R) UHD Graphics"),
+            failed.explain(&config(Codec::Hevc), "Intel(R) UHD Graphics"),
             "Intel(R) UHD Graphics can't encode HEVC:\n· no Hardware encoder\n· no Software encoder\nChoose H.264 in settings."
         );
     }

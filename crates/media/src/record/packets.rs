@@ -397,7 +397,7 @@ impl VideoEncoder for MfVideoEncoder {
             }
             Err(failed) => {
                 log_tried(&failed.tried);
-                Err(failed.explain(config.codec, &self.adapter.name))
+                Err(failed.explain(config, &self.adapter.name))
             }
         }
     }
