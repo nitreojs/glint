@@ -13,10 +13,6 @@ pub(crate) const WM_RELOAD: u32 = WM_APP + 20;
 /// WPARAM 1: release the global hotkey (the settings window is recording a new one);
 /// WPARAM 0: take it back.
 pub(crate) const WM_HOTKEY_PAUSE: u32 = WM_APP + 21;
-/// "check now" in settings; WPARAM holds `CHECK_DOWNLOAD` / `CHECK_BETA` bits.
-pub(crate) const WM_UPDATE_CHECK: u32 = WM_APP + 22;
-/// Install the update now (download it first if it's only known).
-pub(crate) const WM_UPDATE_INSTALL: u32 = WM_APP + 23;
 
 /// Posts `msg` to the running tray app, if any.
 pub(crate) fn post_to_main(msg: u32, wparam: usize) -> bool {

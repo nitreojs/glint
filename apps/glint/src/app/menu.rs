@@ -7,6 +7,7 @@ use glint_shell::clipboard;
 use glint_shell::log::path as log_path;
 use glint_shell::menu::{self, Glyph, Header, Item, Menu};
 use glint_shell::time::local_time;
+use glint_shell::update::Host;
 use windows::Win32::Foundation::HWND;
 
 use super::{ClickTarget, State, open_settings, shell, with_app};
@@ -104,7 +105,7 @@ fn recent_action(hwnd: HWND, e: &Entry, action: usize) {
 fn status() -> Option<String> {
     with_app(|a| match &a.state {
         State::Idle if upload::active() => "uploading…".to_string(),
-        State::Idle => match a.ready_version() {
+        State::Idle => match a.update.ready_version() {
             Some(v) => format!("{} → {v}", env!("CARGO_PKG_VERSION")),
             None => env!("CARGO_PKG_VERSION").to_string(),
         },
@@ -162,7 +163,7 @@ pub(super) fn show_menu(hwnd: HWND, keyboard: bool) {
         Item::command(ID_LOG, "log").glyph(Glyph::Log),
         Item::separator(),
     ]);
-    if let Some(v) = with_app(|a| a.ready_version()).flatten() {
+    if let Some(v) = with_app(|a| a.update.ready_version()).flatten() {
         items.push(Item::command(ID_UPDATE, "restart to update").glyph(Glyph::Update).accented().hint(Some(&v)));
     }
     items.push(Item::command(ID_EXIT, "quit").glyph(Glyph::Quit));

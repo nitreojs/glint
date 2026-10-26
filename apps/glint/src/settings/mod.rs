@@ -9,9 +9,11 @@ use glint_core::paths::app_dir;
 use glint_ui::audio::AudioEditor;
 use glint_ui::capture::Recorder;
 use glint_ui::settings::{self as frame, Pages};
+use glint_ui::updates::{self, Updater};
 use glint_ui::widgets::Look;
 
-use crate::app::ipc::{self, SETTINGS_TITLE, WM_RELOAD};
+use crate::app::ipc::{self, MAIN_CLASS, SETTINGS_TITLE, WM_RELOAD};
+use crate::app::updates::BUILD;
 use crate::platform::paths::{output_dir, remember_previous_output_dir};
 
 mod hotkey_capture;
@@ -20,7 +22,6 @@ mod sections;
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, release_tray_hotkeys};
 use sections::output::Mover;
-use sections::updates::Updater;
 use sections::uploads::Uploaders;
 use sections::{SECTIONS, Section};
 
@@ -33,7 +34,7 @@ pub fn run() {
         Err(e) => (Config::default(), Some(format!("couldn't read the settings, showing defaults: {e}"))),
     };
     let icon = icon_rgba(64, cfg.accent_rgb());
-    let app = SettingsApp::new(cfg, load_error, Updater::load());
+    let app = SettingsApp::new(cfg, load_error, Updater::new(BUILD, MAIN_CLASS));
     frame::run(SETTINGS_TITLE, app_dir().join("settings-window.json"), icon, app);
 }
 
@@ -116,7 +117,9 @@ impl Pages for SettingsApp {
             Section::Screenshots => self.screenshots(ui, look),
             Section::Uploads => self.uploads(ui, look),
             Section::Output => self.output(ui, look),
-            Section::Updates => self.updates(ui, look),
+            Section::Updates => {
+                updates::section(ui, look, &mut self.updater, &mut self.cfg.update_mode, &mut self.cfg.update_beta)
+            }
             Section::About => self.about(ui, look),
         }
     }
@@ -178,6 +181,10 @@ impl Pages for SettingsApp {
         }
         self.licences
     }
+
+    fn updater(&mut self) -> Option<&mut Updater> {
+        Some(&mut self.updater)
+    }
 }
 
 #[cfg(test)]
@@ -205,7 +212,7 @@ mod tests {
         fn new() -> Harness {
             let ctx = egui::Context::default();
             fonts(&ctx);
-            let updater = Updater::at(std::env::temp_dir().join("glint-tests-no-update-status.json"));
+            let updater = Updater::at(BUILD, MAIN_CLASS, std::env::temp_dir().join("glint-tests-no-update-status.json"));
             let app = Frame::new(SettingsApp::new(Config::default(), None, updater), (WINDOW, WINDOW));
             let screen = vec2(WINDOW[0], WINDOW[1]);
             Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0, screen, tree: Vec::new() }
@@ -541,7 +548,7 @@ mod tests {
     #[test]
     fn updates_section_shows_the_tray_apps_status() {
         use glint_core::config::UpdateMode;
-        use crate::update::{State, Status};
+        use glint_core::update::status::{State, Status};
         use egui::accesskit::{Node, Role, Toggled};
         fn find(tree: &[(egui::accesskit::NodeId, Node)], role: Role, text: &str) -> Option<Node> {
             let named = |n: &Node| n.label() == Some(text) || n.value() == Some(text);
@@ -560,6 +567,8 @@ mod tests {
         assert!(find(&tree, Role::Label, "0.2.0 ready ·").is_some() && find(&tree, Role::Link, "restart").is_some());
         assert!(find(&tree, Role::Label, &format!("{version} · last checked 2026-10-21 14:32")).is_some());
         assert!(find(&tree, Role::Link, "what's new in 0.2.0 ↗").is_some());
+        // the sidebar offers the restart too
+        assert!(!find(&tree, Role::Button, "restart to update").expect("the sidebar's update button").is_disabled());
         let modes = find(&tree, Role::RadioGroup, "updates").expect("the mode picker");
         let options: Vec<_> = modes
             .children()
@@ -591,6 +600,7 @@ mod tests {
         let tree = std::mem::take(&mut h.tree);
         assert!(find(&tree, Role::Button, "check now").expect("check now").is_disabled());
         assert!(find(&tree, Role::Label, "checking…").is_some());
+        assert!(find(&tree, Role::Button, "restart to update").is_none(), "nothing to take: the button is gone");
         assert!(find(&tree, Role::Label, &format!("{version} · not checked yet")).is_some());
     }
 

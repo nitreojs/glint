@@ -7,7 +7,6 @@ pub(super) mod general;
 pub(super) mod output;
 mod recording;
 mod screenshots;
-pub(super) mod updates;
 pub(super) mod uploads;
 
 #[derive(Clone, Copy, PartialEq)]

@@ -15,6 +15,7 @@ use glint_shell::identity::{front_window, identify};
 use glint_shell::instance::{self, Again};
 use glint_shell::log::path as log_path;
 use glint_shell::start_menu::{self, Shortcut};
+use glint_shell::update::{self, Checked, Host, Updates};
 use glint_shell::{autostart, file_menu, monitors, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
@@ -29,7 +30,6 @@ use crate::platform::{capture, cursor};
 use crate::platform::paths::{migrate_output_dir, unique_path};
 use crate::shot::editor::Output;
 use crate::shot::{self, Delivered, Shot};
-use crate::update::{self, Checked, UPDATED_ARG};
 use crate::upload::{self, Done};
 
 mod hotkeys;
@@ -41,6 +41,7 @@ pub(crate) mod updates;
 use hotkeys::{ESC_HOTKEY_ID, FULL_HOTKEY_ID, HOTKEY_ID, MONITOR_HOTKEY_ID, PAUSE_HOTKEY_ID, SHOT_HOTKEY_ID};
 use menu::show_menu;
 use tray::{IDLE_TIP, Tray};
+use updates::BUILD;
 
 /// NIN_SELECT | NINF_KEY: the icon was activated with the keyboard.
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
@@ -89,12 +90,14 @@ struct App {
     taskbar_created: u32,
     click: ClickTarget,
     exiting: bool,
-    update: updates::Updates,
+    update: Updates,
     /// The file of the recording being made and the app it shows, for its history entry.
     recording_app: Option<(PathBuf, glint_core::naming::Source)>,
     /// The window in front when the picker was asked for: a region's recording shows its app
     /// when the region's middle is on it.
     front: Option<(HWND, Rect)>,
+    /// Notices about how recordings are made (the software encoder) told since glint started.
+    told: Vec<String>,
 }
 
 thread_local! {
@@ -401,6 +404,13 @@ impl App {
         }
         match started.and_then(|s| s.wait()) {
             Ok(rec) => {
+                for notice in rec.notices() {
+                    log(notice);
+                    if !self.told.contains(notice) {
+                        self.told.push(notice.clone());
+                        self.notify("glint: recording", notice, false, ClickTarget::Log);
+                    }
+                }
                 let indicator = match indicator {
                     Some(mut i) => i.start().map(|_| i),
                     None => Indicator::show(region, monitors, self.hwnd, WM_APP_STOP, 0, self.cfg.indicator_inside),
@@ -643,12 +653,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.tick_countdown());
             return LRESULT(0);
         }
-        WM_TIMER if wp.0 == updates::CHECK_TIMER_ID => {
-            with_app(|a| a.on_check_timer());
-            return LRESULT(0);
-        }
-        WM_TIMER if wp.0 == updates::IDLE_TIMER_ID => {
-            with_app(|a| a.when_idle());
+        WM_TIMER if wp.0 == update::CHECK_TIMER_ID || wp.0 == update::IDLE_TIMER_ID => {
+            with_app(|a| a.on_update_timer(wp.0));
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == CLICK_TIMER_ID => {
@@ -662,11 +668,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             with_app(|a| a.on_indicator(wp.0));
             return LRESULT(0);
         }
-        ipc::WM_UPDATE_CHECK => {
+        update::WM_UPDATE_CHECK => {
             with_app(|a| a.check_now(wp.0));
             return LRESULT(0);
         }
-        ipc::WM_UPDATE_INSTALL => {
+        update::WM_UPDATE_INSTALL => {
             with_app(|a| a.install_update());
             return LRESULT(0);
         }
@@ -760,7 +766,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
-    let updated_from = args.iter().position(|a| a == UPDATED_ARG).and_then(|i| args.get(i + 1)).cloned();
+    let updated_from = update::updated_from(&args);
     let autostarted = args.iter().any(|a| a == autostart::ARG);
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -778,7 +784,7 @@ pub fn run() {
         if updated_from.is_none() {
             glint_shell::log::start_fresh();
         }
-        update::tidy(updated_from.is_some());
+        BUILD.tidy(updated_from.is_some());
         let (mut cfg, cfg_err) = match Config::load() {
             Ok(c) => (c, None),
             Err(e) => (Config::default(), Some(e)),
@@ -787,21 +793,12 @@ pub fn run() {
             migrate_output_dir(&mut cfg);
         }
         let mut update_error = None;
-        if cfg_err.is_none()
-            && cfg.update_mode != UpdateMode::Off
-            && let Some(staged) = update::staged()
-        {
-            let mut args = vec![UPDATED_ARG.to_string(), update::current().to_string()];
-            if autostarted {
-                args.push(autostart::ARG.into());
-            }
-            log(&format!("installing the downloaded {} at start", staged.tag));
-            match update::install(&staged, &args) {
-                Ok(()) => return,
-                Err(e) => {
-                    log(&format!("update to {} failed: {e}", staged.tag));
-                    update_error = Some(e);
-                }
+        if cfg_err.is_none() && cfg.update_mode != UpdateMode::Off {
+            let extra: &[&str] = if autostarted { &[autostart::ARG] } else { &[] };
+            match BUILD.install_at_start(extra) {
+                Some(Ok(())) => return,
+                Some(Err(e)) => update_error = Some(e),
+                None => {}
             }
         }
 
@@ -821,13 +818,14 @@ pub fn run() {
             taskbar_created: window::taskbar_created(),
             click: ClickTarget::None,
             exiting: false,
-            update: updates::Updates::default(),
+            update: Updates::new(BUILD),
             recording_app: None,
             front: None,
+            told: Vec::new(),
         };
         app.register_hotkeys(None);
         if let Some(old) = &updated_from {
-            log(&format!("updated from {old} to {}", update::current()));
+            log(&format!("updated from {old} to {}", BUILD.current()));
         }
         if !instance::test_run() {
             start_menu::sync(&[
@@ -847,7 +845,7 @@ pub fn run() {
                 if let Some(e) = &update_error {
                     app.notify("glint: couldn't update", e, true, ClickTarget::Log);
                 } else if let Some(old) = &updated_from {
-                    let now = update::current();
+                    let now = BUILD.current();
                     let notes = ClickTarget::Link(notes_url(&format!("v{now}")));
                     app.notify_done(&format!("updated to {now}"), &format!("from {old} · click for what's new"), notes);
                 } else if all_held && !autostarted {
@@ -860,7 +858,7 @@ pub fn run() {
                 }
             }
         }
-        app.schedule_update_check(updates::FIRST_CHECK_MS);
+        app.schedule_update_check(update::FIRST_CHECK_MS);
         log(&format!(
             "started, hotkeys record {:?}, screenshot {:?}, all screens {:?}, monitor {:?}",
             app.hotkey, app.shot_hotkey, app.full_hotkey, app.monitor_hotkey

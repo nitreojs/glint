@@ -4,6 +4,7 @@ use eframe::egui::{Id, Ui};
 use glint_core::config::{Config, Expiry};
 use glint_core::upload::proxy::{self, Setting};
 use glint_core::upload::{BUILT_IN, custom};
+use glint_shell::net::proxy::describe_system;
 use glint_ui::widgets::{self, Kind, Look, hint, row, toggle_row};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
@@ -15,7 +16,6 @@ use windows::core::w;
 use crate::app::ipc;
 use glint_shell::explorer::documents;
 use crate::settings::SettingsApp;
-use crate::upload::proxy::describe_system;
 
 fn pick_sxcu() -> Vec<PathBuf> {
     let mut paths = Vec::new();
