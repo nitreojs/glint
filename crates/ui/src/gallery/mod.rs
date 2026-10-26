@@ -11,7 +11,7 @@ use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Event, Id, Key, Modifiers, Pos2, Rect, TextureHandle, Ui, UiBuilder, pos2, vec2};
+use eframe::egui::{self, Event, Id, Key, Modifiers, Pos2, Rect, Ui, UiBuilder, pos2, vec2};
 use glint_core::gallery::grid::{Grid, Spec, Step};
 use glint_core::gallery::thumb::{self, Meta};
 use glint_core::gallery::{self, Day, Filter, Item, Kind, path_id};
@@ -35,12 +35,14 @@ mod decode;
 mod library;
 mod overlay;
 mod play;
+mod textures;
 mod thumbs;
 mod view;
 
 pub use library::list;
 use library::Library;
 use play::Playback;
+use textures::{Texture, Textures};
 use thumbs::{Done, Job, Pool};
 use view::Flip;
 
@@ -215,7 +217,7 @@ pub fn run(setup: Setup, host: impl Host + 'static, select: Option<PathBuf>) {
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
                 window::place(h, r);
             }
-            let mut app = Gallery::new(&cc.egui_ctx, setup, Box::new(host), library, saved, saved_at, started);
+            let mut app = Gallery::new(cc, setup, Box::new(host), library, saved, saved_at, started)?;
             (app.hwnd, app.rounded, app.select) = (hwnd, rounded, select.as_deref().map(path_id));
             Ok(Box::new(app))
         }),
@@ -224,7 +226,7 @@ pub fn run(setup: Setup, host: impl Host + 'static, select: Option<PathBuf>) {
 
 /// A thumbnail on the GPU.
 struct Tex {
-    tex: TextureHandle,
+    tex: Texture,
     /// When it came, for its fade-in.
     at: f64,
     /// The frame it was last drawn in.
@@ -241,7 +243,7 @@ struct Preview {
     /// Where it's drawn now, for hovering.
     rect: Rect,
     /// The picture at its shown size (screenshots), or the playing frame.
-    full: Option<TextureHandle>,
+    full: Option<Texture>,
     /// When `full` came, for its fade over the thumbnail.
     full_at: f64,
     play: Option<Playback>,
@@ -369,6 +371,7 @@ struct Gallery {
     flip: Flip,
 
     pool: Pool,
+    textures: Textures,
     tex: HashMap<u64, Tex>,
     meta: HashMap<u64, Meta>,
     failed: HashSet<u64>,
@@ -398,17 +401,19 @@ struct Gallery {
 
 impl Gallery {
     fn new(
-        ctx: &egui::Context,
+        cc: &eframe::CreationContext<'_>,
         setup: Setup,
         host: Box<dyn Host>,
         library: Library,
         saved: Saved,
         saved_at: PathBuf,
         started: Instant,
-    ) -> Gallery {
+    ) -> Result<Gallery, String> {
+        let gl = cc.gl.clone().ok_or("the gallery draws with OpenGL, and there's none")?;
         let cache = thumbs::cache_dir(setup.app);
-        Gallery {
-            pool: Pool::start(ctx, cache.clone()),
+        Ok(Gallery {
+            pool: Pool::start(&cc.egui_ctx, cache.clone()),
+            textures: Textures::new(gl),
             setup,
             host,
             hwnd: None,
@@ -453,7 +458,7 @@ impl Gallery {
             pending: Deletions::default(),
             busy: Vec::new(),
             copying: None,
-        }
+        })
     }
 
     fn owner(&self) -> HWND {
@@ -528,10 +533,13 @@ impl Gallery {
         }
     }
 
-    fn poll(&mut self, ctx: &egui::Context) {
+    fn poll(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         if let Some(l) = self.library.poll() {
             self.set_items(l);
         }
+        // every texture this frame may take is made before anything is uploaded: the thumbnails,
+        // a screenshot's preview and a playing preview's first frame
+        self.textures.reserve(frame, UPLOADS_PER_FRAME + 2);
         let mut uploaded = 0;
         while uploaded < UPLOADS_PER_FRAME {
             let Some(done) = self.pool.poll() else { break };
@@ -540,8 +548,9 @@ impl Gallery {
                     self.meta.insert(id, meta);
                     match image {
                         Some(image) => {
-                            let tex = ctx.load_texture(format!("thumb-{id:x}"), image, view::THUMB_OPTIONS);
-                            self.tex.insert(id, Tex { tex, at: self.now, used: self.frame });
+                            if let Some(tex) = self.textures.upload(&image, true) {
+                                self.tex.insert(id, Tex { tex, at: self.now, used: self.frame });
+                            }
                             uploaded += 1;
                         }
                         None => {
@@ -553,7 +562,7 @@ impl Gallery {
                     if let (Some(pv), Some(image)) = (&mut self.preview, image)
                         && pv.id == id
                     {
-                        pv.full = Some(ctx.load_texture(format!("full-{id:x}"), image, egui::TextureOptions::LINEAR));
+                        pv.full = self.textures.upload(&image, false);
                         pv.full_at = self.now;
                     }
                 }
@@ -919,7 +928,7 @@ impl Drop for Gallery {
 }
 
 impl eframe::App for Gallery {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
         self.frame += 1;
@@ -945,7 +954,7 @@ impl eframe::App for Gallery {
             self.host.refocus();
         }
         self.focused = focused;
-        self.poll(&ctx);
+        self.poll(&ctx, frame);
         if self.menu.is_none() {
             self.keys(&ctx);
         }

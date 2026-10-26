@@ -1,12 +1,15 @@
 //! A hovered recording or gif playing in its preview, muted and looping: a worker decodes it at
-//! the preview's size (recordings on the GPU) and hands over each frame when it's due.
+//! the preview's size (recordings on the GPU) and hands over each frame when it's due. One thread
+//! plays every preview, one after another: a thread started while the window is drawing can hold
+//! its presents up for tens of milliseconds (in the graphics driver), which a thread per preview
+//! did on every hover.
 
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, ColorImage};
@@ -31,15 +34,7 @@ impl Playback {
         let (stop, stopped) = mpsc::sync_channel(1);
         let pos = Arc::new(AtomicU32::new(0));
         let out = Out { tx, stop: stopped, pos: pos.clone(), ctx: ctx.clone(), length_ms };
-        let spawned = std::thread::Builder::new().name("preview".into()).spawn(move || {
-            let res = if gif { play_gif(&path, size, &out) } else { play_video(&path, size, &out) };
-            if let Err(e) = res {
-                log(&format!("gallery: can't play {}: {e}", path.display()));
-            }
-        });
-        if let Err(e) = spawned {
-            log(&format!("gallery: can't start a preview: {e}"));
-        }
+        send(Job { path, gif, size, out });
         Playback { rx, _stop: stop, pos }
     }
 
@@ -54,6 +49,47 @@ impl Playback {
     }
 }
 
+/// A preview for the player thread to play.
+struct Job {
+    path: PathBuf,
+    gif: bool,
+    size: (u32, u32),
+    out: Out,
+}
+
+static PLAYER: OnceLock<Option<Sender<Job>>> = OnceLock::new();
+
+/// Hands `job` to the player thread, started on the first one.
+fn send(job: Job) {
+    let player = PLAYER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel();
+        match std::thread::Builder::new().name("preview".into()).spawn(move || serve(&rx)) {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                log(&format!("gallery: can't start the previews: {e}"));
+                None
+            }
+        }
+    });
+    if let Some(tx) = player {
+        let _ = tx.send(job);
+    }
+}
+
+fn serve(jobs: &Receiver<Job>) {
+    let _com = Com::init();
+    for Job { path, gif, size, out } in jobs {
+        // closed again before its turn came
+        if out.gone() {
+            continue;
+        }
+        let res = if gif { play_gif(&path, size, &out) } else { play_video(&path, size, &out) };
+        if let Err(e) = res {
+            log(&format!("gallery: can't play {}: {e}", path.display()));
+        }
+    }
+}
+
 struct Out {
     tx: SyncSender<ColorImage>,
     stop: Receiver<()>,
@@ -63,6 +99,11 @@ struct Out {
 }
 
 impl Out {
+    /// The preview is gone.
+    fn gone(&self) -> bool {
+        matches!(self.stop.try_recv(), Err(TryRecvError::Disconnected))
+    }
+
     /// Waits until `due`; false once the preview is gone.
     fn wait(&self, due: Instant) -> bool {
         let left = due.saturating_duration_since(Instant::now());
@@ -81,8 +122,7 @@ impl Out {
 }
 
 fn play_video(path: &Path, size: (u32, u32), out: &Out) -> Result<(), String> {
-    let _com = Com::init();
-    let reader = media::rgb_reader(path, size)?;
+    let reader = media::rgb_reader_on(path, super::thumbs::gpu(), size)?;
     let (w, h) = (size.0 as usize, size.1 as usize);
     let mut start = Instant::now();
     // where this loop starts on the clock, and the first frame's time in the file (100 ns units)

@@ -8,7 +8,7 @@ use eframe::egui::epaint::{RectShape, Shadow};
 use eframe::egui::scroll_area::ScrollSource;
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, Id, Layout, Order, Painter, Rect, Response, Role, Sense, Stroke,
-    StrokeKind, TextureFilter, TextureId, TextureOptions, TextureWrapMode, Ui, UiBuilder, WidgetInfo, pos2, vec2,
+    StrokeKind, TextureId, Ui, UiBuilder, WidgetInfo, pos2, vec2,
 };
 use glint_core::format::{human_duration, human_size};
 use glint_core::gallery::grid::{self, Grid, Line, Spec};
@@ -18,12 +18,6 @@ use glint_core::gallery::{Filter, Kind};
 use super::{Gallery, Menu, Preview, TILE_RANGE};
 use crate::widgets::{self, Look, anim, ease, medium, mix, mono, motion, sans};
 
-pub(super) const THUMB_OPTIONS: TextureOptions = TextureOptions {
-    magnification: TextureFilter::Linear,
-    minification: TextureFilter::Linear,
-    wrap_mode: TextureWrapMode::ClampToEdge,
-    mipmap_mode: Some(TextureFilter::Linear),
-};
 const PAD: f32 = 24.0;
 const GAP: f32 = 10.0;
 const HEADING: f32 = 40.0;
@@ -518,9 +512,9 @@ impl Gallery {
             && let Some(frame) = play.poll()
         {
             match &mut pv.full {
-                Some(tex) => tex.set(frame, TextureOptions::LINEAR),
+                Some(tex) => self.textures.replace(tex, &frame, false),
                 None => {
-                    pv.full = Some(ctx.load_texture(format!("play-{:x}", pv.id), frame, TextureOptions::LINEAR));
+                    pv.full = self.textures.upload(&frame, false);
                     pv.full_at = self.now;
                 }
             }
