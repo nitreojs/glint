@@ -20,8 +20,9 @@ pub mod tail;
 
 /// moov/udta box holding a clip's game events as JSON ([`Payload`]).
 pub const BOX: [u8; 4] = *b"glev";
-/// [`Payload::version`] this build writes and the newest it reads.
-pub const VERSION: u32 = 1;
+/// [`Payload::version`] this build writes and the newest it reads (2 added [`Kind::Streak`],
+/// [`Kind::Result`] and [`Event::detail`]/[`Event::count`]).
+pub const VERSION: u32 = 2;
 
 /// 100 ns units in a millisecond.
 const MS: i64 = 10_000;
@@ -35,7 +36,13 @@ pub enum Kind {
     Respawn,
     /// The match moved on: `GameInProgress`, `PostGame` …, as the game names it.
     Phase(String),
+    /// Which one (`enemy guardian (lane 2)`, `midboss`, or the HUD's words); what befell it in
+    /// [`Event::detail`] (`destroyed`, `attacked` …).
     Objective(String),
+    /// A kill streak: `first_blood`, `streak` (its length in [`Event::count`]) or `ended`.
+    Streak(String),
+    /// How the match ended for the local player: `victory`, `defeat`, `abandoned`, `unknown`.
+    Result(String),
     Custom(String),
 }
 
@@ -59,11 +66,16 @@ pub struct Event {
     /// The local player's own (their kill, their death, their respawn); `None`: can't tell.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mine: Option<bool>,
+    /// More about it, in words: an objective's fate, the HUD's text, a match summary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u32>,
 }
 
 impl Event {
     pub fn new(game: &str, kind: Kind) -> Event {
-        Event { game: game.into(), kind, killer: None, victim: None, hero: None, assists: None, bounty: None, mine: None }
+        Event { game: game.into(), kind, killer: None, victim: None, hero: None, assists: None, bounty: None, mine: None, detail: None, count: None }
     }
 }
 
@@ -299,22 +311,31 @@ mod tests {
         std::fs::write(&path, [atom(b"ftyp", b"isom"), atom(b"mdat", &[7; 64]), moov].concat()).unwrap();
         assert_eq!(load(&path), Ok(None));
         let kill = Event { killer: Some("hero_hornet".into()), victim: Some("hero_atlas".into()), assists: Some(1), bounty: Some(416), mine: Some(true), ..Event::new("deadlock", Kind::Kill) };
+        let streak = Event { killer: Some("alexx".into()), count: Some(3), mine: Some(true), ..Event::new("deadlock", Kind::Streak("streak".into())) };
         let payload = Payload {
             version: VERSION,
-            events: vec![Mark { t: S, event: kill }, Mark { t: 2 * S, event: Event::new("deadlock", Kind::Phase("PostGame".into())) }],
+            events: vec![
+                Mark { t: S, event: kill },
+                Mark { t: S + 1, event: streak },
+                Mark { t: 2 * S, event: Event::new("deadlock", Kind::Phase("PostGame".into())) },
+            ],
         };
         save(&path, &payload).unwrap();
         let back = load(&path);
         let json = String::from_utf8(mp4::movie_box(&path, &BOX).unwrap().unwrap()).unwrap();
-        mp4::set_movie_box(&path, &BOX, json.replace("\"version\":1", "\"version\":2").as_bytes()).unwrap();
+        let first = r#"{"version":1,"events":[{"t":10000000,"game":"deadlock","kind":"kill","mine":true}]}"#;
+        mp4::set_movie_box(&path, &BOX, first.as_bytes()).unwrap();
+        let older = load(&path);
+        mp4::set_movie_box(&path, &BOX, json.replace("\"version\":2", "\"version\":3").as_bytes()).unwrap();
         let refused = load(&path);
         std::fs::remove_file(&path).unwrap();
 
         assert_eq!(
             json,
-            r#"{"version":1,"events":[{"t":10000000,"game":"deadlock","kind":"kill","killer":"hero_hornet","victim":"hero_atlas","assists":1,"bounty":416,"mine":true},{"t":20000000,"game":"deadlock","kind":{"phase":"PostGame"}}]}"#
+            r#"{"version":2,"events":[{"t":10000000,"game":"deadlock","kind":"kill","killer":"hero_hornet","victim":"hero_atlas","assists":1,"bounty":416,"mine":true},{"t":10000001,"game":"deadlock","kind":{"streak":"streak"},"killer":"alexx","mine":true,"count":3},{"t":20000000,"game":"deadlock","kind":{"phase":"PostGame"}}]}"#
         );
         assert_eq!(back, Ok(Some(payload)));
-        assert_eq!(refused, Err("game events were saved by a newer glint (format 2)".into()));
+        assert_eq!(older.map(|p| p.map(|p| p.events[0].event.kind.clone())), Ok(Some(Kind::Kill)), "the first format still reads");
+        assert_eq!(refused, Err("game events were saved by a newer glint (format 3)".into()));
     }
 }

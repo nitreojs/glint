@@ -8,8 +8,9 @@
 //! there tells which hero is the local player's.
 //!
 //! afterglow's addon (`mods/deadlock`) fills that in: a script in the HUD writes the local
-//! player's kills, deaths and assists, the kill feed and objectives as JSON lines
-//! (`[PanoramaScript] [AFTERGLOW]{"v":1,"event":"kill",…}`, [`Addon`]). Once it's heard from, the
+//! player's kills, deaths and assists, the kill feed, kill streaks, objectives destroyed or under
+//! attack, announcements, the match result and a summary as JSON lines
+//! (`[PanoramaScript] [AFTERGLOW]{"v":2,"event":"kill",…}`, [`Addon`]). Once it's heard from, the
 //! server's kill and respawn lines are left out: the addon reports them too, with whose they are.
 
 use std::path::{Path, PathBuf};
@@ -29,8 +30,9 @@ pub const GAME: Game = Game { name: NAME, exe: "deadlock.exe", open };
 const SLACK_MS: i64 = 2_000;
 
 pub const ADDON_TAG: &str = "[AFTERGLOW]";
-/// [`Addon::v`] this build reads.
-pub const ADDON_VERSION: u32 = 1;
+/// [`Addon::v`]: the newest this build reads (2 added `streak`, `result`, `summary`, `announce` and
+/// objectives' `state`); every older one reads too.
+pub const ADDON_VERSION: u32 = 2;
 /// How far the addon's own clock may be from the line's stamp and still be believed (ms).
 const CLIENT_SLACK_MS: i64 = 3_000;
 /// A feed entry naming the player and the addon's own kill or death for it come this close (ms).
@@ -63,15 +65,16 @@ pub enum Line {
     Bot(u32),
     /// Player `id` (on this PC's server) plays `hero`.
     Hero { id: u32, hero: String },
-    Addon(Addon),
+    Addon(Box<Addon>),
 }
 
-/// A line of afterglow's addon. `killer`/`victim` are the names the kill feed shows.
+/// A line of afterglow's addon. `killer`/`victim`/`name` are the names the HUD shows.
 #[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
 #[serde(default)]
 pub struct Addon {
     pub v: u32,
-    /// `hello`, `phase`, `kill`, `death`, `assist`, `respawn`, `feed`, `objective`, `error`.
+    /// `hello`, `phase`, `kill`, `death`, `assist`, `respawn`, `feed`, `objective`, `error`; since
+    /// 2 `streak`, `announce`, `result`, `summary`.
     pub event: String,
     /// When it happened, by the game's clock (unix ms).
     pub t: Option<i64>,
@@ -80,11 +83,62 @@ pub struct Addon {
     pub assists: Option<u32>,
     /// A feed entry the local player is in: `killer` or `victim`.
     pub me: Option<String>,
-    /// An objective's message, as the HUD words it.
+    /// An objective's message (1), an announcement, the match result as the HUD words it.
     pub text: Option<String>,
-    /// An objective the kill feed shows (`bossDied`, `IdolReturned` …).
+    pub sub: Option<String>,
+    /// The objective: `guardian`, `walker`, `patron`, `midboss`, `idol` … (1: a feed class).
     pub what: Option<String>,
+    /// What befell the objective: `destroyed`, `attacked`, `returned` …
+    pub state: Option<String>,
+    /// `ours`, `theirs`, `neutral`.
+    pub side: Option<String>,
+    pub lane: Option<Lane>,
     pub mine: Option<bool>,
+    /// A streak's kind (`first_blood`, `streak`, `ended`).
+    pub kind: Option<String>,
+    pub count: Option<u32>,
+    /// Whose streak, or the local player's name in a summary.
+    pub name: Option<String>,
+    pub hero: Option<String>,
+    /// `victory`, `defeat`, `abandoned`, `unknown`.
+    pub result: Option<String>,
+    pub kills: Option<u32>,
+    pub deaths: Option<u32>,
+    pub level: Option<u32>,
+    pub souls: Option<String>,
+    pub best_streak: Option<u32>,
+}
+
+/// Where an objective stands: the top bar's map numbers lanes, the objective's own panel names
+/// their colour.
+#[derive(Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum Lane {
+    Number(u32),
+    Colour(String),
+}
+
+/// What a line of the addon becomes, and whether the kill feed told it (see [`Session::feed`]).
+type Told = fn(Addon, Option<&str>) -> Option<(Event, bool)>;
+
+/// One entry per event of the addon's that's an event here; the rest (`hello`, `phase`, `error`)
+/// aren't.
+const ADDON_EVENTS: &[(&str, Told)] = &[
+    ("kill", |a, _| Some((a.own(Kind::Kill), false))),
+    ("death", |a, _| Some((a.own(Kind::Death), false))),
+    ("assist", |a, _| Some((a.own(Kind::Assist), false))),
+    ("respawn", |a, _| Some((a.own(Kind::Respawn), false))),
+    ("feed", Addon::feed),
+    ("objective", |a, _| a.objective().map(|e| (e, false))),
+    ("streak", |a, player| Some((a.streak(player), false))),
+    ("announce", |a, _| a.announce().map(|e| (e, false))),
+    ("result", |a, _| a.result().map(|e| (e, false))),
+    ("summary", |a, _| Some((a.summary(), false))),
+];
+
+/// Whether `who` is `player` as the HUD writes names (the kill feed in capitals).
+fn named(who: Option<&str>, player: Option<&str>) -> bool {
+    who.zip(player).is_some_and(|(w, p)| w.trim().eq_ignore_ascii_case(p.trim()))
 }
 
 impl Addon {
@@ -92,33 +146,80 @@ impl Addon {
     /// newer addon.
     pub fn parse(text: &str) -> Option<Addon> {
         let json = &text[text.find(ADDON_TAG)? + ADDON_TAG.len()..];
-        serde_json::from_str::<Addon>(json).ok().filter(|a| a.v == ADDON_VERSION)
+        serde_json::from_str::<Addon>(json).ok().filter(|a| (1..=ADDON_VERSION).contains(&a.v))
     }
 
     /// What it says, as an event; `None` for what isn't one (`hello`, the local player's own feed
-    /// entries, which come as `kill` and `death` too). A feed entry naming `player` is theirs
-    /// even when the addon couldn't tell (the hideout has no top bar to find them on).
+    /// entries, which come as `kill` and `death` too). `player` is the local player's name: a
+    /// feed entry or streak naming them is theirs even when the addon couldn't tell (the hideout
+    /// has no top bar to find them on).
     fn event(self, player: Option<&str>) -> Option<(Event, bool)> {
-        let named = |who: &Option<String>| who.as_deref().zip(player).is_some_and(|(w, p)| w.trim().eq_ignore_ascii_case(p.trim()));
-        if self.event == "feed" && self.me.is_none() && (named(&self.killer) || named(&self.victim)) {
-            let kind = if named(&self.victim) { Kind::Death } else { Kind::Kill };
-            return Some((Event { killer: self.killer, victim: self.victim, assists: self.assists, mine: Some(true), ..Event::new(NAME, kind) }, true));
+        let (_, told) = ADDON_EVENTS.iter().find(|(name, _)| *name == self.event)?;
+        told(self, player)
+    }
+
+    fn own(self, kind: Kind) -> Event {
+        Event { killer: self.killer, victim: self.victim, assists: self.assists, mine: Some(true), ..Event::new(NAME, kind) }
+    }
+
+    fn feed(self, player: Option<&str>) -> Option<(Event, bool)> {
+        if self.me.is_some() {
+            return None;
         }
-        let kind = match self.event.as_str() {
-            "kill" => Kind::Kill,
-            "death" => Kind::Death,
-            "assist" => Kind::Assist,
-            "respawn" => Kind::Respawn,
-            "feed" if self.me.is_none() => Kind::Kill,
-            "objective" => Kind::Objective(self.text.clone().or_else(|| self.victim.clone()).or(self.what)?),
-            _ => return None,
+        let (kind, mine) = match (named(self.killer.as_deref(), player), named(self.victim.as_deref(), player)) {
+            (_, true) => (Kind::Death, true),
+            (true, _) => (Kind::Kill, true),
+            _ => (Kind::Kill, false),
         };
-        let mine = match kind {
-            Kind::Objective(_) => self.mine,
-            Kind::Kill if self.event == "feed" => Some(false),
-            _ => Some(true),
+        Some((Event { killer: self.killer, victim: self.victim, assists: self.assists, mine: Some(mine), ..Event::new(NAME, kind) }, mine))
+    }
+
+    fn objective(self) -> Option<Event> {
+        let Some(state) = self.state else {
+            let which = self.text.or_else(|| self.victim.clone()).or(self.what)?;
+            return Some(Event { killer: self.killer, victim: self.victim, mine: self.mine, ..Event::new(NAME, Kind::Objective(which)) });
         };
-        Some((Event { killer: self.killer, victim: self.victim, assists: self.assists, mine, ..Event::new(NAME, kind) }, false))
+        let what = self.what?.replace('_', " ");
+        let side = match self.side.as_deref() {
+            Some("ours") => Some("our"),
+            Some("theirs") => Some("enemy"),
+            _ => None,
+        };
+        let colour = match &self.lane {
+            Some(Lane::Colour(c)) => Some(c.as_str()),
+            _ => None,
+        };
+        let mut which = [side, colour, Some(what.as_str())].into_iter().flatten().collect::<Vec<_>>().join(" ");
+        if let Some(Lane::Number(n)) = self.lane {
+            which += &format!(" (lane {n})");
+        }
+        Some(Event { killer: self.killer, victim: self.victim, mine: self.mine, detail: Some(state), ..Event::new(NAME, Kind::Objective(which)) })
+    }
+
+    fn streak(self, player: Option<&str>) -> Event {
+        let mine = self.mine == Some(true) || named(self.name.as_deref(), player);
+        let kind = Kind::Streak(self.kind.unwrap_or_else(|| "streak".into()));
+        Event { killer: self.name, hero: self.hero, count: self.count, mine: Some(mine), ..Event::new(NAME, kind) }
+    }
+
+    fn announce(self) -> Option<Event> {
+        let words = [self.text, self.sub].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+        (!words.is_empty()).then(|| Event { detail: Some(words), ..Event::new(NAME, Kind::Custom("announce".into())) })
+    }
+
+    fn result(self) -> Option<Event> {
+        Some(Event { detail: self.text, mine: Some(true), ..Event::new(NAME, Kind::Result(self.result?)) })
+    }
+
+    fn summary(self) -> Event {
+        let n = |v: Option<u32>| v.map_or("?".to_string(), |v| v.to_string());
+        let mut words = vec![format!("{}/{}/{}", n(self.kills), n(self.deaths), n(self.assists))];
+        words.extend(self.level.map(|l| format!("level {l}")));
+        words.extend(self.souls.map(|s| format!("{s} souls")));
+        words.extend(self.best_streak.map(|s| format!("best streak {s}")));
+        words.extend(self.hero.clone());
+        let detail = Some(words.join(" · "));
+        Event { hero: self.hero, assists: self.assists, mine: Some(true), detail, ..Event::new(NAME, Kind::Custom("summary".into())) }
     }
 }
 
@@ -148,7 +249,7 @@ static TABLE: LazyLock<Vec<(&str, Regex, Build)>> =
 pub fn parse(text: &str) -> Option<Line> {
     match TABLE.iter().find(|(start, ..)| text.starts_with(start)) {
         Some((_, re, build)) => build(&re.captures(text)?),
-        None => Addon::parse(text).map(Line::Addon),
+        None => Addon::parse(text).map(|a| Line::Addon(Box::new(a))),
     }
 }
 
@@ -203,7 +304,7 @@ impl Session {
             Line::Addon(addon) => {
                 self.addon = true;
                 let at = addon.t.filter(|t| (t - at).abs() <= CLIENT_SLACK_MS).unwrap_or(at);
-                let (event, by_feed) = addon.event(self.player.as_deref())?;
+                let (event, by_feed) = (*addon).event(self.player.as_deref())?;
                 let slot = match (&event.kind, event.mine) {
                     (Kind::Kill, Some(true)) => Some(0),
                     (Kind::Death, Some(true)) => Some(1),
@@ -378,7 +479,7 @@ mod tests {
         let feed = |s: &mut Session, json: &str| s.feed(stamp(19, 0, 5), at, &format!("[PanoramaScript] [AFTERGLOW]{json}"));
         let event = |s: &mut Session, json: &str| feed(s, json).map(|e| e.event);
 
-        assert_eq!(feed(&mut s, r#"{"v":2,"event":"hello","t":1761494405000}"#), None, "a newer addon's lines are left alone");
+        assert_eq!(feed(&mut s, r#"{"v":3,"event":"hello","t":1761494405000}"#), None, "a newer addon's lines are left alone");
         assert!(!s.addon());
         assert_eq!(feed(&mut s, r#"{"v":1,"event":"hello","version":"1.0.0","t":1761494405000}"#), None);
         assert!(s.addon());
@@ -440,6 +541,46 @@ mod tests {
         assert_eq!(log(&mut s, "Loading map \"street_test\""), None);
         assert!(s.addon(), "the addon is there for the whole run");
         assert_eq!(log(&mut s, "ChangeGameState: GameInProgress (7)"), Some(Kind::Phase("GameInProgress".into())), "the phases still come from the log");
+    }
+
+    #[test]
+    fn the_second_addon_tells_streaks_objectives_and_the_end() {
+        let mut s = Session { player: Some("memories".into()), ..Session::default() };
+        let at = 1_761_494_405_250;
+        let mut event = |json: &str| s.feed(stamp(19, 0, 5), at, &format!("[PanoramaScript] [AFTERGLOW]{json}")).map(|e| e.event);
+        assert_eq!(event(r#"{"v":2,"event":"hello","version":"2.0.0","t":1761494405000}"#), None);
+        assert_eq!(event(r#"{"v":2,"event":"phase","phase":"game","hero_id":12,"t":1761494405000}"#), None);
+
+        let first = event(r#"{"v":2,"event":"streak","kind":"first_blood","name":"MEMORIES","hero":"Infernus","mine":false,"t":1761494405000}"#).unwrap();
+        assert_eq!((first.kind, first.mine, first.killer.as_deref()), (Kind::Streak("first_blood".into()), Some(true), Some("MEMORIES")), "the steam name tells it's theirs");
+        let streak = event(r#"{"v":2,"event":"streak","kind":"streak","count":4,"name":"Bob","hero":"Haze","mine":false,"t":1761494405000}"#).unwrap();
+        assert_eq!((streak.kind, streak.count, streak.mine, streak.hero.as_deref()), (Kind::Streak("streak".into()), Some(4), Some(false), Some("Haze")));
+
+        let mut objective = |json: &str| {
+            let e = event(json).unwrap();
+            let Kind::Objective(which) = e.kind else { panic!("{json}") };
+            (which, e.detail.unwrap_or_default(), e.mine)
+        };
+        let lines = [
+            (r#"{"v":2,"event":"objective","state":"destroyed","what":"guardian","side":"theirs","team":2,"lane":2,"id":"Team2Tier1_2"}"#, ("enemy guardian (lane 2)", "destroyed", None)),
+            (r#"{"v":2,"event":"objective","state":"attacked","what":"guardian","side":"ours","lane":"yellow","name":"Guardian"}"#, ("our yellow guardian", "attacked", None)),
+            (r#"{"v":2,"event":"objective","state":"destroyed","what":"midboss","side":"neutral","name":"Mid-Boss"}"#, ("midboss", "destroyed", None)),
+            (r#"{"v":2,"event":"objective","state":"returned","what":"idol","side":"ours","killer":"alexx","mine":true}"#, ("our idol", "returned", Some(true))),
+            (r#"{"v":2,"event":"objective","state":"destroyed","what":"base_guardian","side":"theirs"}"#, ("enemy base guardian", "destroyed", None)),
+        ];
+        for (json, (which, detail, mine)) in lines {
+            assert_eq!(objective(json), (which.to_string(), detail.to_string(), mine), "{json}");
+        }
+
+        let announce = event(r#"{"v":2,"event":"announce","text":"Enemy Yellow Tier 1","sub":"DESTROYED","good":true,"src":"team"}"#).unwrap();
+        assert_eq!((announce.kind, announce.detail.as_deref()), (Kind::Custom("announce".into()), Some("Enemy Yellow Tier 1 · DESTROYED")));
+        let result = event(r#"{"v":2,"event":"result","result":"victory","team":1,"winner":1,"text":"The Hidden King Victory"}"#).unwrap();
+        assert_eq!((result.kind, result.detail.as_deref()), (Kind::Result("victory".into()), Some("The Hidden King Victory")));
+        assert_eq!(event(r#"{"v":2,"event":"result","team":1}"#), None, "a result without one");
+        let summary = event(r#"{"v":2,"event":"summary","name":"alexx","hero":"Infernus","hero_id":7,"level":17,"souls":"21.4k","objective_damage":5321,"kills":2,"deaths":1,"assists":1,"best_streak":3,"src":"kda"}"#).unwrap();
+        assert_eq!((summary.kind, summary.detail.as_deref()), (Kind::Custom("summary".into()), Some("2/1/1 · level 17 · 21.4k souls · best streak 3 · Infernus")));
+        let bare = event(r#"{"v":2,"event":"summary","kills":0,"deaths":0,"assists":0,"src":"tally"}"#).unwrap();
+        assert_eq!(bare.detail.as_deref(), Some("0/0/0"));
     }
 
     #[test]
