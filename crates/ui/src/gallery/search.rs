@@ -475,7 +475,7 @@ impl Gallery {
                     None => {
                         painter.rect_filled(r, 3, p.line2.gamma_multiply(alpha));
                         let letter: String = name.chars().find(|c| c.is_alphanumeric()).map(|c| c.to_uppercase().collect()).unwrap_or_default();
-                        painter.text(c + vec2(0.0, 0.5), Align2::CENTER_CENTER, letter, medium(9.0), p.t1.gamma_multiply(alpha));
+                        widgets::centred_mark(painter, c, letter, medium(9.0), p.t1.gamma_multiply(alpha));
                     }
                 }
             }

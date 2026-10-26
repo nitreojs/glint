@@ -231,7 +231,7 @@ fn paint_glyph(painter: &Painter, rect: Rect, glyph: &Glyph, devices: &Devices, 
     match glyph {
         Glyph::App(exe) => {
             let letter = exe_stem(exe).chars().find(|c| c.is_alphanumeric()).map_or('?', |c| c.to_ascii_uppercase());
-            painter.text(rect.center(), Align2::CENTER_CENTER, letter, medium(11.0 * k), p.t1.gamma_multiply(alpha));
+            widgets::centred_mark(painter, rect.center(), letter.to_string(), medium(11.0 * k), p.t1.gamma_multiply(alpha));
         }
         Glyph::Speaker => {
             let cone = vec![at(4.0, 8.0), at(7.0, 8.0), at(11.0, 5.0), at(11.0, 15.0), at(7.0, 12.0), at(4.0, 12.0)];

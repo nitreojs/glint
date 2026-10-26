@@ -761,6 +761,19 @@ pub fn dropdown_detail(
     Dropped { picked, opened, response: resp }
 }
 
+/// `text` (a letter or two, as on an app's tile) with its ink centred on `centre`: centring the
+/// line box, as egui does, leaves capitals sitting low.
+pub fn centred_mark(painter: &Painter, centre: egui::Pos2, text: String, font: FontId, color: Color32) {
+    let galley = painter.layout_no_wrap(text, font, color);
+    let ink = galley.rows.iter().flat_map(|r| r.glyphs.iter().map(move |g| (r.pos, g))).fold(None::<Rect>, |ink, (row, g)| {
+        let min = row + g.pos.to_vec2() + g.uv_rect.offset;
+        let r = Rect::from_min_size(min, g.uv_rect.size);
+        Some(ink.map_or(r, |i| i.union(r)))
+    });
+    let Some(ink) = ink.filter(|r| r.is_positive()) else { return };
+    painter.galley(centre - ink.center().to_vec2(), galley, color);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
