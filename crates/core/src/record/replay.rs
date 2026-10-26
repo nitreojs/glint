@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::pipeline::{Packet, PacketSink, Stream};
 
@@ -32,6 +33,47 @@ pub struct Replay {
     finished: bool,
     /// The byte limit, not the window, dropped the oldest video last: it holds less than `keep`.
     capped: bool,
+    /// Where the recording clock sits on the wall clock.
+    clock: Clock,
+}
+
+/// The wall-clock time of the recording clock's zero, from when video packets arrive: a packet
+/// can't arrive before the frame after it was captured, so the earliest arrival seen relative to
+/// its end (encoding latency only) places the clock best. Only the last [`Clock::WINDOW`] of
+/// arrivals counts, so a wall clock set back or forward is followed.
+#[derive(Clone, Debug, Default)]
+pub struct Clock {
+    /// (video time, unix time of video time zero by that arrival), increasing in both: a
+    /// sliding-window minimum.
+    samples: VecDeque<(i64, i64)>,
+}
+
+impl Clock {
+    /// How far back arrivals count (100 ns units).
+    pub const WINDOW: i64 = 10 * 10_000_000;
+
+    /// A video packet ending at `end` (recording clock) arrived at `arrived` (unix time, 100 ns
+    /// units).
+    pub fn arrived(&mut self, end: i64, arrived: i64) {
+        let zero = arrived - end;
+        while self.samples.back().is_some_and(|&(_, z)| z >= zero) {
+            self.samples.pop_back();
+        }
+        self.samples.push_back((end, zero));
+        while self.samples.front().is_some_and(|&(t, _)| t < end - Self::WINDOW) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The unix time (100 ns units) of recording time zero; `None` before any video arrived.
+    pub fn zero(&self) -> Option<i64> {
+        self.samples.front().map(|&(_, z)| z)
+    }
+}
+
+/// Now as unix time in 100 ns units.
+pub fn unix_now() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| (d.as_nanos() / 100) as i64)
 }
 
 /// A stretch of the buffer in presentation order. Its packets keep the recording's timestamps;
@@ -46,6 +88,8 @@ pub struct Clip {
     pub duration: i64,
     /// It's shorter than asked for because the byte limit dropped older video.
     pub capped: bool,
+    /// The unix time (ms) of its first frame, from the buffer's [`Clock`]; `None` when unknown.
+    pub wall: Option<i64>,
 }
 
 impl Replay {
@@ -60,6 +104,7 @@ impl Replay {
             end: None,
             finished: false,
             capped: false,
+            clock: Clock::default(),
         }
     }
 
@@ -93,8 +138,9 @@ impl Replay {
         self.streams.len() - 1
     }
 
-    fn push(&mut self, stream: usize, packet: Packet) {
+    fn push(&mut self, stream: usize, packet: Packet, arrived: i64) {
         if Some(stream) == self.video {
+            self.clock.arrived(packet.pts + packet.duration, arrived);
             if packet.key {
                 self.keys.push_back(packet.pts);
             }
@@ -139,7 +185,8 @@ impl Replay {
             self.packets.iter().filter(|(_, p)| p.pts >= start && p.pts < end).cloned().collect();
         packets.sort_by_key(|(_, p)| p.pts);
         let capped = self.capped && end - start < len;
-        Some(Clip { streams: self.streams.clone(), packets, start, duration: end - start, capped })
+        let wall = self.clock.zero().map(|z| (z + start) / 10_000);
+        Some(Clip { streams: self.streams.clone(), packets, start, duration: end - start, capped, wall })
     }
 }
 
@@ -176,7 +223,8 @@ impl PacketSink for ReplaySink {
     }
 
     fn write(&mut self, stream: usize, packet: Packet) -> Result<(), String> {
-        self.lock().push(stream, packet);
+        let arrived = unix_now();
+        self.lock().push(stream, packet, arrived);
         Ok(())
     }
 
@@ -270,6 +318,37 @@ mod tests {
         let whole = sink.lock().last(60 * S).unwrap();
         assert_eq!(whole.duration, 10 * S, "asking for more than it holds gives everything");
         assert!(ReplaySink::new(Limits { keep: S, max_bytes: 1 }).lock().last(S).is_none(), "nothing yet");
+    }
+
+    #[test]
+    fn the_clock_takes_the_quickest_arrival_and_forgets_old_ones() {
+        let mut c = Clock::default();
+        assert_eq!(c.zero(), None);
+        let epoch = 1_800_000_000 * S;
+        // packets ending at 1 s, 2 s, 3 s arriving 50 ms, 20 ms and 300 ms late
+        c.arrived(S, epoch + S + S / 20);
+        c.arrived(2 * S, epoch + 2 * S + S / 50);
+        c.arrived(3 * S, epoch + 3 * S + 3 * S / 10);
+        assert_eq!(c.zero(), Some(epoch + S / 50), "the 20 ms one");
+        // the wall clock was set 5 s forward: once the quick arrival is out of the window, it's followed
+        c.arrived(14 * S, epoch + 5 * S + 14 * S + S / 10);
+        assert_eq!(c.zero(), Some(epoch + 5 * S + S / 10));
+        c.arrived(15 * S, epoch - 5 * S + 15 * S + S / 10);
+        assert_eq!(c.zero(), Some(epoch - 5 * S + S / 10), "and set back, at once");
+
+        let mut r = Replay::new(Limits { keep: 30 * S, max_bytes: usize::MAX });
+        r.add_stream(video());
+        r.add_stream(audio());
+        for i in 0..30 {
+            let t = i * FRAME;
+            let packet = Packet { data: vec![0; 10], pts: t, dts: t, duration: FRAME, key: i % 10 == 0 };
+            // audio arriving early must not move the clock
+            r.push(1, Packet { key: true, ..packet.clone() }, epoch);
+            r.push(0, packet, epoch + t + FRAME + S / 100);
+        }
+        let clip = r.last(S + FRAME).unwrap();
+        assert_eq!(clip.start, S);
+        assert_eq!(clip.wall, Some((epoch + S / 100 + S) / 10_000), "the first frame, 10 ms of latency included");
     }
 
     #[derive(Default)]
