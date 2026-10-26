@@ -63,6 +63,11 @@ impl Wic {
 
     /// An encoded image (a cache file's).
     pub fn memory(&self, bytes: &[u8]) -> Result<Pixels, String> {
+        self.memory_fit(bytes, |w, h| (w, h))
+    }
+
+    /// An encoded image at `fit(its size)`.
+    pub fn memory_fit(&self, bytes: &[u8], fit: impl FnOnce(u32, u32) -> (u32, u32)) -> Result<Pixels, String> {
         unsafe {
             let stream = self.0.CreateStream().map_err(|e| e.to_string())?;
             stream.InitializeFromMemory(bytes).map_err(|e| e.to_string())?;
@@ -70,7 +75,7 @@ impl Wic {
                 .0
                 .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
                 .map_err(|e| e.to_string())?;
-            self.frame(&decoder, |w, h| (w, h)).map(|(p, _)| p)
+            self.frame(&decoder, fit).map(|(p, _)| p)
         }
     }
 

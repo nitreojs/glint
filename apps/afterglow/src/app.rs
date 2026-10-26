@@ -18,10 +18,12 @@ use glint_core::record::pipeline::Outcome;
 use glint_core::wide::wide;
 use glint_shell::afterglow::{MAIN_CLASS, WM_NOTE_CAPTURABLE};
 use glint_shell::identity::{front_window, identify};
+use glint_shell::instance::{self, Again};
 use glint_shell::menu::{Glyph, Header, Item, Menu};
 use glint_shell::time::date_time;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
-use glint_shell::{autostart, explorer, hotkey, instance, start_menu, window};
+use glint_shell::start_menu::{self, Shortcut};
+use glint_shell::{autostart, explorer, hotkey, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
@@ -367,6 +369,9 @@ impl App {
     }
 
     fn sync_autostart(&self) {
+        if instance::test_run() {
+            return;
+        }
         if let Err(e) = autostart::sync(APP, self.cfg.launch_at_startup) {
             self.notify("afterglow: launch at startup", &e, true);
         }
@@ -595,6 +600,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe { PostQuitMessage(0) };
             return LRESULT(0);
         }
+        // afterglow started again plainly (the Start menu, a shortcut) while it runs
+        m if m != 0 && m == instance::gallery_message() => {
+            // the launch let this process come forward; holding the foreground lets the gallery
+            glint_ui::window::bring_forward(hwnd);
+            gallery::open(None);
+            return LRESULT(0);
+        }
         _ => {}
     }
     if with_app(|a| a.taskbar_created != 0 && msg == a.taskbar_created) == Some(true) {
@@ -609,8 +621,13 @@ pub fn run() {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
     if !instance::take(APP, false) {
-        unsafe {
-            MessageBoxW(None, w!("afterglow is already running (see the tray icon)."), w!("afterglow"), MB_ICONINFORMATION);
+        let args: Vec<_> = std::env::args_os().skip(1).collect();
+        match instance::again(&args) {
+            Again::Gallery if instance::open_gallery(MAIN_CLASS) => {}
+            Again::Quiet => {}
+            Again::Gallery | Again::Notice => unsafe {
+                MessageBoxW(None, w!("afterglow is already running (see the tray icon)."), w!("afterglow"), MB_ICONINFORMATION);
+            },
         }
         return;
     }
@@ -648,7 +665,9 @@ pub fn run() {
         failures: 0,
     };
     app.grab_hotkey();
-    start_menu::sync(APP, "instant replay: saves the last minute of your screen");
+    if !instance::test_run() {
+        start_menu::sync(&[Shortcut { name: APP, args: "", description: "instant replay: saves the last minute of your screen" }]);
+    }
     match cfg_err {
         Some(e) => app.notify("afterglow: settings error (using defaults)", &e, true),
         None => app.sync_autostart(),

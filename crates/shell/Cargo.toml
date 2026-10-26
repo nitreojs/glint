@@ -7,5 +7,7 @@ repository.workspace = true
 [dependencies]
 glint-core.workspace = true
 glint-media.workspace = true
-windows.workspace = true
+# WinRT: the clipboard history (Win+V) the screenshot editor's clipboard strip shows
+windows = { workspace = true, features = ["ApplicationModel_DataTransfer", "Foundation_Collections", "Storage_Streams"] }
+windows-core.workspace = true
 windows-numerics.workspace = true

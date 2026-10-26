@@ -1198,6 +1198,7 @@ dependencies = [
  "glint-core",
  "glint-media",
  "windows",
+ "windows-core",
  "windows-numerics",
 ]
 

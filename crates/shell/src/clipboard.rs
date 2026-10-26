@@ -87,6 +87,20 @@ pub fn copy_text(owner: Option<HWND>, text: &str) -> Result<(), String> {
 }
 
 pub fn copy_files(owner: Option<HWND>, paths: &[PathBuf]) -> Result<(), String> {
+    let list = file_list(paths)?;
+    let effect = copy_effect()?;
+    let _clipboard = Clipboard::open(owner)?;
+    unsafe { EmptyClipboard() }.map_err(|e| format!("EmptyClipboard: {e}"))?;
+    list.give_to_clipboard(u32::from(CF_HDROP.0))?;
+    if let Some((format, mem)) = effect {
+        mem.give_to_clipboard(format)?;
+    }
+    Ok(())
+}
+
+/// `paths` the way CF_HDROP holds them: a DROPFILES header, then the wide names, each ended by a
+/// NUL, and one more NUL.
+pub(crate) fn file_list(paths: &[PathBuf]) -> Result<Global, String> {
     let header = size_of::<DROPFILES>();
     let names: Vec<u8> = paths
         .iter()
@@ -95,20 +109,21 @@ pub fn copy_files(owner: Option<HWND>, paths: &[PathBuf]) -> Result<(), String> 
         .flat_map(u16::to_le_bytes)
         .collect();
     let files = DROPFILES { pFiles: header as u32, fWide: true.into(), ..Default::default() };
-    let list = Global::new(header + names.len(), |buf| {
+    Global::new(header + names.len(), |buf| {
         let (head, body) = buf.split_at_mut(header);
         head.copy_from_slice(unsafe { std::slice::from_raw_parts((&files as *const DROPFILES).cast::<u8>(), header) });
         body.copy_from_slice(&names);
-    })?;
-    let effect = Global::new(4, |buf| buf.copy_from_slice(&DROPEFFECT_COPY.0.to_le_bytes()))?;
-    let effect_format = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
-    let _clipboard = Clipboard::open(owner)?;
-    unsafe { EmptyClipboard() }.map_err(|e| format!("EmptyClipboard: {e}"))?;
-    list.give_to_clipboard(u32::from(CF_HDROP.0))?;
-    if effect_format != 0 {
-        effect.give_to_clipboard(effect_format)?;
+    })
+}
+
+/// The "Preferred DropEffect" format and a copy in it, so pasting or dropping the files never
+/// moves them away; `None` when the format can't be registered.
+pub(crate) fn copy_effect() -> Result<Option<(u32, Global)>, String> {
+    let format = unsafe { RegisterClipboardFormatW(w!("Preferred DropEffect")) };
+    if format == 0 {
+        return Ok(None);
     }
-    Ok(())
+    Ok(Some((format, Global::new(4, |buf| buf.copy_from_slice(&DROPEFFECT_COPY.0.to_le_bytes()))?)))
 }
 
 /// A packed bottom-up DIB: `header`, then the rows, each pixel through `px`.
@@ -129,11 +144,11 @@ fn dib<H>(header: &H, pixels: &[u32], w: u32, px: impl Fn(u32) -> u32) -> Result
 /// 'sRGB' (LCS_sRGB lives in UI_ColorSystem, not worth a crate feature for one constant).
 const LCS_SRGB: u32 = u32::from_be_bytes(*b"sRGB");
 
-/// A GMEM_MOVEABLE block that's freed unless the clipboard takes ownership of it.
-struct Global(HGLOBAL);
+/// A GMEM_MOVEABLE block that's freed unless something takes ownership of it.
+pub(crate) struct Global(pub(crate) HGLOBAL);
 
 impl Global {
-    fn new(len: usize, fill: impl FnOnce(&mut [u8])) -> Result<Global, String> {
+    pub(crate) fn new(len: usize, fill: impl FnOnce(&mut [u8])) -> Result<Global, String> {
         let mem = Global(unsafe { GlobalAlloc(GMEM_MOVEABLE, len) }.map_err(|e| format!("GlobalAlloc: {e}"))?);
         let ptr = unsafe { GlobalLock(mem.0) }.cast::<u8>();
         if ptr.is_null() {
@@ -147,8 +162,15 @@ impl Global {
 
     fn give_to_clipboard(self, format: u32) -> Result<(), String> {
         unsafe { SetClipboardData(format, Some(HANDLE(self.0.0))) }.map_err(|e| format!("SetClipboardData: {e}"))?;
-        std::mem::forget(self);
+        self.into_raw();
         Ok(())
+    }
+
+    /// The block, no longer freed here: its new owner frees it.
+    pub(crate) fn into_raw(self) -> HGLOBAL {
+        let mem = self.0;
+        std::mem::forget(self);
+        mem
     }
 }
 

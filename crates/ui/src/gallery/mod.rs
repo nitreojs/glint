@@ -23,7 +23,7 @@ use glint_core::history::Local;
 use glint_core::icon::icon_rgba;
 use glint_core::log::log;
 use glint_core::paths::app_dir_for;
-use glint_shell::clipboard;
+use glint_shell::{clipboard, drag};
 use glint_shell::time::local_time;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use serde::{Deserialize, Serialize};
@@ -72,6 +72,8 @@ const UPLOADS_PER_FRAME: usize = 3;
 const KEEP_TEXTURES: usize = 240;
 /// Apps' icons, in pixels.
 const ICON_PX: u32 = 32;
+/// The picture dragged along with a file is at most this big, in pixels.
+const DRAG_IMAGE: f32 = 256.0;
 
 /// What an app's gallery is made of; the captures are both apps' ([`sources`]).
 pub struct Setup {
@@ -165,6 +167,24 @@ pub fn open_file(path: &Path) {
     }
 }
 
+/// The newest `n` recordings in `own`'s library (the other app's too once it has run here), newest
+/// first, each with its length when that's known or quick to read. It reads the folders: call it
+/// off the UI thread.
+pub fn recent_recordings(own: Maker, n: usize) -> Vec<Item> {
+    let mut items: Vec<Item> = list(&sources(own)).into_iter().filter(|i| i.kind == Kind::Recording).take(n).collect();
+    for i in items.iter_mut().filter(|i| i.duration_ms.is_none()) {
+        i.duration_ms = length(&i.path);
+    }
+    items
+}
+
+/// `item`'s gallery thumbnail, from `app`'s cache or made (and cached) now. Blocking, and the
+/// calling thread needs COM.
+pub fn thumbnail(app: &str, item: &Item) -> Option<egui::ColorImage> {
+    let job = Job { id: item.id, key: thumb::key(&item.path, item.size, item.modified), path: item.path.clone(), kind: item.kind };
+    thumbs::one(&thumbs::cache_dir(app), &job).map_err(|e| log(&format!("no thumbnail for {}: {e}", item.path.display()))).ok().map(|(image, _)| image)
+}
+
 /// An app's icon read, by the app's key.
 type Icon = (String, egui::ColorImage);
 
@@ -190,7 +210,10 @@ fn spawn(arg: &str, file: Option<&Path>) -> std::io::Result<()> {
 
 /// Brings `app`'s gallery forward, or starts it (on `select`, when given).
 pub fn open(app: &str, select: Option<&Path>) {
-    if let Some(h) = window::find(&title(app)) {
+    // a test run's gallery is its own, beside the user's
+    if !window::quiet()
+        && let Some(h) = window::find(&title(app))
+    {
         return window::bring_forward(h);
     }
     if let Err(e) = spawn(GALLERY_ARG, select) {
@@ -288,6 +311,16 @@ impl Preview {
 struct Menu {
     id: u64,
     at: Pos2,
+}
+
+/// The left button went down on a tile; moved far enough, it drags the file out.
+#[derive(Clone, Copy)]
+struct Press {
+    id: u64,
+    /// Where it went down, and the tile (or preview) it went down on, on screen.
+    at: Pos2,
+    on: Rect,
+    dragged: bool,
 }
 
 #[derive(Clone)]
@@ -431,6 +464,10 @@ struct Gallery {
     pending: Deletions,
     busy: Vec<Busy>,
     copying: Option<JoinHandle<Result<(), String>>>,
+    press: Option<Press>,
+    /// A press that just became a drag: it starts at the next frame's beginning, once a frame
+    /// without the preview is on screen (the window doesn't paint while it lasts).
+    drag: Option<Press>,
 }
 
 impl Gallery {
@@ -497,6 +534,8 @@ impl Gallery {
             pending: Deletions::default(),
             busy: Vec::new(),
             copying: None,
+            press: None,
+            drag: None,
         })
     }
 
@@ -718,6 +757,68 @@ impl Gallery {
             Ok(()) => self.say("link copied", None, false),
             Err(e) => self.say(&format!("couldn't copy the link: {e}"), None, true),
         }
+    }
+
+    /// Follows a press on a tile (`over`, under the pointer): moved past the system's drag
+    /// distance, it becomes a drag that starts with the next frame. True while it's a drag, so the
+    /// button going up isn't a click.
+    fn track_press(&mut self, ctx: &egui::Context, over: Option<u64>) -> bool {
+        let (pressed, down, at) = ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.interact_pos()));
+        if pressed {
+            let on = |id: u64, at: Pos2| {
+                let preview = self.preview.as_ref().filter(|pv| pv.id == id && pv.rect.contains(at)).map(|pv| pv.rect);
+                preview.or_else(|| self.drawn.get(&id).copied())
+            };
+            self.press = match (over, at) {
+                (Some(id), Some(at)) if self.menu.is_none() => on(id, at).map(|on| Press { id, at, on, dragged: false }),
+                _ => None,
+            };
+        }
+        let Some(press) = &mut self.press else { return false };
+        let dragged = press.dragged;
+        if !down {
+            self.press = None;
+            return dragged;
+        }
+        if let Some(now) = at
+            && !dragged
+        {
+            let moved = (now - press.at) * ctx.pixels_per_point();
+            if drag::started(moved.x, moved.y, drag::threshold()) {
+                press.dragged = true;
+                self.drag = Some(*press);
+                // gone at once, not shrinking back: the window holds still while the drag lasts
+                self.preview = None;
+                self.fading = None;
+                self.hover = None;
+                ctx.request_repaint();
+            }
+        }
+        self.press.is_some_and(|p| p.dragged)
+    }
+
+    /// Drags `press`'s file out of the window (into a chat, a browser, a folder) as a copy, its
+    /// thumbnail under the pointer.
+    fn drag_out(&mut self, ctx: &egui::Context, press: Press) {
+        let Some(item) = self.item(press.id).cloned() else { return };
+        if !ctx.input(|i| i.pointer.primary_down()) {
+            return;
+        }
+        let image = self.drag_image(&item, press, ctx.pixels_per_point());
+        if let Err(e) = drag::files(self.hwnd, std::slice::from_ref(&item.path), image.as_ref()) {
+            log(&format!("gallery: can't drag {} out: {e}", item.path.display()));
+            self.say(&format!("couldn't drag it out: {e}"), None, true);
+        }
+    }
+
+    /// `item`'s thumbnail at about the size its tile is on screen, held where the press was on it.
+    fn drag_image(&self, item: &Item, press: Press, ppp: f32) -> Option<drag::Image> {
+        let size = press.on.size() * ppp;
+        let fit = (size.x.clamp(1.0, DRAG_IMAGE) as u32, size.y.clamp(1.0, DRAG_IMAGE) as u32);
+        let px = thumbs::cached_within(&self.cache, thumb::key(&item.path, item.size, item.modified), fit)?;
+        let along = |at: f32, from: f32, len: f32, px: u32| (((at - from) / len.max(1.0)).clamp(0.0, 1.0) * px as f32) as i32;
+        let hold = (along(press.at.x, press.on.left(), press.on.width(), px.w), along(press.at.y, press.on.top(), press.on.height(), px.h));
+        Some(drag::Image { w: px.w, h: px.h, bgra: px.bgra, hold })
     }
 
     fn is_busy(&self, id: u64) -> bool {
@@ -1077,6 +1178,9 @@ impl eframe::App for Gallery {
         }
         self.focused = focused;
         self.poll(&ctx, frame);
+        if let Some(press) = self.drag.take() {
+            self.drag_out(&ctx, press);
+        }
         if self.menu.is_none() {
             self.keys(&ctx);
         }

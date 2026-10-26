@@ -289,7 +289,9 @@ impl Gallery {
         // the preview sits over the grid: it takes the pointer where it is
         let in_preview = self.preview.as_ref().filter(|pv| pointer.is_some_and(|p| pv.rect.contains(p))).map(|pv| pv.id);
         let over = in_preview.or(hit);
-        if clicked.is_some() {
+        // a press that went on into a drag isn't a click
+        let dragging = self.track_press(&ctx, over);
+        if clicked.is_some() && !dragging {
             let id = in_preview.or(clicked);
             if let Some(id) = id {
                 self.focus = Some(id);

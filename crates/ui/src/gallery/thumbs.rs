@@ -208,10 +208,27 @@ fn fit_into(w: u32, h: u32, size: (u32, u32)) -> (u32, u32) {
     (((w as f64 * scale).round() as u32).max(1), ((h as f64 * scale).round() as u32).max(1))
 }
 
+/// `job`'s thumbnail from the cache in `dir`, made and cached when it isn't there yet, on the
+/// calling thread (which needs COM).
+pub(super) fn one(dir: &Path, job: &Job) -> Result<(ColorImage, Meta), String> {
+    let wic = Wic::new()?;
+    let _ = std::fs::create_dir_all(dir);
+    let (pixels, meta) = cached(&wic, dir, job.key).map(Ok).unwrap_or_else(|| make(&wic, dir, job))?;
+    Ok((pixels.image(), meta))
+}
+
 fn cached(wic: &Wic, dir: &Path, key: u64) -> Option<(Pixels, Meta)> {
     let bytes = std::fs::read(dir.join(thumb::file_name(key))).ok()?;
     let (meta, image) = thumb::unpack(&bytes)?;
     Some((wic.memory(image).ok()?, meta))
+}
+
+/// `key`'s cached thumbnail in `dir` as big as fits in `size`, on the calling thread (which needs
+/// COM); `None` while it isn't made yet.
+pub(super) fn cached_within(dir: &Path, key: u64, size: (u32, u32)) -> Option<Pixels> {
+    let bytes = std::fs::read(dir.join(thumb::file_name(key))).ok()?;
+    let (_, image) = thumb::unpack(&bytes)?;
+    Wic::new().ok()?.memory_fit(image, |w, h| fit_into(w, h, size)).ok()
 }
 
 fn make(wic: &Wic, dir: &Path, job: &Job) -> Result<(Pixels, Meta), String> {

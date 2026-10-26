@@ -13,7 +13,7 @@ pub const WM_NOTE_CAPTURABLE: u32 = WM_APP + 23;
 
 /// Runs `grab` with afterglow's note, if one is up, visible to screen capture.
 pub fn with_note_visible<T>(grab: impl FnOnce() -> T) -> T {
-    let Ok(main) = (unsafe { FindWindowW(&HSTRING::from(MAIN_CLASS), None) }) else {
+    let Ok(main) = (unsafe { FindWindowW(&HSTRING::from(crate::instance::scoped(MAIN_CLASS)), None) }) else {
         return grab();
     };
     let mut up = 0usize;

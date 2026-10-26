@@ -12,8 +12,10 @@ use glint_core::update::notes_url;
 use glint_core::wide::wide;
 use glint_media::record::{self, ClickHighlights, KeyOverlay, Params, Source};
 use glint_shell::identity::{front_window, identify};
+use glint_shell::instance::{self, Again};
 use glint_shell::log::path as log_path;
-use glint_shell::{autostart, file_menu, instance, monitors, start_menu, window};
+use glint_shell::start_menu::{self, Shortcut};
+use glint_shell::{autostart, file_menu, monitors, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -152,17 +154,25 @@ impl App {
         }
     }
 
-    /// Adds or removes "open in glint editor" on videos in Explorer; adding keeps it pointing at
-    /// this exe.
+    /// Adds or removes "open in glint editor" on videos in Explorer's menu and "glint editor"
+    /// under its "open with"; adding keeps them pointing at this exe.
     fn sync_explorer_menu(&mut self) {
-        let exts = ["mp4", "mov", "m4v", "mkv"];
+        if instance::test_run() {
+            return;
+        }
+        let exts = crate::clip::VIDEO_EXTS;
         let on = self.cfg.explorer_menu;
-        if let Err(e) = file_menu::sync("glint.edit", "open in glint editor", &exts, "--clip", on) {
+        let synced = file_menu::sync("glint.edit", "open in glint editor", &exts, crate::clip::CLIP_ARG, on)
+            .and_then(|()| file_menu::open_with("glint editor", &exts, crate::clip::CLIP_ARG, on));
+        if let Err(e) = synced {
             self.notify("glint: explorer menu", &e, true, ClickTarget::None);
         }
     }
 
     fn sync_autostart(&mut self) {
+        if instance::test_run() {
+            return;
+        }
         if let Err(e) = autostart::sync("glint", self.cfg.launch_at_startup) {
             self.notify("glint: launch at startup", &e, true, ClickTarget::None);
         }
@@ -732,6 +742,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             unsafe { PostQuitMessage(0) };
             return LRESULT(0);
         }
+        // glint started again plainly (the Start menu, a shortcut) while it runs
+        m if m != 0 && m == instance::gallery_message() => {
+            // the launch let this process come forward; holding the foreground lets the gallery
+            glint_ui::window::bring_forward(hwnd);
+            crate::gallery::open(None);
+            return LRESULT(0);
+        }
         _ => {}
     }
     if with_app(|a| a.taskbar_created != 0 && msg == a.taskbar_created) == Some(true) {
@@ -748,7 +765,13 @@ pub fn run() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         if !instance::take("glint", updated_from.is_some()) {
-            MessageBoxW(None, w!("glint is already running (see the tray icon)."), w!("glint"), MB_ICONINFORMATION);
+            match instance::again(args.get(1..).unwrap_or_default()) {
+                Again::Gallery if instance::open_gallery(ipc::MAIN_CLASS) => {}
+                Again::Quiet => {}
+                Again::Gallery | Again::Notice => {
+                    MessageBoxW(None, w!("glint is already running (see the tray icon)."), w!("glint"), MB_ICONINFORMATION);
+                }
+            }
             return;
         }
         // a fresh log per run; after an update it goes on from the run that installed it
@@ -806,7 +829,12 @@ pub fn run() {
         if let Some(old) = &updated_from {
             log(&format!("updated from {old} to {}", update::current()));
         }
-        start_menu::sync("glint", "screen recorder and screenshots");
+        if !instance::test_run() {
+            start_menu::sync(&[
+                Shortcut { name: "glint", args: "", description: "screen recorder and screenshots" },
+                Shortcut { name: "glint editor", args: crate::clip::CLIP_ARG, description: "trim and export videos" },
+            ]);
+        }
         match cfg_err {
             Some(e) => app.notify("glint: settings error (using defaults)", &e, true, ClickTarget::None),
             None => {
