@@ -6,11 +6,17 @@
 //! everywhere. Kills, respawns and bounties come from the server's side, so they're only there
 //! when the server is this PC (the hideout, bot matches); an online match logs none, and nothing
 //! there tells which hero is the local player's.
+//!
+//! afterglow's addon (`mods/deadlock`) fills that in: a script in the HUD writes the local
+//! player's kills, deaths and assists, the kill feed and objectives as JSON lines
+//! (`[PanoramaScript] [AFTERGLOW]{"v":1,"event":"kill",…}`, [`Addon`]). Once it's heard from, the
+//! server's kill and respawn lines are left out: the addon reports them too, with whose they are.
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex_lite::{Captures, Regex};
+use serde::Deserialize;
 
 use super::tail::Tail;
 use super::{Event, Game, GameEvent, Kind, Now, Source, Stamp};
@@ -21,6 +27,12 @@ pub const GAME: Game = Game { name: NAME, exe: "deadlock.exe", open };
 
 /// What a line can be past slack in its time stamp: the run is what the game starts with.
 const SLACK_MS: i64 = 2_000;
+
+pub const ADDON_TAG: &str = "[AFTERGLOW]";
+/// [`Addon::v`] this build reads.
+pub const ADDON_VERSION: u32 = 1;
+/// How far the addon's own clock may be from the line's stamp and still be believed (ms).
+const CLIENT_SLACK_MS: i64 = 3_000;
 
 fn open(exe: &Path, started: i64) -> Option<Box<dyn Source>> {
     Some(Box::new(LogSource::new(log_path(exe)?, started)))
@@ -47,6 +59,57 @@ pub enum Line {
     Bot(u32),
     /// Player `id` (on this PC's server) plays `hero`.
     Hero { id: u32, hero: String },
+    Addon(Addon),
+}
+
+/// A line of afterglow's addon. `killer`/`victim` are the names the kill feed shows.
+#[derive(Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct Addon {
+    pub v: u32,
+    /// `hello`, `phase`, `kill`, `death`, `assist`, `respawn`, `feed`, `objective`, `error`.
+    pub event: String,
+    /// When it happened, by the game's clock (unix ms).
+    pub t: Option<i64>,
+    pub killer: Option<String>,
+    pub victim: Option<String>,
+    pub assists: Option<u32>,
+    /// A feed entry the local player is in: `killer` or `victim`.
+    pub me: Option<String>,
+    /// An objective's message, as the HUD words it.
+    pub text: Option<String>,
+    /// An objective the kill feed shows (`bossDied`, `IdolReturned` …).
+    pub what: Option<String>,
+    pub mine: Option<bool>,
+}
+
+impl Addon {
+    /// The addon's line in `text` (after the stamp); `None` for other lines and for lines of a
+    /// newer addon.
+    pub fn parse(text: &str) -> Option<Addon> {
+        let json = &text[text.find(ADDON_TAG)? + ADDON_TAG.len()..];
+        serde_json::from_str::<Addon>(json).ok().filter(|a| a.v == ADDON_VERSION)
+    }
+
+    /// What it says, as an event; `None` for what isn't one (`hello`, the local player's own feed
+    /// entries, which come as `kill` and `death` too).
+    fn event(self) -> Option<Event> {
+        let kind = match self.event.as_str() {
+            "kill" => Kind::Kill,
+            "death" => Kind::Death,
+            "assist" => Kind::Assist,
+            "respawn" => Kind::Respawn,
+            "feed" if self.me.is_none() => Kind::Kill,
+            "objective" => Kind::Objective(self.text.clone().or_else(|| self.victim.clone()).or(self.what)?),
+            _ => return None,
+        };
+        let mine = match kind {
+            Kind::Objective(_) => self.mine,
+            Kind::Kill if self.event == "feed" => Some(false),
+            _ => Some(true),
+        };
+        Some(Event { killer: self.killer, victim: self.victim, assists: self.assists, mine, ..Event::new(NAME, kind) })
+    }
 }
 
 type Build = fn(&Captures) -> Option<Line>;
@@ -73,8 +136,10 @@ static TABLE: LazyLock<Vec<(&str, Regex, Build)>> =
 
 /// What the text of a line (after its time stamp) says; `None` for the rest.
 pub fn parse(text: &str) -> Option<Line> {
-    let (_, re, build) = TABLE.iter().find(|(start, ..)| text.starts_with(start))?;
-    build(&re.captures(text)?)
+    match TABLE.iter().find(|(start, ..)| text.starts_with(start)) {
+        Some((_, re, build)) => build(&re.captures(text)?),
+        None => Addon::parse(text).map(Line::Addon),
+    }
 }
 
 /// The time stamp in front of a line (`10/26 18:55:31 `) and the text after it; `None` for a line
@@ -94,7 +159,7 @@ pub fn split(line: &str) -> Option<(Stamp, &str)> {
 }
 
 /// Turns lines into events, remembering what earlier lines told: the bots, the local player's
-/// hero, the phase, the bounty of the coming kill.
+/// hero, the phase, the bounty of the coming kill, whether the addon runs.
 #[derive(Debug, Default)]
 pub struct Session {
     bots: Vec<u32>,
@@ -103,6 +168,8 @@ pub struct Session {
     /// The server's phases are logged: the client's echoes of them come late and are skipped.
     server: bool,
     bounty: Option<(Stamp, u32)>,
+    /// The addon was heard from in this run of the game.
+    addon: bool,
 }
 
 impl Session {
@@ -111,26 +178,36 @@ impl Session {
         self.me.as_deref()
     }
 
-    pub fn feed(&mut self, stamp: Stamp, text: &str) -> Option<Event> {
-        match parse(text)? {
+    pub fn addon(&self) -> bool {
+        self.addon
+    }
+
+    /// The event in a line stamped `stamp` that arrived at `at` (unix ms, [`Now::place`]).
+    pub fn feed(&mut self, stamp: Stamp, at: i64, text: &str) -> Option<GameEvent> {
+        let event = match parse(text)? {
+            Line::Addon(addon) => {
+                self.addon = true;
+                let at = addon.t.filter(|t| (t - at).abs() <= CLIENT_SLACK_MS).unwrap_or(at);
+                return addon.event().map(|event| GameEvent { at, event });
+            }
             Line::Map(_) => {
-                *self = Session::default();
-                None
+                *self = Session { addon: self.addon, ..Session::default() };
+                return None;
             }
             Line::Bot(id) => {
                 self.bots.push(id);
-                None
+                return None;
             }
             // on this PC's server every player who isn't a bot is the local one
             Line::Hero { id, hero } => {
                 if !self.bots.contains(&id) {
                     self.me = Some(hero);
                 }
-                None
+                return None;
             }
             Line::Bounty(b) => {
                 self.bounty = Some((stamp, b));
-                None
+                return None;
             }
             Line::Phase { name, server } => {
                 self.server |= server;
@@ -138,11 +215,12 @@ impl Session {
                     return None;
                 }
                 self.phase = Some(name.clone());
-                Some(Event::new(NAME, Kind::Phase(name)))
+                Event::new(NAME, Kind::Phase(name))
             }
+            Line::Respawn(_) | Line::Kill { .. } if self.addon => return None,
             Line::Respawn(hero) => {
                 let mine = self.me.as_ref().map(|m| *m == hero);
-                Some(Event { hero: Some(hero), mine, ..Event::new(NAME, Kind::Respawn) })
+                Event { hero: Some(hero), mine, ..Event::new(NAME, Kind::Respawn) }
             }
             Line::Kill { killer, victim, assists } => {
                 let bounty = self.bounty.take().filter(|(s, _)| *s == stamp).map(|(_, b)| b);
@@ -151,9 +229,10 @@ impl Session {
                     Some(me) => (Kind::Kill, Some(killer == me)),
                     None => (Kind::Kill, None),
                 };
-                Some(Event { killer: Some(killer), victim: Some(victim), assists: Some(assists), bounty, mine, ..Event::new(NAME, kind) })
+                Event { killer: Some(killer), victim: Some(victim), assists: Some(assists), bounty, mine, ..Event::new(NAME, kind) }
             }
-        }
+        };
+        Some(GameEvent { at, event })
     }
 }
 
@@ -184,9 +263,7 @@ impl Source for LogSource {
             if at < self.since {
                 continue;
             }
-            if let Some(event) = self.session.feed(stamp, text) {
-                out.push(GameEvent { at, event });
-            }
+            out.extend(self.session.feed(stamp, at, text));
         }
         Ok(())
     }
@@ -233,7 +310,7 @@ mod tests {
     fn the_session_knows_whose_kill_it_is() {
         let mut s = Session::default();
         let t = stamp(18, 55, 31);
-        let feed = |s: &mut Session, text: &str| s.feed(t, text);
+        let feed = |s: &mut Session, text: &str| s.feed(t, 0, text).map(|e| e.event);
         let unknown = feed(&mut s, "Killer: hero_hornet, Dying: hero_atlas, Number of Assisters: 0").unwrap();
         assert_eq!((unknown.kind, unknown.mine), (Kind::Kill, None), "nobody known yet");
         assert_eq!(feed(&mut s, "Created bot 497/hero_gigawatt/hero_gigawatt at location 1 2 3"), None);
@@ -249,7 +326,7 @@ mod tests {
         assert_eq!((death.kind, death.mine, death.bounty), (Kind::Death, Some(true), None), "the bounty went with the kill before");
         let theirs = feed(&mut s, "Killer: hero_atlas, Dying: hero_inferno, Number of Assisters: 0").unwrap();
         assert_eq!((theirs.kind, theirs.mine), (Kind::Kill, Some(false)));
-        s.feed(stamp(18, 55, 20), "GameTime: 1.6, Base Bounty: 1, Total Bounty: 2, VictimValue: 3");
+        s.feed(stamp(18, 55, 20), 0, "GameTime: 1.6, Base Bounty: 1, Total Bounty: 2, VictimValue: 3");
         assert_eq!(feed(&mut s, "Killer: hero_atlas, Dying: hero_inferno, Number of Assisters: 0").unwrap().bounty, None, "a stale bounty");
 
         assert_eq!(feed(&mut s, "ChangeGameState: GameInProgress (7)").map(|e| e.kind), Some(Kind::Phase("GameInProgress".into())));
@@ -261,6 +338,53 @@ mod tests {
         let phases: Vec<_> = client.iter().filter_map(|l| feed(&mut s, l)).map(|e| e.kind).collect();
         let names = ["HeroSelection", "GameInProgress", "HeroSelection"].map(|n| Kind::Phase(n.into()));
         assert_eq!(phases, names, "with the server elsewhere, the client's phases are all there is");
+    }
+
+    #[test]
+    fn the_addons_lines_say_whose_events_they_are() {
+        let mut s = Session::default();
+        let at = 1_761_494_405_250;
+        let feed = |s: &mut Session, json: &str| s.feed(stamp(19, 0, 5), at, &format!("[PanoramaScript] [AFTERGLOW]{json}"));
+        let event = |s: &mut Session, json: &str| feed(s, json).map(|e| e.event);
+
+        assert_eq!(feed(&mut s, r#"{"v":2,"event":"hello","t":1761494405000}"#), None, "a newer addon's lines are left alone");
+        assert!(!s.addon());
+        assert_eq!(feed(&mut s, r#"{"v":1,"event":"hello","version":"1.0.0","t":1761494405000}"#), None);
+        assert!(s.addon());
+
+        let kill = feed(&mut s, r#"{"v":1,"event":"kill","kills":1,"src":"kda","t":1761494404100,"clock":"3:07","victim":"Bob"}"#).unwrap();
+        assert_eq!(kill.at, 1_761_494_404_100, "the game's own clock is finer than the stamp");
+        assert_eq!((kill.event.kind, kill.event.mine, kill.event.victim.as_deref()), (Kind::Kill, Some(true), Some("Bob")));
+        let skewed = feed(&mut s, r#"{"v":1,"event":"kill","kills":2,"t":1761490000000}"#).unwrap();
+        assert_eq!((skewed.at, skewed.event.victim), (at, None), "a clock far off the stamp isn't believed");
+
+        let death = event(&mut s, r#"{"v":1,"event":"death","deaths":1,"src":"dead","killer":"Bob","t":1761494405000}"#).unwrap();
+        assert_eq!((death.kind, death.mine, death.killer.as_deref()), (Kind::Death, Some(true), Some("Bob")));
+        let assist = event(&mut s, r#"{"v":1,"event":"assist","assists":1,"victim":"Dan","t":1761494405000}"#).unwrap();
+        assert_eq!((assist.kind, assist.mine, assist.victim.as_deref()), (Kind::Assist, Some(true), Some("Dan")));
+        assert_eq!(event(&mut s, r#"{"v":1,"event":"respawn","t":1761494405000}"#).map(|e| (e.kind, e.mine)), Some((Kind::Respawn, Some(true))));
+
+        let theirs = event(&mut s, r#"{"v":1,"event":"feed","killer":"Carl","victim":"Dan","assists":1,"tags":["enemyDied","hasAssists"],"t":1761494405000}"#).unwrap();
+        assert_eq!((theirs.kind, theirs.mine, theirs.killer.as_deref(), theirs.assists), (Kind::Kill, Some(false), Some("Carl"), Some(1)));
+        let own = r#"{"v":1,"event":"feed","killer":"alexx","victim":"Bob","assists":0,"me":"killer","tags":["enemyDied"],"t":1761494405000}"#;
+        assert_eq!(event(&mut s, own), None, "the local player's own entries come as kill and death");
+
+        let message = event(&mut s, r#"{"v":1,"event":"objective","text":"Your team destroyed the Guardian","good":true,"t":1761494405000}"#).unwrap();
+        assert_eq!(message.kind, Kind::Objective("Your team destroyed the Guardian".into()));
+        let boss = event(&mut s, r#"{"v":1,"event":"objective","what":"bossDied","killer":"alexx","victim":"Guardian","mine":true,"t":1761494405000}"#).unwrap();
+        assert_eq!((boss.kind, boss.mine), (Kind::Objective("Guardian".into()), Some(true)));
+        assert_eq!(event(&mut s, r#"{"v":1,"event":"objective","t":1761494405000}"#), None, "an objective without words");
+
+        for quiet in [r#"{"v":1,"event":"phase","phase":"game","hero":"Infernus"}"#, r#"{"v":1,"event":"error","msg":"x"}"#, r#"{"v":1,"event":"kill""#] {
+            assert_eq!(feed(&mut s, quiet), None, "{quiet}");
+        }
+
+        let log = |s: &mut Session, text: &str| s.feed(stamp(19, 0, 5), at, text).map(|e| e.event.kind);
+        assert_eq!(log(&mut s, "Killer: hero_hornet, Dying: hero_atlas, Number of Assisters: 0"), None, "the addon tells the kills");
+        assert_eq!(log(&mut s, "hero_atlas respawned"), None);
+        assert_eq!(log(&mut s, "Loading map \"street_test\""), None);
+        assert!(s.addon(), "the addon is there for the whole run");
+        assert_eq!(log(&mut s, "ChangeGameState: GameInProgress (7)"), Some(Kind::Phase("GameInProgress".into())), "the phases still come from the log");
     }
 
     #[test]

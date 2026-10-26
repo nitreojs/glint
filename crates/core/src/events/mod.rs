@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::record::mp4;
 
+pub mod addon;
 pub mod deadlock;
+pub mod steam;
 pub mod tail;
 
 /// moov/udta box holding a clip's game events as JSON ([`Payload`]).
