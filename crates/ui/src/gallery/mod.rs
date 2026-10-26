@@ -194,7 +194,8 @@ fn today() -> Date {
     local_time(now).map(Date::of).unwrap_or(Date { year: 1970, month: 1, day: 1 })
 }
 
-fn title(app: &str) -> String {
+/// The gallery window's title.
+pub fn title(app: &str) -> String {
     format!("{app} gallery")
 }
 

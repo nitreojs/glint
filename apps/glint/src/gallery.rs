@@ -14,7 +14,7 @@ use windows::Win32::Foundation::HWND;
 
 use crate::app::ipc::SETTINGS_TITLE;
 
-const APP: &str = "glint";
+pub(crate) const APP: &str = "glint";
 const UPLOAD: u32 = 1;
 const PLAYER: u32 = 2;
 

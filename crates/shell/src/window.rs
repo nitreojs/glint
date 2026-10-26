@@ -68,3 +68,8 @@ pub fn post(class: &str, msg: u32, wparam: usize) -> bool {
         }
     }
 }
+
+/// The top-level window titled `title`, if one is open.
+pub fn find(title: &str) -> Option<HWND> {
+    unsafe { FindWindowW(None, &HSTRING::from(title)).ok() }
+}

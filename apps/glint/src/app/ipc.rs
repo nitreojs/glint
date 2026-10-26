@@ -7,6 +7,8 @@ use windows::core::HSTRING;
 /// Window class of the tray app's hidden main window.
 pub(crate) const MAIN_CLASS: &str = "glint_main";
 pub(crate) const SETTINGS_TITLE: &str = "glint settings";
+/// Starts this exe as the settings window.
+pub const SETTINGS_ARG: &str = "--settings";
 
 /// Settings were saved: re-read config.toml.
 pub(crate) const WM_RELOAD: u32 = WM_APP + 20;

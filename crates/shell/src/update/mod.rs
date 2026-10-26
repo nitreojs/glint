@@ -23,11 +23,13 @@ use crate::time::date_time;
 
 mod agent;
 mod apply;
+mod reopen;
 #[cfg(test)]
 mod tests;
 mod verify;
 
 pub use agent::{CHECK_TIMER_ID, Click, FIRST_CHECK_MS, Host, IDLE_TIMER_ID, Updates};
+pub use reopen::{OwnWindow, REOPEN_ARG, reopen};
 
 /// The public half of the release signing key (minisign, ed25519, key id 7EC36F307DC07BB7); the
 /// release workflows of every app sign with it.

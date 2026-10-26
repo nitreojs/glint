@@ -3,7 +3,7 @@
 use glint_core::config::UpdateMode;
 use glint_core::update::GLINT;
 use glint_core::upload::proxy::{self, Setting};
-use glint_shell::update::{Build, Click, Host, Updates};
+use glint_shell::update::{Build, Click, Host, OwnWindow, Updates};
 use windows::Win32::Foundation::HWND;
 
 use super::{App, ClickTarget, State};
@@ -49,5 +49,12 @@ impl Host for App {
     fn exit_for_update(&mut self) {
         self.exiting = true;
         self.close_window();
+    }
+
+    fn own_windows(&self) -> Vec<OwnWindow> {
+        vec![
+            OwnWindow { title: super::ipc::SETTINGS_TITLE.into(), arg: super::ipc::SETTINGS_ARG },
+            OwnWindow { title: glint_ui::gallery::title(crate::gallery::APP), arg: glint_ui::gallery::GALLERY_ARG },
+        ]
     }
 }

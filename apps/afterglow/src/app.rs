@@ -28,7 +28,7 @@ use glint_shell::menu::{Glyph, Header, Item, Menu};
 use glint_shell::time::date_time;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use glint_shell::start_menu::{self, Shortcut};
-use glint_shell::update::{self, Build, Checked, Click, Host, Updates};
+use glint_shell::update::{self, Build, Checked, Click, Host, OwnWindow, Updates};
 use glint_shell::{autostart, explorer, hotkey, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
@@ -542,6 +542,13 @@ impl Host for App {
             let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
     }
+
+    fn own_windows(&self) -> Vec<OwnWindow> {
+        vec![
+            OwnWindow { title: crate::settings::TITLE.into(), arg: SETTINGS_ARG },
+            OwnWindow { title: glint_ui::gallery::title(crate::config::APP), arg: glint_ui::gallery::GALLERY_ARG },
+        ]
+    }
 }
 
 /// The tray menu, run outside the app's borrow: the menu's own message loop dispatches timers,
@@ -850,6 +857,8 @@ pub fn run() {
         SetTimer(Some(hwnd), TIP_TIMER, 1000, None);
     }
     app.schedule_update_check(update::FIRST_CHECK_MS);
+    let own = app.own_windows();
     APP_STATE.with(|a| *a.borrow_mut() = Some(app));
+    update::reopen(&args, &own);
     window::run();
 }

@@ -38,6 +38,7 @@ mod menu;
 pub(crate) mod tray;
 pub(crate) mod updates;
 
+pub use ipc::SETTINGS_ARG;
 use hotkeys::{ESC_HOTKEY_ID, FULL_HOTKEY_ID, HOTKEY_ID, MONITOR_HOTKEY_ID, PAUSE_HOTKEY_ID, SHOT_HOTKEY_ID};
 use menu::show_menu;
 use tray::{IDLE_TIP, Tray};
@@ -625,7 +626,7 @@ fn open_settings() {
         }
         return;
     }
-    let spawned = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg("--settings").spawn());
+    let spawned = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).arg(ipc::SETTINGS_ARG).spawn());
     if let Err(e) = spawned {
         with_app(|a| a.notify("glint: can't open settings", &e.to_string(), true, ClickTarget::None));
     }
@@ -863,7 +864,9 @@ pub fn run() {
             "started, hotkeys record {:?}, screenshot {:?}, all screens {:?}, monitor {:?}",
             app.hotkey, app.shot_hotkey, app.full_hotkey, app.monitor_hotkey
         ));
+        let own = app.own_windows();
         APP.with(|a| *a.borrow_mut() = Some(app));
+        update::reopen(&args, &own);
 
         window::run();
     }

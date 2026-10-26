@@ -12,12 +12,14 @@ use windows::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGet
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, FindWindowW, GWLP_WNDPROC, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT,
+    CallWindowProcW, GWLP_WNDPROC, GetWindowRect, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT,
     HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsIconic, IsZoomed, SW_RESTORE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WM_NCCALCSIZE,
     WM_NCHITTEST, WM_PAINT, WNDPROC,
 };
-use windows::core::{HSTRING, w};
+use windows::core::w;
+
+pub use glint_shell::window::find;
 
 mod shadow;
 mod shot;
@@ -221,11 +223,6 @@ pub fn bring_forward(hwnd: HWND) {
 /// to the front, so tests never steal it from the user.
 pub fn quiet() -> bool {
     std::env::var_os("GLINT_QUIET").is_some_and(|v| v == "1")
-}
-
-/// The top-level window titled `title`, if one is open.
-pub fn find(title: &str) -> Option<HWND> {
-    unsafe { FindWindowW(None, &HSTRING::from(title)).ok() }
 }
 
 #[cfg(test)]

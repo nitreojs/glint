@@ -57,13 +57,13 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
-fn pid_of(hwnd: HWND) -> Option<u32> {
+pub(crate) fn pid_of(hwnd: HWND) -> Option<u32> {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
     (pid != 0).then_some(pid)
 }
 
-fn image_path(pid: u32) -> Option<String> {
+pub(crate) fn image_path(pid: u32) -> Option<String> {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
         let mut buf = [0u16; 1024];

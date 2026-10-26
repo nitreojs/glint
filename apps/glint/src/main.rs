@@ -6,7 +6,7 @@ fn main() {
         glint::settings::capture_keys();
         return;
     }
-    if std::env::args().any(|a| a == "--settings") {
+    if std::env::args().any(|a| a == glint::app::SETTINGS_ARG) {
         glint::settings::run();
         return;
     }

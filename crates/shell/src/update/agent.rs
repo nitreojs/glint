@@ -11,6 +11,7 @@ use glint_core::upload::proxy::Setting;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
+use super::reopen::{self, OwnWindow};
 use super::{Build, CHECK_BETA, CHECK_DOWNLOAD, Checked, Found, Job, Staged, UPDATED_ARG};
 
 /// Timer ids on the tray app's window; the apps keep theirs below these.
@@ -71,6 +72,11 @@ pub trait Host {
     fn mark_update_ready(&mut self, ready: bool);
     /// The update was swapped in and started: quit now.
     fn exit_for_update(&mut self);
+    /// The app's windows that run as processes of their own (settings, the gallery): a restart
+    /// into an update closes them, and the new version opens them again.
+    fn own_windows(&self) -> Vec<OwnWindow> {
+        Vec::new()
+    }
 
     fn schedule_update_check(&self, ms: u32) {
         unsafe {
@@ -228,9 +234,14 @@ pub trait Host {
         let build = u.build;
         let Some(staged) = u.ready.take() else { return };
         self.mark_update_ready(false);
-        let args = [UPDATED_ARG.to_string(), build.current().to_string()];
+        let open = reopen::open_ones(&self.own_windows());
+        let mut args = vec![UPDATED_ARG.to_string(), build.current().to_string()];
+        args.extend(reopen::args(&open));
         match build.install(&staged, &args) {
-            Ok(()) => self.exit_for_update(),
+            Ok(()) => {
+                reopen::close(&open);
+                self.exit_for_update()
+            }
             Err(e) => {
                 log(&format!("update to {} failed: {e}", staged.tag));
                 build.set_status(State::Failed { error: e.clone() });
