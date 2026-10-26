@@ -31,7 +31,7 @@ pub(crate) fn route(
     }
 }
 
-pub(crate) fn describe_system() -> String {
+pub fn describe_system() -> String {
     let ie = Ie::current();
     let mut parts = Vec::new();
     if let Some(pac) = &ie.pac {

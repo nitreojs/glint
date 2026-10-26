@@ -7,10 +7,8 @@ use glint_core::log::log;
 use glint_core::upload::custom::Uploaded;
 use glint_core::upload::{Destination, Payload};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use glint_shell::net::http;
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
-
-pub(crate) mod http;
-pub(crate) mod proxy;
 
 pub(crate) const WM_UPLOADED: u32 = WM_APP + 50;
 pub(crate) const WM_UPLOAD_PROGRESS: u32 = WM_APP + 51;

@@ -1,3 +1,4 @@
+use glint_core::update::Product;
 use glint_core::update::verify as checks;
 use glint_core::update::version::Version;
 use windows::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
@@ -9,20 +10,34 @@ pub(crate) fn sha256(data: &[u8]) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
-pub(crate) fn verify(exe: &[u8], sums: &str, sig: &str, key: &str, tag: &str, current: &Version) -> Result<(), String> {
-    checks::verify(exe, sums, sig, key, tag, current, sha256)
+pub(crate) fn verify(
+    app: &Product,
+    exe: &[u8],
+    sums: &str,
+    sig: &str,
+    key: &str,
+    tag: &str,
+    current: &Version,
+) -> Result<(), String> {
+    checks::verify(app, exe, sums, sig, key, tag, current, sha256)
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
-    use glint_core::update::verify::{hex, sums_entry, trusted_comment};
+    use glint_core::update::verify::{hex, sums_entry};
+    use glint_core::update::{AFTERGLOW, GLINT};
 
     /// A throwaway minisign key that signed the fixtures; never used for releases.
     const TEST_KEY: &str = "RWQr5QlLKaagCabzmy83MJZXq1/hidI5B+tyy/ykArTUeaZMkmNETif5";
     const EXE: &[u8] = include_bytes!("fixtures/fixture.bin");
     const SIG: &str = include_str!("fixtures/fixture.bin.minisig");
     const SUMS: &str = include_str!("fixtures/SHA256SUMS");
+    /// Another throwaway key, which signed the afterglow fixtures.
+    pub(in crate::update) const AFTERGLOW_TEST_KEY: &str = "RWSfenV/kCdLJyD7I8uY3VSPiuBTh8sXW3QnEl4G+9FXcHrcnC6Hhu96";
+    pub(in crate::update) const AFTERGLOW_EXE: &[u8] = include_bytes!("fixtures/afterglow.bin");
+    pub(in crate::update) const AFTERGLOW_SIG: &str = include_str!("fixtures/afterglow.bin.minisig");
+    pub(in crate::update) const AFTERGLOW_SUMS: &str = include_str!("fixtures/afterglow-SHA256SUMS");
 
     fn v(s: &str) -> Version {
         Version::parse(s).unwrap()
@@ -49,9 +64,9 @@ mod tests {
 
     #[test]
     fn signed_fixture_verifies() {
-        assert_eq!(trusted_comment("v0.2.0"), "glint v0.2.0 glint-v0.2.0-windows-x64.exe");
-        assert_eq!(verify(EXE, SUMS, SIG, TEST_KEY, "v0.2.0", &v("0.1.0")), Ok(()));
-        assert_eq!(verify(EXE, SUMS, SIG, TEST_KEY, "v0.2.0", &v("0.2.0-beta.4")), Ok(()));
+        assert_eq!(GLINT.trusted_comment("v0.2.0"), "glint v0.2.0 glint-v0.2.0-windows-x64.exe");
+        assert_eq!(verify(&GLINT, EXE, SUMS, SIG, TEST_KEY, "v0.2.0", &v("0.1.0")), Ok(()));
+        assert_eq!(verify(&GLINT, EXE, SUMS, SIG, TEST_KEY, "v0.2.0", &v("0.2.0-beta.4")), Ok(()));
     }
 
     #[test]
@@ -59,15 +74,15 @@ mod tests {
         let current = v("0.1.0");
         let mut damaged = EXE.to_vec();
         damaged[40] ^= 1;
-        assert!(verify(&damaged, SUMS, SIG, TEST_KEY, "v0.2.0", &current).unwrap_err().contains("is damaged"));
+        assert!(verify(&GLINT, &damaged, SUMS, SIG, TEST_KEY, "v0.2.0", &current).unwrap_err().contains("is damaged"));
         // a matching checksum doesn't help without the signature
         let resummed = format!("{}  glint-v0.2.0-windows-x64.exe\n", hex(&sha256(&damaged).unwrap()));
-        let err = verify(&damaged, &resummed, SIG, TEST_KEY, "v0.2.0", &current).unwrap_err();
+        let err = verify(&GLINT, &damaged, &resummed, SIG, TEST_KEY, "v0.2.0", &current).unwrap_err();
         assert!(err.contains("isn't signed by glint's release key"), "{err}");
         let other = include_str!("fixtures/other-key.minisig");
-        assert!(verify(EXE, SUMS, other, TEST_KEY, "v0.2.0", &current).unwrap_err().contains("isn't signed"));
-        assert!(verify(EXE, SUMS, "nope", TEST_KEY, "v0.2.0", &current).unwrap_err().contains("can't be read"));
-        let err = verify(EXE, "", SIG, TEST_KEY, "v0.2.0", &current).unwrap_err();
+        assert!(verify(&GLINT, EXE, SUMS, other, TEST_KEY, "v0.2.0", &current).unwrap_err().contains("isn't signed"));
+        assert!(verify(&GLINT, EXE, SUMS, "nope", TEST_KEY, "v0.2.0", &current).unwrap_err().contains("can't be read"));
+        let err = verify(&GLINT, EXE, "", SIG, TEST_KEY, "v0.2.0", &current).unwrap_err();
         assert_eq!(err, "SHA256SUMS has no entry for glint-v0.2.0-windows-x64.exe");
     }
 
@@ -75,22 +90,40 @@ mod tests {
     fn the_trusted_comment_must_name_this_release() {
         let current = v("0.1.0");
         let name = include_str!("fixtures/wrong-name.minisig");
-        let err = verify(EXE, SUMS, name, TEST_KEY, "v0.2.0", &current).unwrap_err();
+        let err = verify(&GLINT, EXE, SUMS, name, TEST_KEY, "v0.2.0", &current).unwrap_err();
         assert_eq!(err, "glint-v0.2.0-windows-x64.exe was signed as \"glint v0.2.0 glint-v0.2.0-windows-arm64.exe\", not as v0.2.0");
         let version = include_str!("fixtures/wrong-version.minisig");
-        let err = verify(EXE, SUMS, version, TEST_KEY, "v0.2.0", &current).unwrap_err();
+        let err = verify(&GLINT, EXE, SUMS, version, TEST_KEY, "v0.2.0", &current).unwrap_err();
         assert!(err.contains("signed as \"glint v0.1.0 glint-v0.2.0-windows-x64.exe\""), "{err}");
     }
 
     #[test]
     fn downgrades_are_refused() {
         for current in ["0.2.0", "0.2.1", "1.0.0"] {
-            let err = verify(EXE, SUMS, SIG, TEST_KEY, "v0.2.0", &v(current)).unwrap_err();
+            let err = verify(&GLINT, EXE, SUMS, SIG, TEST_KEY, "v0.2.0", &v(current)).unwrap_err();
             assert_eq!(err, format!("refusing v0.2.0: it isn't newer than the running {current}"));
         }
         // an older build, even a genuinely signed one, can't pass as a newer tag
         let renamed = SUMS.replace("v0.2.0", "v0.3.0");
-        let err = verify(EXE, &renamed, SIG, TEST_KEY, "v0.3.0", &v("0.2.0")).unwrap_err();
+        let err = verify(&GLINT, EXE, &renamed, SIG, TEST_KEY, "v0.3.0", &v("0.2.0")).unwrap_err();
         assert!(err.contains("not as v0.3.0"), "{err}");
+    }
+
+    #[test]
+    fn afterglow_releases_verify_as_afterglow_only() {
+        let (exe, sums, sig, key) = (AFTERGLOW_EXE, AFTERGLOW_SUMS, AFTERGLOW_SIG, AFTERGLOW_TEST_KEY);
+        assert_eq!(verify(&AFTERGLOW, exe, sums, sig, key, "afterglow-v0.2.0", &v("0.1.0")), Ok(()));
+        let err = verify(&AFTERGLOW, exe, sums, sig, key, "afterglow-v0.2.0", &v("0.2.0")).unwrap_err();
+        assert_eq!(err, "refusing afterglow-v0.2.0: it isn't newer than the running 0.2.0");
+        // glint's tag for the same version names another file and another comment
+        let err = verify(&GLINT, exe, sums, sig, key, "v0.2.0", &v("0.1.0")).unwrap_err();
+        assert_eq!(err, "SHA256SUMS has no entry for glint-v0.2.0-windows-x64.exe");
+        let err = verify(&AFTERGLOW, exe, sums, sig, key, "v0.2.0", &v("0.1.0")).unwrap_err();
+        assert_eq!(err, "v0.2.0 isn't a release of afterglow");
+        // signed by the workflow before it named the app in front of the tag
+        let old = include_str!("fixtures/afterglow-old-comment.minisig");
+        let err = verify(&AFTERGLOW, exe, sums, old, key, "afterglow-v0.2.0", &v("0.1.0")).unwrap_err();
+        assert!(err.contains("was signed as \"afterglow-v0.2.0 afterglow-v0.2.0-windows-x64.exe\""), "{err}");
+        assert!(verify(&AFTERGLOW, exe, sums, sig, TEST_KEY, "afterglow-v0.2.0", &v("0.1.0")).unwrap_err().contains("isn't signed"));
     }
 }

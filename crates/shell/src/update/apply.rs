@@ -1,8 +1,8 @@
 //! Replacing the running exe. Windows lets a running exe be renamed but not deleted or
 //! overwritten, so the running image moves aside to `glint.exe.old` (still mapped by every
-//! process started from it: the tray app, and any settings or trimmer windows, which keep
-//! running), the new exe takes the original path and is started. The Run entry for launch at
-//! startup names that path, so it keeps working.
+//! process started from it: the tray app, and any settings, gallery or trimmer windows, which
+//! keep running), the new exe takes the original path and is started. The Run entry for launch
+//! at startup names that path, so it keeps working.
 
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -59,7 +59,7 @@ fn exec(step: &Step) -> Result<(), String> {
     }
 }
 
-fn move_file(from: &Path, to: &Path) -> Result<(), String> {
+pub(super) fn move_file(from: &Path, to: &Path) -> Result<(), String> {
     let failed = |e: std::io::Error| format!("can't move {} to {}: {e}", from.display(), to.display());
     match std::fs::rename(from, to) {
         Ok(()) => Ok(()),
@@ -81,11 +81,12 @@ fn asides(exe: &Path) -> impl Iterator<Item = PathBuf> + '_ {
     })
 }
 
-/// Swaps `new` in for the running `exe` and starts it; on failure everything is put back.
-pub(crate) fn swap(exe: &Path, new: &Path, args: &[String]) -> Result<(), String> {
+/// Swaps `new` in for the running `exe` of app `name` and starts it; on failure everything is
+/// put back.
+pub(crate) fn swap(name: &str, exe: &Path, new: &Path, args: &[String]) -> Result<(), String> {
     let aside = asides(exe)
         .find(|p| !p.exists() || std::fs::remove_file(p).is_ok())
-        .ok_or_else(|| format!("old copies of {} are still in use; close glint's windows and try again", exe.display()))?;
+        .ok_or_else(|| format!("old copies of {} are still in use; close {name}'s windows and try again", exe.display()))?;
     run(&plan(exe, &aside, new, args), &mut exec)
 }
 

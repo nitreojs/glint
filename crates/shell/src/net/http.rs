@@ -81,7 +81,7 @@ fn reason(code: u32, host: &str, route: &Route, proxy_up: bool) -> Option<String
 const CHUNK: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 8 * 1024 * 1024;
 
-pub(crate) fn send(req: &Request, proxy: &Setting, progress: &mut dyn FnMut(u64, u64)) -> Result<Response, String> {
+pub fn send(req: &Request, proxy: &Setting, progress: &mut dyn FnMut(u64, u64)) -> Result<Response, String> {
     let mut body = Vec::new();
     let mut response = exchange(req, proxy, progress, &mut |data| {
         body.extend_from_slice(data);
@@ -91,9 +91,16 @@ pub(crate) fn send(req: &Request, proxy: &Setting, progress: &mut dyn FnMut(u64,
     Ok(response)
 }
 
-/// Streams the response body into `path`, refusing more than `max` bytes; the returned
-/// response has no text. The file is removed unless the server answered 2xx.
-pub(crate) fn download(req: &Request, proxy: &Setting, path: &Path, max: u64) -> Result<Response, String> {
+/// Streams the response body into `path`, refusing more than `max` bytes; `progress` hears the
+/// bytes received so far. The returned response has no text. The file is removed unless the
+/// server answered 2xx.
+pub fn download(
+    req: &Request,
+    proxy: &Setting,
+    path: &Path,
+    max: u64,
+    progress: &mut dyn FnMut(u64),
+) -> Result<Response, String> {
     let shown = path.display();
     let mut file = std::fs::File::create(path).map_err(|e| format!("{shown}: {e}"))?;
     let mut written = 0u64;
@@ -103,6 +110,7 @@ pub(crate) fn download(req: &Request, proxy: &Setting, path: &Path, max: u64) ->
             return Err(format!("{} is bigger than the {max} bytes expected", req.url));
         }
         file.write_all(data).map_err(|e| format!("{shown}: {e}"))?;
+        progress(written);
         Ok(true)
     });
     let flushed = file.sync_all().map_err(|e| format!("{shown}: {e}"));
