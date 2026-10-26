@@ -63,6 +63,13 @@ pub fn frameless(hwnd: HWND, resizable: bool) {
     }
 }
 
+/// Call from `eframe::App::on_exit`: the window is going, and so is the shadow drawn around it.
+pub fn closing() {
+    if !*WINDOWS_11 {
+        shadow::end();
+    }
+}
+
 /// The radius of the window's own corners, to paint whatever reaches them with: 0 while it's
 /// square or maximized. On Windows 10 anything square there shows past the corners.
 pub fn radius(ctx: &Context) -> u8 {

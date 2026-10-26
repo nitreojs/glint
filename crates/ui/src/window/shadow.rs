@@ -233,13 +233,18 @@ pub(super) fn message(msg: u32, wp: WPARAM, lp: LPARAM) {
                 s.sync(false);
             }
         }),
-        WM_DESTROY => {
-            let gone = SHADOW.with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()));
-            for strip in gone.map(|s| s.strips).into_iter().flatten() {
-                let _ = unsafe { DestroyWindow(strip.hwnd) };
-            }
-        }
+        WM_DESTROY => end(),
         _ => {}
+    }
+}
+
+/// Takes the shadow away for good: the window is closing. eframe ends without hiding or
+/// destroying the window through its messages, so the strips would outlive it until the process
+/// exits.
+pub(super) fn end() {
+    let gone = SHADOW.with(|cell| cell.try_borrow_mut().ok().and_then(|mut s| s.take()));
+    for strip in gone.map(|s| s.strips).into_iter().flatten() {
+        let _ = unsafe { DestroyWindow(strip.hwnd) };
     }
 }
 

@@ -213,6 +213,10 @@ impl<P: Pages> Drop for Frame<P> {
 }
 
 impl<P: Pages> eframe::App for Frame<P> {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::window::closing();
+    }
+
     /// Past the window's painted corners is the desktop.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]

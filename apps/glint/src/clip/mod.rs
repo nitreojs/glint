@@ -1011,6 +1011,10 @@ fn describe(info: &Info) -> String {
 }
 
 impl eframe::App for ClipApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        glint_ui::window::closing();
+    }
+
     /// Past the window's painted corners is the desktop.
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         [0.0; 4]
