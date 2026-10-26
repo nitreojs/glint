@@ -25,6 +25,5 @@ fn main() {
         gallery::run(args.get(i + 1).map(Into::into));
         return;
     }
-    addon::start();
     app::run();
 }

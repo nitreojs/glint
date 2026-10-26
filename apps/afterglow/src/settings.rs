@@ -15,6 +15,7 @@ use glint_ui::audio::AudioEditor;
 use glint_ui::capture::{Recorder, held_names, key_names};
 use glint_ui::naming;
 use glint_ui::settings::{self as frame, Pages};
+use glint_ui::updates::{self, Updater};
 use glint_ui::widgets::{self, Hotkey, HotkeyState, Kind, Look, anim, ease, glide, hint, mix, row};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_SHOWNORMAL};
@@ -23,7 +24,7 @@ use windows::core::{HSTRING, w};
 use glint_shell::afterglow::MAIN_CLASS;
 
 use crate::addon::{self, Status};
-use crate::app::{AMBER, WM_HOTKEY_PAUSE, WM_PREVIEW_NOTE, WM_RELOAD};
+use crate::app::{AMBER, BUILD, WM_HOTKEY_PAUSE, WM_PREVIEW_NOTE, WM_RELOAD};
 use crate::config::{APP, Config, LENGTHS, MEMORY_CAPS, NAMES, Place, default_output_dir};
 
 pub const SETTINGS_ARG: &str = "--settings";
@@ -38,10 +39,11 @@ pub enum Page {
     Audio,
     Output,
     Games,
+    Updates,
     About,
 }
 
-const PAGES: [Page; 6] = [Page::General, Page::Video, Page::Audio, Page::Output, Page::Games, Page::About];
+const PAGES: [Page; 7] = [Page::General, Page::Video, Page::Audio, Page::Output, Page::Games, Page::Updates, Page::About];
 const BETA: &str = "beta";
 
 /// Opens the window, or brings the open one forward.
@@ -53,7 +55,7 @@ pub fn run() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(format!("couldn't read the settings, showing defaults: {e}"))),
     };
-    frame::run(TITLE, app_dir_for(APP).join("settings-window.json"), icon_rgba(64, AMBER), Settings::new(cfg, error));
+    frame::run(TITLE, app_dir_for(APP).join("settings-window.json"), icon_rgba(64, AMBER), Settings::new(cfg, error, Updater::new(BUILD, MAIN_CLASS)));
 }
 
 fn release_tray_hotkey(release: bool) {
@@ -75,6 +77,8 @@ pub struct Settings {
     audio: AudioEditor,
     /// The Deadlock addon as it stood when the window opened or last saved.
     addon: Status,
+    /// The tray app's update status.
+    updater: Updater,
 }
 
 /// A monitor the buffer can keep: what the dropdown calls it, its number in [`Config::monitor`],
@@ -147,7 +151,7 @@ fn with_current<T: Copy + PartialEq + Ord>(presets: &[T], current: T) -> Vec<T> 
 }
 
 impl Settings {
-    fn new(cfg: Config, error: Option<String>) -> Settings {
+    fn new(cfg: Config, error: Option<String>, updater: Updater) -> Settings {
         let outputs = monitors::enumerate().unwrap_or_default();
         let screen = |label: String, n: u32, o: Option<&Output>| Screen {
             label,
@@ -166,7 +170,8 @@ impl Settings {
             media::has_decoder(MFVideoFormat_HEVC)
         };
         let audio = AudioEditor::default();
-        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, screens, last_bitrate, plays_hevc, audio, addon: addon::status() }
+        let addon = addon::status();
+        Settings { saved: cfg.clone(), cfg, error, keys, licences: false, screens, last_bitrate, plays_hevc, audio, addon, updater }
     }
 
     /// The monitor the buffer keeps: the chosen one, or the primary one it falls back to.
@@ -417,6 +422,7 @@ impl Settings {
             Page::Audio => n(a.audio_sources == b.audio_sources) + n(a.audio_track_names == b.audio_track_names),
             Page::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
             Page::Games => n(a.deadlock_addon == b.deadlock_addon) + n(a.game_events == b.game_events),
+            Page::Updates => n(a.update_mode == b.update_mode) + n(a.update_beta == b.update_beta),
             Page::About => 0,
         }
     }
@@ -443,6 +449,7 @@ impl Pages for Settings {
             Page::Audio => "audio",
             Page::Output => "output",
             Page::Games => "games",
+            Page::Updates => "updates",
             Page::About => "about",
         }
     }
@@ -494,6 +501,10 @@ impl Pages for Settings {
                 c.deadlock_addon = d.deadlock_addon;
                 c.game_events = d.game_events;
             }
+            Page::Updates => {
+                c.update_mode = d.update_mode;
+                c.update_beta = d.update_beta;
+            }
             Page::About => {}
         }
     }
@@ -505,6 +516,9 @@ impl Pages for Settings {
             Page::Audio => self.audio(ui, look),
             Page::Output => self.output(ui, look),
             Page::Games => self.games(ui, look),
+            Page::Updates => {
+                updates::section(ui, look, &mut self.updater, &mut self.cfg.update_mode, &mut self.cfg.update_beta)
+            }
             Page::About => self.about(ui, look),
         }
     }
@@ -554,11 +568,15 @@ impl Pages for Settings {
     }
 
     fn overlays(&mut self, ctx: &egui::Context, look: &Look) -> bool {
-        const CRATES: &str = "egui, eframe, winit, windows-rs, serde, toml";
+        const CRATES: &str = "egui, eframe, winit, windows-rs, serde, toml, minisign-verify";
         if self.licences {
             self.licences = frame::licences(ctx, look, CRATES);
         }
         self.licences
+    }
+
+    fn updater(&mut self) -> Option<&mut Updater> {
+        Some(&mut self.updater)
     }
 }
 
@@ -647,6 +665,11 @@ mod tests {
     use glint_ui::theme::fonts;
     use glint_ui::widgets::{CONTENT_X, ROWS, WINDOW};
 
+    /// An updater whose status file is never there.
+    fn no_updates() -> Updater {
+        Updater::at(BUILD, MAIN_CLASS, std::env::temp_dir().join("afterglow-tests-no-update-status.json"))
+    }
+
     fn frames(ctx: &egui::Context, app: &mut Frame<Settings>, width: f32, n: usize, time: &mut f64) {
         let mut frame = eframe::Frame::_new_kittest();
         for _ in 0..n {
@@ -668,7 +691,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 1) });
             cfg.audio_sources.push(AudioSource::new(SourceKind::Mic, 2));
-            let mut app = Frame::new(Settings::new(cfg.clone(), None), (WINDOW, WINDOW));
+            let mut app = Frame::new(Settings::new(cfg.clone(), None, no_updates()), (WINDOW, WINDOW));
             let mut time = 0.0;
             for page in PAGES {
                 app.go(page);
@@ -689,14 +712,14 @@ mod tests {
 
     #[test]
     fn each_page_counts_and_resets_only_its_own_settings() {
-        let mut s = Settings::new(Config::default(), None);
+        let mut s = Settings::new(Config::default(), None, no_updates());
         s.cfg.length = 300;
         s.cfg.note_position = Place::Bottom;
         s.cfg.quality = 18;
         s.cfg.audio_sources.push(AudioSource::new(SourceKind::Mic, 1));
         s.cfg.output_dir = r"D:\clips".into();
         let counts: Vec<usize> = PAGES.iter().map(|&p| s.changes(p)).collect();
-        assert_eq!(counts, [2, 1, 1, 1, 0, 0]);
+        assert_eq!(counts, [2, 1, 1, 1, 0, 0, 0]);
         s.reset(Page::Video);
         assert_eq!((s.cfg.quality, s.cfg.length), (23, 300), "video's reset leaves the length alone");
         s.reset(Page::General);
@@ -706,8 +729,46 @@ mod tests {
     }
 
     #[test]
+    fn the_updates_page_counts_resets_and_shows_the_status() {
+        use glint_core::config::UpdateMode;
+        use glint_core::update::status::{State, Status};
+        let mut s = Settings::new(Config::default(), None, no_updates());
+        s.cfg.update_mode = UpdateMode::Off;
+        s.cfg.update_beta = true;
+        assert_eq!((s.changes(Page::Updates), s.changes(Page::General)), (2, 0));
+        assert_eq!(s.resettable(Page::Updates), Some(true));
+        s.reset(Page::Updates);
+        assert_eq!(s.cfg, Config::default());
+
+        let ctx = egui::Context::default();
+        fonts(&ctx);
+        ctx.enable_accesskit();
+        s.updater.status = Status { checked: Some("2026-10-26 12:00".into()), state: State::Downloading { version: "0.2.0".into(), percent: 42 } };
+        let mut app = Frame::new(s, (WINDOW, WINDOW));
+        app.go(Page::Updates);
+        let mut time = 0.0;
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut tree = Vec::new();
+        for _ in 0..90 {
+            time += 0.016;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(WINDOW[0], WINDOW[1]))),
+                time: Some(time),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| app.ui(ui, &mut frame));
+            tree = out.platform_output.accesskit_update.take().map(|u| u.nodes).unwrap_or_default();
+        }
+        let named = |role, text: &str| tree.iter().any(|(_, n)| n.role() == role && (n.label() == Some(text) || n.value() == Some(text)));
+        use egui::accesskit::Role;
+        assert!(named(Role::Label, "downloading 0.2.0… 42%"));
+        assert!(named(Role::Label, concat!("v", env!("CARGO_PKG_VERSION"), " · last checked 2026-10-26 12:00")));
+        assert!(named(Role::Button, "downloading 42%"), "the sidebar's button follows the download");
+    }
+
+    #[test]
     fn the_deadlock_hint_says_what_stands_in_the_way() {
-        let mut s = Settings::new(Config::default(), None);
+        let mut s = Settings::new(Config::default(), None, no_updates());
         let installed = |running| Status::State { state: State::Current("pak99_dir.vpk".into()), running };
         let missing = |running| Status::State { state: State::Missing, running };
         let hint = |s: &mut Settings, want: bool, saved: bool, status: Status| {

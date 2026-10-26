@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use glint_core::config::CodecName;
+use glint_core::config::{CodecName, UpdateMode};
 use glint_core::geom::rect::Rect;
 use glint_core::config::audio::{AudioSource, MAX_TRACKS, SourceKind};
 use glint_core::config::hotkeys::parse_hotkey;
@@ -52,6 +52,10 @@ pub struct Config {
     /// Keep afterglow's addon installed in Deadlock, which tells the local player's kills,
     /// deaths and assists ([`crate::addon`]).
     pub deadlock_addon: bool,
+    /// What afterglow does about its new releases on GitHub.
+    pub update_mode: UpdateMode,
+    /// Also take pre-releases.
+    pub update_beta: bool,
 }
 
 impl Default for Config {
@@ -76,6 +80,8 @@ impl Default for Config {
             note_position: Place::TopRight,
             game_events: false,
             deadlock_addon: false,
+            update_mode: UpdateMode::Auto,
+            update_beta: false,
         }
     }
 }
@@ -165,6 +171,11 @@ impl Config {
             CodecName::H264 => "h264",
             CodecName::Hevc => "hevc",
         };
+        let update_mode = match self.update_mode {
+            UpdateMode::Auto => "auto",
+            UpdateMode::Notify => "notify",
+            UpdateMode::Off => "off",
+        };
         let mut sources = String::new();
         for s in &self.audio_sources {
             let tracks: Vec<String> = s.tracks.iter().map(u32::to_string).collect();
@@ -232,6 +243,14 @@ game_events = {game_events}
 # lists it), only while the game is closed; false takes it out again.
 deadlock_addon = {deadlock_addon}
 
+# Updates from github.com/nitreojs/glint (afterglow's releases), checked soon after start and
+# every hour, signature-checked before they're used: "auto" downloads them in the background and
+# installs on the next start (or when you click the notification), "notify" only tells you,
+# "off" never checks.
+update_mode = "{update_mode}"
+# Also take beta versions (GitHub pre-releases).
+update_beta = {update_beta}
+
 # What players call tracks 1-6; an empty name is made from the track's sources.
 audio_track_names = [{names}]
 
@@ -253,6 +272,7 @@ audio_track_names = [{names}]
             place = self.note_position.name(),
             game_events = self.game_events,
             deadlock_addon = self.deadlock_addon,
+            update_beta = self.update_beta,
             names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
     }
@@ -348,6 +368,8 @@ mod tests {
             note_position: Place::Bottom,
             game_events: true,
             buffer: false,
+            update_mode: UpdateMode::Notify,
+            update_beta: true,
             ..Config::default()
         };
         edited.audio_sources.push(AudioSource { device: "{0.0.1.00000000}.{mic}".into(), ..AudioSource::new(SourceKind::Mic, 1) });
@@ -355,6 +377,24 @@ mod tests {
         edited.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 2) });
         let back: Config = toml::from_str(&edited.render()).unwrap();
         assert_eq!(back, edited);
+    }
+
+    #[test]
+    fn update_settings_round_trip_with_their_comments() {
+        for mode in [UpdateMode::Auto, UpdateMode::Notify, UpdateMode::Off] {
+            for beta in [false, true] {
+                let cfg = Config { update_mode: mode, update_beta: beta, ..Config::default() };
+                let back: Config = toml::from_str(&cfg.render()).unwrap();
+                assert_eq!((back.update_mode, back.update_beta), (mode, beta));
+            }
+        }
+        let text = Config::default().render();
+        assert!(text.contains("\n# \"off\" never checks.\nupdate_mode = \"auto\"\n"), "{text}");
+        assert!(text.contains("\n# Also take beta versions (GitHub pre-releases).\nupdate_beta = false\n"));
+        // a config.toml from before updates reads as auto, stable
+        let old: Config = toml::from_str("length = 30\n").unwrap();
+        assert_eq!((old.update_mode, old.update_beta), (UpdateMode::Auto, false));
+        assert!(toml::from_str::<Config>("update_mode = \"manual\"\n").is_err());
     }
 
     #[test]

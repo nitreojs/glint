@@ -1,7 +1,9 @@
 //! afterglow's tray app: a hidden window holding the tray icon and the save hotkey, and the
 //! buffer that runs behind it. Clicking the icon or pressing the hotkey saves the last stretch,
 //! a double click opens the gallery; the right-click menu pauses and resumes the buffer, opens
-//! the gallery, the folder and the settings.
+//! the gallery, the folder and the settings. Updates come as glint's do
+//! ([`glint_shell::update`]): checked soon after start and hourly, a dot on the icon and
+//! "restart to update" in the menu once one is downloaded.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -10,11 +12,14 @@ use std::time::{Duration, Instant};
 use glint_core::format::human_duration;
 use glint_core::geom::rect::Rect;
 use glint_core::record::replay::Clip;
-use glint_core::icon::icon_pixels;
+use glint_core::config::UpdateMode;
+use glint_core::icon::{add_badge, icon_pixels};
 use glint_core::history::Kind as HistoryKind;
 use glint_core::log::log;
 use glint_core::naming::{Naming, Source, Subject};
 use glint_core::record::pipeline::Outcome;
+use glint_core::update::{AFTERGLOW, notes_url};
+use glint_core::upload::proxy::Setting;
 use glint_core::wide::wide;
 use glint_shell::afterglow::{MAIN_CLASS, WM_NOTE_CAPTURABLE};
 use glint_shell::identity::{front_window, identify};
@@ -23,6 +28,7 @@ use glint_shell::menu::{Glyph, Header, Item, Menu};
 use glint_shell::time::date_time;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use glint_shell::start_menu::{self, Shortcut};
+use glint_shell::update::{self, Build, Checked, Click, Host, Updates};
 use glint_shell::{autostart, explorer, hotkey, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
@@ -55,6 +61,9 @@ const SAVE_HOTKEY: i32 = 1;
 const RESTART_TIMER: usize = 1;
 const TIP_TIMER: usize = 2;
 const CLICK_TIMER: usize = 3;
+
+/// This build of afterglow, as the updater knows it.
+pub const BUILD: Build = Build { product: AFTERGLOW, version: env!("CARGO_PKG_VERSION") };
 
 /// afterglow's accent: the tray icon while buffering, the settings window.
 /// A save that hasn't answered in this long is given up on, so it can't hold back the next one.
@@ -100,6 +109,16 @@ const ID_LOG: usize = 5;
 const ID_QUIT: usize = 6;
 const ID_LAST: usize = 7;
 const ID_GALLERY: usize = 8;
+const ID_UPDATE: usize = 9;
+
+/// What clicking the last notification does.
+enum Balloon {
+    /// Shows the last clip saved, if there is one.
+    LastClip,
+    Update(Click),
+    /// Opens a page: what's new after an update.
+    Link(String),
+}
 
 struct App {
     hwnd: HWND,
@@ -121,6 +140,8 @@ struct App {
     saves: u64,
     /// The memory cap cutting a clip short was explained once already.
     told_cap: bool,
+    /// Notices about how the buffer is recorded (the software encoder) told since start.
+    told: Vec<String>,
     /// The note up is the settings window's sample, so the picker may take it away.
     sample: bool,
     /// A click on the tray icon cut this clip (or found nothing to cut); it's saved (or says so)
@@ -130,6 +151,12 @@ struct App {
     taskbar_created: u32,
     /// Restarts in a row that failed, so the error is announced once.
     failures: u32,
+    balloon: Balloon,
+    update: Updates,
+    /// A downloaded update waits: the icon has a dot and the tooltip says so.
+    update_ready: bool,
+    /// Quitting to restart into an update.
+    exiting: bool,
 }
 
 thread_local! {
@@ -141,8 +168,39 @@ fn with_app<R>(f: impl FnOnce(&mut App) -> R) -> Option<R> {
 }
 
 impl App {
-    fn notify(&self, title: &str, text: &str, error: bool) {
+    fn notify(&mut self, title: &str, text: &str, error: bool) {
+        self.balloon = Balloon::LastClip;
         self.tray.notify(title, text, error);
+    }
+
+    /// A notification click.
+    fn balloon_clicked(&mut self) {
+        match &self.balloon {
+            Balloon::LastClip => {
+                if let Some(p) = &self.last_saved {
+                    explorer::reveal(p);
+                }
+            }
+            Balloon::Update(Click::Install) => self.install_update(),
+            Balloon::Update(Click::Log) => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
+            Balloon::Link(url) => open(url, None),
+        }
+    }
+
+    /// The icons with the update dot while one waits, the dot-less ones otherwise.
+    fn draw_icons(&mut self) {
+        let size = icon_size();
+        let icon = |on: bool, color: [u8; 3]| {
+            let mut px = icon_pixels(size, on, color);
+            if self.update_ready {
+                add_badge(&mut px, size, AMBER);
+            }
+            make_icon(size, &px)
+        };
+        let (on, off) = (icon(true, AMBER), icon(false, GREY));
+        let old = [std::mem::replace(&mut self.on, on), std::mem::replace(&mut self.off, off)];
+        self.refresh_tray();
+        old.into_iter().for_each(destroy);
     }
 
     /// The icon and tooltip for what the buffer is doing.
@@ -157,6 +215,7 @@ impl App {
             None if self.away => (self.off, "afterglow\nwaiting for you to come back".to_string()),
             None => (self.off, "afterglow\nstarting…".to_string()),
         };
+        let tip = if self.update_ready { tip.replacen('\n', " (update ready)\n", 1) } else { tip };
         self.tray.show(icon, &tip);
     }
 
@@ -168,6 +227,13 @@ impl App {
         match Buffer::start(&self.cfg, self.generation, Notify::new(self.hwnd, WM_ENDED)) {
             Ok(b) => {
                 log(&format!("buffering the last {} s", self.cfg.length));
+                for notice in b.notices() {
+                    log(notice);
+                    if !self.told.contains(notice) {
+                        self.notify("afterglow", notice, false);
+                        self.told.push(notice.clone());
+                    }
+                }
                 self.buffer = Some(b);
                 self.failures = 0;
             }
@@ -349,7 +415,11 @@ impl App {
                 let recording = |c: &Config| (c.monitor, c.fps, c.codec, c.bitrate, c.quality, c.audio_sources.clone(), c.audio_track_names.clone());
                 let restart = recording(&cfg) != recording(&self.cfg);
                 let hotkey = cfg.save_hotkey != self.cfg.save_hotkey;
+                let updates = (cfg.update_mode, cfg.update_beta) != (self.cfg.update_mode, self.cfg.update_beta);
                 self.cfg = cfg;
+                if updates {
+                    self.updates_reconfigured();
+                }
                 if hotkey || !self.hotkey {
                     self.grab_hotkey();
                 }
@@ -368,7 +438,7 @@ impl App {
         }
     }
 
-    fn sync_autostart(&self) {
+    fn sync_autostart(&mut self) {
         if instance::test_run() {
             return;
         }
@@ -391,7 +461,7 @@ impl App {
     fn menu(&self) -> Menu {
         let length = human_duration(self.cfg.length as f64);
         let key = self.hotkey.then_some(self.cfg.save_hotkey.as_str());
-        let items = vec![
+        let mut items = vec![
             Item::command(ID_SAVE, &format!("save last {length}"))
                 .glyph(Glyph::Replay)
                 .accented()
@@ -405,8 +475,11 @@ impl App {
             Item::command(ID_SETTINGS, "settings").glyph(Glyph::Settings),
             Item::command(ID_LOG, "log").glyph(Glyph::Log),
             Item::separator(),
-            Item::command(ID_QUIT, "quit").glyph(Glyph::Quit),
         ];
+        if let Some(v) = self.update.ready_version() {
+            items.push(Item::command(ID_UPDATE, "restart to update").glyph(Glyph::Update).accented().hint(Some(&v)));
+        }
+        items.push(Item::command(ID_QUIT, "quit").glyph(Glyph::Quit));
         Menu { accent: AMBER, header: Some(Header { title: APP.into(), status: self.status() }), items }
     }
 
@@ -423,6 +496,51 @@ impl App {
             self.retry_later();
         }
         self.refresh_tray();
+    }
+}
+
+impl Host for App {
+    fn updates(&mut self) -> &mut Updates {
+        &mut self.update
+    }
+
+    fn window(&self) -> HWND {
+        self.hwnd
+    }
+
+    fn update_settings(&self) -> (UpdateMode, bool) {
+        (self.cfg.update_mode, self.cfg.update_beta)
+    }
+
+    /// afterglow has no proxy setting of its own: the one browsers use.
+    fn update_proxy(&self) -> Result<Setting, String> {
+        Ok(Setting::System)
+    }
+
+    /// No save is being written and no click is about to cut one.
+    fn idle(&self) -> bool {
+        !self.save_running() && self.clicked.is_none() && !self.exiting
+    }
+
+    fn notify_update(&mut self, title: &str, text: &str, error: bool, click: Click) {
+        self.tray.notify(title, text, error);
+        self.balloon = Balloon::Update(click);
+    }
+
+    fn mark_update_ready(&mut self, ready: bool) {
+        if self.update_ready != ready {
+            self.update_ready = ready;
+            self.draw_icons();
+        }
+    }
+
+    /// Closes the window from the message loop, outside the app's borrow; the buffer stops
+    /// with it.
+    fn exit_for_update(&mut self) {
+        self.exiting = true;
+        unsafe {
+            let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
     }
 }
 
@@ -452,6 +570,9 @@ fn menu(hwnd: HWND) {
             }
         }
         ID_LOG => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
+        ID_UPDATE => {
+            with_app(|a| a.install_update());
+        }
         // WM_DESTROY takes the app, so not from inside it
         ID_QUIT => unsafe {
             let _ = DestroyWindow(hwnd);
@@ -502,11 +623,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     menu(hwnd);
                     None
                 }
-                NIN_BALLOONUSERCLICK => with_app(|a| {
-                    if let Some(p) = &a.last_saved {
-                        explorer::reveal(p);
-                    }
-                }),
+                NIN_BALLOONUSERCLICK => with_app(App::balloon_clicked),
                 _ => None,
             };
             return LRESULT(0);
@@ -583,6 +700,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             });
             return LRESULT(0);
         }
+        WM_TIMER if wp.0 == update::CHECK_TIMER_ID || wp.0 == update::IDLE_TIMER_ID => {
+            with_app(|a| a.on_update_timer(wp.0));
+            return LRESULT(0);
+        }
+        update::WM_UPDATE_CHECK => {
+            with_app(|a| a.check_now(wp.0));
+            return LRESULT(0);
+        }
+        update::WM_UPDATE_INSTALL => {
+            with_app(|a| a.install_update());
+            return LRESULT(0);
+        }
+        update::WM_UPDATE_DONE => {
+            let done = unsafe { *Box::from_raw(lp.0 as *mut Checked) };
+            with_app(|a| a.on_checked(done));
+            return LRESULT(0);
+        }
         WM_TIMER if wp.0 == TIP_TIMER => {
             with_app(App::refresh_tray);
             return LRESULT(0);
@@ -620,7 +754,10 @@ pub fn run() {
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    if !instance::take(APP, false) {
+    let args: Vec<String> = std::env::args().collect();
+    let updated_from = update::updated_from(&args);
+    let autostarted = args.iter().any(|a| a == autostart::ARG);
+    if !instance::take(APP, updated_from.is_some()) {
         let args: Vec<_> = std::env::args_os().skip(1).collect();
         match instance::again(&args) {
             Again::Gallery if instance::open_gallery(MAIN_CLASS) => {}
@@ -631,11 +768,25 @@ pub fn run() {
         }
         return;
     }
-    glint_shell::log::start_fresh();
+    // a fresh log per run; after an update it goes on from the run that installed it
+    if updated_from.is_none() {
+        glint_shell::log::start_fresh();
+    }
+    BUILD.tidy(updated_from.is_some());
     let (cfg, cfg_err) = match Config::load() {
         Ok(c) => (c, None),
         Err(e) => (Config::default(), Some(e)),
     };
+    let mut update_error = None;
+    if cfg_err.is_none() && cfg.update_mode != UpdateMode::Off {
+        let extra: &[&str] = if autostarted { &[autostart::ARG] } else { &[] };
+        match BUILD.install_at_start(extra) {
+            Some(Ok(())) => return,
+            Some(Err(e)) => update_error = Some(e),
+            None => {}
+        }
+    }
+    crate::addon::start();
     let hwnd = window::hidden(MAIN_CLASS, "afterglow", Some(wndproc)).expect("main window");
     unsafe {
         let _ = WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION);
@@ -658,11 +809,16 @@ pub fn run() {
         saving: None,
         saves: 0,
         told_cap: false,
+        told: Vec::new(),
         sample: false,
         clicked: None,
         last_saved: None,
         taskbar_created: window::taskbar_created(),
         failures: 0,
+        balloon: Balloon::LastClip,
+        update: Updates::new(BUILD),
+        update_ready: false,
+        exiting: false,
     };
     app.grab_hotkey();
     if !instance::test_run() {
@@ -672,8 +828,17 @@ pub fn run() {
         Some(e) => app.notify("afterglow: settings error (using defaults)", &e, true),
         None => app.sync_autostart(),
     }
+    if let Some(old) = &updated_from {
+        log(&format!("updated from {old} to {}", BUILD.current()));
+    }
     app.start();
-    if app.buffer.is_some() && std::env::args().all(|a| a != autostart::ARG) {
+    if let Some(e) = &update_error {
+        app.notify_update("afterglow: couldn't update", e, true, Click::Log);
+    } else if let Some(old) = &updated_from {
+        let now = BUILD.current();
+        app.notify(&format!("afterglow updated to {now}"), &format!("from {old} · click for what's new"), false);
+        app.balloon = Balloon::Link(notes_url(&AFTERGLOW.tag(&now)));
+    } else if app.buffer.is_some() && !autostarted {
         let text = format!(
             "keeping the last {}. {} or a click on the icon saves it.",
             human_duration(app.cfg.length as f64),
@@ -684,6 +849,7 @@ pub fn run() {
     unsafe {
         SetTimer(Some(hwnd), TIP_TIMER, 1000, None);
     }
+    app.schedule_update_check(update::FIRST_CHECK_MS);
     APP_STATE.with(|a| *a.borrow_mut() = Some(app));
     window::run();
 }
