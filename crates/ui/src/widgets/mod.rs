@@ -11,7 +11,7 @@ mod tokens;
 pub use color::{custom_swatch, hue_strip, sv_square};
 pub use chrome::{TitleAction, nav_item, title_bar};
 pub use controls::{
-    Hotkey, HotkeyState, Kind, button, centred_mark, checkbox, dropdown, dropdown_detail, hint, hotkeys, keycaps, link, nested_row, note_row,
+    Hotkey, HotkeyState, Kind, badge, button, centred_mark, checkbox, dropdown, dropdown_detail, hint, hotkeys, keycaps, link, nested_row, note_row, paint_badge,
     preset_row, row, segmented, shortcuts, slider, subheading, swatch, text_field, toggle, toggle_row, tuned_slider,
 };
 #[cfg(feature = "test-rows")]

@@ -1,8 +1,8 @@
 use std::ops::RangeInclusive;
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, EventFilter, FontId, Galley, Id, Key, Layout, Margin, Painter, Rect,
-    Response, RichText, Role, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, UiStackInfo, WidgetInfo, accesskit,
+    self, Align, Align2, Color32, CursorIcon, EventFilter, FontId, Galley, Id, Key, Layout, Margin, Painter, Pos2, Rect,
+    Response, RichText, Role, Sense, Shape, Stroke, StrokeKind, Ui, UiBuilder, UiStackInfo, Vec2, WidgetInfo, accesskit,
     pos2, vec2,
 };
 
@@ -74,6 +74,32 @@ pub fn nested_row(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, add: imp
 /// A [`toggle`] on a lighter row, for switches that need no hint.
 pub fn toggle_row(ui: &mut Ui, look: &Look, label: &str, on: &mut bool, text: &str) -> Response {
     framed_row(ui, look, label, 1.0, LIGHT_PAD, false, |ui| toggle(ui, look, on, text))
+}
+
+const BADGE_PAD: Vec2 = vec2(5.0, 1.5);
+
+fn badge_galley(painter: &Painter, look: &Look, text: &str) -> std::sync::Arc<Galley> {
+    painter.layout_no_wrap(text.to_owned(), mono_medium(10.0), look.p.on_acc)
+}
+
+/// Paints a [`badge`] whose left edge is at `left_center`; its rect.
+pub fn paint_badge(painter: &Painter, look: &Look, left_center: Pos2, text: &str) -> Rect {
+    let galley = badge_galley(painter, look, text);
+    let size = galley.size() + BADGE_PAD * 2.0;
+    let rect = Rect::from_min_size(pos2(left_center.x, left_center.y - size.y / 2.0), size);
+    painter.rect_filled(rect, size.y / 2.0, look.p.acc);
+    painter.galley(rect.min + BADGE_PAD, galley, look.p.on_acc);
+    rect
+}
+
+/// A small pill in the accent colour with its text in the colour that reads on it, for a label
+/// that needs a word beside it ("beta").
+pub fn badge(ui: &mut Ui, look: &Look, text: &str) -> Response {
+    let size = badge_galley(ui.painter(), look, text).size() + BADGE_PAD * 2.0;
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::hover());
+    paint_badge(ui.painter(), look, pos2(rect.left(), rect.center().y), text);
+    resp.widget_info(|| WidgetInfo::labeled(Role::Label, true, text));
+    resp
 }
 
 fn framed_row<R>(ui: &mut Ui, look: &Look, label: &str, label_dy: f32, pad: f32, nested: bool, add: impl FnOnce(&mut Ui) -> R) -> R {

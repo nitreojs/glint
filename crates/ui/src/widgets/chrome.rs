@@ -3,7 +3,7 @@ use eframe::egui::{
     WidgetInfo, pos2, vec2,
 };
 
-use super::controls::focus_ring;
+use super::controls::{focus_ring, paint_badge};
 use super::motion::{anim, mix};
 use super::tokens::{CLOSE_HOVER, CLOSE_PRESSED, Look, medium, mono, mono_medium, sans, semibold};
 
@@ -78,15 +78,17 @@ pub fn title_bar(ui: &mut Ui, look: &Look, rect: Rect, app: &str, what: &str, ac
     }
 }
 
-/// A sidebar entry: mono index, label, and a dot while the section has unsaved changes. The
-/// selection background is drawn by the caller and slides between entries; `near` (0..=1)
-/// says how close it is, for the colours.
+/// A sidebar entry: mono index, label (with a [`super::badge`] after it, when given), and a dot
+/// while the section has unsaved changes. The selection background is drawn by the caller and
+/// slides between entries; `near` (0..=1) says how close it is, for the colours.
+#[allow(clippy::too_many_arguments)]
 pub fn nav_item(
     ui: &mut Ui,
     look: &Look,
     rect: Rect,
     index: usize,
     label: &str,
+    badge: Option<&str>,
     (selected, near): (bool, f32),
     dirty: bool,
 ) -> Response {
@@ -99,9 +101,12 @@ pub fn nav_item(
     let y = rect.center().y;
     let (num_font, text_font) = if selected { (mono_medium(11.0), medium(13.0)) } else { (mono(11.0), sans(13.0)) };
     painter.text(pos2(rect.left() + 10.0, y), Align2::LEFT_CENTER, index.to_string(), num_font, mix(p.t3, p.acct, near));
-    painter.text(pos2(rect.left() + 32.0, y), Align2::LEFT_CENTER, label, text_font, mix(p.t2, p.t1, near));
+    let text = painter.text(pos2(rect.left() + 32.0, y), Align2::LEFT_CENTER, label, text_font, mix(p.t2, p.t1, near));
+    if let Some(b) = badge {
+        paint_badge(ui.painter(), look, pos2(text.right() + 6.0, y), b);
+    }
     if dot > 0.0 {
-        painter.circle_filled(pos2(rect.right() - 12.5, y), 2.5, p.t2.gamma_multiply(dot));
+        ui.painter().circle_filled(pos2(rect.right() - 12.5, y), 2.5, p.t2.gamma_multiply(dot));
     }
     focus_ring(ui, look, &resp, rect, 5.0);
     resp.widget_info(|| WidgetInfo::selected(Role::Tab, true, selected, label));

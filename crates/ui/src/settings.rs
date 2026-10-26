@@ -36,6 +36,10 @@ pub trait Pages: 'static {
     /// The sidebar, top to bottom.
     fn pages(&self) -> &'static [Self::Page];
     fn name(&self, page: Self::Page) -> &'static str;
+    /// A [`widgets::badge`] beside the page's name in the sidebar and its title ("beta").
+    fn badge(&self, _page: Self::Page) -> Option<&'static str> {
+        None
+    }
     fn accent(&self) -> [u8; 3];
     /// Unsaved changes on `page`.
     fn changes(&self, page: Self::Page) -> usize;
@@ -278,7 +282,7 @@ impl<P: Pages> eframe::App for Frame<P> {
             let near = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
             let dirty = self.pages.changes(s) > 0;
             let name = self.pages.name(s);
-            if widgets::nav_item(ui, &look, item(i as f32), i + 1, name, (i == current, near), dirty).clicked() {
+            if widgets::nav_item(ui, &look, item(i as f32), i + 1, name, self.pages.badge(s), (i == current, near), dirty).clicked() {
                 self.go(s);
             }
         }
@@ -305,7 +309,10 @@ impl<P: Pages> eframe::App for Frame<P> {
         let mut heading = ui.painter().clone();
         heading.multiply_opacity(enter);
         let name = self.pages.name(page);
-        heading.text(pos2(body.left(), body.top() + 18.0 + lift), Align2::LEFT_TOP, name, semibold(20.0), p.t1);
+        let title = heading.text(pos2(body.left(), body.top() + 18.0 + lift), Align2::LEFT_TOP, name, semibold(20.0), p.t1);
+        if let Some(b) = self.pages.badge(page) {
+            widgets::paint_badge(&heading, &look, pos2(title.right() + 8.0, title.center().y), b);
+        }
         let rows = Rect::from_min_max(pos2(body.left(), body.top() + 56.0), pos2(main.right() - 10.0, body.bottom()));
         let gutter = (rows.right() - body.right()) as i8;
         let mut content = ui.new_child(UiBuilder::new().max_rect(rows).layout(Layout::top_down(Align::Min)));
