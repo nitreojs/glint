@@ -10,7 +10,7 @@ use super::motion::{anim, ease, glide, mix, reveal};
 use super::tokens::{LABEL_GAP, LABEL_W, Look, Palette, medium, mono, mono_medium, sans};
 
 /// 2 px ring in text colour with a 1 px gap, only after keyboard navigation.
-pub(super) fn focus_ring(ui: &Ui, look: &Look, resp: &Response, rect: Rect, radius: f32) {
+pub(crate) fn focus_ring(ui: &Ui, look: &Look, resp: &Response, rect: Rect, radius: f32) {
     if look.keyboard && resp.has_focus() {
         ui.painter().rect_stroke(rect.expand(2.0), radius + 2.0, Stroke::new(2.0, look.p.focus), StrokeKind::Middle);
     }

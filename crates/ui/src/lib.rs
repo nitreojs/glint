@@ -4,5 +4,6 @@ pub mod gallery;
 pub mod naming;
 pub mod settings;
 pub mod theme;
+pub mod updates;
 pub mod widgets;
 pub mod window;

@@ -154,7 +154,7 @@ impl Saved {
     }
 }
 
-fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
     unsafe {
         ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL);
     }

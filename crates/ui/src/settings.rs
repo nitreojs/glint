@@ -1,7 +1,8 @@
 //! A settings window in the glint look, for any of our apps: its own title bar, a sidebar of
 //! pages, the page in a scrolling panel, and a footer with reset, cancel / close, save and the
-//! unsaved count. Closing with unsaved changes asks first. It follows the Windows light / dark
-//! app setting. The app supplies the pages ([`Pages`]); [`run`] opens the window.
+//! unsaved count; an update to take rises in at the bottom of the sidebar. Closing with unsaved
+//! changes asks first. It follows the Windows light / dark app setting. The app supplies the
+//! pages ([`Pages`]); [`run`] opens the window.
 //!
 //! Run it as a separate short-lived process (`app.exe --settings`): winit allows only one event
 //! loop per process and the window can be opened many times.
@@ -16,6 +17,7 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
 use crate::theme::{FONT_LICENSE, fonts, visuals};
+use crate::updates::{self, Updater};
 use crate::widgets::{
     self, BAR_H, CONTENT_X, FOOTER_H, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, mono, sans, semibold,
 };
@@ -66,6 +68,10 @@ pub trait Pages: 'static {
     /// Dialogs of the app's own; returns whether one is open.
     fn overlays(&mut self, _ctx: &egui::Context, _look: &Look) -> bool {
         false
+    }
+    /// The app's updates, for the update button at the bottom of the sidebar.
+    fn updater(&mut self) -> Option<&mut Updater> {
+        None
     }
 }
 
@@ -285,6 +291,9 @@ impl<P: Pages> eframe::App for Frame<P> {
             if widgets::nav_item(ui, &look, item(i as f32), i + 1, name, self.pages.badge(s), (i == current, near), dirty).clicked() {
                 self.go(s);
             }
+        }
+        if let Some(updater) = self.pages.updater() {
+            updates::sidebar_button(ui, &look, side, updater);
         }
         let page = self.page();
 
