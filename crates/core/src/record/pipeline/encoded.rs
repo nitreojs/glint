@@ -20,6 +20,11 @@ impl<V: VideoEncoder, A: AudioEncoder, S: PacketSink> Encoded<V, A, S> {
             .collect::<Result<Vec<_>, String>>()?;
         Ok(Encoded { video, video_stream, audio, sink, packets: Vec::new() })
     }
+
+    /// The video encoder, configured.
+    pub fn video_encoder(&self) -> &V {
+        &self.video
+    }
 }
 
 fn flush(packets: &mut Vec<Packet>, sink: &mut impl PacketSink, stream: usize) -> Result<(), String> {

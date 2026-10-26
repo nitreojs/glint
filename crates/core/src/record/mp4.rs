@@ -2,6 +2,8 @@ use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use super::negotiate::Matrix;
+
 struct Atom {
     kind: [u8; 4],
     start: usize,
@@ -226,6 +228,76 @@ pub fn name_tracks(path: &Path, names: &[String]) -> Result<(), String> {
     rewrite_moov(path, |moov| rename_moov(moov, names))
 }
 
+// VisualSampleEntry: 6 reserved bytes, the data reference index and 70 bytes of picture fields;
+// its boxes (avcC, pasp…) follow.
+const VISUAL_ENTRY: usize = 78;
+// stsd: version/flags and the entry count, then the entries.
+const STSD_HEAD: usize = 8;
+
+/// The boxes of `data` after its first `skip` bytes, those `pick` takes rebuilt by `edit`.
+fn map_boxes(
+    data: &[u8],
+    skip: usize,
+    pick: impl Fn(&[u8; 4]) -> bool,
+    mut edit: impl FnMut(&[u8]) -> Result<Vec<u8>, String>,
+) -> Result<Vec<u8>, String> {
+    let (head, rest) = data.split_at(skip.min(data.len()));
+    let mut out = Vec::with_capacity(data.len() + 32);
+    out.extend_from_slice(head);
+    for a in atoms(rest)? {
+        match pick(&a.kind) {
+            true => out.extend(atom(&a.kind, &edit(&rest[a.body..a.end])?)),
+            false => out.extend_from_slice(&rest[a.start..a.end]),
+        }
+    }
+    Ok(out)
+}
+
+/// A video sample entry with a `colr` box saying BT.709 primaries and transfer, `matrix`,
+/// limited range (replacing one it had).
+fn tag_entry(entry: &[u8], matrix: Matrix) -> Result<Vec<u8>, String> {
+    if entry.len() < VISUAL_ENTRY {
+        return Err("broken video sample entry".into());
+    }
+    let mut out = entry[..VISUAL_ENTRY].to_vec();
+    for a in atoms(&entry[VISUAL_ENTRY..])?.iter().filter(|a| &a.kind != b"colr") {
+        out.extend_from_slice(&entry[VISUAL_ENTRY + a.start..VISUAL_ENTRY + a.end]);
+    }
+    // nclx: colour primaries, transfer characteristics (1 = BT.709 both), matrix coefficients,
+    // then the full range flag in the top bit (0 = limited)
+    let [hi, lo] = matrix.code().to_be_bytes();
+    out.extend(atom(b"colr", &[&b"nclx"[..], &[0, 1, 0, 1, hi, lo, 0]].concat()));
+    Ok(out)
+}
+
+fn tag_moov(moov: &[u8], matrix: Matrix) -> Result<Vec<u8>, String> {
+    let is = |k: &'static [u8; 4]| move |kind: &[u8; 4]| kind == k;
+    let video = |kind: &[u8; 4]| matches!(kind, b"avc1" | b"avc3" | b"hvc1" | b"hev1");
+    let mut out = Vec::with_capacity(moov.len() + 64);
+    for a in atoms(moov)? {
+        let body = &moov[a.body..a.end];
+        let vide = child(body, b"mdia").and_then(|m| child(m, b"hdlr")).is_some_and(|h| h.len() >= 12 && &h[8..12] == b"vide");
+        if &a.kind != b"trak" || !vide {
+            out.extend_from_slice(&moov[a.start..a.end]);
+            continue;
+        }
+        let trak = map_boxes(body, 0, is(b"mdia"), |mdia| {
+            map_boxes(mdia, 0, is(b"minf"), |minf| {
+                map_boxes(minf, 0, is(b"stbl"), |stbl| map_boxes(stbl, 0, is(b"stsd"), |stsd| map_boxes(stsd, STSD_HEAD, video, |e| tag_entry(e, matrix))))
+            })
+        })?;
+        out.extend(atom(b"trak", &trak));
+    }
+    Ok(out)
+}
+
+/// Says in the video tracks' sample entries (`colr`) that the picture is BT.709 with `matrix`,
+/// limited range: players read it when the stream doesn't say (Windows' software encoder writes
+/// no colour info).
+pub fn tag_colours(path: &Path, matrix: Matrix) -> Result<(), String> {
+    rewrite_moov(path, |moov| tag_moov(moov, matrix))
+}
+
 fn with_movie_box(moov: &[u8], kind: &[u8; 4], body: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::with_capacity(moov.len() + body.len() + 16);
     let mut placed = false;
@@ -343,6 +415,45 @@ mod tests {
                 String::from_utf8_lossy(&h[HDLR_NAME..h.len() - 1]).into_owned()
             })
             .collect()
+    }
+
+    /// A video trak whose sample entry is an avc1 with an avcC (and `extra` boxes).
+    fn video_trak(extra: &[u8]) -> Vec<u8> {
+        let mut entry = vec![4u8; VISUAL_ENTRY];
+        entry.extend(atom(b"avcC", &[1, 100, 0, 40]));
+        entry.extend_from_slice(extra);
+        let stsd = [&[0u8, 0, 0, 0, 0, 0, 0, 1][..], &atom(b"avc1", &entry)].concat();
+        let stbl = [atom(b"stsd", &stsd), atom(b"stco", &[0; 12])].concat();
+        let minf = [atom(b"vmhd", &[0; 12]), atom(b"stbl", &stbl)].concat();
+        let mdia = [atom(b"mdhd", &[7; 24]), hdlr(b"vide", "VideoHandler"), atom(b"minf", &minf)].concat();
+        atom(b"trak", &[atom(b"tkhd", &[1; 84]), atom(b"mdia", &mdia)].concat())
+    }
+
+    fn entry_boxes(data: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+        let moov = child(data, b"moov").unwrap();
+        let stsd = [b"trak", b"mdia", b"minf", b"stbl", b"stsd"].iter().fold(moov, |d, k| child(d, k).unwrap());
+        let avc1 = child(&stsd[STSD_HEAD..], b"avc1").unwrap();
+        boxes(&avc1[VISUAL_ENTRY..]).unwrap().into_iter().map(|(k, b)| (k, b.to_vec())).collect()
+    }
+
+    #[test]
+    fn the_video_track_says_bt709_limited_range_once() {
+        let path = std::env::temp_dir().join(format!("glint_mp4_colr_{}.mp4", std::process::id()));
+        let old_colr = atom(b"colr", b"nclx\0\x06\0\x06\0\x06\x80");
+        let moov = [atom(b"mvhd", &[2; 100]), video_trak(&old_colr), trak(b"soun", "mic", &[])].concat();
+        let original = [atom(b"ftyp", b"isom"), atom(b"mdat", &[5; 100]), atom(b"moov", &moov)].concat();
+        std::fs::write(&path, &original).unwrap();
+        tag_colours(&path, Matrix::Bt601).unwrap();
+        tag_colours(&path, Matrix::Bt709).unwrap();
+        let data = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let colr = [&b"nclx"[..], &[0, 1, 0, 1, 0, 1, 0]].concat();
+        assert_eq!(entry_boxes(&data), [(*b"avcC", vec![1, 100, 0, 40]), (*b"colr", colr)]);
+        let top = atoms(&data).unwrap();
+        assert_eq!(&data[..top[2].start], &original[..top[2].start], "the samples don't move");
+        let kinds = atoms(child(&data, b"moov").unwrap()).unwrap().iter().map(|a| a.kind).collect::<Vec<_>>();
+        assert_eq!(kinds, [*b"mvhd", *b"trak", *b"trak"]);
     }
 
     #[test]

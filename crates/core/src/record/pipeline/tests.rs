@@ -565,6 +565,7 @@ impl Backend for Fake {
             path: self.path,
             clicks: self.mouse.then_some(clicks),
             keys: None,
+            notices: vec!["the software encoder".into()],
         })
     }
 }
@@ -611,6 +612,7 @@ fn clicks_from_the_mouse_thread_are_saved_in_the_file() {
 fn a_recording_runs_through_every_thread() {
     let Recording { started, done, log, path } = record("saved", false);
     let rec = started.unwrap();
+    assert_eq!(rec.notices(), ["the software encoder"], "the backend's notices come with the recorder");
     let Ok(Outcome::Saved(s)) = done.recv().unwrap() else { panic!("not saved") };
     rec.pause();
     assert!(rec.paused());
@@ -652,7 +654,7 @@ impl VideoEncoder for FakeEncoder {
     type Frame = u32;
 
     fn configure(&mut self, config: &VideoConfig) -> Result<Stream, String> {
-        Ok(Stream::Video { config: *config, headers: vec![0x67] })
+        Ok(Stream::Video { config: *config, headers: vec![0x67], matrix: Matrix::Bt709 })
     }
 
     fn encode(&mut self, frame: u32, time: i64, duration: i64, out: &mut Vec<Packet>) -> Result<(), String> {
@@ -736,7 +738,7 @@ fn encoded_packets_reach_a_sink_between_encoder_and_muxer() {
     assert_eq!(
         ring.streams,
         [
-            Stream::Video { config, headers: vec![0x67] },
+            Stream::Video { config, headers: vec![0x67], matrix: Matrix::Bt709 },
             Stream::Audio { name: "mic".into(), headers: vec![0x12, 0x10] },
             Stream::Audio { name: "desktop".into(), headers: vec![0x12, 0x10] },
         ]

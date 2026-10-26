@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 
 use super::Codec;
+use super::negotiate::Matrix;
 use super::clicks::{self, Payload, Press, Shape, Style};
 use super::keys::{self, KeyFrame, Stroke};
 use super::pointer::PointerShape;
@@ -149,7 +150,8 @@ impl VideoConfig {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stream {
-    Video { config: VideoConfig, headers: Vec<u8> },
+    /// `matrix`: how the pictures' YUV reads back as RGB.
+    Video { config: VideoConfig, headers: Vec<u8>, matrix: Matrix },
     Audio { name: String, headers: Vec<u8> },
 }
 
@@ -226,6 +228,8 @@ pub struct Parts<B: Backend> {
     pub path: PathBuf,
     pub clicks: Option<ClickCapture<B::Mouse>>,
     pub keys: Option<KeyCapture<B::Keys>>,
+    /// Told to the user when recording starts; see [`Recorder::notices`].
+    pub notices: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -252,11 +256,12 @@ pub struct Recorder {
     abort: Arc<AtomicBool>,
     pauses: Arc<Mutex<Pauses>>,
     now: fn() -> i64,
+    notices: Vec<String>,
 }
 
 /// A recorder whose pipeline is initializing; see [`Starting::wait`].
 pub struct Starting {
-    ready: mpsc::Receiver<Result<(), String>>,
+    ready: mpsc::Receiver<Result<Vec<String>, String>>,
     go: mpsc::SyncSender<()>,
     recorder: Recorder,
 }
@@ -264,10 +269,11 @@ pub struct Starting {
 impl Starting {
     /// Waits for initialization, then starts capturing. Call it once anything that must not
     /// appear in the video (the region picker) is gone.
-    pub fn wait(self) -> Result<Recorder, String> {
+    pub fn wait(mut self) -> Result<Recorder, String> {
         match self.ready.recv() {
-            Ok(Ok(())) => {
+            Ok(Ok(notices)) => {
                 let _ = self.go.send(());
+                self.recorder.notices = notices;
                 Ok(self.recorder)
             }
             Ok(Err(e)) => Err(e),
@@ -285,7 +291,7 @@ pub fn start<B: Backend>(
     let stop = Arc::new(AtomicBool::new(false));
     let abort = Arc::new(AtomicBool::new(false));
     let pauses = Arc::new(Mutex::new(Pauses::default()));
-    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<Result<Vec<String>, String>>(1);
     let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
     let (st, ab, ps) = (stop.clone(), abort.clone(), pauses.clone());
     thread::Builder::new()
@@ -296,8 +302,8 @@ pub fn start<B: Backend>(
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
                 }
-                Ok(parts) => {
-                    let _ = ready_tx.send(Ok(()));
+                Ok(mut parts) => {
+                    let _ = ready_tx.send(Ok(std::mem::take(&mut parts.notices)));
                     let path = parts.path.clone();
                     let res = if go_rx.recv().is_ok() {
                         run_session(parts, &st, &ab, &ps)
@@ -314,10 +320,16 @@ pub fn start<B: Backend>(
             }
         })
         .map_err(|e| format!("failed to spawn encoder thread: {e}"))?;
-    Ok(Starting { ready: ready_rx, go: go_tx, recorder: Recorder { stop, abort, pauses, now: B::now } })
+    let recorder = Recorder { stop, abort, pauses, now: B::now, notices: Vec::new() };
+    Ok(Starting { ready: ready_rx, go: go_tx, recorder })
 }
 
 impl Recorder {
+    /// What the user should know about how this recording is made (the software encoder).
+    pub fn notices(&self) -> &[String] {
+        &self.notices
+    }
+
     /// Requests a graceful stop; `on_done` fires once the file is finalized.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -352,7 +364,7 @@ fn run_session<B: Backend>(
     abort: &AtomicBool,
     pauses: &Arc<Mutex<Pauses>>,
 ) -> Result<Summary, String> {
-    let Parts { capture, mut frames, mut output, audio, fps, path, clicks, keys } = parts;
+    let Parts { capture, mut frames, mut output, audio, fps, path, clicks, keys, notices: _ } = parts;
     let OpenedAudio { sources, tracks, issues: mut audio_issues } = audio;
     let names: Vec<String> = tracks.iter().map(|t| t.name.clone()).collect();
     let routes: Vec<Vec<usize>> = tracks.into_iter().map(|t| t.sources).collect();
