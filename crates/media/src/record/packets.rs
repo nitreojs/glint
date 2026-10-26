@@ -1,4 +1,4 @@
-//! The packet path on Windows: the hardware encoder MFT driven directly ([`HwVideoEncoder`]),
+//! The packet path on Windows: the video encoder MFT driven directly ([`MfVideoEncoder`]),
 //! Media Foundation's AAC encoder ([`AacEncoder`]) and an MP4 writer that takes their packets
 //! as they are ([`Mp4Sink`], a sink writer in passthrough). Joined by
 //! [`glint_core::record::pipeline::Encoded`], they replace the sink writer's encode-and-mux in
@@ -10,15 +10,17 @@ use std::path::{Path, PathBuf};
 use glint_core::log::log;
 use glint_core::record::Codec;
 use glint_core::record::mix::{RATE, frames_to_hns};
-use glint_core::record::mp4::name_tracks;
+use glint_core::record::mp4::{name_tracks, tag_colours};
 use glint_core::record::pipeline::{AudioEncoder, Packet, PacketSink, Stream, VideoConfig, VideoEncoder};
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
+use glint_core::record::negotiate::{Engine, Force, Matrix, Refusal, Route, describe, matrix, negotiate, notice};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::{HSTRING, Interface, PWSTR};
+use windows::core::{GUID, HSTRING, Interface};
 
 use super::Ctx;
-use super::encoder::{AAC_BYTES_PER_SECOND, attributes, gop, input_type, pack};
+use super::encoder::{AAC_BYTES_PER_SECOND, attributes, colour_tags, gop, input_type, log_tried, pack};
+use super::gpu::{Adapter, Gpu, friendly_name, hardware_encoders, plain, software_encoders, subtype_name};
 
 /// The fields of `HEAACWAVEINFO` after `WAVEFORMATEX` that MF keeps in `MF_MT_USER_DATA` before the
 /// AudioSpecificConfig: raw AAC (payload type 0), AAC-LC level 2 (0x29).
@@ -32,7 +34,7 @@ fn video_subtype(codec: Codec) -> (windows::core::GUID, u32) {
 }
 
 /// The compressed video type both the encoder's output and the MP4 stream use.
-unsafe fn video_type(config: &VideoConfig) -> Result<IMFMediaType, String> {
+unsafe fn video_type(config: &VideoConfig, matrix: Matrix) -> Result<IMFMediaType, String> {
     let (w, h) = (config.width, config.height);
     let (subtype, profile) = video_subtype(config.codec);
     let nominal_bps = config.nominal_bps();
@@ -47,10 +49,7 @@ unsafe fn video_type(config: &VideoConfig) -> Result<IMFMediaType, String> {
         t.SetUINT64(&MF_MT_FRAME_RATE, pack(fps_milli, 1000)).ctx("mt")?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack(1, 1)).ctx("mt")?;
         t.SetUINT32(&MF_MT_MPEG2_PROFILE, profile).ctx("mt")?;
-        t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32).ctx("mt")?;
-        t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32).ctx("mt")?;
-        t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32).ctx("mt")?;
-        t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32).ctx("mt")?;
+        colour_tags(&t, matrix)?;
         Ok(t)
     }
 }
@@ -122,34 +121,52 @@ fn take(mut buf: MFT_OUTPUT_DATA_BUFFER) -> Option<IMFSample> {
     unsafe { ManuallyDrop::take(&mut buf.pSample) }
 }
 
-fn friendly_name(a: &IMFActivate) -> String {
-    unsafe {
-        let mut p = PWSTR::null();
-        let mut len = 0;
-        if a.GetAllocatedString(&MFT_FRIENDLY_NAME_Attribute, &mut p, &mut len).is_err() {
-            return "video encoder".into();
-        }
-        let name = p.to_string().unwrap_or_default();
-        CoTaskMemFree(Some(p.0 as _));
-        name
-    }
+/// The input subtypes an encoder offers once its output type is set.
+unsafe fn input_subtypes(mft: &IMFTransform) -> Vec<GUID> {
+    (0..64).map_while(|i| unsafe { mft.GetInputAvailableType(0, i) }.ok()).filter_map(|t| unsafe { t.GetGUID(&MF_MT_SUBTYPE) }.ok()).collect()
 }
 
-/// The GPU's video encoder MFT, asynchronous, fed D3D11 textures from the device behind `mgr`.
-/// Constant QP or a bitrate target like the sink writer path, no B-frames (packets come out in
-/// display order, so
-/// decode time equals presentation time), keyframes as the config says.
-pub struct HwVideoEncoder {
+/// An encoder MFT, set up.
+struct Opened {
+    activate: IMFActivate,
+    mft: IMFTransform,
+    /// Asynchronous (hardware) encoders say when they want input and have output; synchronous
+    /// (software) ones are called in turn.
+    events: Option<IMFMediaEventGenerator>,
+    /// The sample a synchronous encoder fills, reused, unless it brings its own.
+    out: Option<(IMFSample, IMFMediaBuffer)>,
+}
+
+/// A video encoder MFT fed D3D11 textures from the capturing GPU's device: that GPU's hardware
+/// encoder (asynchronous) on ARGB32 or NV12 frames, or when none takes them, Windows' software
+/// encoder (synchronous); see [`negotiate`]. Constant QP or a bitrate target like the sink
+/// writer path, no B-frames (packets come out in display order, so decode time equals
+/// presentation time), keyframes as the config says.
+pub struct MfVideoEncoder {
     mgr: IMFDXGIDeviceManager,
-    mft: Option<(IMFActivate, IMFTransform, IMFMediaEventGenerator)>,
-    /// Inputs the encoder has asked for and not been given yet.
+    adapter: Adapter,
+    routes: Vec<Route>,
+    opened: Option<Opened>,
+    /// Inputs an asynchronous encoder has asked for and not been given yet.
     wanted: u32,
     name: String,
+    route: Option<Route>,
+    notice: Option<&'static str>,
 }
 
-impl HwVideoEncoder {
-    pub fn new(mgr: &IMFDXGIDeviceManager) -> HwVideoEncoder {
-        HwVideoEncoder { mgr: mgr.clone(), mft: None, wanted: 0, name: String::new() }
+impl MfVideoEncoder {
+    /// An encoder for `gpu`'s frames, trying the routes `force` leaves.
+    pub(super) fn new(gpu: &Gpu, force: Force) -> MfVideoEncoder {
+        MfVideoEncoder {
+            mgr: gpu.mgr.clone(),
+            adapter: gpu.adapter.clone(),
+            routes: gpu.routes(force),
+            opened: None,
+            wanted: 0,
+            name: String::new(),
+            route: None,
+            notice: None,
+        }
     }
 
     /// The encoder MFT's friendly name, once configured.
@@ -157,54 +174,73 @@ impl HwVideoEncoder {
         &self.name
     }
 
-    fn parts(&self) -> Result<&(IMFActivate, IMFTransform, IMFMediaEventGenerator), String> {
-        self.mft.as_ref().ok_or_else(|| "the video encoder isn't configured".to_string())
+    /// The engine and input format, once configured.
+    pub fn route(&self) -> Option<Route> {
+        self.route
     }
 
-    /// Sets up the first hardware encoder for `config.codec` that takes our device and types.
-    unsafe fn open(&mut self, config: &VideoConfig) -> Result<Vec<u8>, String> {
-        let (subtype, _) = video_subtype(config.codec);
-        let out = MFT_REGISTER_TYPE_INFO { guidMajorType: MFMediaType_Video, guidSubtype: subtype };
-        let mut list: *mut Option<IMFActivate> = std::ptr::null_mut();
-        let mut n = 0u32;
-        unsafe {
-            let flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER;
-            MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER, flags, None, Some(&out), &mut list, &mut n).ctx("MFTEnumEx")?;
-            let found: Vec<IMFActivate> = (0..n as usize).filter_map(|i| (*list.add(i)).take()).collect();
-            CoTaskMemFree(Some(list as _));
-            let mut last = format!("no hardware {:?} encoder", config.codec);
-            for a in found {
-                let name = friendly_name(&a);
-                match self.try_open(&a, config) {
-                    Ok((mft, events, headers)) => {
-                        log(&format!("{name}: configured for the packet path"));
-                        self.name = name;
-                        self.mft = Some((a, mft, events));
-                        return Ok(headers);
-                    }
-                    Err(e) => {
-                        let _ = a.ShutdownObject();
-                        last = format!("{name}: {e}");
+    /// What to tell the user about the route, once configured.
+    pub fn notice(&self) -> Option<&'static str> {
+        self.notice
+    }
+
+    fn parts(&self) -> Result<&Opened, String> {
+        self.opened.as_ref().ok_or_else(|| "the video encoder isn't configured".to_string())
+    }
+
+    /// The first encoder of `route`'s engine that takes our device, types and settings.
+    unsafe fn open_route(&self, config: &VideoConfig, route: Route) -> Result<(Opened, String, Vec<u8>), Refusal> {
+        let codec = config.codec.name();
+        let list = unsafe {
+            match route.engine {
+                Engine::Hardware => hardware_encoders(config.codec, &self.adapter),
+                Engine::Software => software_encoders(config.codec),
+            }
+        };
+        if list.is_empty() {
+            return Err(Refusal::Missing(match route.engine {
+                Engine::Hardware => format!("{} has no {codec} encoder", self.adapter.name),
+                Engine::Software => format!("Windows has no software {codec} encoder"),
+            }));
+        }
+        let mut why = String::new();
+        for a in list {
+            let name = friendly_name(&a);
+            match unsafe { self.try_open(&a, config, route) } {
+                Ok((mft, events, out, headers)) => return Ok((Opened { activate: a, mft, events, out }, name, headers)),
+                Err(e) => {
+                    let _ = unsafe { a.ShutdownObject() };
+                    // the best encoder's reason is the one worth telling
+                    if why.is_empty() {
+                        why = format!("{name} {e}");
                     }
                 }
             }
-            Err(last)
         }
+        Err(Refusal::Format(why))
     }
 
+    #[allow(clippy::type_complexity)]
     unsafe fn try_open(
         &self,
         a: &IMFActivate,
         config: &VideoConfig,
-    ) -> Result<(IMFTransform, IMFMediaEventGenerator, Vec<u8>), String> {
+        route: Route,
+    ) -> Result<(IMFTransform, Option<IMFMediaEventGenerator>, Option<(IMFSample, IMFMediaBuffer)>, Vec<u8>), String> {
         unsafe {
-            let mft: IMFTransform = a.ActivateObject().ctx("ActivateObject")?;
-            let attrs = mft.GetAttributes().ctx("GetAttributes")?;
-            attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).ctx("MF_TRANSFORM_ASYNC_UNLOCK")?;
-            mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, self.mgr.as_raw() as usize)
-                .ctx("MFT_MESSAGE_SET_D3D_MANAGER")?;
-            let api: ICodecAPI = mft.cast().ctx("ICodecAPI")?;
-            let set = |key: &windows::core::GUID, v: VARIANT, what: &str| api.SetValue(key, &v).ctx(what);
+            let mft: IMFTransform = a.ActivateObject().map_err(|e| plain(&e, "ActivateObject"))?;
+            let attrs = mft.GetAttributes().ok();
+            let flag = |key: &GUID| attrs.as_ref().is_some_and(|a| a.GetUINT32(key).is_ok_and(|v| v != 0));
+            let asynchronous = flag(&MF_TRANSFORM_ASYNC);
+            if let (true, Some(attrs)) = (asynchronous, &attrs) {
+                attrs.SetUINT32(&MF_TRANSFORM_ASYNC_UNLOCK, 1).map_err(|e| plain(&e, "MF_TRANSFORM_ASYNC_UNLOCK"))?;
+            }
+            if route.engine == Engine::Hardware || flag(&MF_SA_D3D11_AWARE) {
+                mft.ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, self.mgr.as_raw() as usize)
+                    .map_err(|e| plain(&e, "MFT_MESSAGE_SET_D3D_MANAGER"))?;
+            }
+            let api: ICodecAPI = mft.cast().map_err(|e| plain(&e, "ICodecAPI"))?;
+            let set = |key: &GUID, v: VARIANT, what: &str| api.SetValue(key, &v).map_err(|e| plain(&e, what));
             match (config.bitrate, config.peak_bps()) {
                 (Some(mean), Some(peak)) => {
                     let mode = eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32;
@@ -222,20 +258,56 @@ impl HwVideoEncoder {
             let _ = set(&CODECAPI_AVEncCommonQualityVsSpeed, config.effort.min(100).into(), "effort");
             let _ = set(&CODECAPI_AVEncMPVGOPSize, gop(config).into(), "gop");
             let _ = set(&CODECAPI_AVEncMPVDefaultBPictureCount, 0u32.into(), "b-frames");
-            mft.SetOutputType(0, &video_type(config)?, 0).ctx("SetOutputType")?;
-            mft.SetInputType(0, &input_type(config.width, config.height, config.fps)?, 0).ctx("SetInputType")?;
-            let headers = blob(&mft.GetOutputCurrentType(0).ctx("GetOutputCurrentType")?, &MF_MT_MPEG_SEQUENCE_HEADER);
-            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).ctx("NOTIFY_BEGIN_STREAMING")?;
-            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).ctx("NOTIFY_START_OF_STREAM")?;
-            let events: IMFMediaEventGenerator = mft.cast().ctx("IMFMediaEventGenerator")?;
-            Ok((mft, events, headers))
+            let matrix = matrix(route, config.height);
+            mft.SetOutputType(0, &video_type(config, matrix)?, 0).map_err(|e| plain(&e, "SetOutputType"))?;
+            let in_t = input_type(config.width, config.height, config.fps, route.input, matrix)?;
+            if let Err(e) = mft.SetInputType(0, &in_t, 0) {
+                let takes = input_subtypes(&mft);
+                let wanted = in_t.GetGUID(&MF_MT_SUBTYPE).unwrap_or_default();
+                return Err(match takes.is_empty() || takes.contains(&wanted) {
+                    true => plain(&e, "SetInputType"),
+                    false => {
+                        let names: Vec<String> = takes.iter().map(subtype_name).collect();
+                        format!("takes {} frames, not {} ({})", names.join("/"), route.input.name(), plain(&e, "SetInputType"))
+                    }
+                });
+            }
+            let headers = blob(&mft.GetOutputCurrentType(0).map_err(|e| plain(&e, "GetOutputCurrentType"))?, &MF_MT_MPEG_SEQUENCE_HEADER);
+            let out = match asynchronous {
+                true => None,
+                false => {
+                    let info = mft.GetOutputStreamInfo(0).map_err(|e| plain(&e, "GetOutputStreamInfo"))?;
+                    let provides = (MFT_OUTPUT_STREAM_PROVIDES_SAMPLES.0 | MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES.0) as u32;
+                    match info.dwFlags & provides != 0 {
+                        true => None,
+                        false => {
+                            // room for a frame that doesn't compress at all
+                            let size = info.cbSize.max(config.width * config.height * 3 / 2 + 4096);
+                            let buf = MFCreateMemoryBuffer(size).map_err(|e| plain(&e, "MFCreateMemoryBuffer"))?;
+                            let sample = MFCreateSample().map_err(|e| plain(&e, "MFCreateSample"))?;
+                            sample.AddBuffer(&buf).map_err(|e| plain(&e, "AddBuffer"))?;
+                            Some((sample, buf))
+                        }
+                    }
+                }
+            };
+            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0).map_err(|e| plain(&e, "NOTIFY_BEGIN_STREAMING"))?;
+            mft.ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0).map_err(|e| plain(&e, "NOTIFY_START_OF_STREAM"))?;
+            let events = match asynchronous {
+                true => Some(mft.cast::<IMFMediaEventGenerator>().map_err(|e| plain(&e, "IMFMediaEventGenerator"))?),
+                false => None,
+            };
+            Ok((mft, events, out, headers))
         }
     }
 
-    /// Handles one event: an input request is counted, an output becomes a packet. Returns
-    /// false once draining has finished. With `wait` false, returns `Ok(None)` when no event is queued.
+    /// Handles one event of an asynchronous encoder: an input request is counted, an output
+    /// becomes a packet. Returns false once draining has finished. With `wait` false, returns
+    /// `Ok(None)` when no event is queued.
     unsafe fn event(&mut self, wait: bool, out: &mut Vec<Packet>) -> Result<Option<bool>, String> {
-        let (mft, events) = self.parts().map(|(_, m, e)| (m.clone(), e.clone()))?;
+        let opened = self.parts()?;
+        let mft = opened.mft.clone();
+        let events = opened.events.clone().ok_or("a synchronous encoder has no events")?;
         let flags = if wait { MEDIA_EVENT_GENERATOR_GET_EVENT_FLAGS(0) } else { MF_EVENT_FLAG_NO_WAIT };
         unsafe {
             let e = match events.GetEvent(flags) {
@@ -270,25 +342,86 @@ impl HwVideoEncoder {
             Ok(Some(true))
         }
     }
+
+    /// Every packet a synchronous encoder has ready.
+    unsafe fn drain(&mut self, out: &mut Vec<Packet>) -> Result<(), String> {
+        let opened = self.parts()?;
+        unsafe {
+            loop {
+                let sample = match &opened.out {
+                    Some((sample, buf)) => {
+                        buf.SetCurrentLength(0).ctx("SetCurrentLength")?;
+                        // the last packet's flags (a keyframe's clean point) mustn't stick
+                        sample.DeleteAllItems().ctx("DeleteAllItems")?;
+                        Some(sample.clone())
+                    }
+                    None => None,
+                };
+                let mut buf = [MFT_OUTPUT_DATA_BUFFER { pSample: ManuallyDrop::new(sample), ..Default::default() }];
+                let mut status = 0;
+                let r = opened.mft.ProcessOutput(0, &mut buf, &mut status);
+                let [b] = buf;
+                let got = take(b);
+                match r {
+                    Ok(()) => {
+                        if let Some(sample) = got {
+                            out.push(packet(&sample, true)?);
+                        }
+                    }
+                    Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
+                    Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                        let t = opened.mft.GetOutputAvailableType(0, 0).ctx("GetOutputAvailableType")?;
+                        opened.mft.SetOutputType(0, &t, 0).ctx("SetOutputType (stream change)")?;
+                    }
+                    Err(e) => return Err(format!("IMFTransform::ProcessOutput: {}", e.message())),
+                }
+            }
+        }
+    }
 }
 
-impl VideoEncoder for HwVideoEncoder {
+impl VideoEncoder for MfVideoEncoder {
     type Frame = IMFSample;
 
     fn configure(&mut self, config: &VideoConfig) -> Result<Stream, String> {
-        let headers = unsafe { self.open(config)? };
-        Ok(Stream::Video { config: *config, headers })
+        let routes = self.routes.clone();
+        match negotiate(&routes, |route| unsafe { self.open_route(config, route) }) {
+            Ok(((opened, name, headers), route, tried)) => {
+                log_tried(&tried);
+                log(&format!("video: {}", describe(&name, &self.adapter.name, route)));
+                self.opened = Some(opened);
+                self.name = name;
+                self.route = Some(route);
+                self.notice = notice(route, &tried, (config.width, config.height));
+                Ok(Stream::Video { config: *config, headers, matrix: matrix(route, config.height) })
+            }
+            Err(failed) => {
+                log_tried(&failed.tried);
+                Err(failed.explain(config.codec, &self.adapter.name))
+            }
+        }
     }
 
     fn encode(&mut self, frame: IMFSample, time: i64, duration: i64, out: &mut Vec<Packet>) -> Result<(), String> {
         unsafe {
             frame.SetSampleTime(time).ctx("SetSampleTime")?;
             frame.SetSampleDuration(duration).ctx("SetSampleDuration")?;
+            let mft = self.parts()?.mft.clone();
+            if self.parts()?.events.is_none() {
+                if let Err(e) = mft.ProcessInput(0, &frame, 0) {
+                    if e.code() != MF_E_NOTACCEPTING {
+                        return Err(format!("IMFTransform::ProcessInput: {}", e.message()));
+                    }
+                    self.drain(out)?;
+                    mft.ProcessInput(0, &frame, 0).ctx("IMFTransform::ProcessInput")?;
+                }
+                return self.drain(out);
+            }
             while self.wanted == 0 {
                 self.event(true, out)?;
             }
             self.wanted -= 1;
-            self.parts()?.1.ProcessInput(0, &frame, 0).ctx("IMFTransform::ProcessInput")?;
+            mft.ProcessInput(0, &frame, 0).ctx("IMFTransform::ProcessInput")?;
             // whatever is ready now; the rest comes with the next frame
             while self.event(false, out)?.is_some() {}
         }
@@ -297,24 +430,28 @@ impl VideoEncoder for HwVideoEncoder {
 
     fn finish(&mut self, out: &mut Vec<Packet>) -> Result<(), String> {
         unsafe {
-            let mft = self.parts()?.1.clone();
+            let mft = self.parts()?.mft.clone();
             mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0).ctx("NOTIFY_END_OF_STREAM")?;
             mft.ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0).ctx("COMMAND_DRAIN")?;
-            while self.event(true, out)? != Some(false) {}
+            if self.parts()?.events.is_some() {
+                while self.event(true, out)? != Some(false) {}
+            } else {
+                self.drain(out)?;
+            }
             let _ = mft.ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
         }
         Ok(())
     }
 }
 
-impl Drop for HwVideoEncoder {
+impl Drop for MfVideoEncoder {
     fn drop(&mut self) {
-        if let Some((a, mft, _)) = self.mft.take() {
+        if let Some(Opened { activate, mft, .. }) = self.opened.take() {
             unsafe {
                 if let Ok(s) = mft.cast::<IMFShutdown>() {
                     let _ = s.Shutdown();
                 }
-                let _ = a.ShutdownObject();
+                let _ = activate.ShutdownObject();
             }
         }
     }
@@ -418,6 +555,8 @@ pub struct Mp4Sink {
     streams: Vec<(u32, bool)>,
     names: Vec<String>,
     writing: bool,
+    /// How the video stream's YUV reads back, for the file's `colr`.
+    matrix: Matrix,
 }
 
 impl Mp4Sink {
@@ -432,7 +571,7 @@ impl Mp4Sink {
             }
             let writer =
                 MFCreateSinkWriterFromURL(&HSTRING::from(path.as_os_str()), None, &attrs).ctx("MFCreateSinkWriterFromURL")?;
-            Ok(Mp4Sink { writer, path: path.to_path_buf(), streams: Vec::new(), names: Vec::new(), writing: false })
+            Ok(Mp4Sink { writer, path: path.to_path_buf(), streams: Vec::new(), names: Vec::new(), writing: false, matrix: Matrix::Bt709 })
         }
     }
 }
@@ -444,8 +583,9 @@ impl PacketSink for Mp4Sink {
         }
         unsafe {
             let (t, video) = match &stream {
-                Stream::Video { config, headers } => {
-                    let t = video_type(config)?;
+                Stream::Video { config, headers, matrix } => {
+                    self.matrix = *matrix;
+                    let t = video_type(config, *matrix)?;
                     if !headers.is_empty() {
                         t.SetBlob(&MF_MT_MPEG_SEQUENCE_HEADER, headers).ctx("mt")?;
                     }
@@ -495,6 +635,11 @@ impl PacketSink for Mp4Sink {
             return Err("nothing was written".into());
         }
         unsafe { self.writer.Finalize().ctx("IMFSinkWriter::Finalize")? };
+        if self.streams.iter().any(|&(_, video)| video)
+            && let Err(e) = tag_colours(&self.path, self.matrix)
+        {
+            log(&format!("couldn't tag the video's colours: {e}"));
+        }
         if !self.names.is_empty()
             && let Err(e) = name_tracks(&self.path, &self.names)
         {

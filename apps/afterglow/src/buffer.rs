@@ -133,6 +133,11 @@ impl Buffer {
         self.replay.lock().last(self.length)
     }
 
+    /// What the user should know about how the buffer is recorded (the software encoder).
+    pub fn notices(&self) -> &[String] {
+        self.recorder.notices()
+    }
+
     pub fn stop(&self) {
         self.recorder.stop();
     }

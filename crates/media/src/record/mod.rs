@@ -4,9 +4,11 @@
 //!   device. Frames arrive at the monitors' refresh rates; the region is cropped (and, across
 //!   monitors, composed) on the GPU into a small ring of shared textures. Nothing else
 //!   touches this device, so the encoder can never stall capture.
-//! * Encoder: a second device shared with Media Foundation. It copies frames out of the ring,
-//!   draws the cursor and feeds the hardware encoder MFT through a sink writer, which writes
-//!   the MP4.
+//! * Encoder: a second device on the same adapter, shared with Media Foundation. It copies
+//!   frames out of the ring, draws the cursor and feeds the encoder through a sink writer, which
+//!   writes the MP4: that GPU's hardware encoder on ARGB32 textures, on NV12 ones the GPU's video
+//!   processor converts them to when it only takes those, or Windows' software encoder when no
+//!   hardware one takes either ([`glint_core::record::negotiate`]).
 //! * Audio: WASAPI loopback, per-app process loopback and microphones, written as AAC streams.
 
 use std::path::PathBuf;
@@ -22,9 +24,13 @@ mod audio;
 #[cfg(windows)]
 mod capture;
 #[cfg(windows)]
+mod convert;
+#[cfg(windows)]
 pub(crate) mod cursor;
 #[cfg(windows)]
 mod encoder;
+#[cfg(windows)]
+mod gpu;
 #[cfg(windows)]
 mod packets;
 #[cfg(all(test, windows))]
@@ -43,7 +49,7 @@ pub use apps::{App, running_apps};
 #[cfg(windows)]
 pub use audio::{Microphone, microphones};
 #[cfg(windows)]
-pub use packets::{AacEncoder, HwVideoEncoder, Mp4Sink};
+pub use packets::{AacEncoder, MfVideoEncoder, Mp4Sink};
 
 #[derive(Clone, Debug)]
 pub struct Params {
@@ -107,8 +113,9 @@ pub fn start(
     glint_core::record::pipeline::start(win::Windows(p), on_done)
 }
 
-/// Records through the packet path: the hardware encoder and AAC encoders hand their packets
-/// to the sink `sink` opens on the encoder thread, an [`Mp4Sink`] or afterglow's replay buffer.
+/// Records through the packet path: the video encoder ([`MfVideoEncoder`]) and AAC encoders hand
+/// their packets to the sink `sink` opens on the encoder thread, an [`Mp4Sink`] or afterglow's
+/// replay buffer.
 #[cfg(windows)]
 pub fn start_packets<S: glint_core::record::pipeline::PacketSink + 'static>(
     p: Params,

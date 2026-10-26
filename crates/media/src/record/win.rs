@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_UNKNOWN;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::*;
-use windows::Win32::Media::MediaFoundation::{IMFDXGIDeviceManager, MF_VERSION, MFSTARTUP_FULL, MFShutdown, MFStartup};
+use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFShutdown, MFStartup};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows::Win32::System::Threading::{
@@ -18,8 +18,11 @@ use windows::Win32::System::Threading::{
 };
 
 use super::capture::Capture;
+use glint_core::record::negotiate::{Force, Route, describe};
+
 use super::encoder::{self, Composer, SinkWriter, log_start, video_config};
-use super::packets::{AacEncoder, HwVideoEncoder};
+use super::gpu::Gpu;
+use super::packets::{AacEncoder, MfVideoEncoder};
 use super::keys::Hook as KeyHook;
 use super::mouse::{self, Hook};
 use super::{Ctx, Params, audio};
@@ -91,7 +94,7 @@ impl Backend for Windows {
     }
 
     fn open(self) -> Result<Parts<Self>, String> {
-        unsafe { open(self.0, |p, mgr, names| encoder::sink_writer(p, mgr, names)) }
+        unsafe { open(self.0, |p, gpu, force, names| encoder::sink_writer(p, gpu, force, names)) }
     }
 }
 
@@ -102,7 +105,7 @@ where
 {
     type Capture = Capture;
     type Frames = Composer;
-    type Output = Encoded<HwVideoEncoder, AacEncoder, S>;
+    type Output = Encoded<MfVideoEncoder, AacEncoder, S>;
     type Audio = audio::Source;
     type Mouse = Hook;
     type Keys = KeyHook;
@@ -119,22 +122,27 @@ where
     fn open(self) -> Result<Parts<Self>, String> {
         let make = self.make;
         unsafe {
-            open(self.params, move |p, mgr, names| {
+            open(self.params, move |p, gpu, force, names| {
                 let tracks = names.len();
                 let audio = names.into_iter().map(|n| Ok((n, AacEncoder::new()?))).collect::<Result<Vec<_>, String>>()?;
-                let output = Encoded::new(HwVideoEncoder::new(mgr), &video_config(p), audio, make()?)?;
-                log_start(p, "packet path", tracks);
-                Ok(output)
+                let output = Encoded::new(MfVideoEncoder::new(gpu, force), &video_config(p), audio, make()?)?;
+                let video = output.video_encoder();
+                let route = video.route().ok_or("the video encoder isn't configured")?;
+                log_start(p, &format!("packet path: {}", describe(video.name(), &gpu.adapter.name, route)), tracks);
+                let notice = video.notice();
+                Ok((output, route, notice))
             })
         }
     }
 }
 
-/// Opens everything but the output, which `output` makes on the compositor's device (with the
-/// audio tracks' names). On failure the partial file is deleted.
+/// Opens capture, audio, the output `output` makes on the encoder's side of the GPU (with the
+/// routes the environment leaves and the audio tracks' names; it says which route its encoder
+/// took) and the compositor feeding it what that encoder takes. On failure the partial file is
+/// deleted.
 unsafe fn open<B>(
     p: Params,
-    output: impl FnOnce(&Params, &IMFDXGIDeviceManager, Vec<String>) -> Result<B::Output, String>,
+    output: impl FnOnce(&Params, &Gpu, Force, Vec<String>) -> Result<(B::Output, Route, Option<&'static str>), String>,
 ) -> Result<Parts<B>, String>
 where
     B: Backend<Capture = Capture, Frames = Composer, Audio = audio::Source, Mouse = Hook, Keys = KeyHook>,
@@ -148,7 +156,7 @@ where
 
 unsafe fn open_parts<B>(
     p: &Params,
-    output: impl FnOnce(&Params, &IMFDXGIDeviceManager, Vec<String>) -> Result<B::Output, String>,
+    output: impl FnOnce(&Params, &Gpu, Force, Vec<String>) -> Result<(B::Output, Route, Option<&'static str>), String>,
 ) -> Result<Parts<B>, String>
 where
     B: Backend<Capture = Capture, Frames = Composer, Audio = audio::Source, Mouse = Hook, Keys = KeyHook>,
@@ -157,8 +165,10 @@ where
         let capture = Capture::new(p)?;
         let audio = open_audio::<audio::Source>(&p.audio, &p.track_names);
         let names = audio.tracks.iter().map(|t| t.name.clone()).collect();
-        let (frames, mgr) = encoder::composer(p, &capture)?;
-        let output = output(p, &mgr, names)?;
+        let gpu = Gpu::open(&capture.adapter, (p.region.w as u32, p.region.h as u32))?;
+        let (output, route, notice) = output(p, &gpu, Force::from_env(), names)?;
+        let frames = Composer::new(p, &capture.handles, gpu, route)?;
+        let notices = notice.map(String::from).into_iter().collect();
         let clicks = p.clicks.map(|c| {
             let scale = mouse::scale(p.region);
             ClickCapture { mouse: Hook { region: p.region }, style: Style::new(c.accent, scale), scale, burn_in: c.burn_in }
@@ -167,7 +177,7 @@ where
             let scale = mouse::scale(p.region);
             KeyCapture { keys: KeyHook::new(o.level), style: KeyStyle::new(o.accent, scale).with(o.pos), scale, burn_in: o.burn_in }
         });
-        Ok(Parts { capture, frames, output, audio, fps: p.fps, path: p.path.clone(), clicks, keys })
+        Ok(Parts { capture, frames, output, audio, fps: p.fps, path: p.path.clone(), clicks, keys, notices })
     }
 }
 
