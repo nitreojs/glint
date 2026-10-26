@@ -109,14 +109,7 @@ impl TrayIcon {
 
     /// A balloon (a toast on Windows 10 and 11).
     pub fn notify(&self, title: &str, text: &str, error: bool) {
-        let mut d = self.data();
-        d.uFlags = NIF_INFO;
-        copy_wstr(&mut d.szInfoTitle, title);
-        copy_wstr(&mut d.szInfo, text);
-        d.dwInfoFlags = if error { NIIF_ERROR } else { NIIF_INFO };
-        unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
-        }
+        notify(self.hwnd, title, text, error);
     }
 
     pub fn remove(&self) {
@@ -124,6 +117,18 @@ impl TrayIcon {
         unsafe {
             let _ = Shell_NotifyIconW(NIM_DELETE, &d);
         }
+    }
+}
+
+/// A balloon from the icon `hwnd` added (another thread's or process's), as [`TrayIcon::notify`].
+pub fn notify(hwnd: HWND, title: &str, text: &str, error: bool) {
+    let mut d = NOTIFYICONDATAW { cbSize: size_of::<NOTIFYICONDATAW>() as u32, hWnd: hwnd, uID: 1, ..Default::default() };
+    d.uFlags = NIF_INFO;
+    copy_wstr(&mut d.szInfoTitle, title);
+    copy_wstr(&mut d.szInfo, text);
+    d.dwInfoFlags = if error { NIIF_ERROR } else { NIIF_INFO };
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &d);
     }
 }
 
