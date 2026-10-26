@@ -57,7 +57,7 @@ mod pill;
 use frozen::Frozen;
 use glide::{FLIP_MS, GLIDE_MS, Glide, Ticker, WM_GLIDE};
 use live::Live;
-use pill::{Pill, hint_rects, hint_text, label_spot, pill_size, render_pill};
+use pill::{Pill, hint_due, hint_rects, hint_text, label_spot, pill_size, render_pill};
 
 #[derive(Clone, Debug)]
 pub(crate) struct Selection {
@@ -256,7 +256,7 @@ pub(crate) fn open(
         let painter = Painter::new()?;
         let font = painter.font(13.0)?;
         let hint = hint_text(purpose, outputs.len(), elements);
-        let hints = hint_rects(&painter, &font, &hint, &outputs, (area.x, area.y));
+        let hints = if hint_due() { hint_rects(&painter, &font, &hint, &outputs, (area.x, area.y)) } else { Vec::new() };
         let screen = if freeze {
             let mut frozen = Frozen::capture(area, &outputs)?;
             if !draw_first {
@@ -779,6 +779,18 @@ impl State {
         }
     }
 
+    /// The hint has done its job once a drag starts.
+    fn drop_hints(&mut self) {
+        let gone: Vec<Rect> = match &mut self.screen {
+            Screen::Frozen(f) => f.hints.drain(..).map(|(on_dim, _)| on_dim.rect).collect(),
+            Screen::Live(l) => {
+                l.drop_hints();
+                Vec::new()
+            }
+        };
+        self.invalidate(&gone);
+    }
+
     fn freeze(&mut self) -> Result<(), String> {
         let Screen::Live(live) = &self.screen else { return Ok(()) };
         live.hide();
@@ -1189,6 +1201,9 @@ impl State {
                 {
                     self.dragging = (p.0 - s.0).abs() >= CLICK_SLOP || (p.1 - s.1).abs() >= CLICK_SLOP;
                     self.whole &= !self.dragging;
+                    if self.dragging {
+                        self.drop_hints();
+                    }
                     cleared = self.dragging && !self.chosen.is_empty();
                     if cleared {
                         self.chosen.clear();

@@ -158,6 +158,11 @@ impl Live {
         self.label.place(at, self.origin, painter, font, self.fade);
     }
 
+    /// Takes the hint pills away for good.
+    pub(super) fn drop_hints(&mut self) {
+        self.hints.clear();
+    }
+
     pub(super) fn hide(&self) {
         let glass = self.hints.iter().chain([&self.label]).map(|g| &g.window);
         for h in [&self.dim].into_iter().chain(&self.outlines).chain(glass) {

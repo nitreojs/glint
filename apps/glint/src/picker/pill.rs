@@ -75,6 +75,24 @@ pub(super) fn hint_text(purpose: Purpose, monitors: usize, elements: UiElements)
     )
 }
 
+/// The hint shows on this many pickers, then no more: by then it's known.
+const HINT_SHOWS: u32 = 4;
+
+/// Whether this picker shows the hint, counting it if it does.
+pub(super) fn hint_due() -> bool {
+    hint_due_in(&glint_core::paths::app_dir().join("picker-hints"))
+}
+
+/// [`hint_due`] with its count kept in the file at `path`.
+fn hint_due_in(path: &std::path::Path) -> bool {
+    let shown: u32 = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let due = shown < HINT_SHOWS;
+    if due {
+        let _ = std::fs::write(path, (shown + 1).to_string());
+    }
+    due
+}
+
 pub(super) fn hint_rects(painter: &Painter, font: &IDWriteTextFormat, hint: &str, outputs: &[Monitor], origin: (i32, i32)) -> Vec<Rect> {
     let (w, h) = pill_size(painter, font, hint);
     let top = painter.px(28.0) as i32;
@@ -95,6 +113,15 @@ mod tests {
     const SIZE: (i32, i32) = (100, 26);
     /// Docked at the top centre, as in draw-first.
     const BAR: Rect = Rect { x: 600, y: 10, w: 720, h: 40 };
+
+    #[test]
+    fn the_hint_shows_on_the_first_pickers_only() {
+        let path = std::env::temp_dir().join(format!("glint-picker-hints-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let shown: Vec<bool> = (0..6).map(|_| hint_due_in(&path)).collect();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(shown, [true, true, true, true, false, false]);
+    }
 
     #[test]
     fn labels_go_above_then_inside_and_never_under_the_toolbar() {
