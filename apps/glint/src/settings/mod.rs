@@ -10,7 +10,6 @@ use glint_ui::audio::AudioEditor;
 use glint_ui::capture::Recorder;
 use glint_ui::settings::{self as frame, Pages};
 use glint_ui::widgets::Look;
-use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
 
 use crate::app::ipc::{self, SETTINGS_TITLE, WM_RELOAD};
 use crate::platform::paths::{output_dir, remember_previous_output_dir};
@@ -27,10 +26,7 @@ use sections::{SECTIONS, Section};
 
 pub fn run() {
     if let Some(h) = ipc::find_settings() {
-        unsafe {
-            let _ = SetForegroundWindow(h);
-        }
-        return;
+        return glint_ui::window::bring_forward(h);
     }
     let (cfg, load_error) = match Config::load() {
         Ok(c) => (c, None),

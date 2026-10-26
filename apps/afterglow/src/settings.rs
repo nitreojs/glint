@@ -16,7 +16,7 @@ use glint_ui::naming;
 use glint_ui::settings::{self as frame, Pages};
 use glint_ui::widgets::{self, Hotkey, HotkeyState, Kind, Look, anim, ease, glide, hint, mix, row};
 use windows::Win32::UI::Shell::ShellExecuteW;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_SHOWNORMAL, SetForegroundWindow};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_SHOWNORMAL};
 use windows::core::{HSTRING, w};
 
 use glint_shell::afterglow::MAIN_CLASS;
@@ -42,11 +42,8 @@ const PAGES: [Page; 5] = [Page::General, Page::Video, Page::Audio, Page::Output,
 
 /// Opens the window, or brings the open one forward.
 pub fn run() {
-    unsafe {
-        if let Ok(h) = FindWindowW(None, &HSTRING::from(TITLE)) {
-            let _ = SetForegroundWindow(h);
-            return;
-        }
+    if let Some(h) = glint_ui::window::find(TITLE) {
+        return glint_ui::window::bring_forward(h);
     }
     let (cfg, error) = match Config::load() {
         Ok(c) => (c, None),
