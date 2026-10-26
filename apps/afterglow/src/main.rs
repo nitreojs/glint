@@ -3,6 +3,7 @@
 mod app;
 mod buffer;
 mod config;
+mod events;
 mod gallery;
 mod glint;
 mod note;

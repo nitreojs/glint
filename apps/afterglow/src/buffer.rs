@@ -14,6 +14,7 @@ use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninit
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::Config;
+use crate::events::{self, Watcher};
 
 const SECOND: i64 = 10_000_000;
 
@@ -54,6 +55,8 @@ pub struct Buffer {
     replay: ReplaySink,
     /// What a save covers (100 ns units).
     length: i64,
+    /// Follows games for their events, with `game_events` on.
+    events: Option<Watcher>,
 }
 
 fn limits(cfg: &Config) -> Limits {
@@ -102,13 +105,18 @@ impl Buffer {
         let sink = replay.clone();
         let starting = start_packets(params, move || Ok(sink), move |r: Result<Outcome, String>| ended.post((generation, r)))?;
         let recorder = starting.wait()?;
-        Ok(Buffer { recorder, monitor: r, replay, length })
+        let events = cfg.game_events.then(|| Watcher::start(cfg.length));
+        Ok(Buffer { recorder, monitor: r, replay, length, events })
     }
 
-    /// A new length or memory cap, for what's buffered already.
+    /// A new length or memory cap, for what's buffered already; game events on or off.
     pub fn set_limits(&mut self, cfg: &Config) {
         self.length = cfg.length as i64 * SECOND;
         self.replay.lock().set_limits(limits(cfg));
+        if cfg.game_events != self.events.is_some() {
+            self.events = cfg.game_events.then(|| Watcher::start(cfg.length));
+        }
+        events::keep(cfg.length);
     }
 
     pub fn monitor(&self) -> Rect {
@@ -130,8 +138,8 @@ impl Buffer {
     }
 }
 
-/// Writes `clip` to `dir`/`name`.mp4 (or `name_2.mp4`… when taken) on its own thread; `done`
-/// hears `id` with the path or the error.
+/// Writes `clip` to `dir`/`name`.mp4 (or `name_2.mp4`… when taken) on its own thread, with the
+/// game events it covers; `done` hears `id` with the path or the error.
 pub fn save(id: u64, clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
     std::thread::spawn(move || {
         let result = unsafe {
@@ -167,9 +175,13 @@ fn write(clip: Clip, stem: &Path) -> Result<PathBuf, String> {
     part.push(".part");
     let part = PathBuf::from(part);
     let mut sink = Mp4Sink::create(&part)?;
+    let span = clip.wall.map(|wall| (wall, clip.duration));
     clip.write(&mut sink).inspect_err(|_| {
         let _ = std::fs::remove_file(&part);
     })?;
+    if let Some((wall, duration)) = span {
+        events::attach(&part, wall, duration);
+    }
     std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }

@@ -46,6 +46,9 @@ pub struct Config {
     pub launch_at_startup: bool,
     /// Where on the recorded monitor notes show.
     pub note_position: Place,
+    /// Follow a supported game's events and save those in a clip with it, as markers for the
+    /// trimmer.
+    pub game_events: bool,
 }
 
 impl Default for Config {
@@ -68,6 +71,7 @@ impl Default for Config {
             audio_track_names: vec![String::new(); MAX_TRACKS as usize],
             launch_at_startup: false,
             note_position: Place::TopRight,
+            game_events: false,
         }
     }
 }
@@ -214,6 +218,10 @@ launch_at_startup = {autostart}
 # bottom_right.
 note_position = "{place}"
 
+# Follow a supported game (Deadlock, launched with -condebug) and save what happens in it (match
+# phases; kills and respawns where the game logs them) with each clip, as markers for the trimmer.
+game_events = {game_events}
+
 # What players call tracks 1-6; an empty name is made from the track's sources.
 audio_track_names = [{names}]
 
@@ -233,6 +241,7 @@ audio_track_names = [{names}]
             memory = self.max_memory_mb,
             autostart = self.launch_at_startup,
             place = self.note_position.name(),
+            game_events = self.game_events,
             names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
     }
@@ -326,6 +335,7 @@ mod tests {
             max_memory_mb: 4096,
             launch_at_startup: true,
             note_position: Place::Bottom,
+            game_events: true,
             buffer: false,
             ..Config::default()
         };
