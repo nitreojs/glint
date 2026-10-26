@@ -6,7 +6,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use eframe::egui::{self, ColorImage};
 use glint_core::clip::math::SECOND;
@@ -158,8 +158,6 @@ fn work(shared: &(Mutex<Queue>, Condvar), dir: &Path, tx: &Sender<Done>, ctx: &e
         Ok(w) => w,
         Err(e) => return log(&format!("gallery: {e}")),
     };
-    // made on the first recording, then shared by all of this worker's readers
-    let mut gpu: Option<Option<Gpu>> = None;
     while let Some(task) = next(shared) {
         let done = match task {
             Task::Full(f) => {
@@ -171,7 +169,7 @@ fn work(shared: &(Mutex<Queue>, Condvar), dir: &Path, tx: &Sender<Done>, ctx: &e
                 Done::Full { id: f.id, image: image.ok() }
             }
             Task::Thumb(job) => {
-                let made = cached(&wic, dir, job.key).map(Ok).unwrap_or_else(|| make(&wic, &mut gpu, dir, &job));
+                let made = cached(&wic, dir, job.key).map(Ok).unwrap_or_else(|| make(&wic, dir, &job));
                 finished(shared, job.id);
                 match made {
                     Ok((pixels, meta)) => Done::Thumb { id: job.id, image: Some(pixels.image()), meta },
@@ -189,6 +187,21 @@ fn work(shared: &(Mutex<Queue>, Condvar), dir: &Path, tx: &Sender<Done>, ctx: &e
     }
 }
 
+/// The GPU the gallery decodes recordings on, thumbnails and previews alike.
+struct Shared(Option<Gpu>);
+
+// SAFETY: a DXGI device manager is made to hand one device to readers on any thread (each locks it
+// while it works), and the device under it is multithread protected
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
+
+static GPU: OnceLock<Shared> = OnceLock::new();
+
+/// The GPU to decode recordings on; `None` decodes them in software. The calling thread needs COM.
+pub(super) fn gpu() -> Option<&'static Gpu> {
+    GPU.get_or_init(|| Shared(Gpu::new().map_err(|e| log(&format!("gallery: recordings decode in software: {e}"))).ok())).0.as_ref()
+}
+
 /// The largest size of a `w` x `h` picture inside `size`, never bigger than it is.
 fn fit_into(w: u32, h: u32, size: (u32, u32)) -> (u32, u32) {
     let scale = (size.0 as f64 / w.max(1) as f64).min(size.1 as f64 / h.max(1) as f64).min(1.0);
@@ -201,7 +214,7 @@ fn cached(wic: &Wic, dir: &Path, key: u64) -> Option<(Pixels, Meta)> {
     Some((wic.memory(image).ok()?, meta))
 }
 
-fn make(wic: &Wic, gpu: &mut Option<Option<Gpu>>, dir: &Path, job: &Job) -> Result<(Pixels, Meta), String> {
+fn make(wic: &Wic, dir: &Path, job: &Job) -> Result<(Pixels, Meta), String> {
     let fit = |w, h| thumb::size_for(w, h, SHORT, LONG);
     let (pixels, meta) = match job.kind {
         Kind::Shot => {
@@ -215,14 +228,13 @@ fn make(wic: &Wic, gpu: &mut Option<Option<Gpu>>, dir: &Path, job: &Job) -> Resu
             (p, Meta { width, height, duration_ms: play::gif_length(&job.path), alpha })
         }
         Kind::Recording => {
-            let gpu = gpu.get_or_insert_with(|| Gpu::new().map_err(|e| log(&format!("gallery: thumbnails in software: {e}"))).ok());
             // a second in, or a tenth of a short one: past the first frame's fade, before the first seek point
             let at = |len: i64| (len / 10).min(SECOND);
             let even = |w, h| {
                 let (w, h) = fit(w, h);
                 ((w & !1).max(2), (h & !1).max(2))
             };
-            let s = media::still(&job.path, gpu.as_ref(), at, even)?;
+            let s = media::still(&job.path, gpu(), at, even)?;
             let duration_ms = (s.duration / 10_000).clamp(0, u32::MAX as i64) as u32;
             let meta = Meta { width: s.native.0, height: s.native.1, duration_ms, alpha: false };
             (Pixels::opaque(s.size.0, s.size.1, s.bgrx), meta)
@@ -290,8 +302,7 @@ mod tests {
         let (size, modified) = stat(&path);
         let job = Job { id: 1, key: thumb::key(&path, size, modified), path: path.clone(), kind: Kind::Shot };
         assert!(cached(&wic, &dir, job.key).is_none());
-        let mut gpu = None;
-        let (made, meta) = make(&wic, &mut gpu, &dir, &job).unwrap();
+        let (made, meta) = make(&wic, &dir, &job).unwrap();
         assert_eq!((made.w, made.h), (560, 280));
         assert_eq!(meta, Meta { width: 1200, height: 600, duration_ms: 0, alpha: false });
         let (again, again_meta) = cached(&wic, &dir, job.key).expect("cached");
