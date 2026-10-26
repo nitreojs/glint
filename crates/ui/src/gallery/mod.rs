@@ -200,7 +200,10 @@ pub fn open(app: &str, select: Option<&Path>) {
 
 pub fn run(setup: Setup, host: impl Host + 'static, select: Option<PathBuf>) {
     let title = title(setup.app);
-    if let Some(h) = window::find(&title) {
+    // a test run's gallery is its own, beside the user's
+    if !window::quiet()
+        && let Some(h) = window::find(&title)
+    {
         return window::bring_forward(h);
     }
     let started = Instant::now();
