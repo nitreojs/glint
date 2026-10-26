@@ -189,7 +189,9 @@ impl ClipApp {
             let back = ui.interact(body, Id::unique("clip-sheet-back"), Sense::click());
             close |= back.clicked();
             let painter = ui.painter();
-            painter.rect_filled(body, 0, Color32::from_rgba_premultiplied(10, 10, 10, 204));
+            let r = glint_ui::window::radius(ctx);
+            let corners = egui::CornerRadius { nw: 0, ne: 0, sw: r, se: r };
+            painter.rect_filled(body, corners, Color32::from_rgba_premultiplied(10, 10, 10, 204));
             painter.rect(card, 10, p.surf, Stroke::new(1.0, p.line2), StrokeKind::Inside);
             painter.text(card.left_top() + vec2(24.0, 20.0), Align2::LEFT_TOP, "keys", semibold(15.0), p.t1);
             for (i, (keys, after, what)) in KEYS.iter().enumerate() {
@@ -302,7 +304,8 @@ impl ClipApp {
             .corner_radius(8)
             .inner_margin(egui::Margin::same(20))
             .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(80) });
-        let modal = egui::Modal::new(Id::unique("clip-delete-dialog")).frame(frame).backdrop_color(Color32::from_black_alpha(90));
+        let modal = egui::Modal::new(Id::unique("clip-delete-dialog")).frame(frame);
+        let modal = glint_ui::window::backdrop(ctx, modal, Color32::from_black_alpha(90));
         let mut delete = false;
         let resp = modal.show(ctx, |ui| {
             ui.set_width(360.0);

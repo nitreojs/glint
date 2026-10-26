@@ -520,7 +520,7 @@ impl Gallery {
             }
         }
         // the rest of the grid steps back
-        painter.rect_filled(self.panel, 0, Color32::from_black_alpha((60.0 * t) as u8));
+        painter.rect_filled(self.panel, super::panel_corners(ctx), Color32::from_black_alpha((60.0 * t) as u8));
         let radius = RADIUS as f32 + 2.0 * t;
         let shadow = Shadow { offset: [0, 12], blur: 36, spread: 0, color: Color32::from_black_alpha((110.0 * t) as u8) };
         painter.add(shadow.as_shape(rect, radius as u8));

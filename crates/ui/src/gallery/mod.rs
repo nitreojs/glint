@@ -199,6 +199,8 @@ pub fn run(setup: Setup, host: impl Host + 'static, select: Option<PathBuf>) {
             .with_min_inner_size(MIN_WINDOW)
             .with_resizable(true)
             .with_decorations(false)
+            .with_transparent(window::transparent())
+            .with_active(!window::quiet())
             .with_icon(egui::IconData { rgba: icon_rgba(64, setup.accent), width: 64, height: 64 }),
         centered: saved.rect.is_none(),
         ..Default::default()
@@ -213,12 +215,14 @@ pub fn run(setup: Setup, host: impl Host + 'static, select: Option<PathBuf>) {
                 Ok(RawWindowHandle::Win32(h)) => Some(HWND(h.hwnd.get() as _)),
                 _ => None,
             };
-            let rounded = hwnd.is_some_and(|h| window::frameless(h, true));
+            if let Some(h) = hwnd {
+                window::frameless(h, true);
+            }
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
                 window::place(h, r);
             }
             let mut app = Gallery::new(cc, setup, Box::new(host), library, saved, saved_at, started)?;
-            (app.hwnd, app.rounded, app.select) = (hwnd, rounded, select.as_deref().map(path_id));
+            (app.hwnd, app.select) = (hwnd, select.as_deref().map(path_id));
             Ok(Box::new(app))
         }),
     );
@@ -340,7 +344,6 @@ struct Gallery {
     setup: Setup,
     host: Box<dyn Host>,
     hwnd: Option<HWND>,
-    rounded: bool,
     light: Option<bool>,
     keyboard: bool,
     saved: Saved,
@@ -417,7 +420,6 @@ impl Gallery {
             setup,
             host,
             hwnd: None,
-            rounded: false,
             light: None,
             keyboard: false,
             saved,
@@ -928,6 +930,11 @@ impl Drop for Gallery {
 }
 
 impl eframe::App for Gallery {
+    /// Past the window's painted corners is the desktop.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
@@ -961,7 +968,7 @@ impl eframe::App for Gallery {
 
         let look = Look { p, keyboard: self.keyboard };
         let active = widgets::anim(ui, Id::unique("gallery-active"), focused, 0.15);
-        let radius: u8 = if self.rounded { 8 } else { 0 };
+        let radius = window::radius(&ctx);
         let full = ui.max_rect();
         ui.painter().rect_filled(full, radius, p.side);
         let bar = Rect::from_min_size(full.min, vec2(full.width(), BAR_H));
@@ -973,15 +980,21 @@ impl eframe::App for Gallery {
         let tools = Rect::from_min_size(pos2(full.left(), bar.bottom()), vec2(full.width(), TOOL_H));
         self.toolbar(ui, &look, tools);
         let panel = Rect::from_min_max(pos2(full.left(), tools.bottom()), full.max);
-        let corners = egui::CornerRadius { nw: 8, ne: 8, sw: radius, se: radius };
-        ui.painter().rect_filled(panel, corners, p.surf);
+        ui.painter().rect_filled(panel, panel_corners(&ctx), p.surf);
         self.panel = panel;
         let mut grid_ui = ui.new_child(UiBuilder::new().max_rect(panel));
         self.grid_view(&mut grid_ui, &look);
+        window::border(ui, full, p.line2);
         self.draw_previews(&ctx, &look);
         self.menu_popup(&ctx, &look);
         self.show_toast(&ctx, &look);
     }
+}
+
+/// The grid panel's corners: rounded where it meets the bars, and as the window's own below.
+pub(super) fn panel_corners(ctx: &egui::Context) -> egui::CornerRadius {
+    let radius = window::radius(ctx);
+    egui::CornerRadius { nw: 8, ne: 8, sw: radius, se: radius }
 }
 
 #[cfg(test)]

@@ -92,6 +92,8 @@ pub fn run(path: PathBuf) {
             .with_min_inner_size(MIN_WINDOW)
             .with_resizable(true)
             .with_decorations(false)
+            .with_transparent(glint_ui::window::transparent())
+            .with_active(!glint_ui::window::quiet())
             .with_icon(egui::IconData { rgba: icon_rgba(64, accent), width: 64, height: 64 }),
         centered: saved.rect.is_none(),
         ..Default::default()
@@ -105,12 +107,14 @@ pub fn run(path: PathBuf) {
                 Ok(RawWindowHandle::Win32(h)) => Some(HWND(h.hwnd.get() as _)),
                 _ => None,
             };
-            let rounded = hwnd.is_some_and(|h| glint_ui::window::frameless(h, true));
+            if let Some(h) = hwnd {
+                glint_ui::window::frameless(h, true);
+            }
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
                 glint_ui::window::place(h, r);
             }
             let mut app = ClipApp::new(path, info, index, &cfg, saved, accent);
-            (app.hwnd, app.rounded, app.live, app.hevc) = (hwnd, rounded, true, hevc);
+            (app.hwnd, app.live, app.hevc) = (hwnd, true, hevc);
             Ok(Box::new(app))
         }),
     );
@@ -252,7 +256,6 @@ struct ClipApp {
     key_drag: Option<KeyDrag>,
     frame_rect: Rect,
     keyboard: bool,
-    rounded: bool,
     light: Option<bool>,
     accent: [u8; 3],
     host: String,
@@ -360,7 +363,6 @@ impl ClipApp {
             sheet: false,
             confirm_delete: false,
             keyboard: false,
-            rounded: false,
             light: None,
             accent,
             host: cfg.upload_destination.trim().to_string(),
@@ -1009,6 +1011,11 @@ fn describe(info: &Info) -> String {
 }
 
 impl eframe::App for ClipApp {
+    /// Past the window's painted corners is the desktop.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
@@ -1031,7 +1038,7 @@ impl eframe::App for ClipApp {
         let look = Look { p, keyboard: self.keyboard };
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let active = widgets::anim(ui, Id::unique("clip-active"), focused, 0.15);
-        let radius: u8 = if self.rounded { 8 } else { 0 };
+        let radius = glint_ui::window::radius(&ctx);
         let esc = ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape));
 
         let full = ui.max_rect();
@@ -1079,6 +1086,7 @@ impl eframe::App for ClipApp {
         self.timeline(ui, &look, line, lane);
         self.hint_row(ui, &look, hint);
         self.panel(ui, &look, side);
+        glint_ui::window::border(ui, full, p.line2);
         self.menu_popup(&ctx, &look, self.save_rect);
         self.lane_menu_popup(&ctx, &look);
         self.volume_popup(&ctx, &look);
