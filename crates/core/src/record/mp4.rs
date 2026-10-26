@@ -128,34 +128,80 @@ fn rename_moov(moov: &[u8], names: &[String]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn read_moov(f: &mut std::fs::File) -> Result<(u64, u64, Vec<u8>), String> {
+/// Where the top-level box `kind` starts in `f` (`len` bytes long), its size and its header's.
+fn find_top(f: &mut std::fs::File, len: u64, kind: &[u8; 4]) -> Result<(u64, u64, u64), String> {
+    find_box(f, 0, len, kind)?.ok_or_else(|| format!("no {} box", String::from_utf8_lossy(kind)))
+}
+
+/// The box `kind` among the boxes from `at` up to `end` in `f`: where it starts, its size and its
+/// header's; seeks from header to header, reading nothing else.
+fn find_box(f: &mut std::fs::File, mut at: u64, end: u64, kind: &[u8; 4]) -> Result<Option<(u64, u64, u64)>, String> {
     let err = |e: std::io::Error| e.to_string();
-    let len = f.metadata().map_err(err)?.len();
-    let mut at = 0u64;
     let mut header = [0u8; 16];
-    loop {
-        if at + 8 > len {
-            return Err("no moov box".into());
-        }
+    while at + 8 <= end {
         f.seek(SeekFrom::Start(at)).map_err(err)?;
-        let n = if at + 16 <= len { 16 } else { 8 };
+        let n = if at + 16 <= end { 16 } else { 8 };
         f.read_exact(&mut header[..n]).map_err(err)?;
-        let size = match u32::from_be_bytes(header[..4].try_into().unwrap()) {
-            0 => len - at,
-            1 => u64::from_be_bytes(header[8..16].try_into().unwrap()),
-            s => s as u64,
+        let (size, head) = match u32::from_be_bytes(header[..4].try_into().unwrap()) {
+            0 => (end - at, 8),
+            1 if n == 16 => (u64::from_be_bytes(header[8..16].try_into().unwrap()), 16),
+            s => (s as u64, 8),
         };
-        if size < 8 || at + size > len {
-            return Err("broken top-level box".into());
+        if size < head || at + size > end {
+            return Err("broken box".into());
         }
-        if &header[4..8] == b"moov" {
-            let mut data = vec![0; size as usize];
-            f.seek(SeekFrom::Start(at)).map_err(err)?;
-            f.read_exact(&mut data).map_err(err)?;
-            return Ok((at, len, data));
+        if &header[4..8] == kind {
+            return Ok(Some((at, size, head)));
         }
         at += size;
     }
+    Ok(None)
+}
+
+fn read_moov(f: &mut std::fs::File) -> Result<(u64, u64, Vec<u8>), String> {
+    let err = |e: std::io::Error| e.to_string();
+    let len = f.metadata().map_err(err)?.len();
+    let (at, size, _) = find_top(f, len, b"moov")?;
+    let mut data = vec![0; size as usize];
+    f.seek(SeekFrom::Start(at)).map_err(err)?;
+    f.read_exact(&mut data).map_err(err)?;
+    Ok((at, len, data))
+}
+
+/// How long the movie at `path` plays, in milliseconds, from its movie header (or a fragmented
+/// file's `mehd`): a few small reads, however long the file is. `None` when it doesn't say.
+pub fn duration_ms(path: &Path) -> Option<u32> {
+    let mut f = std::fs::File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    let (at, size, head) = find_top(&mut f, len, b"moov").ok()?;
+    let (moov, end) = (at + head, at + size);
+    let be32 = |b: &[u8], i: usize| b.get(i..i + 4).map(|w| u32::from_be_bytes(w.try_into().unwrap()) as u64);
+    let be64 = |b: &[u8], i: usize| b.get(i..i + 8).map(|w| u64::from_be_bytes(w.try_into().unwrap()));
+    // version and flags, then the times: 32-bit fields in version 0, 64-bit in version 1
+    let body = body_of(&mut f, moov, end, b"mvhd", 32)?;
+    let (scale, mut duration) = match body.first()? {
+        0 => (be32(&body, 12)?, be32(&body, 16)?),
+        1 => (be32(&body, 20)?, be64(&body, 24)?),
+        _ => return None,
+    };
+    if duration == 0 || duration == u32::MAX as u64 || duration == u64::MAX {
+        let (mvex, mvex_size, mvex_head) = find_box(&mut f, moov, end, b"mvex").ok()??;
+        let body = body_of(&mut f, mvex + mvex_head, mvex + mvex_size, b"mehd", 12)?;
+        duration = if body.first() == Some(&1) { be64(&body, 4)? } else { be32(&body, 4)? };
+    }
+    if scale == 0 || duration == 0 || duration == u64::MAX {
+        return None;
+    }
+    u32::try_from(duration as u128 * 1000 / scale as u128).ok()
+}
+
+/// The first `most` bytes of the body of box `kind` among those from `at` up to `end`.
+fn body_of(f: &mut std::fs::File, at: u64, end: u64, kind: &[u8; 4], most: u64) -> Option<Vec<u8>> {
+    let (at, size, head) = find_box(f, at, end, kind).ok()??;
+    let mut buf = vec![0; (size - head).min(most) as usize];
+    f.seek(SeekFrom::Start(at + head)).ok()?;
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
 }
 
 // the media foundation sink writes moov after mdat, so rewriting it moves no sample data.
@@ -390,5 +436,57 @@ mod tests {
         let out = with_movie_box(&moov, b"glck", b"[]").unwrap();
         assert_eq!(out, [moov.clone(), atom(b"udta", &atom(b"glck", b"[]"))].concat());
         assert_eq!(with_movie_box(&out, b"glck", b"{}").unwrap(), [moov, atom(b"udta", &atom(b"glck", b"{}"))].concat());
+    }
+
+    /// A version-0 `mvhd` body: flags, two times, then `scale` and `duration`, and the rest.
+    fn mvhd0(scale: u32, duration: u32) -> Vec<u8> {
+        let mut b = vec![0u8; 12];
+        b.extend(scale.to_be_bytes());
+        b.extend(duration.to_be_bytes());
+        b.extend([0; 80]);
+        atom(b"mvhd", &b)
+    }
+
+    fn mvhd1(scale: u32, duration: u64) -> Vec<u8> {
+        let mut b = vec![1u8, 0, 0, 0];
+        b.extend([0; 16]);
+        b.extend(scale.to_be_bytes());
+        b.extend(duration.to_be_bytes());
+        b.extend([0; 80]);
+        atom(b"mvhd", &b)
+    }
+
+    #[test]
+    fn lengths_come_from_the_movie_header_wherever_it_is() {
+        let dir = std::env::temp_dir().join(format!("glint_mp4_length_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let length = |name: &str, data: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, data).unwrap();
+            duration_ms(&path)
+        };
+        let ftyp = atom(b"ftyp", b"isomiso2avc1mp41");
+        let mdat = atom(b"mdat", &[7; 5000]);
+        let moov = |head: Vec<u8>| atom(b"moov", &[head, trak(b"vide", "VideoHandler", &[])].concat());
+        // media foundation's layout: the samples, then the index
+        assert_eq!(length("end.mp4", &[ftyp.clone(), mdat.clone(), moov(mvhd0(1000, 4250))].concat()), Some(4250));
+        // fast start: the index first, a 90 kHz clock
+        assert_eq!(length("start.mp4", &[ftyp.clone(), moov(mvhd0(90_000, 2_700_000)), mdat.clone()].concat()), Some(30_000));
+        // version 1 times behind a 64-bit mdat size
+        let mut big = atom(b"mdat", &[1; 64]);
+        big.splice(0..8, [1u32.to_be_bytes().as_slice(), b"mdat", &(64u64 + 16).to_be_bytes()].concat());
+        assert_eq!(length("v1.mp4", &[ftyp.clone(), big, moov(mvhd1(600, 600 * 125 + 300))].concat()), Some(125_500));
+        // fragmented: the header says nothing, mvex/mehd does
+        let mehd = atom(b"mehd", &[[0u8; 4].as_slice(), &1_500u32.to_be_bytes()].concat());
+        let fragmented = atom(b"moov", &[mvhd0(1000, 0), atom(b"mvex", &[mehd, atom(b"trex", &[0; 24])].concat())].concat());
+        assert_eq!(length("frag.mp4", &[ftyp.clone(), fragmented, mdat.clone()].concat()), Some(1_500));
+        // nothing to go by
+        assert_eq!(length("zero.mp4", &[ftyp.clone(), mdat.clone(), moov(mvhd0(1000, 0))].concat()), None);
+        assert_eq!(length("noscale.mp4", &[ftyp.clone(), moov(mvhd0(0, 50))].concat()), None);
+        assert_eq!(length("nomoov.mp4", &[ftyp.clone(), mdat.clone()].concat()), None);
+        assert_eq!(length("cut.mp4", &[ftyp.clone(), mdat[..400].to_vec()].concat()), None);
+        assert_eq!(length("text.mp4", b"not a movie at all"), None);
+        assert_eq!(duration_ms(&dir.join("missing.mp4")), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
