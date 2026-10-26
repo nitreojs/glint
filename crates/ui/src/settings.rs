@@ -19,7 +19,7 @@ use crate::theme::{FONT_LICENSE, fonts, visuals};
 use crate::widgets::{
     self, BAR_H, CONTENT_X, FOOTER_H, Kind, Look, SIDEBAR_W, TitleAction, WINDOW, hint, mono, sans, semibold,
 };
-use crate::window::frameless;
+use crate::window::{self, frameless};
 
 /// The bright panel's rounding where it meets the darker frame.
 const PANEL_RADIUS: u8 = 8;
@@ -95,6 +95,8 @@ pub fn run<P: Pages>(title: &str, size_file: PathBuf, icon: Vec<u8>, pages: P) {
             .with_min_inner_size(WINDOW)
             .with_resizable(true)
             .with_decorations(false)
+            .with_transparent(window::transparent())
+            .with_active(!window::quiet())
             .with_icon(egui::IconData { rgba: icon, width: 64, height: 64 }),
         centered: true,
         ..Default::default()
@@ -108,7 +110,7 @@ pub fn run<P: Pages>(title: &str, size_file: PathBuf, icon: Vec<u8>, pages: P) {
             fonts(&cc.egui_ctx);
             let _ = CTX.set(cc.egui_ctx.clone());
             if let Ok(RawWindowHandle::Win32(h)) = cc.window_handle().map(|h| h.as_raw()) {
-                frame.rounded = frameless(HWND(h.hwnd.get() as _), true);
+                frameless(HWND(h.hwnd.get() as _), true);
             }
             Ok(Box::new(frame))
         }),
@@ -123,8 +125,6 @@ pub struct Frame<P: Pages> {
     asking: bool,
     /// The last input was keyboard navigation, so focus rings show.
     keyboard: bool,
-    /// Windows 11 rounds the window corners.
-    rounded: bool,
     /// The theme and accent the egui visuals were set up for.
     styled: Option<(bool, [u8; 3])>,
     /// Closing was confirmed (or there was nothing to lose): let the close through.
@@ -144,7 +144,6 @@ impl<P: Pages> Frame<P> {
             page: None,
             asking: false,
             keyboard: false,
-            rounded: false,
             styled: None,
             closing: false,
             shown: None,
@@ -214,6 +213,11 @@ impl<P: Pages> Drop for Frame<P> {
 }
 
 impl<P: Pages> eframe::App for Frame<P> {
+    /// Past the window's painted corners is the desktop.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        [0.0; 4]
+    }
+
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.pages.tick();
         let ctx = ui.ctx().clone();
@@ -244,7 +248,7 @@ impl<P: Pages> eframe::App for Frame<P> {
         let look = Look { p, keyboard: self.keyboard };
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let active = widgets::anim(ui, Id::unique("window-active"), focused, 0.15);
-        let radius: u8 = if self.rounded { 8 } else { 0 };
+        let radius = window::radius(&ctx);
         let esc = ctx.input(|i| i.key_pressed(Key::Escape));
         let mut had_overlay = self.asking || egui::Popup::is_any_open(&ctx);
 
@@ -327,6 +331,7 @@ impl<P: Pages> eframe::App for Frame<P> {
             self.pages.show(page, content, &look);
         });
         self.footer(ui, &look, Rect::from_min_max(pos2(main.left(), body.bottom()), main.right_bottom()));
+        window::border(ui, full, p.line2);
         had_overlay |= self.pages.overlays(&ctx, &look);
         self.ask(&ctx, &look);
 
@@ -394,7 +399,7 @@ impl<P: Pages> Frame<P> {
             return;
         }
         let p = look.p;
-        let resp = dialog(look).show(ctx, |ui| {
+        let resp = dialog(ctx, look).show(ctx, |ui| {
             ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
             ui.set_width(340.0);
             ui.label(RichText::new("save changes?").font(semibold(15.0)).color(p.t1));
@@ -428,7 +433,7 @@ impl<P: Pages> Frame<P> {
 pub fn licences(ctx: &egui::Context, look: &Look, crates: &str) -> bool {
     let p = look.p;
     let mut open = true;
-    let resp = dialog(look).show(ctx, |ui| {
+    let resp = dialog(ctx, look).show(ctx, |ui| {
         ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
         ui.set_width(460.0);
         let body = |ui: &mut Ui, text: &str| ui.label(RichText::new(text).font(sans(13.0)).color(p.t2));
@@ -449,7 +454,7 @@ pub fn licences(ctx: &egui::Context, look: &Look, crates: &str) -> bool {
 }
 
 /// A modal in the window's look: the app's own dialogs use it too.
-pub fn dialog(look: &Look) -> egui::Modal {
+pub fn dialog(ctx: &egui::Context, look: &Look) -> egui::Modal {
     let p = look.p;
     let frame = egui::Frame::new()
         .fill(p.surf)
@@ -457,5 +462,6 @@ pub fn dialog(look: &Look) -> egui::Modal {
         .corner_radius(8)
         .inner_margin(egui::Margin::same(20))
         .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(80) });
-    egui::Modal::new(Id::unique("dialog")).frame(frame).backdrop_color(Color32::from_black_alpha(90))
+    let modal = egui::Modal::new(Id::unique("dialog")).frame(frame);
+    window::backdrop(ctx, modal, Color32::from_black_alpha(90))
 }
