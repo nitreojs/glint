@@ -383,7 +383,7 @@ fn record_route(which: Via, codec: Codec, force: Force, size: (u32, u32), frames
     let (route, notice, fps) = unsafe {
         match which {
             Via::SinkWriter => {
-                let (mut out, route, notice) = sink_writer(&p, &gpu, force, Vec::new())?;
+                let (mut out, route, notice, _) = sink_writer(&p, &gpu, force, Vec::new())?;
                 let mut frames_ = Composer::new(&p, &[ring.handle], gpu, route)?;
                 let start = Instant::now();
                 run(&mut frames_, &mut |s, t| out.video(s, t, frame_hns))?;
@@ -521,6 +521,26 @@ fn the_software_encoder_on_nv12_from_the_video_processor() {
 fn the_software_encoder_on_argb32_converted_by_media_foundation() {
     check_route(Via::SinkWriter, Codec::H264, forced(Some("software"), Some("argb")), SW_ARGB, true);
     check_route_sized(Via::SinkWriter, Codec::H264, forced(Some("software"), Some("argb")), SW_ARGB, true, (640, 360));
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_rate_no_encoder_takes_is_recorded_at_a_whole_fraction_of_it() {
+    // Windows' software H.264 encoder refuses more than about 172 fps
+    let size = (640, 360);
+    let path = temp_mp4("rate");
+    let mut p = params(Codec::H264, size, &path);
+    p.fps = 240.0;
+    let force = forced(Some("software"), Some("nv12"));
+    let (out, route, _, fps) = unsafe { sink_writer(&p, &gpu_sized(size), force, Vec::new()) }.unwrap();
+    drop(out);
+    assert_eq!((route, fps), (SW_NV12, 120.0));
+    let mut enc = MfVideoEncoder::new(&gpu_sized(size), force);
+    let Stream::Video { config, .. } = glint_core::record::pipeline::VideoEncoder::configure(&mut enc, &video_config(&p)).unwrap() else {
+        panic!("not a video stream")
+    };
+    assert_eq!((enc.fps(), config.fps), (120.0, 120.0), "the packet path records and says the same rate");
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]

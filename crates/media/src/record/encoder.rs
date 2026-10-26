@@ -7,7 +7,7 @@ use glint_core::record::clicks::Shape;
 use glint_core::record::keys::KeyFrame;
 use glint_core::record::mix::{RATE, frames_to_hns};
 use glint_core::record::mp4::{name_tracks, tag_colours};
-use glint_core::record::negotiate::{Engine, Force, Input, Matrix, Refusal, Route, Tried, describe, matrix, negotiate, notice};
+use glint_core::record::negotiate::{Engine, Force, Input, Matrix, Refusal, Route, describe, log_tried, matrix, negotiate_rate, notice};
 use glint_core::record::pipeline::{Frames, Output, VideoConfig};
 use glint_core::record::pointer::PointerShape;
 use windows::Win32::Foundation::HANDLE;
@@ -204,35 +204,31 @@ pub(super) fn log_start(p: &Params, encoder: &str, tracks: usize) {
     ));
 }
 
-/// Logs the routes to the encoder that didn't work.
-pub(super) fn log_tried(tried: &[Tried]) {
-    for t in tried {
-        let (Refusal::Format(why) | Refusal::Missing(why) | Refusal::Fatal(why)) = &t.why;
-        log(&format!("{:?} encoder, {} frames: {why}", t.route.engine, t.route.input.name()));
-    }
-}
-
 /// The sink writer encoding and muxing in one, on `gpu`: the first route to the encoder that
-/// works (see [`negotiate`]), with what to tell the user about it; the error says what was tried.
+/// works (see [`negotiate_rate`]), with what to tell the user about it and the rate it records
+/// at (lower than asked when no encoder takes that); the error says what was tried.
 pub(super) unsafe fn sink_writer(
     p: &Params,
     gpu: &Gpu,
     force: Force,
     track_names: Vec<String>,
-) -> Result<(SinkWriter, Route, Option<&'static str>), String> {
+) -> Result<(SinkWriter, Route, Option<&'static str>, f64), String> {
     let config = video_config(p);
     let hardware: Vec<String> = unsafe { hardware_encoders(config.codec, &gpu.adapter) }.iter().map(|a| friendly_name(a)).collect();
     log(&format!("{} encoders on {}: {}", config.codec.name(), gpu.adapter.name, match hardware.is_empty() {
         true => "none".to_string(),
         false => hardware.join(", "),
     }));
-    let attempt = |route| unsafe { SinkWriter::new(gpu, &config, &track_names, &p.path, route, hardware.first().map(String::as_str)) };
-    match negotiate(&gpu.routes(force), attempt) {
-        Ok(((writer, name), route, tried)) => {
+    let attempt = |fps, route| {
+        let config = VideoConfig { fps, ..config };
+        unsafe { SinkWriter::new(gpu, &config, &track_names, &p.path, route, hardware.first().map(String::as_str)) }
+    };
+    match negotiate_rate(p.fps, &gpu.routes(force), attempt) {
+        Ok(((writer, name), route, fps, tried)) => {
             log_tried(&tried);
             log(&format!("video: {}", describe(&name, &gpu.adapter.name, route)));
-            log_start(p, &name, track_names.len());
-            Ok((writer, route, notice(route, &tried, (config.width, config.height))))
+            log_start(&Params { fps, ..p.clone() }, &name, track_names.len());
+            Ok((writer, route, notice(route, &tried, (config.width, config.height)), fps))
         }
         Err(failed) => {
             log_tried(&failed.tried);

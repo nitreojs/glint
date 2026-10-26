@@ -2,6 +2,7 @@ use std::marker::PhantomData;
 use std::sync::LazyLock;
 
 use glint_core::geom::rect::Rect;
+use glint_core::log::log;
 use glint_core::record::clicks::Style;
 use glint_core::record::keys::Style as KeyStyle;
 use glint_core::record::pipeline::{Backend, ClickCapture, Encoded, KeyCapture, PacketSink, Parts, Role, open_audio};
@@ -18,7 +19,7 @@ use windows::Win32::System::Threading::{
 };
 
 use super::capture::Capture;
-use glint_core::record::negotiate::{Force, Route, describe};
+use glint_core::record::negotiate::{Force, Route, describe, fps_text};
 
 use super::encoder::{self, Composer, SinkWriter, log_start, video_config};
 use super::gpu::Gpu;
@@ -128,9 +129,10 @@ where
                 let output = Encoded::new(MfVideoEncoder::new(gpu, force), &video_config(p), audio, make()?)?;
                 let video = output.video_encoder();
                 let route = video.route().ok_or("the video encoder isn't configured")?;
-                log_start(p, &format!("packet path: {}", describe(video.name(), &gpu.adapter.name, route)), tracks);
-                let notice = video.notice();
-                Ok((output, route, notice))
+                let at = Params { fps: video.fps(), ..p.clone() };
+                log_start(&at, &format!("packet path: {}", describe(video.name(), &gpu.adapter.name, route)), tracks);
+                let (notice, fps) = (video.notice(), video.fps());
+                Ok((output, route, notice, fps))
             })
         }
     }
@@ -138,11 +140,11 @@ where
 
 /// Opens capture, audio, the output `output` makes on the encoder's side of the GPU (with the
 /// routes the environment leaves and the audio tracks' names; it says which route its encoder
-/// took) and the compositor feeding it what that encoder takes. On failure the partial file is
-/// deleted.
+/// took and the rate it encodes at) and the compositor feeding it what that encoder takes, at
+/// that rate. On failure the partial file is deleted.
 unsafe fn open<B>(
     p: Params,
-    output: impl FnOnce(&Params, &Gpu, Force, Vec<String>) -> Result<(B::Output, Route, Option<&'static str>), String>,
+    output: impl FnOnce(&Params, &Gpu, Force, Vec<String>) -> Result<(B::Output, Route, Option<&'static str>, f64), String>,
 ) -> Result<Parts<B>, String>
 where
     B: Backend<Capture = Capture, Frames = Composer, Audio = audio::Source, Mouse = Hook, Keys = KeyHook>,
@@ -156,7 +158,7 @@ where
 
 unsafe fn open_parts<B>(
     p: &Params,
-    output: impl FnOnce(&Params, &Gpu, Force, Vec<String>) -> Result<(B::Output, Route, Option<&'static str>), String>,
+    output: impl FnOnce(&Params, &Gpu, Force, Vec<String>) -> Result<(B::Output, Route, Option<&'static str>, f64), String>,
 ) -> Result<Parts<B>, String>
 where
     B: Backend<Capture = Capture, Frames = Composer, Audio = audio::Source, Mouse = Hook, Keys = KeyHook>,
@@ -166,7 +168,11 @@ where
         let audio = open_audio::<audio::Source>(&p.audio, &p.track_names);
         let names = audio.tracks.iter().map(|t| t.name.clone()).collect();
         let gpu = Gpu::open(&capture.adapter, (p.region.w as u32, p.region.h as u32))?;
-        let (output, route, notice) = output(p, &gpu, Force::from_env(), names)?;
+        let (output, route, notice, fps) = output(p, &gpu, Force::from_env(), names)?;
+        if fps != p.fps {
+            log(&format!("recording at {} fps: no encoder takes {}", fps_text(fps), fps_text(p.fps)));
+        }
+        let p = &Params { fps, ..p.clone() };
         let frames = Composer::new(p, &capture.handles, gpu, route)?;
         let notices = notice.map(String::from).into_iter().collect();
         let clicks = p.clicks.map(|c| {

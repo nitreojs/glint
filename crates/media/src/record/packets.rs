@@ -13,13 +13,13 @@ use glint_core::record::mix::{RATE, frames_to_hns};
 use glint_core::record::mp4::{name_tracks, tag_colours};
 use glint_core::record::pipeline::{AudioEncoder, Packet, PacketSink, Stream, VideoConfig, VideoEncoder};
 use windows::Win32::Media::MediaFoundation::*;
-use glint_core::record::negotiate::{Engine, Force, Matrix, Refusal, Route, describe, matrix, negotiate, notice};
+use glint_core::record::negotiate::{Engine, Force, Matrix, Refusal, Route, describe, log_tried, matrix, negotiate_rate, notice};
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{GUID, HSTRING, Interface};
 
 use super::Ctx;
-use super::encoder::{AAC_BYTES_PER_SECOND, attributes, colour_tags, gop, input_type, log_tried, pack};
+use super::encoder::{AAC_BYTES_PER_SECOND, attributes, colour_tags, gop, input_type, pack};
 use super::gpu::{Adapter, Gpu, friendly_name, hardware_encoders, plain, software_encoders, subtype_name};
 
 /// The fields of `HEAACWAVEINFO` after `WAVEFORMATEX` that MF keeps in `MF_MT_USER_DATA` before the
@@ -152,6 +152,8 @@ pub struct MfVideoEncoder {
     name: String,
     route: Option<Route>,
     notice: Option<&'static str>,
+    /// The rate it was configured at: lower than asked when no encoder took that.
+    fps: f64,
 }
 
 impl MfVideoEncoder {
@@ -166,6 +168,7 @@ impl MfVideoEncoder {
             name: String::new(),
             route: None,
             notice: None,
+            fps: 0.0,
         }
     }
 
@@ -182,6 +185,11 @@ impl MfVideoEncoder {
     /// What to tell the user about the route, once configured.
     pub fn notice(&self) -> Option<&'static str> {
         self.notice
+    }
+
+    /// The rate it encodes at, once configured.
+    pub fn fps(&self) -> f64 {
+        self.fps
     }
 
     fn parts(&self) -> Result<&Opened, String> {
@@ -385,15 +393,20 @@ impl VideoEncoder for MfVideoEncoder {
 
     fn configure(&mut self, config: &VideoConfig) -> Result<Stream, String> {
         let routes = self.routes.clone();
-        match negotiate(&routes, |route| unsafe { self.open_route(config, route) }) {
-            Ok(((opened, name, headers), route, tried)) => {
+        let attempt = |fps, route| {
+            let config = VideoConfig { fps, ..*config };
+            unsafe { self.open_route(&config, route) }
+        };
+        match negotiate_rate(config.fps, &routes, attempt) {
+            Ok(((opened, name, headers), route, fps, tried)) => {
                 log_tried(&tried);
                 log(&format!("video: {}", describe(&name, &self.adapter.name, route)));
                 self.opened = Some(opened);
                 self.name = name;
                 self.route = Some(route);
                 self.notice = notice(route, &tried, (config.width, config.height));
-                Ok(Stream::Video { config: *config, headers, matrix: matrix(route, config.height) })
+                self.fps = fps;
+                Ok(Stream::Video { config: VideoConfig { fps, ..*config }, headers, matrix: matrix(route, config.height) })
             }
             Err(failed) => {
                 log_tried(&failed.tried);

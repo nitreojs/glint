@@ -208,6 +208,62 @@ pub fn negotiate<T>(
     Err(Failed { tried })
 }
 
+/// Rates to offer the encoders for a recording at `fps`: as asked and, above 60, whole fractions
+/// of it down to 30, which keep motion even (every second or third frame). Some encoders refuse
+/// high rates (one NVIDIA laptop GPU took 60 fps but not 165 at 1440p; Windows' software
+/// encoder stops near 172).
+pub fn rates(fps: f64) -> Vec<f64> {
+    let mut out = vec![fps];
+    if fps > 60.0 {
+        out.extend((2..).map(|k| fps / k as f64).take_while(|&r| r >= 30.0));
+    }
+    out
+}
+
+/// [`negotiate`] at the first of [`rates`] some route takes: what it made, the route, the rate
+/// and the routes refused at it. A lower rate is only tried while every route refused the
+/// frames themselves (a missing encoder or a file that can't be made won't change). The error
+/// is the one at the rate asked for.
+pub fn negotiate_rate<T>(
+    fps: f64,
+    routes: &[Route],
+    mut attempt: impl FnMut(f64, Route) -> Result<T, Refusal>,
+) -> Result<(T, Route, f64, Vec<Tried>), Failed> {
+    let mut first: Option<Failed> = None;
+    for rate in rates(fps) {
+        match negotiate(routes, |route| attempt(rate, route)) {
+            Ok((made, route, tried)) => return Ok((made, route, rate, tried)),
+            Err(failed) => {
+                let format = failed.tried.iter().any(|t| matches!(t.why, Refusal::Format(_)));
+                let fatal = failed.tried.iter().any(|t| matches!(t.why, Refusal::Fatal(_)));
+                let stop = !format || fatal;
+                if !stop {
+                    log_tried(&failed.tried);
+                    crate::log::log(&format!("no encoder took {} fps, trying less", fps_text(rate)));
+                }
+                first.get_or_insert(failed);
+                if stop {
+                    break;
+                }
+            }
+        }
+    }
+    Err(first.unwrap_or(Failed { tried: Vec::new() }))
+}
+
+/// Logs the routes to the encoder that didn't work.
+pub fn log_tried(tried: &[Tried]) {
+    for t in tried {
+        let (Refusal::Format(why) | Refusal::Missing(why) | Refusal::Fatal(why)) = &t.why;
+        crate::log::log(&format!("{:?} encoder, {} frames: {why}", t.route.engine, t.route.input.name()));
+    }
+}
+
+/// A rate as people say it: `165`, `82.50`.
+pub fn fps_text(fps: f64) -> String {
+    if fps.fract().abs() < 0.01 { format!("{:.0}", fps) } else { format!("{:.2}", fps) }
+}
+
 impl Failed {
     /// The error the user sees: what was tried on `adapter` for `config`'s frames and why each
     /// didn't work. The size and rate are in it: encoders refuse some (odd sides, high rates).
@@ -223,7 +279,7 @@ impl Failed {
         let mut text = if missing {
             format!("{adapter} can't encode {}:", codec.name())
         } else {
-            let fps = if config.fps.fract().abs() < 0.01 { format!("{:.0}", config.fps) } else { format!("{:.2}", config.fps) };
+            let fps = fps_text(config.fps);
             format!("no encoder took {}×{} {} at {fps} fps on {adapter}:", config.width, config.height, codec.name())
         };
         for t in &self.tried {
@@ -374,5 +430,57 @@ mod tests {
             failed.explain(&config(Codec::Hevc), "Intel(R) UHD Graphics"),
             "Intel(R) UHD Graphics can't encode HEVC:\n· no Hardware encoder\n· no Software encoder\nChoose H.264 in settings."
         );
+    }
+
+    #[test]
+    fn high_rates_fall_back_to_whole_fractions_down_to_30() {
+        assert_eq!(rates(165.0), [165.0, 82.5, 55.0, 41.25, 33.0]);
+        assert_eq!(rates(240.0), [240.0, 120.0, 80.0, 60.0, 48.0, 40.0, 240.0 / 7.0, 30.0]);
+        assert_eq!(rates(60.0), [60.0], "60 and below is recorded as asked or not at all");
+    }
+
+    #[test]
+    fn a_rate_every_route_refuses_is_halved_until_one_takes_it() {
+        let routes = routes(Force::default(), true);
+        let mut offered = Vec::new();
+        let (_, route, rate, tried) = negotiate_rate(165.0, &routes, |rate, r| {
+            offered.push(rate);
+            // the hardware encoder takes up to 144 fps, software nothing at all
+            if r.engine == Engine::Hardware && rate <= 144.0 { Ok(()) } else { Err(Refusal::Format(format!("refused {rate}"))) }
+        })
+        .unwrap();
+        assert_eq!((route, rate), (HW_ARGB, 82.5));
+        assert!(tried.is_empty(), "only refusals at the rate that worked are reported with it");
+        assert_eq!(offered, [165.0, 165.0, 165.0, 165.0, 82.5]);
+    }
+
+    #[test]
+    fn missing_encoders_and_fatal_errors_dont_try_lower_rates() {
+        let routes = routes(Force::default(), true);
+        let mut asked = Vec::new();
+        let failed = negotiate_rate(240.0, &routes, |rate, _| -> Result<(), _> {
+            asked.push(rate);
+            Err(Refusal::Missing("no encoder".into()))
+        })
+        .unwrap_err();
+        assert!(asked.iter().all(|&r| r == 240.0), "{asked:?}");
+        assert!(failed.tried.iter().all(|t| matches!(t.why, Refusal::Missing(_))));
+        let mut asked = Vec::new();
+        let failed = negotiate_rate(240.0, &routes, |rate, _| -> Result<(), _> {
+            asked.push(rate);
+            Err(Refusal::Fatal("can't make the file".into()))
+        })
+        .unwrap_err();
+        assert_eq!(asked, [240.0]);
+        assert_eq!(failed.explain(&config(Codec::H264), "GPU"), "can't make the file");
+    }
+
+    #[test]
+    fn when_no_rate_works_the_error_is_about_the_rate_asked_for() {
+        let failed = negotiate_rate(165.0, &routes(Force::default(), true), |rate, _| -> Result<(), _> {
+            Err(Refusal::Format(format!("refused {rate}")))
+        })
+        .unwrap_err();
+        assert!(failed.tried.iter().all(|t| t.why == Refusal::Format("refused 165".into())), "{failed:?}");
     }
 }
