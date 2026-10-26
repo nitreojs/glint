@@ -1,81 +1,191 @@
 use std::cell::RefCell;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::*;
-use windows::core::{BOOL, w};
+use windows::core::{BOOL, HSTRING, w};
 
 use glint_shell::gfx::{Canvas, rgba};
 
 const SHADE: D2D1_COLOR_F = rgba(0, 0, 0, 0.6);
-const FORMATS: usize = 8;
+const PILL: D2D1_COLOR_F = rgba(12, 12, 16, 0.62);
+const FORMATS: usize = 32;
+const LAYOUTS: usize = 24;
+/// Wider than any text: lines are only broken at newlines unless a mark has a width.
+const UNBOUNDED: f32 = 100_000.0;
 
-/// A caret operation on a text being typed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Op {
-    Insert(char),
-    Back,
-    Delete,
+/// Families offered first, when they're installed.
+const FAVOURITES: [&str; 13] = [
+    "Segoe UI",
+    "Segoe UI Variable Display",
+    "Arial",
+    "Calibri",
+    "Bahnschrift",
+    "Georgia",
+    "Times New Roman",
+    "Consolas",
+    "Cascadia Code",
+    "Comic Sans MS",
+    "Impact",
+    "Segoe Print",
+    "Ink Free",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub(super) enum Align {
+    #[default]
     Left,
+    Centre,
     Right,
-    Home,
-    End,
-    Up,
-    Down,
 }
 
-fn line_start(t: &str, at: usize) -> usize {
+impl Align {
+    pub(super) fn next(self) -> Align {
+        match self {
+            Align::Left => Align::Centre,
+            Align::Centre => Align::Right,
+            Align::Right => Align::Left,
+        }
+    }
+}
+
+/// What keeps a text readable over a busy screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub(super) enum Back {
+    /// A dark outline around the letters.
+    #[default]
+    Outline,
+    /// A dark translucent pill behind the text.
+    Shade,
+    /// A pill in the text's colour, the letters in black or white on it.
+    Tag,
+    None,
+}
+
+impl Back {
+    pub(super) fn next(self) -> Back {
+        match self {
+            Back::Outline => Back::Shade,
+            Back::Shade => Back::Tag,
+            Back::Tag => Back::None,
+            Back::None => Back::Outline,
+        }
+    }
+}
+
+/// How a whole text mark looks, besides its colour and size.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct Style {
+    pub(super) font: Arc<str>,
+    pub(super) bold: bool,
+    pub(super) italic: bool,
+    pub(super) underline: bool,
+    pub(super) strike: bool,
+    pub(super) align: Align,
+    pub(super) back: Back,
+}
+
+impl Default for Style {
+    fn default() -> Style {
+        Style {
+            font: Arc::from("Segoe UI"),
+            bold: true,
+            italic: false,
+            underline: false,
+            strike: false,
+            align: Align::Left,
+            back: Back::Outline,
+        }
+    }
+}
+
+/// The style and size the last text had: new texts start with them, in this shot and the next.
+static LAST: Mutex<Option<(Style, f32)>> = Mutex::new(None);
+
+pub(super) fn last_style() -> Option<(Style, f32)> {
+    LAST.lock().ok()?.clone()
+}
+
+pub(super) fn remember_style(style: &Style, size: f32) {
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((style.clone(), size));
+    }
+}
+
+/// Space between a pill's edge and its text, for a font of `px` physical pixels.
+pub(super) fn padding(back: Back, px: f32) -> (f32, f32) {
+    match back {
+        Back::Shade | Back::Tag => ((px * 0.34).round().max(3.0), (px * 0.14).round().max(2.0)),
+        Back::Outline | Back::None => (0.0, 0.0),
+    }
+}
+
+/// How far the dark outline around text reaches, for a font of `px` physical pixels.
+pub(super) fn outline(px: f32) -> f32 {
+    (px / 14.0).round().max(1.0)
+}
+
+// --- editing: byte offsets into the text, always on char boundaries ---
+
+pub(super) fn line_start(t: &str, at: usize) -> usize {
     t[..at].rfind('\n').map_or(0, |i| i + 1)
 }
 
-fn line_end(t: &str, at: usize) -> usize {
+pub(super) fn line_end(t: &str, at: usize) -> usize {
     t[at..].find('\n').map_or(t.len(), |i| at + i)
 }
 
-fn prev(t: &str, at: usize) -> usize {
+pub(super) fn prev(t: &str, at: usize) -> usize {
     t[..at].char_indices().next_back().map_or(0, |(i, _)| i)
 }
 
-fn next(t: &str, at: usize) -> usize {
+pub(super) fn next(t: &str, at: usize) -> usize {
     t[at..].chars().next().map_or(at, |c| at + c.len_utf8())
 }
 
-fn at_column(t: &str, start: usize, column: usize) -> usize {
-    let end = line_end(t, start);
-    t[start..end].char_indices().nth(column).map_or(end, |(i, _)| start + i)
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
-/// Applies `op` to `text` with the caret at byte offset `caret`; returns the new caret.
-pub(super) fn edit(text: &mut String, caret: usize, op: Op) -> usize {
-    let t = text.as_str();
-    let column = || t[line_start(t, caret)..caret].chars().count();
-    match op {
-        Op::Insert(c) => {
-            text.insert(caret, c);
-            caret + c.len_utf8()
+/// Where Ctrl+Left lands: the start of the word before `at` (skipping the spaces in between).
+pub(super) fn word_left(t: &str, at: usize) -> usize {
+    let mut chars = t[..at].char_indices().rev().peekable();
+    while chars.next_if(|(_, c)| c.is_whitespace()).is_some() {}
+    match chars.peek() {
+        Some(&(_, c)) if is_word(c) => {
+            let mut start = at;
+            while let Some((i, _)) = chars.next_if(|(_, c)| is_word(*c)) {
+                start = i;
+            }
+            start
         }
-        Op::Back => {
-            let p = prev(t, caret);
-            text.replace_range(p..caret, "");
-            p
-        }
-        Op::Delete => {
-            let n = next(t, caret);
-            text.replace_range(caret..n, "");
-            caret
-        }
-        Op::Left => prev(t, caret),
-        Op::Right => next(t, caret),
-        Op::Home => line_start(t, caret),
-        Op::End => line_end(t, caret),
-        Op::Up => match line_start(t, caret) {
-            0 => 0,
-            start => at_column(t, line_start(t, start - 1), column()),
-        },
-        Op::Down => match line_end(t, caret) {
-            end if end == t.len() => end,
-            end => at_column(t, end + 1, column()),
-        },
+        Some(&(i, _)) => i,
+        None => 0,
     }
+}
+
+/// Where Ctrl+Right lands: past the word at `at` and the spaces after it.
+pub(super) fn word_right(t: &str, at: usize) -> usize {
+    let mut chars = t[at..].char_indices().map(|(i, c)| (at + i, c)).peekable();
+    match chars.peek() {
+        Some(&(_, c)) if is_word(c) => while chars.next_if(|(_, c)| is_word(*c)).is_some() {},
+        Some(_) => {
+            chars.next();
+        }
+        None => return t.len(),
+    }
+    while chars.next_if(|(_, c)| c.is_whitespace() && *c != '\n').is_some() {}
+    chars.peek().map_or(t.len(), |&(i, _)| i)
+}
+
+/// The word (or run of other characters) around `at`, for a double-click.
+pub(super) fn word_at(t: &str, at: usize) -> (usize, usize) {
+    let kind = |c: char| if is_word(c) { 0 } else if c.is_whitespace() { 1 } else { 2 };
+    let Some(c) = t[at..].chars().next().or_else(|| t[..at].chars().next_back()) else { return (at, at) };
+    let k = kind(c);
+    let start = t[..at].char_indices().rev().take_while(|(_, c)| kind(*c) == k).last().map_or(at, |(i, _)| i);
+    let end = t[at..].char_indices().find(|(_, c)| kind(*c) != k).map_or(t.len(), |(i, _)| at + i);
+    (start, end)
 }
 
 fn utf16_len(s: &str) -> u32 {
@@ -94,33 +204,56 @@ fn byte_at(t: &str, pos: u32) -> usize {
     t.len()
 }
 
-/// Lays out mark text: Segoe UI Semibold, top-left aligned, lines broken only at newlines.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct LayoutKey {
+    text: String,
+    style: Style,
+    px: u32,
+    width: Option<u32>,
+}
+
+struct Laid {
+    key: LayoutKey,
+    layout: IDWriteTextLayout,
+    /// The text's box: width (the wrap width when it has one) and height.
+    size: (f32, f32),
+}
+
+/// A text format's family, bold, italic and size (its bits).
+type FormatKey = (Arc<str>, bool, bool, u32);
+
+/// Lays out and draws mark text with DirectWrite. Layouts are kept for the last few texts, so
+/// measuring, the caret, hit tests and drawing the same text share one.
 pub(super) struct Typesetter {
     dwrite: IDWriteFactory,
-    formats: RefCell<Vec<(u32, IDWriteTextFormat)>>,
+    formats: RefCell<Vec<(FormatKey, IDWriteTextFormat)>>,
+    layouts: RefCell<Vec<Laid>>,
 }
 
 impl Typesetter {
     pub(super) fn new() -> Typesetter {
         // the shared factory is a process singleton the picker's painter has already created
         let dwrite = unsafe { DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED) }.expect("DirectWrite shared factory");
-        Typesetter { dwrite, formats: RefCell::new(Vec::new()) }
+        Typesetter { dwrite, formats: RefCell::new(Vec::new()), layouts: RefCell::new(Vec::new()) }
     }
 
-    fn format(&self, px: f32) -> Option<IDWriteTextFormat> {
-        let key = px.to_bits();
+    fn format(&self, font: &Arc<str>, bold: bool, italic: bool, px: f32) -> Option<IDWriteTextFormat> {
+        let key = (font.clone(), bold, italic, px.to_bits());
         let mut formats = self.formats.borrow_mut();
-        if let Some((_, f)) = formats.iter().find(|(k, _)| *k == key) {
-            return Some(f.clone());
+        if let Some(i) = formats.iter().position(|(k, _)| *k == key) {
+            let entry = formats.remove(i);
+            let f = entry.1.clone();
+            formats.push(entry);
+            return Some(f);
         }
         let f = unsafe {
             let f = self
                 .dwrite
                 .CreateTextFormat(
-                    w!("Segoe UI"),
+                    &HSTRING::from(&*key.0),
                     None,
-                    DWRITE_FONT_WEIGHT_SEMI_BOLD,
-                    DWRITE_FONT_STYLE_NORMAL,
+                    if bold { DWRITE_FONT_WEIGHT_BOLD } else { DWRITE_FONT_WEIGHT_NORMAL },
+                    if italic { DWRITE_FONT_STYLE_ITALIC } else { DWRITE_FONT_STYLE_NORMAL },
                     DWRITE_FONT_STRETCH_NORMAL,
                     px,
                     w!("en-us"),
@@ -136,101 +269,298 @@ impl Typesetter {
         Some(f)
     }
 
-    fn layout(&self, text: &str, px: f32) -> Option<IDWriteTextLayout> {
+    /// The layout of `text` in `style` at `px` physical pixels, `width` wide when it wraps, and the
+    /// size of its box.
+    fn laid<R>(&self, text: &str, style: &Style, px: f32, width: Option<f32>, f: impl FnOnce(&IDWriteTextLayout, (f32, f32)) -> R) -> Option<R> {
+        let key = LayoutKey { text: text.to_owned(), style: style.clone(), px: px.to_bits(), width: width.map(f32::to_bits) };
+        {
+            let mut layouts = self.layouts.borrow_mut();
+            if let Some(i) = layouts.iter().position(|l| l.key == key) {
+                let l = layouts.remove(i);
+                let out = f(&l.layout, l.size);
+                layouts.push(l);
+                return Some(out);
+            }
+        }
+        let format = self.format(&style.font, style.bold, style.italic, px)?;
         let s: Vec<u16> = text.encode_utf16().collect();
-        unsafe { self.dwrite.CreateTextLayout(&s, &self.format(px)?, 100_000.0, 100_000.0).ok() }
+        let (layout, size) = unsafe {
+            let layout = self.dwrite.CreateTextLayout(&s, &format, width.unwrap_or(UNBOUNDED), UNBOUNDED).ok()?;
+            let all = DWRITE_TEXT_RANGE { startPosition: 0, length: s.len() as u32 };
+            if style.underline {
+                let _ = layout.SetUnderline(true, all);
+            }
+            if style.strike {
+                let _ = layout.SetStrikethrough(true, all);
+            }
+            if width.is_some() {
+                let _ = layout.SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+            }
+            let mut m = DWRITE_TEXT_METRICS::default();
+            layout.GetMetrics(&mut m).ok()?;
+            let w = width.unwrap_or(m.widthIncludingTrailingWhitespace);
+            // lines line up with each other inside the box
+            let _ = layout.SetMaxWidth(w.max(1.0));
+            let _ = layout.SetTextAlignment(match style.align {
+                Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
+                Align::Centre => DWRITE_TEXT_ALIGNMENT_CENTER,
+                Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+            });
+            (layout, (w, m.height))
+        };
+        let out = f(&layout, size);
+        let mut layouts = self.layouts.borrow_mut();
+        if layouts.len() == LAYOUTS {
+            layouts.remove(0);
+        }
+        layouts.push(Laid { key, layout, size });
+        Some(out)
     }
 
-    /// Width and height of `text` at `px` physical pixels; an empty text is one line high.
-    pub(super) fn extent(&self, text: &str, px: f32) -> (f32, f32) {
-        let Some(layout) = self.layout(text, px) else { return (0.0, px) };
-        let mut m = DWRITE_TEXT_METRICS::default();
-        match unsafe { layout.GetMetrics(&mut m) } {
-            Ok(()) => (m.widthIncludingTrailingWhitespace, m.height),
-            Err(_) => (0.0, px),
-        }
+    /// Width and height of the text's box (without padding); an empty text is one line high.
+    pub(super) fn extent(&self, text: &str, style: &Style, px: f32, width: Option<f32>) -> (f32, f32) {
+        self.laid(text, style, px, width, |_, size| size).unwrap_or((width.unwrap_or(0.0), px))
     }
 
-    /// Top of the caret before byte `caret`, and its height, relative to the text's corner.
-    pub(super) fn caret(&self, text: &str, px: f32, caret: usize) -> (f32, f32, f32) {
-        let Some(layout) = self.layout(text, px) else { return (0.0, 0.0, px) };
-        let (mut x, mut y, mut m) = (0.0, 0.0, DWRITE_HIT_TEST_METRICS::default());
-        match unsafe { layout.HitTestTextPosition(utf16_len(&text[..caret]), false, &mut x, &mut y, &mut m) } {
-            Ok(()) => (x, m.top, m.height),
-            Err(_) => (0.0, 0.0, px),
-        }
+    /// Left and top of the caret before byte `caret`, and its height, relative to the text's corner.
+    pub(super) fn caret(&self, text: &str, style: &Style, px: f32, width: Option<f32>, caret: usize) -> (f32, f32, f32) {
+        self.laid(text, style, px, width, |layout, _| {
+            let (mut x, mut y, mut m) = (0.0, 0.0, DWRITE_HIT_TEST_METRICS::default());
+            match unsafe { layout.HitTestTextPosition(utf16_len(&text[..caret]), false, &mut x, &mut y, &mut m) } {
+                Ok(()) => (x, m.top, m.height),
+                Err(_) => (0.0, 0.0, px),
+            }
+        })
+        .unwrap_or((0.0, 0.0, px))
     }
 
     /// The byte offset a click at `(x, y)` (relative to the text's corner) puts the caret at.
-    pub(super) fn hit(&self, text: &str, px: f32, (x, y): (f32, f32)) -> usize {
-        let Some(layout) = self.layout(text, px) else { return text.len() };
-        let (mut trailing, mut inside, mut m) = (BOOL(0), BOOL(0), DWRITE_HIT_TEST_METRICS::default());
-        match unsafe { layout.HitTestPoint(x, y, &mut trailing, &mut inside, &mut m) } {
-            Ok(()) => byte_at(text, m.textPosition + if trailing.as_bool() { m.length } else { 0 }),
-            Err(_) => text.len(),
-        }
+    pub(super) fn hit(&self, text: &str, style: &Style, px: f32, width: Option<f32>, (x, y): (f32, f32)) -> usize {
+        self.laid(text, style, px, width, |layout, _| {
+            let (mut trailing, mut inside, mut m) = (BOOL(0), BOOL(0), DWRITE_HIT_TEST_METRICS::default());
+            match unsafe { layout.HitTestPoint(x, y, &mut trailing, &mut inside, &mut m) } {
+                Ok(()) => byte_at(text, m.textPosition + if trailing.as_bool() { m.length } else { 0 }),
+                Err(_) => text.len(),
+            }
+        })
+        .unwrap_or(text.len())
     }
 
-    /// `text` with its corner at `at`, inside a dark outline `reach` pixels wide.
-    pub(super) fn draw_outlined(
+    /// The boxes (relative to the text's corner) the bytes `from..to` cover, one per line.
+    pub(super) fn range(&self, text: &str, style: &Style, px: f32, width: Option<f32>, (from, to): (usize, usize)) -> Vec<[f32; 4]> {
+        if from >= to {
+            return Vec::new();
+        }
+        self.laid(text, style, px, width, |layout, _| unsafe {
+            let (start, len) = (utf16_len(&text[..from]), utf16_len(&text[from..to]));
+            let mut n = 0;
+            let _ = layout.HitTestTextRange(start, len, 0.0, 0.0, None, &mut n);
+            let mut boxes = vec![DWRITE_HIT_TEST_METRICS::default(); n as usize];
+            if layout.HitTestTextRange(start, len, 0.0, 0.0, Some(&mut boxes), &mut n).is_err() {
+                return Vec::new();
+            }
+            // an empty line still shows that it's selected
+            boxes.iter().map(|m| [m.left, m.top, m.width.max(px / 4.0), m.height]).collect()
+        })
+        .unwrap_or_default()
+    }
+
+    /// Draws a text mark's box at `at`: its backing, then the letters.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn draw(
         &self,
         c: &Canvas,
         text: &str,
+        style: &Style,
         px: f32,
+        width: Option<f32>,
         at: (f32, f32),
         color: D2D1_COLOR_F,
-        reach: f32,
+        ink_on_color: D2D1_COLOR_F,
     ) {
-        let Some(layout) = self.layout(text, px) else { return };
-        let d = reach * std::f32::consts::FRAC_1_SQRT_2;
-        for (dx, dy) in [(reach, 0.0), (-reach, 0.0), (0.0, reach), (0.0, -reach), (d, d), (d, -d), (-d, d), (-d, -d)] {
-            c.text_layout(&layout, (at.0 + dx, at.1 + dy), SHADE);
+        let (pad_x, pad_y) = padding(style.back, px);
+        let origin = (at.0 + pad_x, at.1 + pad_y);
+        self.laid(text, style, px, width, |layout, (w, h)| {
+            let pill = |fill| c.round_rect(at.0, at.1, w + 2.0 * pad_x, h + 2.0 * pad_y, (h + 2.0 * pad_y) * 0.3, fill);
+            match style.back {
+                Back::Outline => {
+                    let reach = outline(px);
+                    let d = reach * std::f32::consts::FRAC_1_SQRT_2;
+                    for (dx, dy) in [(reach, 0.0), (-reach, 0.0), (0.0, reach), (0.0, -reach), (d, d), (d, -d), (-d, d), (-d, -d)] {
+                        c.text_layout(layout, (origin.0 + dx, origin.1 + dy), SHADE);
+                    }
+                    c.text_layout(layout, origin, color);
+                }
+                Back::Shade => {
+                    if !text.is_empty() {
+                        pill(PILL);
+                    }
+                    c.text_layout(layout, origin, color);
+                }
+                Back::Tag => {
+                    if !text.is_empty() {
+                        pill(color);
+                    }
+                    c.text_layout(layout, origin, if text.is_empty() { color } else { ink_on_color });
+                }
+                Back::None => c.text_layout(layout, origin, color),
+            }
+        });
+    }
+
+    /// One line of `text` in `font`, left-aligned and vertically centred in `[x, y, w, h]`, cut off
+    /// at the box's right edge.
+    pub(super) fn draw_line(&self, c: &Canvas, text: &str, style: &Style, px: f32, [x, y, w, h]: [f32; 4], color: D2D1_COLOR_F) {
+        let plain = Style { align: Align::Left, back: Back::None, ..style.clone() };
+        let Some(format) = self.format(&plain.font, plain.bold, plain.italic, px) else { return };
+        let s: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            let Ok(layout) = self.dwrite.CreateTextLayout(&s, &format, w.max(1.0), h.max(1.0)) else { return };
+            let _ = layout.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            let all = DWRITE_TEXT_RANGE { startPosition: 0, length: s.len() as u32 };
+            if style.underline {
+                let _ = layout.SetUnderline(true, all);
+            }
+            if style.strike {
+                let _ = layout.SetStrikethrough(true, all);
+            }
+            let trim = DWRITE_TRIMMING { granularity: DWRITE_TRIMMING_GRANULARITY_CHARACTER, ..Default::default() };
+            let _ = layout.SetTrimming(&trim, None);
+            c.text_layout(&layout, (x, y), color);
         }
-        c.text_layout(&layout, at, color);
     }
 
     pub(super) fn draw_centred(&self, c: &Canvas, text: &str, px: f32, centre: (f32, f32), color: D2D1_COLOR_F) {
-        if let Some(format) = self.format(px) {
+        if let Some(format) = self.format(&Arc::from("Segoe UI"), true, false, px) {
             c.text_centred(text, &format, centre, color);
         }
     }
+
+    /// A short `text` in `style`'s font, weight and slant, its ink centred on `centre`.
+    pub(super) fn draw_glyph(&self, c: &Canvas, text: &str, style: &Style, px: f32, centre: (f32, f32), color: D2D1_COLOR_F) {
+        if let Some(format) = self.format(&style.font, style.bold, style.italic, px) {
+            c.text_centred(text, &format, centre, color);
+        }
+    }
+
+    /// Width of one line of `text` in the UI's face at `px`.
+    pub(super) fn measure(&self, text: &str, px: f32) -> f32 {
+        let style = Style { bold: false, ..Style::default() };
+        self.extent(text, &style, px, None).0
+    }
+
+    /// The installed font families: the favourites first, then the rest alphabetically.
+    pub(super) fn families(&self) -> Arc<Vec<Arc<str>>> {
+        FAMILIES.0.clone()
+    }
+
+    /// Whether family `name` draws pictures instead of letters (icons, dingbats).
+    pub(super) fn is_symbol(&self, name: &str) -> bool {
+        FAMILIES.1.iter().any(|s| s == name)
+    }
+}
+
+/// The installed families in the order the font list shows them, and the symbol fonts among them.
+type Families = (Arc<Vec<Arc<str>>>, Vec<String>);
+
+/// The installed font families, read once.
+static FAMILIES: LazyLock<Families> = LazyLock::new(|| {
+    let found = match unsafe { DWriteCreateFactory::<IDWriteFactory>(DWRITE_FACTORY_TYPE_SHARED) } {
+        Ok(dwrite) => system_families(&dwrite),
+        Err(_) => Vec::new(),
+    };
+    let symbols = found.iter().filter(|(_, symbol)| *symbol).map(|(n, _)| n.clone()).collect();
+    (Arc::new(ordered(found.into_iter().map(|(n, _)| n).collect())), symbols)
+});
+
+/// `names` with the favourites that are there first, then the rest alphabetically.
+fn ordered(mut names: Vec<String>) -> Vec<Arc<str>> {
+    names.sort_by_key(|n| n.to_lowercase());
+    names.dedup();
+    let mut out: Vec<Arc<str>> = FAVOURITES.iter().filter(|f| names.iter().any(|n| n == *f)).map(|f| Arc::from(*f)).collect();
+    out.extend(names.iter().filter(|n| !FAVOURITES.contains(&n.as_str())).map(|n| Arc::from(n.as_str())));
+    out
+}
+
+/// The families in `names` matching `query` (any case, anywhere in the name), in order; names
+/// starting with it come first.
+pub(super) fn search(names: &[Arc<str>], query: &str) -> Vec<Arc<str>> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return names.to_vec();
+    }
+    let (mut starts, mut inside) = (Vec::new(), Vec::new());
+    for n in names {
+        let lower = n.to_lowercase();
+        if lower.starts_with(&q) {
+            starts.push(n.clone());
+        } else if lower.contains(&q) {
+            inside.push(n.clone());
+        }
+    }
+    starts.extend(inside);
+    starts
+}
+
+/// Every installed family's name, and whether it's a symbol font.
+fn system_families(dwrite: &IDWriteFactory) -> Vec<(String, bool)> {
+    let mut names = Vec::new();
+    unsafe {
+        let mut collection = None;
+        if dwrite.GetSystemFontCollection(&mut collection, false).is_err() {
+            return names;
+        }
+        let Some(collection) = collection else { return names };
+        for i in 0..collection.GetFontFamilyCount() {
+            let Ok(family) = collection.GetFontFamily(i) else { continue };
+            let Ok(localized) = family.GetFamilyNames() else { continue };
+            let (mut index, mut exists) = (0, BOOL(0));
+            let _ = localized.FindLocaleName(w!("en-us"), &mut index, &mut exists);
+            if !exists.as_bool() {
+                index = 0;
+            }
+            let Ok(len) = localized.GetStringLength(index) else { continue };
+            let mut buf = vec![0u16; len as usize + 1];
+            if localized.GetString(index, &mut buf).is_ok() {
+                let symbol = family
+                    .GetFirstMatchingFont(DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL)
+                    .is_ok_and(|f| f.IsSymbolFont().as_bool());
+                names.push((String::from_utf16_lossy(&buf[..len as usize]), symbol));
+            }
+        }
+    }
+    names
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn run(text: &str, caret: usize, ops: &[Op]) -> (String, usize) {
-        let mut t = text.to_owned();
-        let mut c = caret;
-        for &op in ops {
-            c = edit(&mut t, c, op);
-        }
-        (t, c)
+    #[test]
+    fn words_are_found_both_ways() {
+        let t = "hello,  big world\nnext";
+        assert_eq!(word_left(t, 13), 12, "back to the start of the word");
+        assert_eq!(word_left(t, 12), 8, "over the space into the word before");
+        assert_eq!(word_left(t, 8), 5, "over the spaces onto the comma");
+        assert_eq!(word_left(t, 5), 0);
+        assert_eq!(word_left(t, 0), 0);
+        assert_eq!(word_right(t, 0), 5, "past hello");
+        assert_eq!(word_right(t, 5), 8, "the comma and the spaces after it");
+        assert_eq!(word_right(t, 8), 12);
+        assert_eq!(word_right(t, 12), 17, "stops at the line's end");
+        assert_eq!(word_right(t, t.len()), t.len());
+        assert_eq!(word_at(t, 9), (8, 11));
+        assert_eq!(word_at(t, 6), (6, 8), "a run of spaces");
+        assert_eq!(word_at("ab", 2), (0, 2), "at the end, the word before");
+        assert_eq!(word_left("é😀 x", 7), 2, "an emoji isn't part of a word");
     }
 
     #[test]
-    fn caret_edits_text() {
-        assert_eq!(run("", 0, &[Op::Insert('h'), Op::Insert('é'), Op::Insert('y')]), ("héy".into(), 4));
-        assert_eq!(run("héy", 4, &[Op::Left, Op::Back]), ("hy".into(), 1));
-        assert_eq!(run("héy", 0, &[Op::Right, Op::Delete]), ("hy".into(), 1));
-        assert_eq!(run("ab", 0, &[Op::Back, Op::Left]), ("ab".into(), 0));
-        assert_eq!(run("ab", 2, &[Op::Delete, Op::Right]), ("ab".into(), 2));
-        assert_eq!(run("a😀b", 5, &[Op::Back]), ("ab".into(), 1));
-    }
-
-    #[test]
-    fn caret_moves_between_lines() {
+    fn lines_and_chars_step_on_boundaries() {
         let t = "first\nab\nthird";
-        assert_eq!(run(t, 4, &[Op::Down]).1, 8, "column clamps to the shorter line");
-        assert_eq!(run(t, 4, &[Op::Down, Op::Down]).1, 11, "the column is the shorter line's end");
-        assert_eq!(run(t, 13, &[Op::Up]).1, 8);
-        assert_eq!(run(t, 13, &[Op::Up, Op::Up]).1, 2);
-        assert_eq!(run(t, 2, &[Op::Up]).1, 0);
-        assert_eq!(run(t, 13, &[Op::Down]).1, t.len());
-        assert_eq!(run(t, 7, &[Op::Home]).1, 6);
-        assert_eq!(run(t, 7, &[Op::End]).1, 8);
-        assert_eq!(run(t, 8, &[Op::Insert('\n'), Op::Insert('c')]), ("first\nab\nc\nthird".into(), 10));
+        assert_eq!((line_start(t, 7), line_end(t, 7)), (6, 8));
+        assert_eq!(prev("a😀b", 5), 1);
+        assert_eq!(next("a😀b", 1), 5);
     }
 
     #[test]
@@ -241,5 +571,38 @@ mod tests {
         assert_eq!(byte_at(t, 3), 5);
         assert_eq!(byte_at(t, 4), 7);
         assert_eq!(byte_at(t, 9), 7);
+    }
+
+    #[test]
+    fn font_search_puts_favourites_and_prefixes_first() {
+        let names = ordered(["Zapf", "Arial", "Segoe UI", "Consolas", "Segoe Script", "Calibri Light"].map(String::from).to_vec());
+        let names: Vec<&str> = names.iter().map(|n| &**n).collect();
+        assert_eq!(names, ["Segoe UI", "Arial", "Consolas", "Calibri Light", "Segoe Script", "Zapf"]);
+        let all = ordered(["Segoe UI", "Consolas", "Segoe Script", "Calibri"].map(String::from).to_vec());
+        let found: Vec<String> = search(&all, "SC").iter().map(|n| n.to_string()).collect();
+        assert_eq!(found, ["Segoe Script"]);
+        let found: Vec<String> = search(&all, "c").iter().map(|n| n.to_string()).collect();
+        assert_eq!(found, ["Calibri", "Consolas", "Segoe Script"], "prefix matches first");
+    }
+
+    #[test]
+    fn styles_change_the_layout() {
+        let ts = Typesetter::new();
+        let plain = Style { bold: false, ..Style::default() };
+        let bold = Style::default();
+        let (w, h) = ts.extent("glint", &plain, 40.0, None);
+        assert!(w > 40.0 && h >= 40.0, "{w} {h}");
+        assert!(ts.extent("glint", &bold, 40.0, None).0 > w, "bold is wider");
+        let wrapped = ts.extent("one two three four", &plain, 40.0, Some(120.0));
+        assert_eq!(wrapped.0, 120.0, "a wrapping text's box is its width");
+        assert!(wrapped.1 > 2.0 * h, "and it wraps onto more lines");
+        let centred = Style { align: Align::Centre, ..plain.clone() };
+        let (x, ..) = ts.caret("wide line\nab", &centred, 40.0, None, 10);
+        assert!(x > 20.0, "a short line is centred under the long one: {x}");
+        assert_eq!(ts.caret("wide line\nab", &plain, 40.0, None, 10).0, 0.0);
+        let hit = ts.hit("abc", &plain, 40.0, None, (1000.0, 10.0));
+        assert_eq!(hit, 3);
+        let boxes = ts.range("ab\ncd", &plain, 40.0, None, (1, 4));
+        assert_eq!(boxes.len(), 2, "one box per line");
     }
 }

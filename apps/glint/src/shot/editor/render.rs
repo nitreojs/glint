@@ -12,12 +12,15 @@ use super::effects::apply_effect;
 use super::marks::{Edges, GRIPS, Mark, draw_mark, edge_point, numbered};
 use super::text::Typesetter;
 use super::toolbar::{BAR_BG, WHITE};
+use super::textbar::Panel;
 use super::{Drag, Editor, hull};
 use crate::picker::DIM;
 use glint_shell::gfx::{Canvas, Dib, Painter, rgba};
 use crate::platform::rect::ring;
 
 const GRIP_EDGE: D2D1_COLOR_F = rgba(20, 20, 24, 0.9);
+/// Selected text, over the letters.
+const SELECTED: D2D1_COLOR_F = rgba(10, 132, 255, 0.38);
 
 impl Editor {
     /// Brings `view` and the pills' placement up to date. `bright` is the frozen screen. Returns
@@ -217,12 +220,16 @@ impl Editor {
                 if let Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { .. } | Mark::Cursor { .. } = m {
                     dashed_box(dc, local(self.outline(m)), white, black, self.px(4.0) as i32);
                 }
+                for r in self.selection_rects().into_iter().filter(|r| visible(*r)) {
+                    let (w, h) = (r.w as f32, r.h as f32);
+                    painter.draw_on(dc, local(r).to_win(), |c| c.fill(0.0, 0.0, w, h, SELECTED))?;
+                }
                 if let Some(c) = self.caret_rect() {
                     FillRect(dc, &local(c).inflate(1).to_win(), black);
                     FillRect(dc, &local(c).to_win(), white);
                 }
                 let (r, edge) = (4.5 * self.scale, 1.5 * self.scale);
-                for (_, q) in m.grips() {
+                for (_, q) in self.grips_of(m) {
                     let gb = self.grip_box(q);
                     if visible(gb) {
                         let at = (q.0 - gb.x as f32, q.1 - gb.y as f32);
@@ -251,6 +258,19 @@ impl Editor {
         let visible = |r: Rect| r.intersect(&rp).is_some();
         if visible(self.bar) {
             painter.draw_on(dc, local(self.bar).to_win(), |c| self.draw_bar(c))?;
+        }
+        if let Some((panel, rect, cells)) = self.panel_layout()
+            && visible(rect)
+        {
+            painter.draw_on(dc, local(rect).to_win(), |c| match panel {
+                Panel::Text => self.draw_text_bar(c, rect, &cells),
+                Panel::Strip => self.draw_strip(c, rect, &cells),
+            })?;
+        }
+        if let Some(list) = self.font_list()
+            && visible(list.rect)
+        {
+            painter.draw_on(dc, local(list.rect).to_win(), |c| self.draw_font_list(c, &list))?;
         }
         if let Some((r, _, text)) = &self.pill
             && visible(*r)

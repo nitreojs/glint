@@ -1,9 +1,11 @@
-//! Pictures to PNG / JPG bytes through WIC: screenshots, thumbnails, what goes on the clipboard.
+//! Pictures to PNG / JPG bytes through WIC and back: screenshots, thumbnails, what goes on (and
+//! comes off) the clipboard.
 
 use windows::Win32::Foundation::{HGLOBAL, RPC_E_CHANGED_MODE};
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_ContainerFormatJpeg, GUID_ContainerFormatPng, GUID_WICPixelFormat24bppBGR,
-    GUID_WICPixelFormat32bppBGRA, IWICImagingFactory, WICBitmapEncoderNoCache,
+    GUID_WICPixelFormat32bppBGRA, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, IWICPalette,
+    WICBitmapDitherTypeNone, WICBitmapEncoderNoCache, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::StructuredStorage::{CreateStreamOnHGlobal, GetHGlobalFromStream, PROPBAG2};
 use windows::Win32::System::Com::{
@@ -12,7 +14,7 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::System::Variant::{VARIANT, VT_R4};
-use windows::core::{Error, PWSTR, w};
+use windows::core::{Error, GUID, PWSTR, w};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -42,6 +44,39 @@ pub fn encode(
     check_size(pixels, w, h)?;
     let _com = Com::init()?;
     encode_wic(pixels, w, h, alpha, format, quality)
+}
+
+/// Any picture WIC reads (PNG, JPG, BMP, GIF's first frame, …) as `(w, h, pixels)`: top-down rows
+/// of premultiplied 0xAARRGGBB, ready to draw.
+pub fn decode(bytes: &[u8]) -> Result<(u32, u32, Vec<u32>), String> {
+    let _com = Com::init()?;
+    decode_as(bytes, &GUID_WICPixelFormat32bppPBGRA)
+}
+
+fn decode_as(bytes: &[u8], format: &GUID) -> Result<(u32, u32, Vec<u32>), String> {
+    unsafe {
+        let factory: IWICImagingFactory = CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| format!("WIC CoCreateInstance: {e}"))?;
+        let stream = factory.CreateStream().map_err(|e| format!("WIC CreateStream: {e}"))?;
+        stream.InitializeFromMemory(bytes).map_err(|e| format!("WIC stream: {e}"))?;
+        let decoder = factory
+            .CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand)
+            .map_err(|e| format!("WIC decoder: {e}"))?;
+        let frame = decoder.GetFrame(0).map_err(|e| format!("WIC GetFrame: {e}"))?;
+        let converter = factory.CreateFormatConverter().map_err(|e| format!("WIC converter: {e}"))?;
+        converter
+            .Initialize(&frame, format, WICBitmapDitherTypeNone, None::<&IWICPalette>, 0.0, WICBitmapPaletteTypeCustom)
+            .map_err(|e| format!("WIC convert: {e}"))?;
+        let (mut w, mut h) = (0, 0);
+        converter.GetSize(&mut w, &mut h).map_err(|e| format!("WIC GetSize: {e}"))?;
+        if w == 0 || h == 0 || w as u64 * h as u64 * 4 > u32::MAX as u64 {
+            return Err(format!("bad image: {w}x{h}"));
+        }
+        let mut px = vec![0u32; w as usize * h as usize];
+        let bytes = std::slice::from_raw_parts_mut(px.as_mut_ptr().cast::<u8>(), px.len() * 4);
+        converter.CopyPixels(std::ptr::null(), w * 4, bytes).map_err(|e| format!("WIC CopyPixels: {e}"))?;
+        Ok((w, h, px))
+    }
 }
 
 /// Straight alpha as PNG and CF_DIBV5 store it; fully transparent pixels lose their colour, which would
@@ -175,42 +210,11 @@ impl Drop for Com {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Graphics::Imaging::{
-        GUID_WICPixelFormat32bppBGR, IWICPalette, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
-        WICDecodeMetadataCacheOnDemand,
-    };
-    use windows::core::GUID;
+    use windows::Win32::Graphics::Imaging::GUID_WICPixelFormat32bppBGR;
 
     fn decode(bytes: &[u8]) -> (u32, u32, Vec<u32>) {
-        let (w, h, px) = decode_as(bytes, &GUID_WICPixelFormat32bppBGR);
+        let (w, h, px) = decode_as(bytes, &GUID_WICPixelFormat32bppBGR).unwrap();
         (w, h, px.into_iter().map(|p| p & 0x00FF_FFFF).collect())
-    }
-
-    fn decode_as(bytes: &[u8], format: &GUID) -> (u32, u32, Vec<u32>) {
-        unsafe {
-            let factory: IWICImagingFactory =
-                CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).unwrap();
-            let stream = factory.CreateStream().unwrap();
-            stream.InitializeFromMemory(bytes).unwrap();
-            let decoder =
-                factory.CreateDecoderFromStream(&stream, std::ptr::null(), WICDecodeMetadataCacheOnDemand).unwrap();
-            let converter = factory.CreateFormatConverter().unwrap();
-            converter
-                .Initialize(
-                    &decoder.GetFrame(0).unwrap(),
-                    format,
-                    WICBitmapDitherTypeNone,
-                    None::<&IWICPalette>,
-                    0.0,
-                    WICBitmapPaletteTypeCustom,
-                )
-                .unwrap();
-            let (mut w, mut h) = (0, 0);
-            converter.GetSize(&mut w, &mut h).unwrap();
-            let mut buf = vec![0u8; (w * h * 4) as usize];
-            converter.CopyPixels(std::ptr::null(), w * 4, &mut buf).unwrap();
-            (w, h, buf.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect())
-        }
     }
 
     #[test]
@@ -257,7 +261,11 @@ mod tests {
         assert_eq!(&png[12..16], b"IHDR");
         assert_eq!(png[25], 6, "colour type: truecolour with alpha");
         let expected: Vec<u32> = pixels.iter().map(|&p| if p >> 24 == 0 { 0 } else { p }).collect();
-        assert_eq!(decode_as(&png, &GUID_WICPixelFormat32bppBGRA), (w, h, expected));
+        assert_eq!(decode_as(&png, &GUID_WICPixelFormat32bppBGRA).unwrap(), (w, h, expected));
+        let (_, _, premultiplied) = super::decode(&png).unwrap();
+        assert_eq!(premultiplied[0] >> 24, 0xFF);
+        assert_eq!(premultiplied[2], 0, "transparent stays empty");
+        assert!(premultiplied[1] >> 24 == 0x80 && (premultiplied[1] >> 16) & 0xFF <= 0x61, "{:08X}", premultiplied[1]);
 
         let opaque = encode(&pixels, w, h, false, ImageFormat::Png, 100).unwrap();
         assert_eq!(opaque[25], 2, "colour type: truecolour");

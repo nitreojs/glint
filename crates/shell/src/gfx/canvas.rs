@@ -137,7 +137,12 @@ impl Canvas<'_> {
 
     /// Draws `w`×`h` premultiplied 0xAARRGGBB pixels from `px` (rows `stride` pixels apart) into
     /// the box `[x, y, bw, bh]`, scaled to fit it.
-    pub fn image(&self, px: &[u32], stride: usize, (w, h): (u32, u32), [x, y, bw, bh]: [f32; 4]) {
+    pub fn image(&self, px: &[u32], stride: usize, size: (u32, u32), at: [f32; 4]) {
+        self.image_faded(px, stride, size, at, 1.0);
+    }
+
+    /// [`Canvas::image`] at `opacity` (0 to 1).
+    pub fn image_faded(&self, px: &[u32], stride: usize, (w, h): (u32, u32), [x, y, bw, bh]: [f32; 4], opacity: f32) {
         if w == 0 || h == 0 || px.len() < (h as usize - 1) * stride + w as usize {
             return;
         }
@@ -152,7 +157,7 @@ impl Canvas<'_> {
                 return;
             };
             let mode = D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
-            self.rt.DrawBitmap(&bitmap, Some(&rect_f(x, y, bw, bh)), self.fade, mode, None);
+            self.rt.DrawBitmap(&bitmap, Some(&rect_f(x, y, bw, bh)), self.fade * opacity, mode, None);
         }
     }
 

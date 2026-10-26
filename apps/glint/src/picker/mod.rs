@@ -9,12 +9,14 @@
 //! ([`crate::shot::editor`]) on the same frozen screen. In draw-first mode the editor is up from
 //! the start, toolbar and all, and while its region tool is on (the default) the picker picks over
 //! whatever is drawn: the pick is the finished shot, or with Shift held it opens in the editor.
+//! Ctrl+V before a screenshot region is picked brings the editor up the same way, with the
+//! clipboard's picture on it.
 //!
 //! The result is posted to the owner as `Box<Option<Picked>>` in LPARAM; the picker keeps
 //! showing until the owner calls [`dismiss`], so the fade-out can overlap other work.
 
 use std::cell::{Cell, RefCell};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -33,9 +35,10 @@ use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmFlush, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, VK_A, VK_CONTROL, VK_ESCAPE, VK_MENU, VK_RETURN, VK_SHIFT, VK_SPACE,
-    VK_TAB,
+    VK_TAB, VK_V,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, w};
@@ -101,6 +104,8 @@ const EDITOR_TIMER: usize = 0x6E01;
 const DWELL_TIMER: usize = 0x6E02;
 /// Posted by [`Elements`] when its results change.
 const WM_ELEMENTS: u32 = WM_APP + 41;
+/// Posted by the clipboard strip's loader as its pictures come in.
+const WM_RECENTS: u32 = WM_APP + 42;
 
 enum Screen {
     Frozen(Frozen),
@@ -184,7 +189,12 @@ struct State {
     shot_cursor: Option<(Arc<CursorImage>, (i32, i32))>,
     /// Screenshots: the picture the editor's cursor tool places.
     arrow: Option<Arc<CursorImage>>,
+    /// The clipboard strip's pictures as the loader finds them, and whether it's done.
+    recents: Option<Recents>,
 }
+
+/// The clipboard strip's pictures as the loader finds them, and whether it's done.
+type Recents = Arc<Mutex<(Vec<editor::Recent>, bool)>>;
 
 impl Drop for State {
     fn drop(&mut self) {
@@ -356,6 +366,7 @@ pub(crate) fn open(
                 frame,
                 shot_cursor: shot_cursor.map(|(img, at)| (Arc::new(img), (at.0 - area.x, at.1 - area.y))),
                 arrow,
+                recents: None,
             };
             if elements == UiElements::Always {
                 st.start_elements();
@@ -975,7 +986,12 @@ impl State {
         let Some(ed) = self.edit.as_mut() else { return Action::Handled };
         let before = ed.frame();
         let event = call(ed);
+        let wants_recents = ed.take_recents_request();
         schedule_tick(self.hwnd, ed);
+        if wants_recents {
+            self.load_recents();
+        }
+        let Some(ed) = self.edit.as_mut() else { return Action::Handled };
         match event {
             editor::Event::None => Action::Handled,
             editor::Event::Repaint => {
@@ -1009,13 +1025,70 @@ impl State {
         }
     }
 
-    /// Ctrl or Alt went down or up: the editor's drag moves or snaps accordingly.
+    /// Ctrl, Alt or Shift went down or up: the editor's drag moves, snaps or keeps proportions
+    /// accordingly.
     fn edit_mods(&mut self) -> Action {
-        let (ctrl, alt, at) = (held(VK_CONTROL.0), held(VK_MENU.0), self.cursor);
+        let (ctrl, alt, shift, at) = (held(VK_CONTROL.0), held(VK_MENU.0), held(VK_SHIFT.0), self.cursor);
         self.edit_event(|e| {
-            e.set_mods(ctrl, alt);
+            e.set_mods(ctrl, alt, shift);
             e.mouse_move(at)
         })
+    }
+
+    /// Loads the clipboard strip's pictures on a thread of its own; each one found is posted
+    /// back as [`WM_RECENTS`].
+    fn load_recents(&mut self) {
+        let slot = Arc::new(Mutex::new((Vec::new(), false)));
+        self.recents = Some(slot.clone());
+        let hwnd = self.hwnd.0 as isize;
+        let post = move || unsafe {
+            let _ = PostMessageW(Some(HWND(hwnd as _)), WM_RECENTS, WPARAM(0), LPARAM(0));
+        };
+        std::thread::spawn(move || {
+            // the clipboard history is WinRT, waited on synchronously: an MTA thread
+            let com = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok();
+            editor::load_recents(|list| {
+                if let Ok(mut s) = slot.lock() {
+                    s.0 = list.to_vec();
+                }
+                post();
+            });
+            if let Ok(mut s) = slot.lock() {
+                s.1 = true;
+            }
+            post();
+            if com {
+                unsafe { CoUninitialize() };
+            }
+        });
+    }
+
+    /// Select-first before a region is picked: Ctrl+V turns the picker into draw-first's canvas
+    /// with the clipboard's picture on it, to place before the region is picked.
+    fn paste_on_canvas(&mut self) -> Action {
+        let was_live = matches!(self.screen, Screen::Live(_));
+        if let Err(e) = self.freeze() {
+            log(&format!("screenshot failed: {e}"));
+            return Action::Finish(None);
+        }
+        self.drop_hints();
+        if let Screen::Frozen(f) = &mut self.screen
+            && let Some(was) = f.hide_cursor()
+        {
+            self.invalidate(&[was]);
+        }
+        self.reset_pick();
+        let screen = Rect { x: 0, y: 0, w: self.size.0, h: self.size.1 };
+        let mut ed = Editor::canvas(screen, self.monitors(), self.painter.scale, self.cursor);
+        self.equip(&mut ed);
+        self.add_cursor(&mut ed);
+        self.edit = Some(ed);
+        let action = self.edit_event(|e| e.key(VK_V.0 as u32, true, false));
+        match action {
+            Action::Finish(r) => Action::Finish(r),
+            _ if was_live => Action::ShowFrozen,
+            _ => Action::Paint,
+        }
     }
 
     /// Input while the markup editor is open (and not picking).
@@ -1034,10 +1107,10 @@ impl State {
                 self.cursor = p;
                 self.shift = held(VK_SHIFT.0);
                 let element = self.edit_element(p);
-                let (ctrl, alt) = (held(VK_CONTROL.0), held(VK_MENU.0));
+                let (ctrl, alt, shift) = (held(VK_CONTROL.0), held(VK_MENU.0), held(VK_SHIFT.0));
                 self.edit_event(|e| {
                     e.set_element(element);
-                    e.set_mods(ctrl, alt);
+                    e.set_mods(ctrl, alt, shift);
                     e.mouse_move(p)
                 })
             }
@@ -1058,9 +1131,11 @@ impl State {
             WM_KEYDOWN | WM_KEYUP if wp.0 == VK_SHIFT.0 as usize => {
                 self.shift = msg == WM_KEYDOWN;
                 let element = self.edit_element(self.cursor);
+                let (ctrl, alt, shift, at) = (held(VK_CONTROL.0), held(VK_MENU.0), self.shift, self.cursor);
                 self.edit_event(|e| {
                     e.set_element(element);
-                    e.refresh_pick()
+                    e.set_mods(ctrl, alt, shift);
+                    if e.dragging() { e.mouse_move(at) } else { e.refresh_pick() }
                 })
             }
             WM_KEYDOWN | WM_KEYUP | WM_SYSKEYDOWN | WM_SYSKEYUP
@@ -1127,6 +1202,13 @@ impl State {
             return match msg {
                 WM_CLOSE | WM_KEYDOWN | WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONUP | WM_MOUSEMOVE => Action::Handled,
                 _ => Action::Default,
+            };
+        }
+        if msg == WM_RECENTS {
+            let got = self.recents.as_ref().and_then(|slot| slot.lock().ok().map(|s| (s.0.clone(), s.1)));
+            return match got {
+                Some((list, done)) => self.edit_event(|e| e.set_recents(list, done)),
+                None => Action::Handled,
             };
         }
         if msg == WM_ELEMENTS {
@@ -1278,6 +1360,16 @@ impl State {
                 self.edit_event(|e| e.key(VK_ESCAPE.0 as u32, false, false))
             }
             WM_KEYDOWN if wp.0 == VK_ESCAPE.0 as usize => Action::Finish(None),
+            // select-first, nothing picked yet: Ctrl+V brings the editor up on the whole screen
+            WM_KEYDOWN
+                if wp.0 == VK_V.0 as usize
+                    && ctrl()
+                    && self.edit.is_none()
+                    && self.drag_start.is_none()
+                    && matches!(self.purpose, Purpose::Shot { .. }) =>
+            {
+                self.paste_on_canvas()
+            }
             WM_KEYDOWN if wp.0 == VK_A.0 as usize && ctrl() => {
                 if self.drag_start.is_none() {
                     self.whole = true;

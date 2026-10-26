@@ -2,7 +2,7 @@ use glint_core::geom::rect::Rect;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
 
-use super::Editor;
+use super::{Editor, hull};
 use super::marks::{COLORS, TOOLS, Tool, arrow};
 use super::text::Typesetter;
 use glint_shell::gfx::{Canvas, Painter, rgba};
@@ -26,6 +26,20 @@ pub(super) enum Item {
     Pin,
     Done,
     Close,
+    // the text bar
+    Font,
+    Smaller,
+    Bigger,
+    Bold,
+    Italic,
+    Underline,
+    Strike,
+    Align,
+    Back,
+    /// A family in the font list (an index into what the search found).
+    FontRow(usize),
+    /// A picture in the clipboard strip.
+    Recent(usize),
 }
 
 impl Item {
@@ -43,6 +57,16 @@ impl Item {
             Item::Pin => "pin to screen",
             Item::Done => "done  ·  Enter",
             Item::Close => "cancel  ·  Esc",
+            Item::Font => "font",
+            Item::Smaller => "smaller  ·  [",
+            Item::Bigger => "bigger  ·  ]",
+            Item::Bold => "bold  ·  Ctrl+B",
+            Item::Italic => "italic  ·  Ctrl+I",
+            Item::Underline => "underline  ·  Ctrl+U",
+            Item::Strike => "strikethrough",
+            Item::Align => "align",
+            Item::Back => "backdrop",
+            Item::FontRow(_) | Item::Recent(_) => return None,
         })
     }
 }
@@ -97,18 +121,25 @@ impl Editor {
         self.pill = None;
     }
 
-    /// Tooltip for the hovered button, on the side of the bar away from the selection.
+    /// Whether what goes beside the bar (the tooltip, the text bar, the clipboard strip) goes
+    /// under it: on the side away from the selection.
+    pub(super) fn below_bar(&self) -> bool {
+        !self.selected || self.bar.y >= self.sel.bottom()
+    }
+
+    /// Tooltip for the hovered button, beyond the bar and its panels on the side away from the
+    /// selection.
     pub(super) fn place_pill(&self, item: Item, text: &str, painter: &Painter, font: &IDWriteTextFormat) -> Rect {
         let (tw, _) = painter.measure(text, font);
         let (w, h) = ((tw.ceil() + self.px(20.0)) as i32, self.px(26.0) as i32);
-        let b = self.bar;
-        let cell = self.cells.iter().find(|(i, _)| *i == item).map(|(_, r)| *r).unwrap_or(b);
+        let b = self.panel_rects().into_iter().fold(self.bar, hull);
+        let cell = self.all_cells().into_iter().find(|(i, _)| *i == item).map_or(b, |(_, r)| r);
         let gap = self.px(6.0) as i32;
-        let below_sel = !self.selected || b.y >= self.sel.bottom();
-        let mut y = if below_sel { b.bottom() + gap } else { b.y - gap - h };
+        let below = self.below_bar();
+        let mut y = if below { b.bottom() + gap } else { b.y - gap - h };
         let m = self.bar_monitor;
         if y < m.y || y + h > m.bottom() {
-            y = if below_sel { b.y - gap - h } else { b.bottom() + gap };
+            y = if below { b.y - gap - h } else { b.bottom() + gap };
         }
         let x = (cell.x + cell.w / 2 - w / 2).clamp(m.x, (m.right() - w).max(m.x));
         Rect { x, y, w, h }
@@ -266,6 +297,12 @@ fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR
             c.polyline(&[p(-7.0, 1.0), p(-7.0, 3.0)], 1.4 * s, ink);
             c.round_rect(x - 2.0 * s, y - 2.0 * s, 9.0 * s, 9.0 * s, 1.5 * s, ink);
         }
+        Item::Tool(Tool::Image) => {
+            // a clipboard with a picture on it
+            c.round_rect_outline([x - 6.0 * s, y - 5.5 * s, 12.0 * s, 13.0 * s], 1.5 * s, 1.4 * s, ink);
+            c.round_rect(x - 3.0 * s, y - 7.5 * s, 6.0 * s, 3.5 * s, 1.0 * s, ink);
+            c.polygon(&[p(-3.5, 5.0), p(-0.5, 1.0), p(1.5, 3.0), p(2.5, 2.0), p(3.5, 5.0)], ink);
+        }
         Item::Color(i) => {
             c.circle((x, y), 6.0 * s, COLORS[i]);
             if i == color {
@@ -308,6 +345,18 @@ fn draw_icon(c: &Canvas, item: Item, (x, y): (f32, f32), s: f32, ink: D2D1_COLOR
             c.polyline(&[p(-5.0, -5.0), p(5.0, 5.0)], 1.6 * s, ink);
             c.polyline(&[p(-5.0, 5.0), p(5.0, -5.0)], 1.6 * s, ink);
         }
+        // the panels draw their own buttons
+        Item::Font
+        | Item::Smaller
+        | Item::Bigger
+        | Item::Bold
+        | Item::Italic
+        | Item::Underline
+        | Item::Strike
+        | Item::Align
+        | Item::Back
+        | Item::FontRow(_)
+        | Item::Recent(_) => {}
     }
 }
 
