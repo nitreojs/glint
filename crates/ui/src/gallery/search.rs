@@ -6,7 +6,7 @@
 
 use eframe::egui::epaint::{RectShape, Shadow};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, Frame, Id, Margin, Order, Painter, Pos2, Rect, RichText, Role, Sense, Shape,
+    self, Align2, Color32, CursorIcon, Frame, Id, Margin, Mesh, Order, Painter, Pos2, Rect, RichText, Role, Sense, Shape,
     Stroke, StrokeKind, Ui, UiBuilder, WidgetInfo, emath::TSTransform, pos2, vec2,
 };
 use glint_core::format::human_size;
@@ -19,6 +19,8 @@ use crate::widgets::{self, Look, anim, anim_ctx, ease, glide, medium, mix, mono,
 /// The search box's width with nothing in it, and the most it grows to with chips.
 const FIELD_W: f32 = 260.0;
 const FIELD_MAX: f32 = 560.0;
+/// What the typed text keeps of the box however many chips there are.
+const TYPING_ROOM: f32 = 72.0;
 const CHIP_H: f32 = 22.0;
 const CHIP_GAP: f32 = 4.0;
 /// How long chips take to grow in or shrink away, and to slide over.
@@ -306,9 +308,15 @@ impl Gallery {
         painter.circle_stroke(m, 4.5, Stroke::new(1.4, lens));
         painter.line_segment([m + vec2(3.3, 3.3), m + vec2(6.5, 6.5)], Stroke::new(1.6, lens));
 
-        let clip = painter.with_clip_rect(field.shrink(1.0));
+        // the text after the chips keeps some room: chips past it slide left, out under the lens
+        let clear_w = 26.0;
+        let typing = field.right() - clear_w - TYPING_ROOM;
+        let row: f32 = widths.iter().map(|w| w + CHIP_GAP).sum();
+        let strip = Rect::from_min_max(pos2(field.left() + 24.0, field.top() + 1.0), pos2(field.right() - 1.0, field.bottom() - 1.0));
+        let clip = painter.with_clip_rect(strip);
         let fresh = std::mem::take(&mut self.search.fresh);
-        let mut x = field.left() + 28.0;
+        let start = field.left() + 28.0;
+        let mut x = start - (start + row - typing).max(0.0);
         let mut removed = None;
         let mut opened = false;
         self.search.chips = [None; 5];
@@ -323,9 +331,9 @@ impl Gallery {
             let cx = glide(ui, id.with("x"), x, CHIP_MOVE);
             let r = Rect::from_min_size(pos2(cx, cy - CHIP_H / 2.0), vec2(*cw, CHIP_H));
             let shown = Rect::from_center_size(r.center(), r.size() * (0.82 + 0.18 * grow));
-            let body = ui.interact(r.intersect(field), id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+            let body = ui.interact(r.intersect(strip), id, Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
             let close_r = Rect::from_min_max(pos2(r.right() - 20.0, r.top()), r.max);
-            let close = ui.interact(close_r.intersect(field), id.with("x"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+            let close = ui.interact(close_r.intersect(strip), id.with("x"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
             let label = t.label(self.today);
             close.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("remove {label}")));
             body.widget_info(|| WidgetInfo::labeled(Role::Button, true, label.clone()));
@@ -351,9 +359,19 @@ impl Gallery {
         if !self.search.leaving.is_empty() {
             ctx.request_repaint();
         }
+        // chips slid out on the left fade away by the lens
+        if self.search.chips.iter().flatten().any(|r| r.left() < start) {
+            let edge = Rect::from_min_size(strip.min, vec2(14.0, strip.height()));
+            let mut mesh = Mesh::default();
+            for (at, color) in [(edge.left_top(), p.field), (edge.right_top(), Color32::TRANSPARENT), (edge.right_bottom(), Color32::TRANSPARENT), (edge.left_bottom(), p.field)] {
+                mesh.colored_vertex(at, color);
+            }
+            mesh.add_triangle(0, 1, 2);
+            mesh.add_triangle(0, 2, 3);
+            painter.add(Shape::mesh(mesh));
+        }
         // the text after the chips, and a clear-all at the end
-        let clear_w = 26.0;
-        let edit_r = Rect::from_min_max(pos2(x.min(field.right() - clear_w - 40.0), field.top()), pos2(field.right() - clear_w, field.bottom()));
+        let edit_r = Rect::from_min_max(pos2(x.min(typing), field.top()), pos2(field.right() - clear_w, field.bottom()));
         let hint = if chips.is_empty() { "search" } else { "" };
         let before = self.search.query.len();
         let edit = egui::TextEdit::singleline(&mut self.search.query)
@@ -496,7 +514,8 @@ impl Gallery {
         if look.keyboard && resp.has_focus() {
             painter.rect_stroke(rect.expand(2.0), 8.0, Stroke::new(2.0, p.focus), StrokeKind::Middle);
         }
-        let resp = resp.on_hover_text("filter");
+        // open, the popover says what it is; the tip would sit on its corner
+        let resp = if open { resp } else { resp.on_hover_text("filter") };
         if resp.clicked() {
             self.search.popover = !self.search.popover;
         }
@@ -609,10 +628,14 @@ impl Gallery {
                 pills.push(Pill::new(Act::Clear(Facet::Length), l.label(), None, true, None));
             }
             y = self.pills(ui, look, "length", &pills, x0, y, inner_w, &mut action);
-            // app
+            // app: as many rows as the window leaves room for under it, and it scrolls
             if !self.index.apps.is_empty() {
                 y = section(&painter, look, "app", x0, y + 6.0);
-                y = self.app_list(ui, look, x0, y, inner_w, &mut action);
+                let made_by = if self.index.makers.len() > 1 { 6.0 + 20.0 + PILL_H + 4.0 } else { 0.0 };
+                let clear = if self.search.filters != Filters::default() { 28.0 } else { 0.0 };
+                let room = ctx.content_rect().bottom() - 8.0 - y - 4.0 - made_by - clear - 12.0;
+                let rows = ((room / APP_ROW).floor().max(0.0) as usize).clamp(2, APP_ROWS);
+                y = self.app_list(ui, look, x0, y, inner_w, rows, &mut action);
             }
             // made by
             if self.index.makers.len() > 1 {
@@ -737,11 +760,11 @@ impl Gallery {
         y + PILL_H + 4.0
     }
 
-    /// The apps captured, most first, each with its icon and how many; scrolls past a few.
-    fn app_list(&self, ui: &mut Ui, look: &Look, x0: f32, y0: f32, w: f32, action: &mut Option<Act>) -> f32 {
+    /// The apps captured, most first, each with its icon and how many; scrolls past `rows`.
+    #[allow(clippy::too_many_arguments)]
+    fn app_list(&self, ui: &mut Ui, look: &Look, x0: f32, y0: f32, w: f32, rows: usize, action: &mut Option<Act>) -> f32 {
         let p = look.p;
-        let rows = self.index.apps.len();
-        let h = rows.min(APP_ROWS) as f32 * APP_ROW;
+        let h = self.index.apps.len().min(rows) as f32 * APP_ROW;
         let area = Rect::from_min_size(pos2(x0 - 4.0, y0), vec2(w + 8.0, h));
         let mut child = ui.new_child(UiBuilder::new().max_rect(area));
         egui::ScrollArea::vertical().id_salt("gallery-popover-apps").max_height(h).auto_shrink([false, true]).show(&mut child, |ui| {

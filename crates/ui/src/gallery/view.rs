@@ -251,7 +251,8 @@ impl Gallery {
                 after = self.grid.items_in(self.grid.visible(bottom, bottom + span));
                 let clip = ui.clip_rect();
                 let resp = ui.interact(clip, Id::unique("gallery-tiles"), Sense::click());
-                pointer = ctx.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p));
+                // not through what's over the grid (the filter popover, the offers, a toast)
+                pointer = ctx.input(|i| i.pointer.hover_pos()).filter(|p| clip.contains(*p) && resp.contains_pointer());
                 let painter = ui.painter().clone();
                 self.drawn.clear();
                 let mut last = HashMap::new();
