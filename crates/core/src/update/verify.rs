@@ -1,6 +1,6 @@
 use minisign_verify::{PublicKey, Signature};
 
-use super::release::asset_name;
+use super::Product;
 use super::version::Version;
 
 pub fn hex(bytes: &[u8]) -> String {
@@ -23,14 +23,11 @@ pub fn sums_entry(sums: &str, name: &str) -> Option<[u8; 32]> {
     })
 }
 
-/// What the release workflow signs into the trusted comment, binding the file to its release.
-pub fn trusted_comment(tag: &str) -> String {
-    format!("glint {tag} {}", asset_name(tag))
-}
-
-/// Accepts `exe` as release `tag` only if it is newer than `current`, matches SHA256SUMS, and
-/// carries a signature from `key` made for exactly this release and file.
+/// Accepts `exe` as `app`'s release `tag` only if it is newer than `current`, matches SHA256SUMS,
+/// and carries a signature from `key` made for exactly this release and file.
+#[allow(clippy::too_many_arguments)]
 pub fn verify(
+    app: &Product,
     exe: &[u8],
     sums: &str,
     sig: &str,
@@ -39,11 +36,11 @@ pub fn verify(
     current: &Version,
     sha256: impl Fn(&[u8]) -> Result<[u8; 32], String>,
 ) -> Result<(), String> {
-    let version = Version::parse(tag).ok_or_else(|| format!("{tag} isn't a version"))?;
+    let version = app.version(tag).ok_or_else(|| format!("{tag} isn't a release of {}", app.name))?;
     if version <= *current {
         return Err(format!("refusing {tag}: it isn't newer than the running {current}"));
     }
-    let name = asset_name(tag);
+    let name = app.asset_name(tag);
     let expected = sums_entry(sums, &name).ok_or_else(|| format!("SHA256SUMS has no entry for {name}"))?;
     let actual = sha256(exe)?;
     if actual != expected {
@@ -53,7 +50,7 @@ pub fn verify(
     let sig = Signature::decode(sig).map_err(|e| format!("{name}.minisig can't be read: {e}"))?;
     key.verify(exe, &sig, false).map_err(|e| format!("{name} isn't signed by glint's release key: {e}"))?;
     let comment = sig.trusted_comment();
-    if comment != trusted_comment(tag) {
+    if comment != app.trusted_comment(tag) {
         return Err(format!("{name} was signed as \"{comment}\", not as {tag}"));
     }
     Ok(())

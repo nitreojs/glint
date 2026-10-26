@@ -1,5 +1,6 @@
 use serde::Deserialize;
 
+use super::Product;
 use super::version::Version;
 
 /// One entry of GitHub's `GET /repos/{owner}/{repo}/releases`.
@@ -34,11 +35,6 @@ pub struct Candidate {
 
 pub const SUMS: &str = "SHA256SUMS";
 
-/// The exe a release publishes, as named by the release workflow.
-pub fn asset_name(tag: &str) -> String {
-    format!("glint-{tag}-windows-x64.exe")
-}
-
 pub fn parse(json: &str) -> Result<Vec<Release>, String> {
     serde_json::from_str(json).map_err(|e| format!("github sent a release list glint couldn't read: {e}"))
 }
@@ -53,18 +49,19 @@ pub fn next_page(link: Option<&str>) -> Option<String> {
     })
 }
 
-/// The newest release above `current` with a signed exe; pre-releases only on the beta channel.
-pub fn pick(releases: &[Release], current: &Version, beta: bool) -> Option<Candidate> {
+/// `app`'s newest release above `current` with a signed exe; pre-releases only on the beta
+/// channel. Other apps' releases are skipped.
+pub fn pick(app: &Product, releases: &[Release], current: &Version, beta: bool) -> Option<Candidate> {
     releases
         .iter()
-        .filter(|r| !r.draft && r.tag_name.starts_with('v'))
+        .filter(|r| !r.draft)
         .filter_map(|r| {
-            let version = Version::parse(&r.tag_name)?;
+            let version = app.version(&r.tag_name)?;
             if version <= *current || (!beta && (r.prerelease || version.is_pre())) {
                 return None;
             }
             let asset = |name: &str| r.assets.iter().find(|a| a.name == name).cloned();
-            let exe_name = asset_name(&r.tag_name);
+            let exe_name = app.asset_name(&r.tag_name);
             Some(Candidate {
                 version,
                 tag: r.tag_name.clone(),
@@ -79,6 +76,7 @@ pub fn pick(releases: &[Release], current: &Version, beta: bool) -> Option<Candi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update::{AFTERGLOW, GLINT};
 
     const RECORDED: &str = include_str!("fixtures/releases.json");
     const WITH_AFTERGLOW: &str = include_str!("fixtures/releases-with-afterglow.json");
@@ -108,7 +106,7 @@ mod tests {
     #[test]
     fn stable_takes_the_newest_signed_release() {
         let releases = parse(RECORDED).unwrap();
-        let c = pick(&releases, &v("0.1.0"), false).unwrap();
+        let c = pick(&GLINT, &releases, &v("0.1.0"), false).unwrap();
         // v0.4.0 is a draft, v0.3.0-beta.1 a pre-release, v0.2.1 has no signature
         assert_eq!((c.tag.as_str(), c.version.to_string().as_str()), ("v0.2.0", "0.2.0"));
         assert_eq!(crate::update::notes_url(&c.tag), "https://github.com/nitreojs/glint/releases/tag/v0.2.0");
@@ -119,18 +117,18 @@ mod tests {
         );
         assert_eq!(c.sig.name, "glint-v0.2.0-windows-x64.exe.minisig");
         assert_eq!(c.sums.name, "SHA256SUMS");
-        assert_eq!(pick(&releases, &v("0.2.0"), false), None);
-        assert_eq!(pick(&releases, &v("0.3.0"), false), None);
+        assert_eq!(pick(&GLINT, &releases, &v("0.2.0"), false), None);
+        assert_eq!(pick(&GLINT, &releases, &v("0.3.0"), false), None);
     }
 
     #[test]
     fn beta_also_takes_pre_releases() {
         let releases = parse(RECORDED).unwrap();
-        assert_eq!(pick(&releases, &v("0.1.0"), true).unwrap().tag, "v0.3.0-beta.1");
-        assert_eq!(pick(&releases, &v("0.3.0-alpha.2"), true).unwrap().tag, "v0.3.0-beta.1");
-        assert_eq!(pick(&releases, &v("0.3.0-beta.1"), true), None);
+        assert_eq!(pick(&GLINT, &releases, &v("0.1.0"), true).unwrap().tag, "v0.3.0-beta.1");
+        assert_eq!(pick(&GLINT, &releases, &v("0.3.0-alpha.2"), true).unwrap().tag, "v0.3.0-beta.1");
+        assert_eq!(pick(&GLINT, &releases, &v("0.3.0-beta.1"), true), None);
         // a beta user leaving the channel still gets the next stable release above them
-        assert_eq!(pick(&releases, &v("0.2.0-beta.3"), false).unwrap().tag, "v0.2.0");
+        assert_eq!(pick(&GLINT, &releases, &v("0.2.0-beta.3"), false).unwrap().tag, "v0.2.0");
     }
 
     #[test]
@@ -148,7 +146,7 @@ mod tests {
         // releases from several pages are picked from together
         let mut all = parse(WITH_AFTERGLOW).unwrap();
         all.extend(parse(RECORDED).unwrap());
-        assert_eq!(pick(&all, &v("0.1.1"), false).unwrap().tag, "v0.2.0");
+        assert_eq!(pick(&GLINT, &all, &v("0.1.1"), false).unwrap().tag, "v0.2.0");
     }
 
     #[test]
@@ -161,9 +159,24 @@ mod tests {
         );
         assert_eq!(releases[1].assets[0].name, "afterglow-v0.1.0-windows-x64.exe");
         for beta in [false, true] {
-            let c = pick(&releases, &v("0.1.1"), beta).unwrap();
+            let c = pick(&GLINT, &releases, &v("0.1.1"), beta).unwrap();
             assert_eq!((c.tag.as_str(), c.exe.name.as_str()), ("v0.1.2", "glint-v0.1.2-windows-x64.exe"));
-            assert_eq!(pick(&releases, &v("0.1.2"), beta), None);
+            assert_eq!(pick(&GLINT, &releases, &v("0.1.2"), beta), None);
         }
+    }
+
+    #[test]
+    fn afterglow_takes_only_its_own_releases() {
+        let mut all = parse(WITH_AFTERGLOW).unwrap();
+        all.extend(parse(RECORDED).unwrap());
+        let c = pick(&AFTERGLOW, &all, &v("0.0.9"), false).unwrap();
+        assert_eq!((c.tag.as_str(), c.version.to_string().as_str()), ("afterglow-v0.1.0", "0.1.0"));
+        assert_eq!(c.exe.name, "afterglow-v0.1.0-windows-x64.exe");
+        assert_eq!(c.sig.name, "afterglow-v0.1.0-windows-x64.exe.minisig");
+        assert_eq!(c.sums.name, "SHA256SUMS");
+        assert_eq!(pick(&AFTERGLOW, &all, &v("0.1.0"), false), None);
+        assert_eq!(pick(&AFTERGLOW, &all, &v("0.1.0"), true).unwrap().tag, "afterglow-v0.2.0-beta.1");
+        // glint's v0.2.0 is far above afterglow's 0.1.0 but isn't afterglow's
+        assert_eq!(pick(&AFTERGLOW, &parse(RECORDED).unwrap(), &v("0.0.1"), true), None);
     }
 }
