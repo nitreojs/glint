@@ -13,7 +13,7 @@ use windows::Win32::UI::Shell::{
 use windows::core::w;
 
 use crate::app::ipc;
-use crate::platform::paths::documents_dir;
+use glint_shell::explorer::documents;
 use crate::settings::SettingsApp;
 use crate::upload::proxy::describe_system;
 
@@ -206,7 +206,7 @@ impl SettingsApp {
                 Err(e) => self.uploaders.note = Some((e, true)),
             }
         }
-        let sharex = documents_dir().and_then(custom::sharex_config);
+        let sharex = documents().and_then(custom::sharex_config);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             if widgets::button(ui, look, "import .sxcu…", Kind::Secondary, 28.0, true).clicked() {

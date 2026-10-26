@@ -1,19 +1,20 @@
-//! Drawing the gallery: the toolbar, the virtualized grid (only the rows in view are touched),
-//! tiles that fade in as their thumbnails come and lift under the pointer, the grown preview, and
-//! the motion when the list changes (tiles slide to their new places, gone ones fade away).
+//! Drawing the gallery: the virtualized grid (only the rows in view are touched), tiles that fade
+//! in as their thumbnails come and lift under the pointer (marked with the app that made them
+//! once both apps have captures), the grown preview, and the motion when the list changes (tiles
+//! slide to their new places, gone ones fade away).
 
 use std::collections::{HashMap, HashSet};
 
 use eframe::egui::epaint::{RectShape, Shadow};
 use eframe::egui::scroll_area::ScrollSource;
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, Id, Layout, Order, Painter, Rect, Response, Role, Sense, Stroke,
-    StrokeKind, TextureId, Ui, UiBuilder, WidgetInfo, pos2, vec2,
+    self, Align2, Color32, CursorIcon, Id, Order, Painter, Rect, Response, Role, Sense, Stroke, StrokeKind, TextureId, Ui,
+    WidgetInfo, pos2, vec2,
 };
 use glint_core::format::{human_duration, human_size};
+use glint_core::gallery::Kind;
 use glint_core::gallery::grid::{self, Grid, Line, Spec};
 use glint_core::gallery::thumb::Meta;
-use glint_core::gallery::{Filter, Kind};
 
 use super::{Gallery, Menu, Preview, TILE_RANGE};
 use crate::widgets::{self, Look, anim, ease, medium, mix, mono, motion, sans};
@@ -121,7 +122,7 @@ fn lerp_rect(a: Rect, b: Rect, t: f32) -> Rect {
     Rect::from_min_max(a.min.lerp(b.min, t), a.max.lerp(b.max, t))
 }
 
-fn image(painter: &Painter, rect: Rect, radius: f32, tex: TextureId, uv: Rect, alpha: f32) {
+pub(super) fn image(painter: &Painter, rect: Rect, radius: f32, tex: TextureId, uv: Rect, alpha: f32) {
     let tint = Color32::WHITE.gamma_multiply(alpha);
     painter.add(RectShape::filled(rect, radius, tint).with_texture(tex, uv));
 }
@@ -145,17 +146,8 @@ pub(super) fn preview_rect(tile: Rect, meta: Meta, panel: Rect, ppp: f32) -> Rec
     grid::grown(tile, aspect, bounds, 2.6, 520.0f32.min(bounds.width() * 0.8), limit)
 }
 
-/// What the filter calls a kind.
-fn chip(kind: Kind) -> (Filter, &'static str) {
-    match kind {
-        Kind::Shot => (Filter::Shots, "screenshots"),
-        Kind::Recording => (Filter::Recordings, "recordings"),
-        Kind::Gif => (Filter::Gifs, "gifs"),
-    }
-}
-
 /// A square button with a gear in it.
-fn gear(ui: &mut Ui, look: &Look, rect: Rect) -> Response {
+pub(super) fn gear(ui: &mut Ui, look: &Look, rect: Rect) -> Response {
     let p = &look.p;
     let resp = ui.interact(rect, Id::unique("gallery-settings"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
     resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "settings"));
@@ -182,51 +174,6 @@ fn gear(ui: &mut Ui, look: &Look, rect: Rect) -> Response {
 }
 
 impl Gallery {
-    pub(super) fn toolbar(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
-        let p = look.p;
-        let inner = Rect::from_min_max(pos2(rect.left() + 16.0, rect.top() + 4.0), pos2(rect.right() - 16.0, rect.bottom() - 16.0));
-        let mut row = ui.new_child(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)));
-        let kinds = self.setup.kinds;
-        if kinds.len() > 1 {
-            let before = self.filter;
-            // "all", then each kind: at most four, so no allocation a frame
-            let mut options = [(Filter::All, "all"); 4];
-            for (slot, &k) in options[1..].iter_mut().zip(kinds) {
-                *slot = chip(k);
-            }
-            let options = &options[..(kinds.len() + 1).min(4)];
-            let width = (100.0 * options.len() as f32).min(inner.width() * 0.6);
-            widgets::segmented(&mut row, look, &mut self.filter, options, Some(width));
-            if self.filter != before {
-                self.refilter();
-            }
-        }
-        row.with_layout(Layout::right_to_left(Align::Center), |row| {
-            let right = row.max_rect().right();
-            let gear_rect = Rect::from_center_size(pos2(right - 16.0, inner.center().y), vec2(32.0, 32.0));
-            if gear(row, look, gear_rect).clicked() {
-                self.open_settings();
-            }
-            let search_w = 240.0_f32.min((row.available_width() - 48.0).max(120.0));
-            let mut field = row.new_child(UiBuilder::new().max_rect(Rect::from_min_size(
-                pos2(gear_rect.left() - 8.0 - search_w, inner.center().y - 16.0),
-                vec2(search_w, 32.0),
-            )));
-            let before = self.query.clone();
-            let resp = widgets::text_field(&mut field, look, &mut self.query, "search", false);
-            self.search_id = Some(resp.id);
-            if self.query != before {
-                self.refilter();
-            }
-            row.add_space(32.0 + 8.0 + search_w + 14.0);
-            if self.loaded && !self.shown.is_empty() {
-                let bytes: u64 = self.shown.iter().map(|&i| self.items[i].size).sum();
-                let text = format!("{} · {}", self.shown.len(), human_size(bytes));
-                row.label(egui::RichText::new(text).font(sans(12.0)).color(p.t3));
-            }
-        });
-    }
-
     fn spec(&self, width: f32) -> Spec {
         Spec { width, min_tile: self.tile_width(), aspect: ASPECT, gap: GAP, heading: HEADING, day_gap: DAY_GAP }
     }
@@ -235,9 +182,26 @@ impl Gallery {
         let p = look.p;
         let ctx = ui.ctx().clone();
         let panel = ui.max_rect();
-        if self.loaded && self.shown.is_empty() && self.pending.is_empty() {
-            let text = if self.items.is_empty() { self.setup.empty } else { "nothing matches" };
-            ui.painter().text(panel.center(), Align2::CENTER_CENTER, text, sans(13.0), p.t3);
+        let empty = self.loaded && self.shown.is_empty() && self.pending.is_empty();
+        // known while there's a list, so the empty state fades in when a filter leaves nothing
+        let shown = ease(anim(ui, Id::unique("gallery-empty"), empty, 0.2));
+        if empty {
+            let narrowed = !self.items.is_empty();
+            let text = if narrowed { "nothing here" } else { self.setup.empty };
+            let at = panel.center() - vec2(0.0, if narrowed { 14.0 } else { 0.0 } + 6.0 * (1.0 - shown));
+            ui.painter().text(at, Align2::CENTER_CENTER, text, sans(13.0), p.t3.gamma_multiply(shown));
+            if narrowed && self.narrowed() {
+                let g = ui.painter().layout_no_wrap("clear filters".into(), sans(13.0), p.t1);
+                let r = Rect::from_center_size(at + vec2(0.0, 28.0), g.size());
+                let resp = ui.interact(r.expand(4.0), Id::unique("gallery-empty-clear"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+                resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, "clear filters"));
+                let hv = anim(ui, resp.id.with("hov"), resp.hovered(), 0.08);
+                ui.painter().hline(r.x_range(), r.bottom() + 1.0, Stroke::new(1.0, mix(p.line3, p.t1, hv).gamma_multiply(shown)));
+                ui.painter().galley(r.min, g, mix(p.t2, p.t1, hv).gamma_multiply(shown));
+                if resp.clicked() {
+                    self.clear_filters();
+                }
+            }
             self.drawn.clear();
             self.flip.last.clear();
             return;
@@ -424,14 +388,25 @@ impl Gallery {
         }
         let meta = self.meta.get(&id).copied();
         let badges = arrived * shown * if previewing { 0.0 } else { 1.0 };
-        if badges > 0.0 && kind.moves() && let Some(m) = meta {
-            let length = human_duration(m.duration_ms as f64 / 1000.0);
+        let ms = item.duration_ms.or(meta.map(|m| m.duration_ms).filter(|ms| *ms > 0));
+        if badges > 0.0 && kind.moves() && let Some(ms) = ms {
+            let length = human_duration(ms as f64 / 1000.0);
             let text = if kind == Kind::Gif { format!("gif {length}") } else { length };
             badge(painter, r, &text, true, badges);
         }
+        // who made it, quietly in a corner, once both apps have captures
+        if self.index.makers.len() > 1 && !previewing {
+            let alpha = shown * (0.8 + 0.2 * h);
+            let c = r.left_top() + vec2(13.0, 13.0);
+            painter.circle_filled(c, 7.5, GLASS.gamma_multiply(alpha));
+            super::search::mark(painter, c, 5.0, self.accents[item.maker as usize], alpha);
+        }
         if h > 0.0 && !previewing && let Some(local) = self.locals[self.shown[i]] {
-            let text = format!("{:02}:{:02} · {}", local.hour, local.minute, human_size(item.size));
-            badge(painter, r, &text, false, h * shown);
+            let text = match &item.app {
+                Some(app) => format!("{:02}:{:02} · {app} · {}", local.hour, local.minute, human_size(item.size)),
+                None => format!("{:02}:{:02} · {}", local.hour, local.minute, human_size(item.size)),
+            };
+            badge(&painter.with_clip_rect(r.intersect(painter.clip_rect())), r, &text, false, h * shown);
         }
         if self.is_busy(id) {
             let t = (self.now * 0.8).fract() as f32;

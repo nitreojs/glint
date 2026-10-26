@@ -1,20 +1,24 @@
-//! The gallery both apps open with `--gallery [file]`: every capture the app made, newest first
-//! and grouped by day, as a grid of thumbnails. Hovering a tile for half a second grows it into a
-//! bigger preview (recordings and gifs play in it, muted); a click opens it, the context menu and
-//! the keys do the rest, and the gear opens the app's settings. The app says where its captures
-//! come from and which kinds it makes ([`Setup`]), and what opening one does and which lines of
-//! its own the menu has ([`Host`]).
+//! The gallery both apps open with `--gallery [file]`: every capture glint and afterglow made
+//! (whichever app's window it is), newest first and grouped by day, as a grid of thumbnails, each
+//! marked with the app that made it once both have. Hovering a tile for half a second grows it
+//! into a bigger preview (recordings and gifs play in it, muted); a click opens it, the context
+//! menu and the keys do the rest, the search box and the filter narrow the list, and the gear
+//! opens the app's settings. The app says what opening an item does and which lines of its own
+//! the menu has ([`Host`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui::{self, Event, Id, Key, Modifiers, Pos2, Rect, Ui, UiBuilder, pos2, vec2};
+use glint_core::config::{DEFAULT_ACCENT, parse_hex};
+use glint_core::gallery::filter::{self, Counts, Index, Narrow, Vocabulary};
 use glint_core::gallery::grid::{Grid, Spec, Step};
 use glint_core::gallery::thumb::{self, Meta};
-use glint_core::gallery::{self, Day, Filter, Item, Kind, path_id};
+use glint_core::gallery::{self, Date, Day, Item, Kind, Maker, path_id};
 use glint_core::history::Local;
 use glint_core::icon::icon_rgba;
 use glint_core::log::log;
@@ -35,13 +39,15 @@ mod decode;
 mod library;
 mod overlay;
 mod play;
+mod search;
 mod textures;
 mod thumbs;
 mod view;
 
-pub use library::list;
+pub use library::{length, list, sources};
 use library::Library;
 use play::Playback;
+use search::Search;
 use textures::{Texture, Textures};
 use thumbs::{Done, Job, Pool};
 use view::Flip;
@@ -64,24 +70,26 @@ const UNDO: f64 = 6.0;
 const UPLOADS_PER_FRAME: usize = 3;
 /// Textures kept at least; far-away ones beyond this go.
 const KEEP_TEXTURES: usize = 240;
+/// Apps' icons, in pixels.
+const ICON_PX: u32 = 32;
 
-/// What an app's gallery is made of.
+/// What an app's gallery is made of; the captures are both apps' ([`sources`]).
 pub struct Setup {
     /// The app's name: the window is "<app> gallery", its thumbnails are cached in
     /// `%LOCALAPPDATA%\<app>\thumbs` and its size is kept in `%APPDATA%\<app>\gallery.json`.
     pub app: &'static str,
     pub accent: [u8; 3],
-    /// What the app makes; with more than one, the toolbar filters by kind.
-    pub kinds: &'static [Kind],
-    /// The app's history of captures (`history.jsonl`).
-    pub history: PathBuf,
-    /// The folder captures are saved in and how many folders deep they go; read again whenever
-    /// the window comes back to the front (the settings may have moved it).
-    pub folder: fn() -> (PathBuf, usize),
     /// The settings window's title: the gear brings it forward, or starts `<exe> --settings`.
     pub settings: &'static str,
     /// What an empty gallery says.
     pub empty: &'static str,
+}
+
+impl Setup {
+    /// Which app's window it is.
+    fn maker(&self) -> Maker {
+        Maker::ALL.into_iter().find(|m| m.name() == self.app).unwrap_or(Maker::Glint)
+    }
 }
 
 /// A line of the app's own in an item's menu.
@@ -157,6 +165,15 @@ pub fn open_file(path: &Path) {
     }
 }
 
+/// An app's icon read, by the app's key.
+type Icon = (String, egui::ColorImage);
+
+/// The local date now.
+fn today() -> Date {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    local_time(now).map(Date::of).unwrap_or(Date { year: 1970, month: 1, day: 1 })
+}
+
 fn title(app: &str) -> String {
     format!("{app} gallery")
 }
@@ -189,7 +206,7 @@ pub fn run(setup: Setup, host: impl Host + 'static, select: Option<PathBuf>) {
     let started = Instant::now();
     let ctx_cell = Arc::new(OnceLock::new());
     // the list is read while the window comes up
-    let library = Library::start(setup.history.clone(), setup.folder, setup.kinds, ctx_cell.clone());
+    let library = Library::start(setup.maker(), thumbs::cache_dir(setup.app), ctx_cell.clone());
     let saved_at = app_dir_for(setup.app).join("gallery.json");
     let saved = Saved::load(&saved_at);
     let options = eframe::NativeOptions {
@@ -342,6 +359,7 @@ impl Deletions {
 
 struct Gallery {
     setup: Setup,
+    ctx: egui::Context,
     host: Box<dyn Host>,
     hwnd: Option<HWND>,
     light: Option<bool>,
@@ -362,9 +380,16 @@ struct Gallery {
     items: Vec<Item>,
     /// Each item's local time, made once per list.
     locals: Vec<Option<Local>>,
-    filter: Filter,
-    query: String,
-    /// Indices into `items`: what the filter and search let through, newest first.
+    /// What the filters look at in each item, and the apps among them: made once per list.
+    index: Index,
+    /// How many each filter option would show, as things are.
+    counts: Counts,
+    /// The local date the filters count days from.
+    today: Date,
+    /// The marks of the apps that made the captures, by [`Maker::ALL`].
+    accents: [[u8; 3]; 2],
+    search: Search,
+    /// Indices into `items`: what the filters and search let through, newest first.
     shown: Vec<usize>,
     days: Vec<Day>,
     grid: Grid,
@@ -378,6 +403,10 @@ struct Gallery {
     tex: HashMap<u64, Tex>,
     meta: HashMap<u64, Meta>,
     failed: HashSet<u64>,
+    /// Apps' icons by their key, those asked for, and where they come in.
+    icons: HashMap<String, Texture>,
+    icons_asked: HashSet<String>,
+    icons_in: (Sender<Icon>, Receiver<Icon>),
 
     /// The tile under the pointer and since when.
     hover: Option<(u64, f64)>,
@@ -394,7 +423,6 @@ struct Gallery {
     drawn: HashMap<u64, Rect>,
     /// The part of the window the grid scrolls in.
     panel: Rect,
-    search_id: Option<Id>,
     menu: Option<Menu>,
     toast: Option<Toast>,
     pending: Deletions,
@@ -418,6 +446,7 @@ impl Gallery {
             pool: Pool::start(&cc.egui_ctx, cache.clone()),
             textures: Textures::new(gl),
             setup,
+            ctx: cc.egui_ctx.clone(),
             host,
             hwnd: None,
             light: None,
@@ -434,8 +463,11 @@ impl Gallery {
             loaded: false,
             items: Vec::new(),
             locals: Vec::new(),
-            filter: Filter::All,
-            query: String::new(),
+            index: Index::default(),
+            counts: Counts::default(),
+            today: today(),
+            accents: [parse_hex(DEFAULT_ACCENT).unwrap_or_default(), glint_core::gallery::source::AMBER],
+            search: Search::default(),
             shown: Vec::new(),
             days: Vec::new(),
             grid: Grid::default(),
@@ -445,6 +477,9 @@ impl Gallery {
             tex: HashMap::new(),
             meta: HashMap::new(),
             failed: HashSet::new(),
+            icons: HashMap::new(),
+            icons_asked: HashSet::new(),
+            icons_in: mpsc::channel(),
             hover: None,
             preview: None,
             fading: None,
@@ -454,7 +489,6 @@ impl Gallery {
             select: None,
             drawn: HashMap::new(),
             panel: Rect::NOTHING,
-            search_id: None,
             menu: None,
             toast: None,
             pending: Deletions::default(),
@@ -484,12 +518,17 @@ impl Gallery {
         self.shown.get(index).map(|&i| &self.items[i])
     }
 
-    /// Filters and groups the list again; what moves, comes or goes animates.
+    /// Narrows and groups the list again, and counts what each filter option would show; what
+    /// moves, comes or goes animates.
     fn refilter(&mut self) {
-        let words = gallery::words(&self.query);
-        self.shown = (0..self.items.len())
-            .filter(|&i| !self.pending.holds(self.items[i].id) && self.items[i].matches(self.filter, &words))
-            .collect();
+        let vocab = Vocabulary { index: &self.index, today: self.today };
+        // the search box's whole phrases narrow as they're typed, the rest is searched for
+        let (tokens, words) = filter::read(&self.search.query, &vocab);
+        let narrow = Narrow::new(&self.search.filters.with(&tokens), &self.index, self.today);
+        let (items, pending) = (&self.items, &self.pending);
+        let visible = |i: usize| !pending.holds(items[i].id) && items[i].holds(&words);
+        filter::apply(&self.index, &narrow, visible, &mut self.shown, &mut self.counts);
+        self.search.offers = self.offers();
         // grouped by position in `items`, whose local times are made already
         self.days = gallery::days(self.shown.iter().map(|&i| i as u64), |i| self.locals[i as usize]);
         self.dirty = true;
@@ -498,19 +537,22 @@ impl Gallery {
     fn set_items(&mut self, loaded: library::Loaded) {
         let first = !self.loaded;
         self.loaded = true;
+        self.accents = loaded.accents;
         self.locals = loaded.items.iter().map(|i| local_time(i.time)).collect();
         // a file that changed gets a new thumbnail
+        let before: HashMap<u64, (u64, u64)> = self.items.iter().map(|o| (o.id, (o.size, o.modified))).collect();
         for it in &loaded.items {
-            if let Some(old) = self.items.iter().find(|o| o.id == it.id)
-                && (old.size, old.modified) != (it.size, it.modified)
-            {
+            if before.get(&it.id).is_some_and(|was| *was != (it.size, it.modified)) {
                 self.tex.remove(&it.id);
                 self.meta.remove(&it.id);
                 self.failed.remove(&it.id);
             }
         }
-        let fresh = loaded.items.first().map(|i| i.id).filter(|id| !first && self.item(*id).is_none());
+        let fresh = loaded.items.first().map(|i| i.id).filter(|id| !first && !before.contains_key(id));
         self.items = loaded.items;
+        let locals = &self.locals;
+        self.index = Index::new(&self.items, |i| locals[i].map(Date::of));
+        self.want_icons();
         self.refilter();
         if first {
             log(&format!(
@@ -541,7 +583,7 @@ impl Gallery {
         }
         // every texture this frame may take is made before anything is uploaded: the thumbnails,
         // a screenshot's preview and a playing preview's first frame
-        self.textures.reserve(frame, UPLOADS_PER_FRAME + 2);
+        self.textures.reserve(frame, UPLOADS_PER_FRAME + 3);
         let mut uploaded = 0;
         while uploaded < UPLOADS_PER_FRAME {
             let Some(done) = self.pool.poll() else { break };
@@ -570,8 +612,21 @@ impl Gallery {
                 }
             }
         }
+        // an app's icon, one a frame: they're small, and only the filter shows them
+        if let Ok((key, image)) = self.icons_in.1.try_recv() {
+            if let Some(tex) = self.textures.upload(&image, true) {
+                self.icons.insert(key, tex);
+            }
+            ctx.request_repaint();
+        }
         if uploaded == UPLOADS_PER_FRAME {
             ctx.request_repaint();
+        }
+        // past midnight "today" and "this week" are other days
+        let today = today();
+        if today != self.today {
+            self.today = today;
+            self.refilter();
         }
         self.poll_busy(ctx);
         if let Some(t) = self.copying.take_if(|t| t.is_finished()) {
@@ -587,6 +642,35 @@ impl Gallery {
         }
         if !self.pending.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+    }
+
+    /// Reads the icons of the apps whose icons weren't asked for yet, off the UI thread.
+    fn want_icons(&mut self) {
+        let todo: Vec<(String, String)> = self
+            .index
+            .apps
+            .iter()
+            .filter(|a| !self.icons_asked.contains(&a.key))
+            .filter_map(|a| Some((a.key.clone(), a.exe.clone()?)))
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        self.icons_asked.extend(todo.iter().map(|(k, _)| k.clone()));
+        let (tx, ctx) = (self.icons_in.0.clone(), self.ctx.clone());
+        let spawned = std::thread::Builder::new().name("app icons".into()).spawn(move || {
+            for (key, exe) in todo {
+                let Some(icon) = glint_shell::icon::exe_icon(&exe, ICON_PX) else { continue };
+                let size = icon.size as usize;
+                if tx.send((key, egui::ColorImage::from_rgba_unmultiplied([size, size], &icon.rgba))).is_err() {
+                    return;
+                }
+                ctx.request_repaint();
+            }
+        });
+        if let Err(e) = spawned {
+            log(&format!("gallery: can't read app icons: {e}"));
         }
     }
 
@@ -788,14 +872,15 @@ impl Gallery {
     }
 
     fn keys(&mut self, ctx: &egui::Context) {
-        let typing = self.search_id.is_some_and(|id| ctx.memory(|m| m.has_focus(id)));
+        let field = search::field_id();
+        let typing = ctx.memory(|m| m.has_focus(field));
         let none = Modifiers::NONE;
         let cmd = Modifiers::COMMAND;
         let (esc, find, undo) = ctx.input_mut(|i| {
             (i.consume_key(none, Key::Escape), i.consume_key(cmd, Key::F), !typing && i.consume_key(cmd, Key::Z))
         });
-        if find && let Some(id) = self.search_id {
-            ctx.memory_mut(|m| m.request_focus(id));
+        if find {
+            ctx.memory_mut(|m| m.request_focus(field));
         }
         if undo {
             self.undo();
@@ -805,22 +890,44 @@ impl Gallery {
                 self.menu = None;
             } else if self.preview.is_some() {
                 self.close_preview();
+            } else if self.search.popover {
+                self.search.popover = false;
+            } else if typing && self.search.offers_shown {
+                // the offers go until something else is typed
+                self.search.hushed = true;
+            } else if typing && !self.search.query.is_empty() {
+                self.search.query.clear();
+                self.refilter();
+            } else if self.search.last_chip().is_some() {
+                self.remove_last_chip();
             } else if typing {
-                if self.query.is_empty() {
-                    ctx.memory_mut(|m| m.surrender_focus(self.search_id.unwrap_or(Id::NULL)));
-                } else {
-                    self.query.clear();
-                    self.refilter();
-                }
+                ctx.memory_mut(|m| m.surrender_focus(field));
             } else {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         }
         let widget_focused = ctx.memory(|m| m.focused().is_some());
         if typing {
-            let down = ctx.input_mut(|i| i.consume_key(none, Key::ArrowDown) | i.consume_key(none, Key::Enter));
-            if down && !self.shown.is_empty() {
-                ctx.memory_mut(|m| m.surrender_focus(self.search_id.unwrap_or(Id::NULL)));
+            let offers = if self.search.offers_shown { self.search.offers.len() } else { 0 };
+            let (up, down, enter, tab, back) = ctx.input_mut(|i| {
+                let step = |i: &mut egui::InputState, k| offers > 0 && i.consume_key(none, k);
+                let back = self.search.query.is_empty() && i.consume_key(none, Key::Backspace);
+                (step(i, Key::ArrowUp), i.consume_key(none, Key::ArrowDown), i.consume_key(none, Key::Enter), step(i, Key::Tab), back)
+            });
+            if back {
+                self.remove_last_chip();
+            }
+            if offers > 0 {
+                let n = offers as i32;
+                let pick = self.search.pick as i32 + i32::from(down) - i32::from(up);
+                self.search.pick = pick.rem_euclid(n) as usize;
+                if enter || tab {
+                    self.pick_offer(self.search.pick);
+                }
+                return;
+            }
+            if (down || enter) && !self.shown.is_empty() {
+                ctx.memory_mut(|m| m.surrender_focus(field));
                 self.focus = self.shown_item(0).map(|i| i.id);
                 self.scroll_to = self.focus;
                 self.keyboard = true;
@@ -935,6 +1042,10 @@ impl eframe::App for Gallery {
         [0.0; 4]
     }
 
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        crate::window::closing();
+    }
+
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.now = ctx.input(|i| i.time);
@@ -986,6 +1097,8 @@ impl eframe::App for Gallery {
         self.grid_view(&mut grid_ui, &look);
         window::border(ui, full, p.line2);
         self.draw_previews(&ctx, &look);
+        self.draw_offers(&ctx, &look);
+        self.draw_popover(&ctx, &look);
         self.menu_popup(&ctx, &look);
         self.show_toast(&ctx, &look);
     }
@@ -1012,7 +1125,8 @@ mod tests {
     #[test]
     fn one_undo_brings_back_every_deletion_until_the_last_ones_time_runs_out() {
         let files = ["a.png", "b.png", "c.png"].map(|n| gallery::OnDisk { path: PathBuf::from(format!(r"C:\caps\{n}")), size: 1, modified: 0 });
-        let items = gallery::collect(&[], files.to_vec(), Path::new(r"C:\caps"), |_| None);
+        let source = gallery::Source { maker: Maker::Glint, history: PathBuf::new(), root: PathBuf::from(r"C:\caps"), depth: 1, app_folder: None, accent: [0; 3] };
+        let items = gallery::collect(vec![gallery::Shelf { source: &source, history: Vec::new(), found: files.to_vec() }], |_| None);
         let (a, b, c) = (items[0].clone(), items[1].clone(), items[2].clone());
         let mut d = Deletions::default();
         assert_eq!((d.due_at(), d.undo()), (None, None));

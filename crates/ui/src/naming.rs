@@ -15,7 +15,7 @@ pub fn rows(ui: &mut Ui, look: &Look, names: &Names, pattern: &mut String) {
     row(ui, look, "file names", 7.0, |ui| {
         widgets::text_field(ui, look, pattern, names.default, problem.is_some());
         let (date, time) = date_time();
-        let sample = Source { exe: "Telegram.exe".into(), app: "Telegram Desktop".into(), title: "Saved Messages".into() };
+        let sample = Source { exe: "Telegram.exe".into(), app: "Telegram Desktop".into(), title: "Saved Messages".into(), path: String::new() };
         let naming = Naming { date: &date, time: &time, kind: HistoryKind::Recording, subject: Subject::Window(&sample) };
         let example = format!("{}.mp4", names.expand(pattern, &naming).display());
         ui.horizontal(|ui| {

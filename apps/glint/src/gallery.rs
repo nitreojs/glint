@@ -1,34 +1,26 @@
-//! glint's side of the gallery: its captures (the history and the output folder), recordings open
-//! in the trimmer, and an upload line once an uploader is set up.
+//! glint's side of the gallery, which lists afterglow's clips too when afterglow is there (see
+//! [`glint_ui::gallery`]): recordings open in the trimmer whichever app made them, and an upload
+//! line shows once an uploader is set up.
 
 use std::path::{Path, PathBuf};
 
 use glint_core::config::Config;
 use glint_core::gallery::{Item, Kind};
-use glint_core::history::{self, Kind as HistoryKind};
+use glint_core::history::{self, Entry, Kind as HistoryKind};
 use glint_core::log::log;
 use glint_core::upload::{Destination, Payload};
 use glint_ui::gallery::{self, Extra, Host, Note, Setup, Work};
 use windows::Win32::Foundation::HWND;
 
 use crate::app::ipc::SETTINGS_TITLE;
-use crate::platform::paths::output_dir;
 
 const APP: &str = "glint";
-/// How deep the walk goes below the output folder (`{app}/` folders and one more).
-const DEPTH: usize = 3;
 const UPLOAD: u32 = 1;
+const PLAYER: u32 = 2;
 
 pub fn run(select: Option<PathBuf>) {
-    let setup = Setup {
-        app: APP,
-        accent: Config::load().unwrap_or_default().accent_rgb(),
-        kinds: &[Kind::Shot, Kind::Recording, Kind::Gif],
-        history: history::file(),
-        folder: || (output_dir(&Config::load().unwrap_or_default()), DEPTH),
-        settings: SETTINGS_TITLE,
-        empty: "nothing captured yet",
-    };
+    let accent = Config::load().unwrap_or_default().accent_rgb();
+    let setup = Setup { app: APP, accent, settings: SETTINGS_TITLE, empty: "nothing captured yet" };
     gallery::run(setup, Glint { uploadable: uploadable() }, select);
 }
 
@@ -59,15 +51,26 @@ impl Host for Glint {
         Ok(())
     }
 
-    fn extras(&self, _item: &Item, busy: bool) -> Vec<Extra> {
-        if self.uploadable && !busy { vec![Extra { key: UPLOAD, name: "upload", top: false }] } else { Vec::new() }
+    fn extras(&self, item: &Item, busy: bool) -> Vec<Extra> {
+        let mut out = Vec::new();
+        if item.kind == Kind::Recording {
+            out.push(Extra { key: PLAYER, name: "open in player", top: true });
+        }
+        if self.uploadable && !busy {
+            out.push(Extra { key: UPLOAD, name: "upload", top: false });
+        }
+        out
     }
 
     fn pick(&mut self, key: u32, item: &Item, owner: HWND) -> Result<Option<Work>, String> {
-        if key != UPLOAD {
-            return Ok(None);
+        match key {
+            UPLOAD => upload(item, owner).map(Some).map_err(|e| format!("couldn't upload: {e}")),
+            PLAYER => {
+                gallery::open_file(&item.path);
+                Ok(None)
+            }
+            _ => Ok(None),
         }
-        upload(item, owner).map(Some).map_err(|e| format!("couldn't upload: {e}"))
     }
 
     fn refocus(&mut self) {
@@ -89,7 +92,7 @@ fn upload(item: &Item, owner: HWND) -> Result<Work, String> {
             log(&format!("gallery: upload to {} failed: {e}", dest.name));
             format!("couldn't upload to {}: {e}", dest.name)
         })?;
-        history::add(kind, Some(&path), size, Some(&url), None);
+        history::add(Entry::new(kind, Some(&path), size).with_url(&url));
         let copied = copy_link && glint_shell::clipboard::copy_text(Some(HWND(owner as _)), &url).is_ok();
         let text = if copied { "uploaded, link copied" } else { "uploaded" };
         Ok(Note { text: text.into(), link: Some(url) })

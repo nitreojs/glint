@@ -10,8 +10,6 @@ use glint_core::config::hotkeys::parse_hotkey;
 use glint_core::naming::{Names, pattern_problem};
 use glint_core::paths::app_dir_for;
 use serde::Deserialize;
-use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::UI::Shell::{FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 
 pub const APP: &str = "afterglow";
 /// Lengths the settings offer, in seconds.
@@ -301,19 +299,10 @@ impl Place {
 }
 
 /// afterglow's file naming: `afterglow_<date>_<time>` until a pattern is set.
-pub const NAMES: Names = Names { default: "afterglow_{date}_{time}", fallback: "afterglow" };
+pub const NAMES: Names = glint_core::naming::AFTERGLOW;
 
 pub fn default_output_dir() -> PathBuf {
-    videos().unwrap_or_else(|| app_dir_for(APP)).join(APP)
-}
-
-fn videos() -> Option<PathBuf> {
-    unsafe {
-        let p = SHGetKnownFolderPath(&FOLDERID_Videos, KF_FLAG_DEFAULT, None).ok()?;
-        let path = p.to_string().ok().map(PathBuf::from);
-        CoTaskMemFree(Some(p.0 as _));
-        path
-    }
+    glint_shell::explorer::videos().unwrap_or_else(|| app_dir_for(APP)).join(APP)
 }
 
 #[cfg(test)]
