@@ -7,8 +7,8 @@ use eframe::egui::{
 use glint_core::clip::clicks::{ClickColor, ClickSize};
 use glint_core::clip::keys::KeySize;
 use glint_core::clip::crop::Crop;
-use glint_core::clip::export::{self, CodecChoice, Compress, Format, Job, MB, TARGETS_MB, Video, VideoJob};
-use glint_core::clip::math::{GIF_FPS, GIF_WARN_BYTES, fmt_short};
+use glint_core::clip::export::{self, CodecChoice, Compress, Format, Job, MB, Reencode, TARGETS_MB, Video, VideoJob};
+use glint_core::clip::math::{GIF_FPS, GIF_WARN_BYTES, SECOND, fmt_short};
 use glint_core::record::Codec;
 use glint_core::record::keys::Position;
 use glint_ui::widgets::{self, Look, anim, ease, glide, mix, mono, sans, semibold};
@@ -18,6 +18,11 @@ use super::{ClipApp, PAD};
 const ROW_GAP: f32 = 14.0;
 const SAVE_H: f32 = 44.0;
 const MORE_W: f32 = 40.0;
+/// The size estimate and the line under it.
+const EST_H: f32 = 52.0;
+/// The lossless / re-encodes lines under the estimate.
+const WHY_GAP: f32 = 6.0;
+const WHY_LINE: f32 = 18.0;
 const CLICK_COLORS: [([u8; 3], &str); 3] = [([0xFF, 0xD6, 0x0A], "yellow"), ([0x34, 0xC7, 0x59], "green"), ([0x0A, 0x84, 0xFF], "blue")];
 const HEVC_TIP: &str = "hevc makes smaller files, but some pcs need the free “hevc video extensions” to play them";
 
@@ -98,13 +103,48 @@ fn codec_name(c: Codec) -> &'static str {
     }
 }
 
+/// A reason the picture is made anew, in a few words.
+fn why_label(r: Reencode) -> String {
+    match r {
+        Reencode::Gif => "gif".into(),
+        Reencode::Clicks => "clicks drawn in".into(),
+        Reencode::Keys => "keys drawn in".into(),
+        Reencode::Crop => "cropped".into(),
+        Reencode::Height(h) => format!("{h}p"),
+        Reencode::Fps(f) => format!("{f} fps"),
+        Reencode::Compress => "compress".into(),
+        Reencode::Bitrate => "custom bitrate".into(),
+        Reencode::Codec(c) => codec_name(c).into(),
+        Reencode::Size(mb) => format!("≤ {mb} MB"),
+        Reencode::Unindexed => "can't copy this file".into(),
+    }
+}
+
+/// What undoing a reason does, for the ones a click undoes.
+fn undo_label(r: Reencode) -> Option<&'static str> {
+    Some(match r {
+        Reencode::Clicks => "hide clicks",
+        Reencode::Keys => "hide keys",
+        Reencode::Crop => "reset the crop",
+        Reencode::Height(_) => "original resolution",
+        Reencode::Fps(_) => "original frame rate",
+        Reencode::Compress => "don't compress",
+        Reencode::Bitrate => "auto bitrate",
+        Reencode::Codec(_) => "same codec as the source",
+        Reencode::Size(_) => "no size limit",
+        Reencode::Gif | Reencode::Unindexed => return None,
+    })
+}
+
 impl ClipApp {
     pub(super) fn panel(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
         let p = look.p;
         ui.painter().vline(rect.left() + 0.5, rect.y_range(), Stroke::new(1.0, p.line));
         let inner = rect.shrink(PAD);
+        let gif = self.saved.export.format == Format::Gif;
         let save_row = Rect::from_min_max(pos2(inner.left(), inner.bottom() - SAVE_H), inner.max);
-        let est = Rect::from_min_max(pos2(inner.left(), save_row.top() - 14.0 - 54.0), pos2(inner.right(), save_row.top() - 14.0));
+        let est_h = if gif { EST_H } else { EST_H + WHY_GAP + 2.0 * WHY_LINE };
+        let est = Rect::from_min_max(pos2(inner.left(), save_row.top() - 14.0 - est_h), pos2(inner.right(), save_row.top() - 14.0));
         let top = Rect::from_min_max(inner.min, pos2(inner.right(), est.top() - ROW_GAP));
         if self.info().is_none() {
             ui.painter().text(inner.left_top(), Align2::LEFT_TOP, "export", semibold(15.0), p.t1);
@@ -117,10 +157,10 @@ impl ClipApp {
             .max_height(top.height())
             .show(&mut child, |ui| self.rows(ui, look));
 
-        let job = self.job();
-        let src = self.source();
-        if let (Some(job), Some(src)) = (&job, &src) {
-            let bytes = export::estimate(job, src);
+        let planned = self.plan();
+        let mut lines = None;
+        if let (Some((job, why)), Some(src)) = (&planned, self.source()) {
+            let bytes = export::estimate(job, &src);
             let over = self.saved.export.target_mb.is_some_and(|mb| bytes > mb as u64 * MB)
                 || matches!(job, Job::Gif(_)) && bytes > GIF_WARN_BYTES;
             let color = mix(p.t1, p.warn, anim(ui, Id::unique("clip-est-over"), over, 0.3));
@@ -128,10 +168,123 @@ impl ClipApp {
             painter.text(est.left_top(), Align2::LEFT_TOP, format!("≈ {}", export::size_label(bytes)), semibold(26.0), color);
             let tracks = src.info.tracks.len();
             let sub = format!("{} of {} · {}", fmt_short(job.len()), fmt_short(src.info.duration), sound_line(job, tracks));
-            painter.text(est.left_bottom(), Align2::LEFT_BOTTOM, sub, sans(12.0), p.t3);
+            painter.text(est.left_top() + vec2(0.0, EST_H), Align2::LEFT_BOTTOM, sub, sans(12.0), p.t3);
+            if let Job::Video(v) = job {
+                lines = Some((why, v.early()));
+            }
         }
-        let gif = self.saved.export.format == Format::Gif;
+        if let Some((why, early)) = lines {
+            let area = Rect::from_min_max(est.left_top() + vec2(0.0, EST_H + WHY_GAP), est.right_bottom());
+            self.why_line(ui, look, area, why, early);
+        }
         self.save_button(ui, look, save_row, gif);
+    }
+
+    /// Whether the video is copied as recorded or made anew, and why, each reason a click away
+    /// from undone; under a copy, how much earlier than the trim it starts.
+    fn why_line(&mut self, ui: &mut Ui, look: &Look, area: Rect, why: &[Reencode], early: i64) {
+        let p = look.p;
+        // a changed line fades in rather than snapping
+        let key = Id::unique("clip-why").with(format!("{why:?}")).with(early > self.frame_len());
+        let since = ui.ctx().data_mut(|d| {
+            let at = d.get_temp_mut_or_insert_with(Id::unique("clip-why-at"), || (key, self.now));
+            if at.0 != key {
+                *at = (key, self.now);
+            }
+            self.now - at.1
+        });
+        let fade = ease((since / 0.2).min(1.0) as f32);
+        if fade < 1.0 {
+            ui.ctx().request_repaint();
+        }
+        let mut painter = ui.painter().with_clip_rect(area.intersect(ui.clip_rect()));
+        painter.set_opacity(fade);
+        let line = |k: usize| area.top() + WHY_LINE * (k as f32 + 0.5);
+        let font = sans(12.0);
+        if why.is_empty() {
+            let (x, y) = (area.left(), line(0));
+            let check = vec![pos2(x + 1.0, y), pos2(x + 4.5, y + 3.5), pos2(x + 11.0, y - 3.5)];
+            painter.add(Shape::line(check, Stroke::new(1.6, p.acc)));
+            let word = painter.text(pos2(x + 17.0, y), Align2::LEFT_CENTER, "lossless", font.clone(), p.t1);
+            painter.text(pos2(word.right() + 5.0, y), Align2::LEFT_CENTER, "· no re-encode", font.clone(), p.t3);
+            ui.interact(word.union(Rect::from_center_size(pos2(x + 6.0, y), vec2(12.0, 12.0))), Id::unique("clip-lossless"), Sense::hover())
+                .on_hover_text("the video is copied as recorded, frame for frame");
+            if early > self.frame_len() {
+                let secs = early as f64 / SECOND as f64;
+                let text = format!("starts {secs:.1} s early, on a keyframe");
+                let r = painter.text(pos2(x, line(1)), Align2::LEFT_CENTER, text, font, p.t3);
+                ui.interact(r, Id::unique("clip-early"), Sense::hover())
+                    .on_hover_text("a copy can only start on a keyframe: the one just before your trim start");
+            }
+            return;
+        }
+        let mut x = painter.text(pos2(area.left(), line(0)), Align2::LEFT_CENTER, "re-encodes ·", font.clone(), p.t3).right() + 5.0;
+        let mut row = 0;
+        let mut undo = None;
+        let shown: Vec<Reencode> = why.iter().copied().filter(|r| *r != Reencode::Gif).collect();
+        for (i, &r) in shown.iter().enumerate() {
+            let last = i + 1 == shown.len();
+            let text = if last { why_label(r) } else { format!("{},", why_label(r)) };
+            let g = painter.layout_no_wrap(text, font.clone(), p.t2);
+            if x + g.size().x > area.right() && row == 0 {
+                (row, x) = (1, area.left());
+            }
+            let y = line(row);
+            let r_text = Rect::from_min_size(pos2(x, y - g.size().y / 2.0), g.size());
+            let color = match undo_label(r) {
+                Some(action) => {
+                    let tip = if shown.len() == 1 { format!("{action}: lossless again") } else { action.to_string() };
+                    let resp = ui
+                        .interact(r_text.expand2(vec2(2.0, 2.0)), Id::unique(("clip-why-item", i)), Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(tip);
+                    resp.widget_info(|| WidgetInfo::labeled(Role::Link, true, action));
+                    let h = anim(ui, resp.id.with("hov"), resp.hovered(), 0.1);
+                    let underline = r_text.left()..=r_text.right() - if last { 0.0 } else { 3.0 };
+                    painter.hline(underline, r_text.bottom() + 1.0, Stroke::new(1.0, mix(p.line2, p.t2, h)));
+                    if resp.clicked() {
+                        undo = Some(r);
+                    }
+                    mix(p.t2, p.t1, h)
+                }
+                None => p.t3,
+            };
+            painter.galley(r_text.min, g, color);
+            x = r_text.right() + 5.0;
+        }
+        if let Some(r) = undo {
+            self.undo_reencode(r);
+        }
+    }
+
+    /// Takes back the one choice that makes the picture be made anew.
+    fn undo_reencode(&mut self, r: Reencode) {
+        let s = &mut self.saved.export;
+        match r {
+            Reencode::Clicks => {
+                self.change(|e| e.clicks.as_mut().map(|c| c.shown = false).is_some());
+            }
+            Reencode::Keys => {
+                self.change(|e| e.keys.as_mut().map(|k| k.shown = false).is_some());
+            }
+            Reencode::Crop => {
+                self.cropping = None;
+                self.change(|e| e.crop.take().is_some());
+            }
+            Reencode::Height(_) => s.height = None,
+            Reencode::Fps(_) => s.fps = None,
+            Reencode::Compress => s.set_compress(None),
+            Reencode::Bitrate => {
+                s.set_kbps(None);
+                self.custom_mbps.clear();
+            }
+            Reencode::Codec(_) => s.codec = CodecChoice::Same,
+            Reencode::Size(_) => {
+                s.set_target(None);
+                self.custom_mb.clear();
+            }
+            Reencode::Gif | Reencode::Unindexed => {}
+        }
     }
 
     fn rows(&mut self, ui: &mut Ui, look: &Look) {

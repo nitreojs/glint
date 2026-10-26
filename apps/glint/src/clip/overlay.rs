@@ -26,7 +26,7 @@ const ITEMS: [(Item, &str, &str); 5] = [
 ];
 
 /// The keys sheet: caps, what follows them, what they do.
-const KEYS: [(&[&str], &str, &str); 18] = [
+const KEYS: [(&[&str], &str, &str); 19] = [
     (&["space"], "", "play / pause"),
     (&["←", "→"], "", "step a frame"),
     (&["I", "O"], "", "trim start / end here"),
@@ -44,6 +44,7 @@ const KEYS: [(&[&str], &str, &str); 18] = [
     (&["enter"], "", "save"),
     (&["ctrl+shift+s"], "", "save as…"),
     (&["ctrl+c"], "", "copy the file"),
+    (&["ctrl+o"], "/ drop", "open a video"),
     (&["?"], "", "this sheet"),
 ];
 
@@ -224,7 +225,7 @@ impl ClipApp {
         let p = look.p;
         let Some(toast) = &self.toast else { return };
         let life = match toast.note {
-            Note::Failed(_) => 6.0,
+            Note::Failed(_) | Note::Left(_) => 6.0,
             Note::Saved(..) | Note::Uploaded { .. } | Note::Copied(Some(_)) => 4.0,
             _ => 2.2,
         };
@@ -257,6 +258,7 @@ impl ClipApp {
             }
             Note::Info(s) => (s.clone(), None, p.t2),
             Note::Failed(s) => (s.clone(), None, p.warn),
+            Note::Left(name) => (format!("{name}: edits kept · "), Some("back"), p.t1),
         };
         let note = toast.note.clone();
         let mut open = false;
@@ -288,6 +290,10 @@ impl ClipApp {
             match note {
                 Note::Saved(path, _) => super::actions::show_in_folder(&path),
                 Note::Uploaded { url, .. } => super::actions::open_url(&url),
+                Note::Left(_) => {
+                    self.toast = None;
+                    self.back();
+                }
                 _ => {}
             }
         }

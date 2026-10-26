@@ -7,10 +7,11 @@ use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, CoTaskMemFree};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
-    FileSaveDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName, SIGDN_FILESYSPATH, ShellExecuteW,
+    FileOpenDialog, FileSaveDialog, IFileOpenDialog, IFileSaveDialog, IShellItem, SHCreateItemFromParsingName,
+    SIGDN_FILESYSPATH, ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-use windows::core::{HSTRING, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(default)]
@@ -79,6 +80,25 @@ pub(super) fn save_dialog(owner: HWND, suggested: &Path, ext: &str) -> Option<Pa
             let _ = dialog.SetFileName(&HSTRING::from(file));
         }
         if let Some(dir) = suggested.parent()
+            && let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None)
+        {
+            let _ = dialog.SetFolder(&item);
+        }
+        dialog.Show(Some(owner)).ok()?;
+        let path = dialog.GetResult().ok()?.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+        let s = path.to_string().ok();
+        CoTaskMemFree(Some(path.0 as _));
+        s.map(PathBuf::from)
+    }
+}
+
+/// Asks for a video to open, starting in `folder` when given.
+pub(super) fn open_dialog(owner: HWND, folder: Option<&Path>) -> Option<PathBuf> {
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        let spec = HSTRING::from(super::VIDEO_EXTS.map(|e| format!("*.{e}")).join(";"));
+        dialog.SetFileTypes(&[COMDLG_FILTERSPEC { pszName: w!("videos"), pszSpec: PCWSTR(spec.as_ptr()) }]).ok()?;
+        if let Some(dir) = folder.filter(|d| d.is_dir())
             && let Ok(item) = SHCreateItemFromParsingName::<_, _, IShellItem>(&HSTRING::from(dir.as_os_str()), None)
         {
             let _ = dialog.SetFolder(&item);

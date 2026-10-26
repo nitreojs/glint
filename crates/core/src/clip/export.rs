@@ -313,6 +313,12 @@ impl VideoJob {
     pub fn copies(&self, t: &Sound) -> bool {
         t.source.is_some() && !self.combine && t.volume == FULL_VOLUME
     }
+
+    /// How much sooner than the trim start a copied file starts: its first piece begins on the
+    /// keyframe before. 0 for an encoded one, which starts on the frame.
+    pub fn early(&self) -> i64 {
+        self.pieces.first().map_or(0, |p| p.start - p.lead)
+    }
 }
 
 /// The lanes that aren't muted, in order, which are the tracks the file gets.
@@ -400,7 +406,37 @@ fn muxed(payload: u64) -> u64 {
     (payload as f64 * MUXING) as u64 + MUXING_FIXED
 }
 
+/// Why an export makes the picture anew instead of copying it as recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Reencode {
+    /// A gif is always made anew.
+    Gif,
+    /// Clicks are drawn into the picture.
+    Clicks,
+    /// Keys are drawn into the picture.
+    Keys,
+    Crop,
+    /// Scaled down to this height.
+    Height(u32),
+    /// Down to this frame rate.
+    Fps(u32),
+    Compress,
+    /// A custom bitrate.
+    Bitrate,
+    /// Another codec than the recording's.
+    Codec(Codec),
+    /// The copy wouldn't fit under this size limit, in MB.
+    Size(u32),
+    /// No sample index to cut the file's packets by (not an mp4 this reads).
+    Unindexed,
+}
+
 pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
+    plan_why(edit, s, src).0
+}
+
+/// [`plan`], and why its picture is made anew: empty exactly when the video is copied, lossless.
+pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>) {
     let size = src.info.size;
     let kept = edit.kept();
     let crop = edit.crop.filter(|c| !c.is_full(size)).map(|c| c.even(size));
@@ -427,7 +463,7 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
             let k = (t as f64 * UNDER / est).sqrt();
             out = (even(out.0 as f64 * k).max(MIN_GIF), even(out.1 as f64 * k).max(MIN_GIF));
         }
-        return Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target, burn, keys });
+        return (Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target, burn, keys }), vec![Reencode::Gif]);
     }
     let tracks = sounds(edit, src.info);
     let combine = s.combine && tracks.iter().filter(|t| t.source.is_some()).count() > 1;
@@ -437,20 +473,29 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
     let compress = s.compress.filter(|_| kbps.is_none() && target.is_none());
     let codec = s.codec.resolve(src.info.codec);
     let same_codec = src.info.codec.is_none_or(|c| c == codec);
-    let plain = crop.is_none()
-        && height.is_none()
-        && fps.is_none()
-        && kbps.is_none()
-        && compress.is_none()
-        && burn.is_none()
-        && keys.is_none();
-    if src.index.is_some() && plain && same_codec {
+    let why: Vec<Reencode> = [
+        burn.as_ref().map(|_| Reencode::Clicks),
+        keys.as_ref().map(|_| Reencode::Keys),
+        crop.map(|_| Reencode::Crop),
+        height.map(Reencode::Height),
+        fps.map(Reencode::Fps),
+        compress.map(|_| Reencode::Compress),
+        kbps.map(|_| Reencode::Bitrate),
+        (!same_codec).then_some(Reencode::Codec(codec)),
+        src.index.is_none().then_some(Reencode::Unindexed),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if why.is_empty() {
         let pieces = kept.iter().map(|r| Piece { lead: lead(src.keys(), r.start), start: r.start, end: r.end }).collect();
         let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target, burn: None, keys: None };
-        if target.is_none_or(|t| estimate(&Job::Video(copy.clone()), src) <= t) {
-            return Job::Video(copy);
+        match s.target_mb {
+            Some(mb) if estimate(&Job::Video(copy.clone()), src) > mb as u64 * MB => {}
+            _ => return (Job::Video(copy), why),
         }
     }
+    let why = if why.is_empty() { vec![Reencode::Size(s.target_mb.unwrap_or_default())] } else { why };
     let out = scaled(base, height);
     let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end }).collect();
     let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn, keys };
@@ -469,7 +514,7 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
         }
     };
     job.video = Video::Encode { crop, size: out, bitrate, fps, codec, qp };
-    Job::Video(job)
+    (Job::Video(job), why)
 }
 
 pub(super) fn audio_bytes(job: &VideoJob, src: &Source) -> u64 {
@@ -884,6 +929,55 @@ mod tests {
         gif.clicks = Some(Clicks::new(&payload));
         let Job::Gif(g) = plan(&gif, &Settings { format: Format::Gif, ..s }, &src(&info, Some(&idx))) else { panic!() };
         assert_eq!(g.burn.map(|b| b.clicks.len()), Some(1));
+    }
+
+    #[test]
+    fn the_plan_says_why_it_reencodes_and_nothing_when_it_copies() {
+        use crate::clip::clicks::Clicks;
+        use crate::clip::keys::Keys;
+        use crate::record::clicks::{Button, Payload};
+        let (mut info, idx) = (info(1), index(1));
+        let click = Click { button: Button::Left, down: 5 * S, up: Some(5 * S + S / 10), x: 10.0, y: 10.0 };
+        let clicks = Payload { version: 1, scale: 1.0, clicks: vec![click] };
+        let key = keys::Key { at: 5 * S, hold: Some(6 * S), mods: keys::Mods::default(), main: keys::KeyLabel::Text("s".into()) };
+        let pressed = keys::Payload { version: 1, scale: 1.0, keys: vec![key] };
+        info.codec = Some(Codec::H264);
+        let source = src(&info, Some(&idx));
+        let why = |e: &Edit, s: &Settings| plan_why(e, s, &source).1;
+        let plain = Settings::default();
+
+        let e = edit(1);
+        let (job, none) = plan_why(&e, &plain, &source);
+        assert_eq!(none, []);
+        let Job::Video(v) = job else { panic!() };
+        assert_eq!((v.video, v.early()), (Video::Copy, S), "the copy starts on the keyframe at 2 s");
+        assert_eq!(why(&e, &Settings { target_mb: Some(50), ..plain }), [], "it fits as it is");
+
+        let mut drawn = e.clone();
+        drawn.clicks = Some(Clicks::new(&clicks));
+        drawn.keys = Some(Keys::new(&pressed));
+        drawn.crop = Some(Crop { x: 100, y: 0, w: 1000, h: 1080 });
+        assert_eq!(why(&drawn, &plain), [Reencode::Clicks, Reencode::Keys, Reencode::Crop]);
+        drawn.clicks.as_mut().unwrap().shown = false;
+        drawn.keys.as_mut().unwrap().shown = false;
+        drawn.crop = None;
+        assert_eq!(why(&drawn, &plain), [], "hidden clicks and keys aren't drawn");
+
+        let s = Settings { height: Some(720), fps: Some(24), codec: CodecChoice::Hevc, ..plain };
+        assert_eq!(why(&e, &s), [Reencode::Height(720), Reencode::Fps(24), Reencode::Codec(Codec::Hevc)]);
+        let s = Settings { height: Some(1080), fps: Some(60), codec: CodecChoice::H264, ..plain };
+        assert_eq!(why(&e, &s), [], "a height, a frame rate and a codec the recording already has");
+        let mut s = plain;
+        s.set_compress(Some(Compress::Light));
+        assert_eq!(why(&e, &s), [Reencode::Compress]);
+        s.set_kbps(Some(4_000));
+        assert_eq!(why(&e, &s), [Reencode::Bitrate]);
+
+        let (job, tight) = plan_why(&e, &Settings { target_mb: Some(10), ..plain }, &source);
+        assert_eq!(tight, [Reencode::Size(10)], "the copy is ~20 MB");
+        assert!(matches!(&job, Job::Video(v) if v.early() == 0 && matches!(v.video, Video::Encode { .. })));
+        assert_eq!(plan_why(&e, &plain, &src(&info, None)).1, [Reencode::Unindexed]);
+        assert_eq!(why(&e, &Settings { format: Format::Gif, ..plain }), [Reencode::Gif]);
     }
 
     #[test]

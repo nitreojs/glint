@@ -12,7 +12,7 @@ use glint_core::clip::clicks::Clicks;
 use glint_core::clip::keys::Keys;
 use glint_core::clip::crop::{Aspect, Crop, Grip};
 use glint_core::clip::edit::{Edit, Undo};
-use glint_core::clip::export::{Format, Job, Source, Video, VideoJob};
+use glint_core::clip::export::{Format, Job, Reencode, Source, Video, VideoJob};
 use glint_core::clip::glide::Glide;
 use glint_core::clip::index::Index;
 use glint_core::clip::info::Info;
@@ -43,6 +43,7 @@ mod panel;
 mod player;
 mod preview;
 mod scan;
+mod start;
 mod timeline;
 mod wave;
 
@@ -55,6 +56,8 @@ use timeline::{Drag, Nudge, View};
 use wave::Waves;
 
 pub const CLIP_ARG: &str = "--clip";
+/// What the editor opens: dropped, picked, or given to `--clip`.
+pub const VIDEO_EXTS: [&str; 4] = ["mp4", "mov", "m4v", "mkv"];
 const TITLE: &str = "glint clip";
 const WINDOW: [f32; 2] = [1100.0, 740.0];
 const MIN_WINDOW: [f32; 2] = [860.0, 560.0];
@@ -70,32 +73,56 @@ pub(crate) fn spawn(path: &Path) -> std::io::Result<()> {
     std::process::Command::new(exe).arg(CLIP_ARG).arg(path).spawn().map(|_| ())
 }
 
-pub fn run(path: PathBuf) {
-    let probe = path.clone();
-    let (info, hevc) = std::thread::spawn(move || {
-        let _com = Com::init();
-        (media::probe(&probe), media::has_encoder(MFVideoFormat_HEVC))
-    })
-    .join()
-    .unwrap_or_else(|_| (Err("the video couldn't be read".into()), false));
+/// A file probed for the editor.
+struct Opened {
+    path: PathBuf,
+    info: Result<Info, String>,
+    index: Option<Index>,
+}
+
+/// Reads what the editor needs to know of `path`; the calling thread needs COM.
+fn probe(path: PathBuf) -> Opened {
+    let info = media::probe(&path);
     if let Err(e) = &info {
         log(&format!("clip: {}: {e}", path.display()));
     }
     let index = info.as_ref().ok().and_then(|_| {
         index::read(&path).map_err(|e| log(&format!("clip: no sample index for {}: {e}", path.display()))).ok()
     });
+    Opened { path, info, index }
+}
+
+fn is_video(path: &Path) -> bool {
+    path.extension().is_some_and(|e| VIDEO_EXTS.iter().any(|v| e.eq_ignore_ascii_case(v)))
+}
+
+/// The window's title: the file's name when one is open.
+fn title(name: &str) -> String {
+    if name.is_empty() { TITLE.to_string() } else { format!("{name} · {TITLE}") }
+}
+
+/// Opens the editor on `path`, or on its start screen without one.
+pub fn run(path: Option<PathBuf>) {
+    let (file, hevc) = std::thread::spawn(move || {
+        let _com = Com::init();
+        (path.map(probe), media::has_encoder(MFVideoFormat_HEVC))
+    })
+    .join()
+    .unwrap_or((None, false));
     let cfg = Config::load().unwrap_or_default();
     let accent = cfg.accent_rgb();
     let saved = Saved::load();
+    let name = file.as_ref().and_then(|f| f.path.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title(TITLE)
+            .with_title(title(&name))
             .with_inner_size(WINDOW)
             .with_min_inner_size(MIN_WINDOW)
             .with_resizable(true)
             .with_decorations(false)
             .with_transparent(glint_ui::window::transparent())
             .with_active(!glint_ui::window::quiet())
+            .with_drag_and_drop(true)
             .with_icon(egui::IconData { rgba: icon_rgba(64, accent), width: 64, height: 64 }),
         centered: saved.rect.is_none(),
         ..Default::default()
@@ -115,7 +142,7 @@ pub fn run(path: PathBuf) {
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
                 glint_ui::window::place(h, r);
             }
-            let mut app = ClipApp::new(path, info, index, &cfg, saved, accent);
+            let mut app = ClipApp::new(file, cfg.effort, cfg.upload_destination.trim().to_string(), saved, accent);
             (app.hwnd, app.live, app.hevc) = (hwnd, true, hevc);
             Ok(Box::new(app))
         }),
@@ -171,6 +198,8 @@ enum Note {
     Copied(Option<String>),
     Info(String),
     Failed(String),
+    /// Another file opened over this one's unsaved edits, which "back" brings back.
+    Left(String),
 }
 
 struct Toast {
@@ -262,6 +291,14 @@ struct ClipApp {
     accent: [u8; 3],
     host: String,
     now: f64,
+    /// No file open: the start screen.
+    start: Option<start::Start>,
+    /// A file being read to open next.
+    opening: Option<start::Opening>,
+    /// The file left for another with edits not saved, and those edits.
+    previous: Option<(PathBuf, Edit)>,
+    /// The edit as the file opened, to tell whether anything was changed.
+    pristine: Edit,
 }
 
 fn fit(src: (u32, u32), area: egui::Vec2) -> egui::Vec2 {
@@ -280,20 +317,17 @@ fn decode_size(info: &Info, px: egui::Vec2) -> (u32, u32) {
 }
 
 impl ClipApp {
-    fn new(
-        path: PathBuf,
-        info: Result<Info, String>,
-        index: Option<Index>,
-        cfg: &Config,
-        saved: Saved,
-        accent: [u8; 3],
-    ) -> Self {
+    /// The editor on `file`, or on the start screen without one.
+    fn new(file: Option<Opened>, effort: u32, host: String, saved: Saved, accent: [u8; 3]) -> Self {
+        let start = file.is_none().then(start::Start::default);
+        let Opened { path, info, index } = file.unwrap_or(Opened { path: PathBuf::new(), info: Err(String::new()), index: None });
         let duration = info.as_ref().map_or(0, |i| i.duration);
         let tracks = info.as_ref().map_or(0, |i| i.tracks.len());
         let clicks = info.as_ref().ok().and_then(|i| i.clicks.as_ref()).map(Clicks::new);
         let keys = info.as_ref().ok().and_then(|i| i.keys.as_ref()).map(Keys::new);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let file_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+        let edit = Edit { clicks, keys, ..Edit::new(duration, tracks) };
         let custom_mb = match saved.export.target_mb {
             Some(mb) if !export::TARGETS_MB.contains(&mb) => mb.to_string(),
             _ => String::new(),
@@ -305,7 +339,7 @@ impl ClipApp {
             info,
             index,
             file_bytes,
-            effort: cfg.effort,
+            effort,
             hwnd: None,
             live: false,
             player: None,
@@ -325,7 +359,8 @@ impl ClipApp {
             shown: None,
             pos: 0,
             play: Play::Paused,
-            edit: Edit { clicks, keys, ..Edit::new(duration, tracks) },
+            pristine: edit.clone(),
+            edit,
             undo: Undo::default(),
             before_drag: None,
             selected: None,
@@ -367,8 +402,11 @@ impl ClipApp {
             keyboard: false,
             light: None,
             accent,
-            host: cfg.upload_destination.trim().to_string(),
+            host,
             now: 0.0,
+            start,
+            opening: None,
+            previous: None,
         }
     }
 
@@ -396,10 +434,16 @@ impl ClipApp {
         Some(Source { info: self.info()?, index: self.index.as_ref(), bytes: self.file_bytes, accent: self.accent })
     }
 
+    /// What saving would write right now, and why its picture would be made anew (nothing: it's
+    /// copied as recorded).
+    fn plan(&self) -> Option<(Job, Vec<Reencode>)> {
+        let src = self.source()?;
+        Some(export::plan_why(&self.edit, &self.saved.export, &src))
+    }
+
     /// What saving would write right now.
     fn job(&self) -> Option<Job> {
-        let src = self.source()?;
-        Some(export::plan(&self.edit, &self.saved.export, &src))
+        self.plan().map(|(job, _)| job)
     }
 
     fn sync_gains(&self) {
@@ -1064,6 +1108,20 @@ impl eframe::App for ClipApp {
         ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, p.line));
 
         let body = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
+        let held = self.files(&ctx);
+        self.poll_opening(&ctx);
+        if !self.confirm_delete && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
+            self.browse();
+        }
+        if self.start.is_some() {
+            self.start_screen(ui, &look, body, held.as_ref());
+            glint_ui::window::border(ui, full, p.line2);
+            self.show_toast(&ctx, &look, body);
+            if esc {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
         let side = Rect::from_min_max(pos2(body.right() - SIDE_W, body.top()), body.max);
         let main = Rect::from_min_max(body.min + vec2(PAD, PAD), pos2(side.left() - PAD, body.bottom() - GAP));
         let lanes = if self.info.is_ok() { self.edit.lanes.len() } else { 0 };
@@ -1105,6 +1163,7 @@ impl eframe::App for ClipApp {
         self.click_menu_popup(&ctx, &look);
         self.key_menu_popup(&ctx, &look);
         self.keys_sheet(&ctx, &look, body);
+        self.drop_overlay(&ctx, &look, body, held.as_ref());
         self.show_toast(&ctx, &look, body);
         self.delete_dialog(&ctx, &look);
 

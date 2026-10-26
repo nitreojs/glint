@@ -13,7 +13,8 @@ pub struct Samples {
 }
 
 impl Samples {
-    pub(super) fn new(mut list: Vec<(i64, u32, bool)>) -> Samples {
+    /// From (time, bytes, keyframe) per sample, in any order.
+    pub fn new(mut list: Vec<(i64, u32, bool)>) -> Samples {
         list.sort_by_key(|s| s.0);
         let mut total = 0;
         let mut before = Vec::with_capacity(list.len());

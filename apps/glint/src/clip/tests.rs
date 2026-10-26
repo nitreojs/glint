@@ -2,6 +2,7 @@ use eframe::App;
 use eframe::egui::{Event, PointerButton, Pos2};
 use glint_core::clip::export::Format;
 use glint_core::clip::info::Track;
+use glint_core::clip::index::Samples;
 use glint_core::clip::math::SECOND;
 use glint_core::clip::keys::KeySize;
 use glint_core::record::clicks::{Button, Click, Payload};
@@ -11,6 +12,26 @@ use super::*;
 
 const SCREEN: egui::Vec2 = vec2(WINDOW[0], WINDOW[1]);
 
+fn info(tracks: usize, clicks: Option<Payload>, keys: Option<keys::Payload>) -> Info {
+    let names = ["desktop", "spotifast.exe", "mic: HyperX QuadCast"];
+    Info {
+        duration: 42 * SECOND,
+        size: (1920, 1080),
+        fps: 60.0,
+        codec: None,
+        tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: names[k % 3].into() }).collect(),
+        clicks,
+        keys,
+    }
+}
+
+/// 60 fps over 42 s, a keyframe every 2 s; sound in 1/4 s packets.
+fn index(tracks: usize) -> Index {
+    let video = Samples::new((0..42 * 60).map(|i| (i * SECOND / 60, 40_000, i % 120 == 0)).collect());
+    let audio = (0..tracks).map(|_| Samples::new((0..42 * 4).map(|i| (i * SECOND / 4, 5_000, true)).collect())).collect();
+    Index { video, audio }
+}
+
 struct Harness {
     ctx: egui::Context,
     app: ClipApp,
@@ -18,6 +39,10 @@ struct Harness {
     time: f64,
     texts: Vec<(String, Rect)>,
     rects: Vec<(Rect, Color32)>,
+    /// Files held over the window, every frame, as winit reports a drag.
+    hovered: Vec<PathBuf>,
+    /// Files dropped with the next frame.
+    dropped: Vec<PathBuf>,
 }
 
 impl Harness {
@@ -34,21 +59,30 @@ impl Harness {
     }
 
     fn build(tracks: usize, clicks: Option<Payload>, keys: Option<keys::Payload>) -> Harness {
+        Harness::opened(info(tracks, clicks, keys), None)
+    }
+
+    fn opened(info: Info, index: Option<Index>) -> Harness {
+        let path = PathBuf::from("C:/nowhere/glint_2026-10-21_04-36.mp4");
+        Harness::start(Some(Opened { path, info: Ok(info), index }))
+    }
+
+    /// The editor on `file`, or on its start screen without one.
+    fn start(file: Option<Opened>) -> Harness {
         let ctx = egui::Context::default();
         glint_ui::theme::fonts(&ctx);
-        let names = ["desktop", "spotifast.exe", "mic: HyperX QuadCast"];
-        let info = Info {
-            duration: 42 * SECOND,
-            size: (1920, 1080),
-            fps: 60.0,
-            codec: None,
-            tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: names[k % 3].into() }).collect(),
-            clicks,
-            keys,
+        let cfg = Config::default();
+        let app = ClipApp::new(file, cfg.effort, cfg.upload_destination.trim().to_string(), Saved::default(), [0xE5, 0x40, 0x2F]);
+        let mut h = Harness {
+            ctx,
+            app,
+            frame: eframe::Frame::_new_kittest(),
+            time: 0.0,
+            texts: Vec::new(),
+            rects: Vec::new(),
+            hovered: Vec::new(),
+            dropped: Vec::new(),
         };
-        let path = PathBuf::from("C:/nowhere/glint_2026-10-21_04-36.mp4");
-        let app = ClipApp::new(path, Ok(info), None, &Config::default(), Saved::default(), [0xE5, 0x40, 0x2F]);
-        let mut h = Harness { ctx, app, frame: eframe::Frame::_new_kittest(), time: 0.0, texts: Vec::new(), rects: Vec::new() };
         h.app.hevc = true;
         h.settle();
         h
@@ -60,6 +94,8 @@ impl Harness {
             screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), SCREEN)),
             time: Some(self.time),
             events,
+            hovered_files: self.hovered.iter().map(|p| egui::HoveredFile { path: Some(p.clone()), ..Default::default() }).collect(),
+            dropped_files: self.dropped.drain(..).map(glint_ui::window::dropped_file).collect(),
             ..Default::default()
         };
         let (app, frame) = (&mut self.app, &mut self.frame);
@@ -159,7 +195,8 @@ fn the_export_panel_shows_only_the_rows_that_apply() {
     assert!(h.has("drag the red edges to trim · ") && h.has("all keys"));
     assert!(h.starts("≈ ").is_some());
     assert_eq!(h.starts("0:42 of").as_deref(), Some("0:42 of 0:42 · 3 sound tracks"));
-    assert!(h.texts.iter().all(|(t, _)| !t.contains("instantly") && !t.contains("re-encode")));
+    assert!(h.texts.iter().all(|(t, _)| !t.contains("instantly")));
+    assert!(h.has("re-encodes ·") && h.has("can't copy this file"), "no sample index to copy by");
 
     h.app.set_muted(1, true);
     h.settle();
@@ -650,4 +687,136 @@ fn a_lanes_volume_shows_off_100_and_moves_by_wheel_drag_and_slider_one_undo_each
     assert!(h.app.volume_pop.is_none());
     h.undo();
     assert_eq!(h.volumes(), [100, 50]);
+}
+
+impl Harness {
+    /// The last text drawn as `text`: the export panel's lines come after its rows.
+    fn at_last(&self, text: &str) -> Pos2 {
+        self.texts.iter().rev().find(|(t, _)| t == text).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no {text:?}"))
+    }
+
+    /// Frames until the file being read is opened (or isn't).
+    fn opened_by_now(&mut self) {
+        for _ in 0..500 {
+            if self.app.opening.is_none() {
+                return self.settle();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            self.frame(Vec::new());
+        }
+        panic!("still opening");
+    }
+}
+
+fn file(name: &str, tracks: usize) -> Opened {
+    Opened { path: PathBuf::from(format!("C:/nowhere/{name}")), info: Ok(info(tracks, None, None)), index: None }
+}
+
+#[test]
+fn without_a_file_the_editor_offers_a_drop_zone_and_tells_videos_apart() {
+    let mut h = Harness::start(None);
+    assert!(h.has("drop a video") && h.has("mp4 · mov · m4v · mkv") && h.has("open file…"));
+    assert!(!h.has("export") && !h.has("save"), "no panel without a file");
+
+    h.hovered = vec![PathBuf::from("C:/clips/run.mkv")];
+    h.settle();
+    assert!(h.has("drop to open") && h.has("run.mkv") && !h.has("open file…"));
+    h.hovered = vec![PathBuf::from("C:/clips/notes.txt")];
+    h.settle();
+    assert!(h.has("not a video") && h.has("notes.txt"));
+    h.hovered.clear();
+    h.dropped = vec![PathBuf::from("C:/clips/notes.txt")];
+    h.settle();
+    assert!(h.has("opens mp4, mov, m4v and mkv") && h.app.opening.is_none());
+    assert!(h.has("drop a video"));
+}
+
+#[test]
+fn another_file_opens_in_place_and_unsaved_edits_stay_a_click_away() {
+    let mut h = Harness::start(None);
+    let ctx = h.ctx.clone();
+    h.app.swap_in(&ctx, file("a.mp4", 1), None);
+    h.settle();
+    assert!(h.app.start.is_none() && h.has("a.mp4") && h.has("export"));
+    assert!(h.app.toast.is_none() && h.app.previous.is_none(), "the start screen had nothing to keep");
+
+    h.app.change(|e| e.add_marker(SECOND, 1));
+    h.app.swap_in(&ctx, file("b.mp4", 2), None);
+    h.settle();
+    assert!(h.has("b.mp4") && h.has("a.mp4: edits kept · ") && h.has("back"));
+    assert_eq!(h.app.edit.lanes.len(), 2, "b.mp4's own timeline");
+    let (path, kept) = h.app.previous.clone().unwrap();
+    assert_eq!((path, kept.markers.clone()), (PathBuf::from("C:/nowhere/a.mp4"), vec![SECOND]));
+
+    // "back" reads a.mp4 again; one that can't be read leaves what's open alone
+    h.click(h.at("back"));
+    assert!(h.app.previous.is_none());
+    h.opened_by_now();
+    assert!(h.starts("can't open a.mp4: ").is_some() && h.has("b.mp4"));
+
+    // read, its edits go back on
+    h.app.swap_in(&ctx, file("a.mp4", 1), Some(kept));
+    h.settle();
+    assert_eq!(h.app.edit.markers, [SECOND]);
+    assert!(h.app.previous.is_none(), "b.mp4 had no edits to keep");
+}
+
+#[test]
+fn a_file_held_over_an_open_clip_shows_where_it_goes() {
+    let mut h = Harness::new(1);
+    assert!(!h.has("drop to open"));
+    h.hovered = vec![PathBuf::from("C:/clips/next.mp4")];
+    h.settle();
+    assert!(h.has("drop to open") && h.has("next.mp4"));
+    h.hovered.clear();
+    h.settle();
+    assert!(!h.has("drop to open"));
+    h.dropped = vec![PathBuf::from("C:/nowhere/glint_2026-10-21_04-36.mp4")];
+    h.settle();
+    assert!(h.app.opening.is_none(), "the file that's open stays as it is");
+}
+
+#[test]
+fn the_panel_says_when_the_export_is_lossless_and_why_not() {
+    let mut h = Harness::opened(info(1, None, None), Some(index(1)));
+    assert!(h.has("lossless") && h.has("· no re-encode"));
+    assert!(h.starts("starts ").is_none(), "the whole file starts on its first keyframe");
+    let frame = h.app.frame_len();
+    h.app.change(|e| {
+        e.range.set_start(3 * SECOND, frame);
+        true
+    });
+    h.settle();
+    assert!(h.has("starts 1.0 s early, on a keyframe"));
+
+    h.app.saved.export.height = Some(720);
+    h.settle();
+    assert!(h.has("re-encodes ·") && !h.has("lossless"));
+    h.click(h.at_last("720p"));
+    assert_eq!(h.app.saved.export.height, None);
+    assert!(h.has("lossless"));
+
+    h.app.saved.export.fps = Some(30);
+    h.app.change(|e| {
+        e.crop = Some(Crop { x: 0, y: 0, w: 960, h: 540 });
+        true
+    });
+    h.settle();
+    assert!(h.has("cropped,") && h.has("30 fps"));
+    h.click(h.at_last("cropped,"));
+    assert!(h.app.edit.crop.is_none() && h.has("30 fps") && !h.has("cropped,"));
+    h.click(h.at_last("30 fps"));
+    assert!(h.app.saved.export.fps.is_none() && h.has("lossless"));
+}
+
+#[test]
+fn drawn_in_clicks_are_the_reason_and_a_click_hides_them() {
+    let down = 5 * SECOND;
+    let clicks = vec![Click { button: Button::Left, down, up: Some(down + SECOND / 10), x: 10.0, y: 10.0 }];
+    let mut h = Harness::opened(info(1, Some(Payload { version: 1, scale: 1.0, clicks }), None), Some(index(1)));
+    assert!(h.has("re-encodes ·") && h.has("clicks drawn in"));
+    h.click(h.at_last("clicks drawn in"));
+    assert!(h.app.edit.clicks.as_ref().is_some_and(|c| !c.shown) && h.has("lossless"));
+    let without = Harness::opened(info(1, None, None), None);
+    assert!(without.has("can't copy this file"), "no sample index, no copy");
 }

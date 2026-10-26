@@ -22,7 +22,7 @@ use windows::core::{HSTRING, w};
 mod shadow;
 mod shot;
 
-pub use shot::shots;
+pub use shot::{dropped_file, shots};
 
 const EDGE: f32 = 5.0;
 const CORNER: f32 = 14.0;
@@ -101,7 +101,7 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     if !*WINDOWS_11 {
         shadow::message(msg, wp, lp);
     }
-    if shot::message(msg, wp) {
+    if shot::message(msg, wp, lp) {
         return LRESULT(0);
     }
     match msg {

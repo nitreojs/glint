@@ -38,6 +38,7 @@ public static void PostKey(IntPtr hwnd, uint vk, char c) {
 '@
 }
 $script:ShotMessage = [GlintShot.Win]::RegisterWindowMessageW('glint-shot')
+$script:DropMessage = [GlintShot.Win]::RegisterWindowMessageW('glint-drop')
 
 # Starts `exe` with `arguments` quietly (GLINT_QUIET=1), shots going to `shots`, with its own
 # APPDATA and LOCALAPPDATA when given; waits for its window titled `title` and returns
@@ -125,6 +126,17 @@ function Send-Wheel([IntPtr]$hwnd, [int]$x, [int]$y, [int]$notches) {
     # WM_MOUSEWHEEL carries screen coordinates
     $wp = [IntPtr](([int16]($notches * 120)) * 65536)
     [void][GlintShot.Win]::PostMessageW($hwnd, 0x020A, $wp, (Get-Lparam ($r.Left + $x) ($r.Top + $y)))
+}
+
+# A file dragged over the window without the cursor (GLINT_SHOT_DIR windows only): `hold` it
+# over the window, `drop` it, or take it away (`leave`), as winit reports a real drag to egui.
+function Send-Drop([IntPtr]$hwnd, [string]$path, [ValidateSet('hold', 'drop', 'leave')][string]$what = 'drop') {
+    $atom = [GlintShot.Win]::GlobalAddAtomW($path)
+    $lp = [IntPtr](@{ hold = 0; drop = 1; leave = 2 }[$what])
+    if (-not [GlintShot.Win]::PostMessageW($hwnd, $script:DropMessage, [IntPtr][int]$atom, $lp)) {
+        [void][GlintShot.Win]::GlobalDeleteAtom($atom)
+        throw "can't post to $hwnd"
+    }
 }
 
 # The first element in the window named `name` (and of control `type`, e.g. 'Edit', 'Button'),
