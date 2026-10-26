@@ -102,8 +102,12 @@ pub struct Addon {
     pub hero: Option<String>,
     /// `victory`, `defeat`, `abandoned`, `unknown`.
     pub result: Option<String>,
+    /// The local player's totals so far, on `kill` and `death` from the top bar's counters.
     pub kills: Option<u32>,
     pub deaths: Option<u32>,
+    /// What told a `kill` or `death`: `kda` the top bar's counters, which the game refreshes in
+    /// bursts (several kills seconds late at once), `dead` the player's portrait going dark.
+    pub src: Option<String>,
     pub level: Option<u32>,
     pub souls: Option<String>,
     pub best_streak: Option<u32>,
@@ -129,7 +133,7 @@ const ADDON_EVENTS: &[(&str, Told)] = &[
     ("assist", |a, _| Some((a.own(Kind::Assist), false))),
     ("respawn", |a, _| Some((a.own(Kind::Respawn), false))),
     ("feed", Addon::feed),
-    ("objective", |a, _| a.objective().map(|e| (e, false))),
+    ("objective", |a, player| a.objective(player).map(|e| (e, false))),
     ("streak", |a, player| Some((a.streak(player), false))),
     ("announce", |a, _| a.announce().map(|e| (e, false))),
     ("result", |a, _| a.result().map(|e| (e, false))),
@@ -174,10 +178,11 @@ impl Addon {
         Some((Event { killer: self.killer, victim: self.victim, assists: self.assists, mine: Some(mine), ..Event::new(NAME, kind) }, mine))
     }
 
-    fn objective(self) -> Option<Event> {
+    fn objective(self, player: Option<&str>) -> Option<Event> {
+        let mine = (self.mine == Some(true) || named(self.killer.as_deref(), player)).then_some(true).or(self.mine);
         let Some(state) = self.state else {
             let which = self.text.or_else(|| self.victim.clone()).or(self.what)?;
-            return Some(Event { killer: self.killer, victim: self.victim, mine: self.mine, ..Event::new(NAME, Kind::Objective(which)) });
+            return Some(Event { killer: self.killer, victim: self.victim, mine, ..Event::new(NAME, Kind::Objective(which)) });
         };
         let what = self.what?.replace('_', " ");
         let side = match self.side.as_deref() {
@@ -193,7 +198,7 @@ impl Addon {
         if let Some(Lane::Number(n)) = self.lane {
             which += &format!(" (lane {n})");
         }
-        Some(Event { killer: self.killer, victim: self.victim, mine: self.mine, detail: Some(state), ..Event::new(NAME, Kind::Objective(which)) })
+        Some(Event { killer: self.killer, victim: self.victim, mine, detail: Some(state), ..Event::new(NAME, Kind::Objective(which)) })
     }
 
     fn streak(self, player: Option<&str>) -> Event {
@@ -283,9 +288,11 @@ pub struct Session {
     addon: bool,
     /// The name the local player plays under, from Steam.
     player: Option<String>,
-    /// The local player's recent kills and deaths (unix ms, and whether a feed entry told it),
-    /// so one told by both the addon's counters and a feed entry naming them counts once.
+    /// The local player's recent kills and deaths told as they happened (unix ms, and whether a
+    /// feed entry told it), so one told both by the feed and by the portrait counts once.
     own: [Vec<(i64, bool)>; 2],
+    /// The local player's kills and deaths told so far: a counter's total only adds what's past it.
+    told: [u32; 2],
 }
 
 impl Session {
@@ -304,6 +311,7 @@ impl Session {
             Line::Addon(addon) => {
                 self.addon = true;
                 let at = addon.t.filter(|t| (t - at).abs() <= CLIENT_SLACK_MS).unwrap_or(at);
+                let totals = [addon.kills, addon.deaths].map(|t| t.filter(|_| addon.src.as_deref() == Some("kda")));
                 let (event, by_feed) = (*addon).event(self.player.as_deref())?;
                 let slot = match (&event.kind, event.mine) {
                     (Kind::Kill, Some(true)) => Some(0),
@@ -311,18 +319,27 @@ impl Session {
                     _ => None,
                 };
                 if let Some(i) = slot {
-                    // one told the other way a moment ago is this one; two told the same way are two
-                    let own = &mut self.own[i];
-                    own.retain(|(t, _)| at - t <= SAME_MS);
-                    if let Some(k) = own.iter().position(|&(_, feed)| feed != by_feed) {
-                        own.remove(k);
-                        return None;
+                    match totals[i] {
+                        // the counters lag and come in bursts: they only fill in what the feed missed
+                        Some(total) if total <= self.told[i] => return None,
+                        Some(_) => {}
+                        None => {
+                            // one told the other way a moment ago is this one; two told the same way are two
+                            let own = &mut self.own[i];
+                            own.retain(|(t, _)| at - t <= SAME_MS);
+                            if let Some(k) = own.iter().position(|&(_, feed)| feed != by_feed) {
+                                own.remove(k);
+                                return None;
+                            }
+                            own.push((at, by_feed));
+                        }
                     }
-                    own.push((at, by_feed));
+                    self.told[i] += 1;
                 }
                 return Some(GameEvent { at, event });
             }
             Line::Map(_) => {
+                // a new match: the counters start over
                 *self = Session { addon: self.addon, player: self.player.take(), ..Session::default() };
                 return None;
             }
@@ -652,4 +669,36 @@ mod tests {
         }
         assert_eq!(log_path(Path::new("deadlock.exe")), None);
     }
+
+    #[test]
+    fn the_counters_fill_in_only_what_the_feed_missed() {
+        // from a real bot match: the feed tells kills as they happen, the top bar's counters
+        // catch up seconds later in bursts (kills 6 and 7 together, 10 to 13 and a death at once)
+        let mut s = Session { player: Some("memories".into()), ..Session::default() };
+        let line = |s: &mut Session, json: &str| {
+            let t: i64 = json.split("\"t\":").nth(1).and_then(|r| r.split([',', '}']).next()).and_then(|t| t.parse().ok()).unwrap();
+            s.feed(stamp(22, 0, 0), t, &format!("[PanoramaScript] [AFTERGLOW]{json}")).map(|e| (e.event.kind, e.event.mine))
+        };
+        let mut told = Vec::new();
+        for json in [
+            r#"{"v":1,"event":"feed","killer":"memories","victim":"Rem","me":"killer","t":1793041490919}"#,
+            r#"{"v":1,"event":"feed","killer":"MEMORIES","victim":"GREY TALON","assists":1,"t":1793041502219}"#,
+            r#"{"v":1,"event":"kill","kills":1,"src":"kda","t":1793041509195}"#,
+            r#"{"v":1,"event":"kill","kills":2,"src":"kda","t":1793041509195}"#,
+            r#"{"v":1,"event":"objective","what":"bossDied","killer":"MEMORIES","victim":"GUARDIAN","mine":false,"t":1793041570189}"#,
+            r#"{"v":1,"event":"feed","killer":"WALKER","victim":"MEMORIES","assists":6,"t":1793041672287}"#,
+            r#"{"v":1,"event":"death","deaths":0,"src":"dead","t":1793041672391}"#,
+            r#"{"v":1,"event":"feed","killer":"MEMORIES","victim":"DEADMAN DANNY","assists":2,"t":1793041731774}"#,
+            r#"{"v":1,"event":"kill","kills":3,"src":"kda","t":1793041748804}"#,
+            r#"{"v":1,"event":"kill","kills":4,"src":"kda","t":1793041748804}"#,
+            r#"{"v":1,"event":"death","deaths":1,"src":"kda","t":1793041748804}"#,
+        ] {
+            told.extend(line(&mut s, json));
+        }
+        let kills = told.iter().filter(|(k, m)| *k == Kind::Kill && *m == Some(true)).count();
+        let deaths = told.iter().filter(|(k, m)| *k == Kind::Death && *m == Some(true)).count();
+        assert_eq!((kills, deaths), (4, 1), "3 from the feed, 1 only the counters saw; one death told three ways: {told:?}");
+        assert!(told.contains(&(Kind::Objective("GUARDIAN".into()), Some(true))), "a guardian the feed credits to the player is theirs");
+    }
+
 }
