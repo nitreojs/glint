@@ -37,10 +37,12 @@ pub enum Page {
     Video,
     Audio,
     Output,
+    Games,
     About,
 }
 
-const PAGES: [Page; 5] = [Page::General, Page::Video, Page::Audio, Page::Output, Page::About];
+const PAGES: [Page; 6] = [Page::General, Page::Video, Page::Audio, Page::Output, Page::Games, Page::About];
+const BETA: &str = "beta";
 
 /// Opens the window, or brings the open one forward.
 pub fn run() {
@@ -192,13 +194,15 @@ impl Settings {
         widgets::toggle_row(ui, look, "with windows", &mut self.cfg.launch_at_startup, text);
         let text = if self.cfg.buffer { "right away" } else { "waits for resume in the tray" };
         widgets::toggle_row(ui, look, "buffering", &mut self.cfg.buffer, text);
-        widgets::subheading(ui, look, "games");
+    }
+
+    fn games(&mut self, ui: &mut Ui, look: &Look) {
         row(ui, look, "deadlock events", 1.0, |ui| {
             if widgets::toggle(ui, look, &mut self.cfg.deadlock_addon, "markers for your kills, deaths and assists").changed() && self.cfg.deadlock_addon {
                 self.cfg.game_events = true;
             }
             let (text, warn) = self.addon_hint();
-            hint(ui, text, if warn { look.p.warn } else { t3 });
+            hint(ui, text, if warn { look.p.warn } else { look.p.t3 });
         });
     }
 
@@ -401,8 +405,6 @@ impl Settings {
                     + n(a.save_hotkey == b.save_hotkey)
                     + n(a.launch_at_startup == b.launch_at_startup)
                     + n(a.note_position == b.note_position)
-                    + n(a.deadlock_addon == b.deadlock_addon)
-                    + n(a.game_events == b.game_events)
             }
             Page::Video => {
                 n(a.monitor == b.monitor)
@@ -414,6 +416,7 @@ impl Settings {
             }
             Page::Audio => n(a.audio_sources == b.audio_sources) + n(a.audio_track_names == b.audio_track_names),
             Page::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
+            Page::Games => n(a.deadlock_addon == b.deadlock_addon) + n(a.game_events == b.game_events),
             Page::About => 0,
         }
     }
@@ -439,8 +442,13 @@ impl Pages for Settings {
             Page::Video => "video",
             Page::Audio => "audio",
             Page::Output => "output",
+            Page::Games => "games",
             Page::About => "about",
         }
+    }
+
+    fn badge(&self, page: Page) -> Option<&'static str> {
+        (page == Page::Games).then_some(BETA)
     }
 
     fn accent(&self) -> [u8; 3] {
@@ -465,8 +473,6 @@ impl Pages for Settings {
                 c.save_hotkey = d.save_hotkey;
                 c.launch_at_startup = d.launch_at_startup;
                 c.note_position = d.note_position;
-                c.deadlock_addon = d.deadlock_addon;
-                c.game_events = d.game_events;
             }
             Page::Video => {
                 c.monitor = d.monitor;
@@ -484,6 +490,10 @@ impl Pages for Settings {
                 c.output_dir = d.output_dir;
                 c.file_name = d.file_name;
             }
+            Page::Games => {
+                c.deadlock_addon = d.deadlock_addon;
+                c.game_events = d.game_events;
+            }
             Page::About => {}
         }
     }
@@ -494,6 +504,7 @@ impl Pages for Settings {
             Page::Video => self.video(ui, look),
             Page::Audio => self.audio(ui, look),
             Page::Output => self.output(ui, look),
+            Page::Games => self.games(ui, look),
             Page::About => self.about(ui, look),
         }
     }
@@ -685,7 +696,7 @@ mod tests {
         s.cfg.audio_sources.push(AudioSource::new(SourceKind::Mic, 1));
         s.cfg.output_dir = r"D:\clips".into();
         let counts: Vec<usize> = PAGES.iter().map(|&p| s.changes(p)).collect();
-        assert_eq!(counts, [2, 1, 1, 1, 0]);
+        assert_eq!(counts, [2, 1, 1, 1, 0, 0]);
         s.reset(Page::Video);
         assert_eq!((s.cfg.quality, s.cfg.length), (23, 300), "video's reset leaves the length alone");
         s.reset(Page::General);
@@ -717,11 +728,12 @@ mod tests {
 
         s.saved = Config::default();
         s.cfg = Config::default();
-        assert_eq!(s.changes(Page::General), 0);
+        assert_eq!(s.changes(Page::Games), 0);
         s.cfg.deadlock_addon = true;
         s.cfg.game_events = true;
-        assert_eq!(s.changes(Page::General), 2, "both are general's");
-        s.reset(Page::General);
+        assert_eq!((s.changes(Page::Games), s.changes(Page::General)), (2, 0), "both are the games page's");
+        assert_eq!((s.badge(Page::Games), s.badge(Page::General)), (Some("beta"), None));
+        s.reset(Page::Games);
         assert!(!s.cfg.deadlock_addon && !s.cfg.game_events);
     }
 }
