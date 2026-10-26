@@ -231,18 +231,28 @@ mod tests {
         OnDisk { path: PathBuf::from(path), size: 7, modified: secs * 1_000_000_000 + 5 }
     }
 
+    /// The output folder the tests list, in this platform's own path form.
+    fn root() -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\caps" } else { "/caps" })
+    }
+
+    /// `rel` ('/'-separated) inside [`root`].
+    fn at(rel: &str) -> String {
+        rel.split('/').fold(root(), |p, s| p.join(s)).to_string_lossy().into_owned()
+    }
+
     #[test]
     fn history_and_found_files_merge_newest_first_without_doubles() {
-        let root = Path::new(r"C:\caps");
+        let root = root();
         let history = [
-            entry(r"C:\caps\a.png", 100, Some("Telegram Desktop")),
-            entry(r"C:\caps\gone.png", 150, None),
-            entry(r"C:\caps\b.mp4", 200, None),
-            entry(r"C:\caps\notes.txt", 250, None),
+            entry(&at("a.png"), 100, Some("Telegram Desktop")),
+            entry(&at("gone.png"), 150, None),
+            entry(&at("b.mp4"), 200, None),
+            entry(&at("notes.txt"), 250, None),
         ];
-        let found = vec![disk(r"c:/caps/A.PNG", 999), disk(r"C:\caps\old\c.gif", 50), disk(r"C:\caps\d.jpeg", 300)];
+        let found = vec![disk(&at("A.PNG"), 999), disk(&at("old/c.gif"), 50), disk(&at("d.jpeg"), 300)];
         let stat = |p: &Path| (!p.ends_with("gone.png")).then_some((42, 9));
-        let items = collect(&history, found, root, stat);
+        let items = collect(&history, found, &root, stat);
         let names: Vec<String> = items.iter().map(Item::name).collect();
         assert_eq!(names, ["d.jpeg", "b.mp4", "a.png", "c.gif"]);
         let kinds: Vec<Kind> = items.iter().map(|i| i.kind).collect();
@@ -250,15 +260,17 @@ mod tests {
         // the history's own time and size from disk; found files by their last write
         assert_eq!((items[2].time, items[2].size, items[2].modified), (100, 42, 9));
         assert_eq!((items[0].time, items[0].size), (300, 7));
-        assert_eq!(items[2].id, path_id(Path::new(r"c:/CAPS/a.png")));
+        assert_eq!(items[2].id, path_id(Path::new(&at("A.PNG"))));
+        #[cfg(windows)]
+        assert_eq!(items[2].id, path_id(Path::new(r"c:/CAPS/a.png")), "either slash, any case");
     }
 
     #[test]
     fn filter_and_search_look_at_kind_name_folder_and_app() {
-        let root = Path::new(r"C:\caps");
-        let history = [entry(r"C:\caps\Discord\clip 1.mp4", 1, None), entry(r"C:\caps\glint_1.png", 2, Some("Telegram Desktop"))];
-        let found = vec![disk(r"C:\caps\party.gif", 0)];
-        let items = collect(&history, found, root, |_| Some((1, 1)));
+        let root = root();
+        let history = [entry(&at("Discord/clip 1.mp4"), 1, None), entry(&at("glint_1.png"), 2, Some("Telegram Desktop"))];
+        let found = vec![disk(&at("party.gif"), 0)];
+        let items = collect(&history, found, &root, |_| Some((1, 1)));
         let shown = |filter: Filter, q: &str| -> Vec<String> {
             let w = words(q);
             items.iter().filter(|i| i.matches(filter, &w)).map(Item::name).collect()
