@@ -20,6 +20,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{HSTRING, w};
 
 mod shadow;
+mod shot;
+
+pub use shot::shots;
 
 const EDGE: f32 = 5.0;
 const CORNER: f32 = 14.0;
@@ -97,6 +100,9 @@ unsafe extern "system" fn frame_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     let zoomed = unsafe { IsZoomed(hwnd).as_bool() };
     if !*WINDOWS_11 {
         shadow::message(msg, wp, lp);
+    }
+    if shot::message(msg, wp) {
+        return LRESULT(0);
     }
     match msg {
         // winit 0.30 keeps a 1 px non-client strip at the top for the shadow, which win10 paints as a light line

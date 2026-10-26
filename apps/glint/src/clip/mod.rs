@@ -1029,6 +1029,7 @@ impl eframe::App for ClipApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        glint_ui::window::shots(&ctx);
         self.now = ctx.input(|i| i.time);
         let light = ctx.system_theme() == Some(egui::Theme::Light);
         let p = widgets::palette(light, self.accent);

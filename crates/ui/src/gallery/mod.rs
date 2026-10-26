@@ -1048,6 +1048,7 @@ impl eframe::App for Gallery {
 
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        window::shots(&ctx);
         self.now = ctx.input(|i| i.time);
         self.frame += 1;
         let light = ctx.system_theme() == Some(egui::Theme::Light);

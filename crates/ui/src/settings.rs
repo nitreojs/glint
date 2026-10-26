@@ -225,6 +225,7 @@ impl<P: Pages> eframe::App for Frame<P> {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         self.pages.tick();
         let ctx = ui.ctx().clone();
+        window::shots(&ctx);
         let light = ctx.system_theme() == Some(egui::Theme::Light);
         let accent = self.pages.accent();
         let p = widgets::palette(light, accent);
