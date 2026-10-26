@@ -20,9 +20,11 @@ use glint_core::clip::math::frame_len;
 use glint_core::clip::viewer::Viewer;
 use glint_core::clip::{export, index, math};
 use glint_core::config::Config;
-use glint_core::history::{self, Kind as HistoryKind};
+use glint_core::gallery::Maker;
+use glint_core::history::{self, Entry, Kind as HistoryKind};
 use glint_core::icon::icon_rgba;
 use glint_core::log::log;
+use glint_core::paths::appdata;
 use glint_core::upload::{Destination, Payload};
 use glint_media::clip::audio::{Audio, Clock};
 use glint_media::clip::media::Com;
@@ -721,7 +723,12 @@ impl ClipApp {
         match res {
             Ok(path) => {
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                history::add(HistoryKind::Recording, Some(&path), size, None, None);
+                // the export shows what the clip it's cut from shows, whichever app saved that
+                let histories = Maker::ALL.map(|m| m.history(&appdata()));
+                let from = history::find_in(&histories, &self.path);
+                let (app, exe) = from.map_or((None, None), |e| (e.app, e.exe));
+                let entry = Entry::new(HistoryKind::Recording, Some(&path), size).with_app(app.as_deref(), exe.as_deref());
+                history::add(entry.with_duration(glint_ui::gallery::length(&path)));
                 if task.then == Then::Nothing {
                     self.flash = self.now;
                 }
@@ -773,7 +780,7 @@ impl ClipApp {
         let Some(up) = self.upload.take() else { return };
         let note = match res {
             Ok(url) => {
-                history::add(HistoryKind::Recording, Some(&up.path), up.size, Some(&url), None);
+                history::add(Entry::new(HistoryKind::Recording, Some(&up.path), up.size).with_url(&url));
                 let copied = up.copy_link && glint_shell::clipboard::copy_text(self.hwnd, &url).is_ok();
                 Note::Uploaded { url, copied }
             }

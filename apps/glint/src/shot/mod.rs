@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use glint_core::config::{Config, ShotFormat};
 use glint_core::geom::rect::Rect;
-use glint_core::history::{self, Kind};
+use glint_core::history::{self, Entry, Kind};
 use glint_core::naming::{Source, Subject};
 use glint_core::upload::Payload;
 use glint_media::image::{ImageFormat, encode};
@@ -67,7 +67,7 @@ pub(crate) fn deliver(shot: &Shot, cfg: &Config, owner: HWND, subject: Subject) 
                     let path = unique_path(cfg, Kind::Shot, subject, format.extension());
                     match std::fs::write(&path, &bytes) {
                         Ok(()) => {
-                            history::add(Kind::Shot, Some(&path), bytes.len() as u64, None, subject.app());
+                            history::add(Entry::new(Kind::Shot, Some(&path), bytes.len() as u64).with_source(subject.source()));
                             saved = Some((path, bytes.len()));
                         }
                         Err(e) => errors.push(format!("couldn't save: {}: {e}", path.display())),

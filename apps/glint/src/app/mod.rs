@@ -4,13 +4,14 @@ use std::path::PathBuf;
 use glint_core::config::{ClickMode, Config, Keystrokes, ShotStyle, UpdateMode};
 use glint_core::format::{human_duration, human_size};
 use glint_core::geom::rect::Rect;
-use glint_core::history::{self, Kind};
+use glint_core::history::{self, Entry, Kind};
 use glint_core::log::log;
 use glint_core::naming::Subject;
 use glint_core::record::pipeline::{Outcome, Recorder};
 use glint_core::update::notes_url;
 use glint_core::wide::wide;
 use glint_media::record::{self, ClickHighlights, KeyOverlay, Params, Source};
+use glint_shell::identity::{front_window, identify};
 use glint_shell::log::path as log_path;
 use glint_shell::{autostart, file_menu, instance, monitors, start_menu, window};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -87,8 +88,11 @@ struct App {
     click: ClickTarget,
     exiting: bool,
     update: updates::Updates,
-    /// The file of the recording being made and the app whose window it shows, for its history entry.
-    recording_app: Option<(PathBuf, String)>,
+    /// The file of the recording being made and the app it shows, for its history entry.
+    recording_app: Option<(PathBuf, glint_core::naming::Source)>,
+    /// The window in front when the picker was asked for: a region's recording shows its app
+    /// when the region's middle is on it.
+    front: Option<(HWND, Rect)>,
 }
 
 thread_local! {
@@ -210,6 +214,7 @@ impl App {
     }
 
     fn start_selection(&mut self, shot: bool) {
+        self.front = front_window();
         self.reload();
         let outputs = match monitors::enumerate() {
             Ok(o) if !o.is_empty() => o,
@@ -271,7 +276,10 @@ impl App {
         };
         let subject = sel.source.as_ref().map_or(Subject::Region, Subject::Window);
         let path = unique_path(&self.cfg, Kind::Recording, subject, "mp4");
-        self.recording_app = subject.app().map(|app| (path.clone(), app.to_string()));
+        let (cx, cy) = (sel.rect.x + sel.rect.w / 2, sel.rect.y + sel.rect.h / 2);
+        let in_front = || self.front.take().filter(|(_, r)| r.contains(cx, cy)).and_then(|(h, _)| identify(h));
+        let app = subject.source().cloned().or_else(in_front).filter(|s| !s.app.trim().is_empty());
+        self.recording_app = app.map(|app| (path.clone(), app));
         let params = Params {
             sources: sel
                 .outputs
@@ -487,7 +495,8 @@ impl App {
                     text += &format!("\nStopped early: {why}");
                 }
                 let app = self.recording_app.take().filter(|(p, _)| *p == s.path).map(|(_, app)| app);
-                history::add(Kind::Recording, Some(&s.path), bytes, None, app.as_deref());
+                let ms = (s.duration_s * 1000.0).round() as u32;
+                history::add(Entry::new(Kind::Recording, Some(&s.path), bytes).with_source(app.as_ref()).with_duration(Some(ms)));
                 let mut upload_failed = false;
                 if self.cfg.recording_upload
                     && let Err(e) = upload::start_file(&self.cfg, Kind::Recording, &s.path, self.hwnd)
@@ -522,7 +531,7 @@ impl App {
         }
         match done.result {
             Ok(url) => {
-                history::add(done.kind, done.path.as_deref(), done.size, Some(&url), None);
+                history::add(Entry::new(done.kind, done.path.as_deref(), done.size).with_url(&url));
                 let copied = self.cfg.upload_copy_link && {
                     let copied = glint_shell::clipboard::copy_text(Some(self.hwnd), &url);
                     if let Err(e) = &copied {
@@ -791,6 +800,7 @@ pub fn run() {
             exiting: false,
             update: updates::Updates::default(),
             recording_app: None,
+            front: None,
         };
         app.register_hotkeys(None);
         if let Some(old) = &updated_from {

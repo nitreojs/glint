@@ -10,6 +10,8 @@ pub struct Source {
     /// The exe's description (`Telegram Desktop`), else its name without `.exe`.
     pub app: String,
     pub title: String,
+    /// Where the exe is (`C:\…\Telegram.exe`): its icon.
+    pub path: String,
 }
 
 /// What a capture shows, for `{app}` and `{title}`.
@@ -27,6 +29,14 @@ impl<'a> Subject<'a> {
     pub fn app(self) -> Option<&'a str> {
         match self {
             Subject::Window(s) if !s.app.trim().is_empty() => Some(s.app.as_str()),
+            _ => None,
+        }
+    }
+
+    /// The app window it is, when it's one app's.
+    pub fn source(self) -> Option<&'a Source> {
+        match self {
+            Subject::Window(s) if !s.app.trim().is_empty() => Some(s),
             _ => None,
         }
     }
@@ -52,6 +62,8 @@ pub struct Names {
 }
 
 pub const GLINT: Names = Names { default: "glint_{date}_{time}", fallback: "glint" };
+/// afterglow's file naming: `afterglow_<date>_<time>` until a pattern is set.
+pub const AFTERGLOW: Names = Names { default: "afterglow_{date}_{time}", fallback: "afterglow" };
 /// The file part of the pattern "name files after the window" sets.
 pub const WINDOW_NAME: &str = "{app}_{date}_{time}";
 /// The folder "sort into folders by app" puts in front.
@@ -207,6 +219,18 @@ impl Names {
             _ => pattern.to_string(),
         }
     }
+
+    /// How many folders deep captures go below the output folder: the pattern's own `/`
+    /// folders, plus the folder itself.
+    pub fn depth(&self, pattern: &str) -> usize {
+        self.or_default(pattern).split('/').filter(|s| !s.trim().is_empty()).count().max(1)
+    }
+
+    /// Which of the folders below the output folder (0 the first) is named after the app.
+    pub fn app_folder(&self, pattern: &str) -> Option<usize> {
+        let segments: Vec<&str> = self.or_default(pattern).split('/').map(str::trim).filter(|s| !s.is_empty()).collect();
+        segments[..segments.len().saturating_sub(1)].iter().position(|s| *s == "{app}")
+    }
 }
 
 #[cfg(test)]
@@ -216,7 +240,7 @@ mod tests {
     use super::*;
 
     fn telegram() -> Source {
-        Source { exe: "Telegram.exe".into(), app: "Telegram Desktop".into(), title: "Saved Messages".into() }
+        Source { exe: "Telegram.exe".into(), app: "Telegram Desktop".into(), title: "Saved Messages".into(), path: String::new() }
     }
 
     fn named(pattern: &str, kind: Kind, subject: Subject) -> PathBuf {
@@ -252,7 +276,7 @@ mod tests {
         assert_eq!(named("{app}/{app}", Kind::Shot, Subject::Screen), path(&["screen", "screen"]));
         let untitled = Source { title: " \t".into(), ..telegram() };
         assert_eq!(named("{title}", Kind::Shot, Subject::Window(&untitled)), path(&["Telegram Desktop"]));
-        let nameless = Source { app: "???".into(), title: String::new(), exe: "x.exe".into() };
+        let nameless = Source { app: "???".into(), title: String::new(), exe: "x.exe".into(), path: String::new() };
         assert_eq!(named("{app}/{title}", Kind::Shot, Subject::Window(&nameless)), path(&["other", "screen"]));
     }
 
@@ -307,5 +331,18 @@ mod tests {
         assert_eq!(GLINT.with_app_folders("mine {time}", false), "mine {time}");
         let folders = GLINT.expand(&sorted, &Naming { date: "d", time: "t", kind: Kind::Shot, subject: Subject::Region });
         assert_eq!(folders, Path::new("other").join("screen_d_t"));
+    }
+
+    #[test]
+    fn captures_go_as_deep_as_the_pattern_makes_folders() {
+        assert_eq!(AFTERGLOW.depth(""), 1);
+        assert_eq!(AFTERGLOW.depth("afterglow_{date}_{time}"), 1);
+        assert_eq!(AFTERGLOW.depth("{app}/{date}_{time}"), 2);
+        assert_eq!(AFTERGLOW.depth("clips/ {app} /{date}/{time}"), 4);
+        assert_eq!(AFTERGLOW.depth("/{app}//{time}/"), 2);
+        assert_eq!(GLINT.app_folder(""), None);
+        assert_eq!(GLINT.app_folder("{app}/{app}_{date}"), Some(0));
+        assert_eq!(GLINT.app_folder("{kind}/ {app} /x"), Some(1));
+        assert_eq!(GLINT.app_folder("{kind}/{app}"), None, "the file name isn't a folder");
     }
 }

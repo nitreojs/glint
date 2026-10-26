@@ -17,12 +17,12 @@ use glint_core::naming::{Naming, Source, Subject};
 use glint_core::record::pipeline::Outcome;
 use glint_core::wide::wide;
 use glint_shell::afterglow::{MAIN_CLASS, WM_NOTE_CAPTURABLE};
-use glint_shell::identity::identify;
+use glint_shell::identity::{front_window, identify};
 use glint_shell::menu::{Glyph, Header, Item, Menu};
 use glint_shell::time::date_time;
 use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use glint_shell::{autostart, explorer, hotkey, instance, start_menu, window};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
 use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
@@ -59,13 +59,15 @@ const CLICK_TIMER: usize = 3;
 const STUCK: Duration = Duration::from_secs(90);
 
 /// A save being written: how long the clip is ("0:42 of 1:00" when the memory cap cut it short),
-/// the monitor it's of, whether the cap cut it, the app it shows, and since when.
+/// the monitor it's of, whether the cap cut it, the app it shows, how long it plays in
+/// milliseconds, and since when.
 struct Saving {
     id: u64,
     long: String,
     monitor: Rect,
     capped: bool,
-    app: Option<String>,
+    app: Option<Source>,
+    ms: u32,
     since: Instant,
 }
 
@@ -75,31 +77,17 @@ struct Cut {
     clip: Clip,
     monitor: Rect,
     name: PathBuf,
-    app: Option<String>,
+    app: Option<Source>,
 }
 
 /// The app whose window is in front, when that window is on `monitor`; None for the desktop
 /// and the taskbar, which name clips after the screen.
 fn front_app(monitor: Rect) -> Option<Source> {
-    unsafe {
-        let hwnd = GetForegroundWindow();
-        let mut class = [0u16; 32];
-        let n = GetClassNameW(hwnd, &mut class) as usize;
-        let class = String::from_utf16_lossy(&class[..n]);
-        if ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"].contains(&class.as_str()) {
-            return None;
-        }
-        let mut r = RECT::default();
-        GetWindowRect(hwnd, &mut r).ok()?;
-        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-        if !monitor.contains(cx, cy) {
-            return None;
-        }
-        identify(hwnd)
-    }
+    let (hwnd, r) = front_window()?;
+    monitor.contains(r.x + r.w / 2, r.y + r.h / 2).then(|| identify(hwnd)).flatten()
 }
 
-pub const AMBER: [u8; 3] = [0xF5, 0x9E, 0x0B];
+pub const AMBER: [u8; 3] = glint_core::gallery::source::AMBER;
 const GREY: [u8; 3] = [0x7A, 0x77, 0x72];
 
 const ID_SAVE: usize = 1;
@@ -213,8 +201,8 @@ impl App {
         let subject = front.as_ref().map_or(Subject::Screen, Subject::Window);
         let (date, time) = date_time();
         let naming = Naming { date: &date, time: &time, kind: HistoryKind::Recording, subject };
-        let app = front.as_ref().map(|s| s.app.clone()).filter(|a| !a.trim().is_empty());
-        Some(Cut { clip, monitor, name: NAMES.expand(&self.cfg.file_name, &naming), app })
+        let name = NAMES.expand(&self.cfg.file_name, &naming);
+        Some(Cut { clip, monitor, name, app: front.filter(|s| !s.app.trim().is_empty()) })
     }
 
     fn save(&mut self) {
@@ -285,7 +273,7 @@ impl App {
             }
         }
         note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
-        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, since: Instant::now() });
+        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, ms: (secs * 1000.0).round() as u32, since: Instant::now() });
         buffer::save(id, clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
     }
 
@@ -294,11 +282,11 @@ impl App {
             log(&format!("save #{id} finished after it was given up on: {result:?}"));
             return;
         }
-        let Some(Saving { long, monitor, capped, app, since, .. }) = self.saving.take() else { return };
+        let Some(Saving { long, monitor, capped, app, ms, since, .. }) = self.saving.take() else { return };
         match result {
             Ok(path) => {
                 log(&format!("save #{id} done in {:.1} s: {}", since.elapsed().as_secs_f64(), path.display()));
-                gallery::remember(&path, app.as_deref());
+                gallery::remember(&path, app.as_ref(), ms);
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                 let kind = if capped { Kind::Warning } else { Kind::Saved };
                 note::show(monitor, self.cfg.note_position, kind, &format!("saved the last {long}"), &name);

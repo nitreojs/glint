@@ -5,6 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::log::log;
+use crate::naming::Source;
 use crate::paths::app_dir;
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,9 +24,15 @@ pub struct Entry {
     pub url: Option<String>,
     pub size: u64,
     pub time: u64,
-    /// The app whose window was captured, when it was one app's.
+    /// The app whose window was captured, when it was one app's (or the app in front).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+    /// That app's exe, a full path: where its icon comes from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exe: Option<String>,
+    /// How long it plays (recordings and gifs), in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -45,19 +52,22 @@ pub fn file() -> PathBuf {
     app_dir().join("history.jsonl")
 }
 
-/// Records a capture; `app` names the app whose window it shows.
-pub fn add(kind: Kind, path: Option<&Path>, size: u64, url: Option<&str>, app: Option<&str>) {
-    add_to(&file(), kind, path, size, url, app);
+/// Records a capture in glint's history.
+pub fn add(entry: Entry) {
+    add_to(&file(), entry);
 }
 
 /// Records a capture in the history `file` (another app's than glint's).
-pub fn add_to(file: &Path, kind: Kind, path: Option<&Path>, size: u64, url: Option<&str>, app: Option<&str>) {
-    let time = now();
-    let (path, url, app) = (path.map(Path::to_path_buf), url.map(str::to_string), app.map(str::to_string));
-    let entry = Entry { kind, path, url, size, time, app };
+pub fn add_to(file: &Path, entry: Entry) {
     if let Err(e) = append(file, &entry) {
         log(&format!("history: {e}"));
     }
+}
+
+/// What the first of the history `files` that knows `path` says about it.
+pub fn find_in(files: &[PathBuf], path: &Path) -> Option<Entry> {
+    let id = crate::gallery::path_id(path);
+    files.iter().find_map(|f| read(f).into_iter().find(|e| e.path.as_deref().is_some_and(|p| crate::gallery::path_id(p) == id)))
 }
 
 /// Every entry in the history `file`, oldest first, whether its file is still there or not.
@@ -98,6 +108,33 @@ fn relocate_in(file: &Path, moved: &[(PathBuf, PathBuf)]) -> Result<(), String> 
 }
 
 impl Entry {
+    /// A capture of `kind` made now, saved at `path` (none for a link to something unsaved).
+    pub fn new(kind: Kind, path: Option<&Path>, size: u64) -> Entry {
+        Entry { kind, path: path.map(Path::to_path_buf), url: None, size, time: now(), app: None, exe: None, duration_ms: None }
+    }
+
+    pub fn with_url(mut self, url: &str) -> Entry {
+        self.url = Some(url.to_string());
+        self
+    }
+
+    /// The app it shows, and its exe when that's known.
+    pub fn with_app(mut self, app: Option<&str>, exe: Option<&str>) -> Entry {
+        self.app = app.filter(|a| !a.trim().is_empty()).map(str::to_string);
+        self.exe = exe.filter(|e| self.app.is_some() && !e.trim().is_empty()).map(str::to_string);
+        self
+    }
+
+    /// The app window `source` it shows.
+    pub fn with_source(self, source: Option<&Source>) -> Entry {
+        self.with_app(source.map(|s| s.app.as_str()), source.map(|s| s.path.as_str()))
+    }
+
+    pub fn with_duration(mut self, ms: Option<u32>) -> Entry {
+        self.duration_ms = ms.filter(|ms| *ms > 0);
+        self
+    }
+
     pub fn exists(&self) -> bool {
         self.path.as_deref().is_some_and(Path::is_file)
     }
@@ -178,6 +215,10 @@ fn read(file: &Path) -> Vec<Entry> {
                 }
                 if e.app.is_some() {
                     old.app = e.app;
+                    old.exe = e.exe;
+                }
+                if e.duration_ms.is_some() {
+                    old.duration_ms = e.duration_ms;
                 }
             }
             None => entries.push(e),
@@ -205,31 +246,37 @@ mod tests {
         let file = dir.join("history.jsonl");
         let _ = std::fs::remove_file(&file);
         let shot = Entry {
-            kind: Kind::Shot,
-            path: Some(dir.join("a.png")),
-            url: None,
-            size: 1200,
-            time: 10,
             app: Some("Telegram Desktop".into()),
+            exe: Some(r"C:\Telegram\Telegram.exe".into()),
+            time: 10,
+            ..Entry::new(Kind::Shot, Some(&dir.join("a.png")), 1200)
         };
-        let rec = Entry { kind: Kind::Recording, path: Some(dir.join("b.mp4")), url: None, size: 9000, time: 20, app: None };
-        let link = Entry { kind: Kind::Shot, path: None, url: Some("https://x/1.png".into()), size: 5, time: 30, app: None };
-        let uploaded = Entry { url: Some("https://x/a.png".into()), time: 40, app: None, ..shot.clone() };
-        for e in [&shot, &rec, &link, &uploaded] {
+        let rec = Entry { time: 20, ..Entry::new(Kind::Recording, Some(&dir.join("b.mp4")), 9000) };
+        let link = Entry { time: 30, ..Entry::new(Kind::Shot, None, 5).with_url("https://x/1.png") };
+        let uploaded = Entry { url: Some("https://x/a.png".into()), time: 40, app: None, exe: None, ..shot.clone() };
+        // a line with the length a later look found
+        let measured = Entry { time: 50, ..rec.clone().with_duration(Some(4_250)) };
+        for e in [&shot, &rec, &link, &uploaded, &measured] {
             append(&file, e).unwrap();
         }
         std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(b"not json\n").unwrap();
+        // a line from before apps, exes and lengths were kept
+        std::fs::OpenOptions::new().append(true).open(&file).unwrap().write_all(br#"{"kind":"shot","path":"old.png","size":3,"time":5}"#).unwrap();
         let back = read(&file);
-        assert_eq!(back, vec![Entry { url: Some("https://x/a.png".into()), ..shot }, rec, link]);
+        let old = Entry { time: 5, ..Entry::new(Kind::Shot, Some(Path::new("old.png")), 3) };
+        let rec_measured = Entry { duration_ms: Some(4_250), ..rec };
+        assert_eq!(back, vec![Entry { url: Some("https://x/a.png".into()), ..shot }, rec_measured, link, old]);
         let text = std::fs::read_to_string(&file).unwrap();
         assert!(text.contains(r#""kind":"recording""#) && text.contains(r#""app":"Telegram Desktop""#));
+        assert!(text.contains(r#""duration_ms":4250"#) && text.contains(r#""exe":"C:\\Telegram\\Telegram.exe""#));
         assert_eq!(text.matches(r#""app""#).count(), 1);
+        assert_eq!(find_in(&[dir.join("none.jsonl"), file.clone()], &dir.join("b.mp4")).and_then(|e| e.duration_ms), Some(4_250));
         compact(&file).unwrap();
         assert_eq!(read(&file), back);
         let moved = dir.join("sub").join("b.mp4");
         relocate_in(&file, &[(dir.join("b.mp4"), moved.clone()), (dir.join("gone.png"), dir.join("x.png"))]).unwrap();
         let paths: Vec<_> = read(&file).into_iter().map(|e| e.path).collect();
-        assert_eq!(paths, [Some(dir.join("a.png")), Some(moved), None]);
+        assert_eq!(paths, [Some(dir.join("a.png")), Some(moved), None, Some(PathBuf::from("old.png"))]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

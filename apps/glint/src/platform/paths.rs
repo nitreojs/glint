@@ -5,9 +5,7 @@ use glint_core::history::Kind;
 use glint_core::log::log;
 use glint_core::naming::{self, Naming, Subject};
 use glint_core::paths::app_dir;
-use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::UI::Shell::{FOLDERID_Documents, FOLDERID_Videos, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-use windows::core::GUID;
+use glint_shell::explorer::{documents, videos};
 
 use glint_shell::time::date_time;
 
@@ -18,14 +16,12 @@ const DOCUMENTS_DEFAULT: &str = "documents-default-folder";
 const PREVIOUS_DIR: &str = "previous-output-dir";
 
 pub(crate) fn output_dir(cfg: &Config) -> PathBuf {
-    cfg.output_dir_or(|| {
-        documents_dir().unwrap_or_else(|| user_folder("Documents"))
-    })
+    cfg.output_dir_or(|| documents().unwrap_or_else(|| user_folder("Documents")))
 }
 
 /// Where captures went by default up to 0.1.
 pub(crate) fn old_default_dir() -> PathBuf {
-    known_folder(&FOLDERID_Videos).unwrap_or_else(|| user_folder("Videos")).join("glint")
+    videos().unwrap_or_else(|| user_folder("Videos")).join("glint")
 }
 
 fn user_folder(name: &str) -> PathBuf {
@@ -105,17 +101,4 @@ pub(crate) fn previous_output_dir() -> Option<PathBuf> {
 
 pub(crate) fn remember_previous_output_dir(dir: &Path) {
     let _ = std::fs::write(app_dir().join(PREVIOUS_DIR), dir.display().to_string());
-}
-
-fn known_folder(id: &GUID) -> Option<PathBuf> {
-    unsafe {
-        let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
-        let s = p.to_string().unwrap_or_default();
-        CoTaskMemFree(Some(p.0 as _));
-        (!s.is_empty()).then(|| PathBuf::from(s))
-    }
-}
-
-pub(crate) fn documents_dir() -> Option<PathBuf> {
-    known_folder(&FOLDERID_Documents)
 }
