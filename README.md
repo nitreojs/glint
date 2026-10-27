@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/readme/hero.png" alt="glint" width="880"></p>
+<p align="center"><picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/hero-light.png"><img src="docs/readme/hero.png" alt="glint" width="880"></picture></p>
 
 <p align="center">
 screenshots and screen recording for windows, living in your tray<br>
@@ -7,7 +7,7 @@ screenshots and screen recording for windows, living in your tray<br>
 
 <br>
 
-<img src="docs/readme/head-screenshots.png" alt="draw on it, type on it, blur the rest" width="880">
+<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-screenshots-light.png"><img src="docs/readme/head-screenshots.png" alt="draw on it, type on it, blur the rest" width="880"></picture>
 
 `ctrl+printscreen`, drag over the thing, done<br>
 or don't stop there: pens, arrows, boxes, numbered steps, text in any font you have, blur and pixelate for the stuff nobody should see
@@ -16,7 +16,7 @@ or don't stop there: pens, arrows, boxes, numbered steps, text in any font you h
 
 <br>
 
-<img src="docs/readme/head-grab.png" alt="grab a piece, make it bigger" width="880">
+<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-grab-light.png"><img src="docs/readme/head-grab.png" alt="grab a piece, make it bigger" width="880"></picture>
 
 grab any piece of the screen and drop it right on top, as big as you want<br>
 paste pictures in with `ctrl+v`, pin the result above every window
@@ -25,7 +25,7 @@ paste pictures in with `ctrl+v`, pin the result above every window
 
 <br>
 
-<img src="docs/readme/head-recording.png" alt="record it, then cut the boring part" width="880">
+<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-recording-light.png"><img src="docs/readme/head-recording.png" alt="record it, then cut the boring part" width="880"></picture>
 
 `ctrl+alt+printscreen`, pick a region or a window, go<br>
 it records straight off the gpu with your mic and system sound, and can show your clicks and keys
@@ -37,7 +37,7 @@ if nothing has to be re-encoded, it isn't: the cut is lossless and glint says so
 
 <br>
 
-<img src="docs/readme/head-gallery.png" alt="everything, findable" width="880">
+<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-gallery-light.png"><img src="docs/readme/head-gallery.png" alt="everything, findable" width="880"></picture>
 
 every shot and clip in one place<br>
 hover to play, search by app or game or day, drag straight into a chat
@@ -46,7 +46,7 @@ hover to play, search by app or game or day, drag straight into a chat
 
 <br>
 
-<img src="docs/readme/head-afterglow.png" alt="it was recording the whole time" width="880">
+<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-afterglow-light.png"><img src="docs/readme/head-afterglow.png" alt="it was recording the whole time" width="880"></picture>
 
 **afterglow** is glint's little sibling for games: it keeps the last minute of your screen and sound, and `alt+f10` saves it<br>
 clips open in glint's editor, and in deadlock it even knows when you got a kill (beta)
