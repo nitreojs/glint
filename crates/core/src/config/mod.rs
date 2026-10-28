@@ -10,9 +10,11 @@ use crate::record::keys::Position;
 pub mod audio;
 pub mod color;
 pub mod hotkeys;
+pub mod toolbar;
 
 use audio::AudioSource;
 use hotkeys::parse_hotkey;
+use toolbar::{Slot, ToolKeys};
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 #[serde(default, deny_unknown_fields)]
@@ -55,6 +57,11 @@ pub struct Config {
     pub screenshot_copy: bool,
     pub screenshot_save: bool,
     pub screenshot_upload: bool,
+    /// The screenshot editor's toolbar, left to right; tools left out are hidden.
+    #[serde(deserialize_with = "toolbar::de_slots")]
+    pub toolbar: Vec<Slot>,
+    #[serde(deserialize_with = "toolbar::de_keys")]
+    pub toolbar_keys: ToolKeys,
     pub upload_destination: String,
     pub litterbox_expiry: Expiry,
     pub upload_copy_link: bool,
@@ -223,6 +230,8 @@ impl Default for Config {
             screenshot_copy: true,
             screenshot_save: true,
             screenshot_upload: false,
+            toolbar: toolbar::default_slots(),
+            toolbar_keys: ToolKeys::default(),
             upload_destination: "catbox".into(),
             litterbox_expiry: Expiry::Day,
             upload_copy_link: true,
@@ -507,6 +516,15 @@ screenshot_copy = {screenshot_copy}
 screenshot_save = {screenshot_save}
 screenshot_upload = {screenshot_upload}
 
+# The editor's toolbar, left to right: pen, highlighter, arrow, rectangle, blur, pixelate, eraser,
+# text, step, cursor, grab, clipboard; "|" puts a separator between groups. Tools left out are
+# hidden and their keys do nothing.
+{toolbar}
+# Each tool's keys in the editor, where they differ from the default: a digit and a letter
+# (not Q), either optional, e.g. {{ eraser = "6 D", pixelate = "9 X" }}. A key given here moves
+# off the tool that has it by default.
+{toolbar_keys}
+
 # Where uploads go: "catbox" (permanent, 200 MB), "litterbox" (temporary, 1 GB), "uguu"
 # (temporary, 128 MB), "pomf" (pomf.lain.la, 1 GB), or the name of a custom uploader
 # imported in settings (a ShareX .sxcu file in %APPDATA%\glint\uploaders).
@@ -561,6 +579,8 @@ update_beta = {update_beta}
             screenshot_copy = self.screenshot_copy,
             screenshot_save = self.screenshot_save,
             screenshot_upload = self.screenshot_upload,
+            toolbar = toolbar::render_slots(&self.toolbar),
+            toolbar_keys = toolbar::render_keys(&self.toolbar_keys),
             upload_destination = q(&self.upload_destination),
             expiry = self.litterbox_expiry.name(),
             upload_copy_link = self.upload_copy_link,
@@ -662,6 +682,13 @@ mod tests {
             screenshot_copy: false,
             screenshot_save: true,
             screenshot_upload: true,
+            toolbar: vec![Slot::Tool(9), Slot::Tool(0), Slot::Separator, Slot::Tool(3), Slot::Tool(11)],
+            toolbar_keys: {
+                let mut keys = ToolKeys::default();
+                keys.set(6, toolbar::KeyKind::Digit, Some(b'6'));
+                keys.set(10, toolbar::KeyKind::Letter, None);
+                keys
+            },
             upload_destination: "my \"host\".sxcu".into(),
             litterbox_expiry: Expiry::Hour,
             upload_copy_link: false,
@@ -793,5 +820,34 @@ mod tests {
         assert_eq!(parsed("burn-in").unwrap(), ClickMode::BurnIn);
         assert!(parsed("burn_in").is_err());
         assert_eq!((Config::default().click_highlights, Config::default().clicks), (false, ClickMode::Editable));
+    }
+
+    #[test]
+    fn the_toolbar_round_trips_and_old_files_keep_todays() {
+        let (t, s) = (Slot::Tool, Slot::Separator);
+        let old = Config::parse("fps = 60").unwrap();
+        assert_eq!((old.toolbar, old.toolbar_keys), (toolbar::default_slots(), ToolKeys::default()));
+        let text = Config::default().render();
+        let all = "\"pen\", \"highlighter\", \"arrow\", \"rectangle\", \"blur\", \"pixelate\", \"eraser\", \"text\", \"step\", \"cursor\", \"grab\", \"clipboard\"";
+        assert!(text.contains(&format!("\n# toolbar = [{all}]\n")), "{text}");
+        assert!(text.contains("\ntoolbar_keys = {}\n"));
+
+        let cfg = Config::parse("toolbar = [\"|\", \"Pen\", \"lasso\", \"|\", \"|\", \"arrow\", \"pen\", \"|\"]").unwrap();
+        assert_eq!(cfg.toolbar, [t(0), s, t(2)], "unknown names, repeats and stray separators are dropped");
+        assert_eq!(toolbar::hidden(&cfg.toolbar).count(), 10, "tools left out stay hidden");
+        assert!(cfg.render().contains("\ntoolbar = [\"pen\", \"|\", \"arrow\"]\n"));
+        assert_eq!(Config::parse(&cfg.render()).unwrap().toolbar, cfg.toolbar);
+
+        // eraser takes 6 and D: pixelate loses its default 6; Q stays draw-first's region key
+        let cfg = Config::parse("toolbar_keys = { eraser = \"6 d\", grab = \"q\", nope = \"Z\" }").unwrap();
+        let keys = |t: usize| cfg.toolbar_keys.0[t];
+        assert_eq!(keys(6), toolbar::Keys { digit: Some(b'6'), letter: Some(b'D') });
+        assert_eq!(keys(5), toolbar::Keys { digit: None, letter: Some(b'X') });
+        assert_eq!(keys(10), toolbar::Keys::default(), "grab, listed with nothing usable: no keys");
+        assert!(cfg.render().contains("\ntoolbar_keys = { pixelate = \"X\", eraser = \"6 D\", grab = \"\" }\n"), "{}", cfg.render());
+        assert_eq!(Config::parse(&cfg.render()).unwrap().toolbar_keys, cfg.toolbar_keys);
+        let clash = Config::parse("toolbar_keys = { pen = \"1 A\", arrow = \"1 A\" }").unwrap();
+        let (pen, arrow) = (clash.toolbar_keys.0[0], clash.toolbar_keys.0[2]);
+        assert_eq!((pen.letter, arrow), (Some(b'A'), toolbar::Keys::default()), "two tools ask for one key: the first gets it");
     }
 }
