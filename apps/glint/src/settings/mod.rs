@@ -709,6 +709,58 @@ mod tests {
     }
 
     #[test]
+    fn digits_switch_sections_but_not_while_typing_or_binding() {
+        use egui::Modifiers;
+        use egui::accesskit::Role;
+        // a key pressed, what it types, and let go (or egui takes the next press for a repeat)
+        let tap = |key, modifiers, text: &str| {
+            let key_event = |pressed| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+            let typed = (!text.is_empty()).then(|| egui::Event::Text(text.into()));
+            [Some(key_event(true)), typed, Some(key_event(false))].into_iter().flatten().collect::<Vec<_>>()
+        };
+        let (none, ctrl) = (Modifiers::NONE, Modifiers::CTRL | Modifiers::COMMAND);
+        let mut h = Harness::new();
+        let at = |h: &Harness| h.app.page().name();
+        h.ctx.enable_accesskit();
+        h.screen = vec2(WINDOW[0], 1000.0);
+        h.settle();
+        h.frame(tap(Key::Num3, none, "3"), "");
+        h.settle();
+        assert_eq!(at(&h), "overlays");
+        h.frame(tap(Key::Num5, ctrl, ""), "");
+        assert_eq!(at(&h), "screenshots");
+        h.frame(tap(Key::Num0, none, "0"), "");
+        assert_eq!(at(&h), "about", "0 is the tenth");
+        h.frame(tap(Key::Num8, none, "8"), "");
+        h.settle();
+        assert_eq!(at(&h), "output");
+
+        // a digit typed into the folder field stays there; ctrl+digit still switches, keeping it
+        let folder = h.control("folder");
+        h.click(pos2(folder.left() + 40.0, folder.top() + 16.0));
+        assert!(h.ctx.text_edit_focused());
+        h.frame(tap(Key::Num3, none, "3"), "");
+        h.settle();
+        assert_eq!((at(&h), h.app.pages.cfg.output_dir.as_str()), ("output", "3"));
+        h.frame(tap(Key::Num6, ctrl, ""), "");
+        h.settle();
+        assert_eq!(at(&h), "toolbar");
+        assert_eq!((h.app.pages.cfg.output_dir.as_str(), Section::Output.changes(&h.app.pages.cfg, &h.app.pages.saved)), ("3", 1));
+
+        // binding a tool's digit takes the digit, bare or with ctrl
+        let b = find(&h.tree, Role::Button, "grab digit").and_then(|n| n.bounds()).expect("grab digit");
+        let digit = pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32);
+        h.click(digit);
+        assert!(h.app.pages.toolbar.listening());
+        h.frame(tap(Key::Num2, ctrl, ""), "");
+        h.frame(tap(Key::Num2, none, "2"), "");
+        h.settle();
+        assert_eq!((at(&h), h.app.pages.cfg.toolbar_keys.0[10].digit), ("toolbar", Some(b'2')));
+        h.frame(tap(Key::Num2, none, "2"), "");
+        assert_eq!(at(&h), "recording", "bound, digits switch again");
+    }
+
+    #[test]
     fn overlays_show_only_the_rows_that_apply_and_count_as_changes() {
         use egui::accesskit::{Role, Toggled};
         use glint_core::config::{ClickMode, Keystrokes};

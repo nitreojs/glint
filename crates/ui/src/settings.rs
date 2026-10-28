@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CornerRadius, Id, Key, Layout, Margin, Rect, RichText, Stroke, Ui, UiBuilder, pos2, vec2,
+    self, Align, Align2, Color32, CornerRadius, Event, Id, Key, Layout, Margin, Modifiers, Rect, RichText, Stroke, Ui, UiBuilder,
+    pos2, vec2,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
@@ -127,12 +128,26 @@ pub fn run<P: Pages>(title: &str, size_file: PathBuf, icon: Vec<u8>, pages: P) {
     );
 }
 
+/// The page (index into [`Pages::pages`]) a key picks, as the sidebar numbers them: 1–9, and 0 for
+/// the tenth; numpad digits are the same keys. Ctrl+digit always picks one, a bare digit only while
+/// no text field is `typing`; neither while something `held` takes keys (a key being recorded, a
+/// dialog or popup).
+fn digit_page(key: Key, mods: Modifiers, count: usize, typing: bool, held: bool) -> Option<usize> {
+    const DIGITS: [Key; 10] =
+        [Key::Num1, Key::Num2, Key::Num3, Key::Num4, Key::Num5, Key::Num6, Key::Num7, Key::Num8, Key::Num9, Key::Num0];
+    let page = DIGITS.iter().position(|&d| d == key).filter(|&n| n < count)?;
+    let ok = !held && ((mods.ctrl && !mods.alt && !mods.shift) || (mods.is_none() && !typing));
+    ok.then_some(page)
+}
+
 /// The window around the pages.
 pub struct Frame<P: Pages> {
     pub pages: P,
     page: Option<P::Page>,
     /// Closing with unsaved changes: the "save changes?" dialog is up.
     asking: bool,
+    /// A dialog or popup was up last frame: digits are its, not the sidebar's.
+    overlaid: bool,
     /// The last input was keyboard navigation, so focus rings show.
     keyboard: bool,
     /// The theme and accent the egui visuals were set up for.
@@ -153,6 +168,7 @@ impl<P: Pages> Frame<P> {
             pages,
             page: None,
             asking: false,
+            overlaid: false,
             keyboard: false,
             styled: None,
             closing: false,
@@ -253,6 +269,22 @@ impl<P: Pages> eframe::App for Frame<P> {
                 self.keyboard = true;
             }
         });
+        // A digit picks a page as clicking it would; checked before the page shows, which may take
+        // the key itself (a toolbar chip being bound).
+        let held = self.pages.busy() || self.overlaid || self.asking || egui::Popup::is_any_open(&ctx);
+        let typing = ctx.text_edit_focused();
+        let count = self.pages.pages().len();
+        let picked = ctx.input(|i| {
+            i.events.iter().find_map(|e| match *e {
+                Event::Key { key, modifiers, pressed: true, repeat: false, .. } => digit_page(key, modifiers, count, typing, held),
+                _ => None,
+            })
+        });
+        if let Some(n) = picked
+            && self.pages.pages()[n] != self.page()
+        {
+            self.go(self.pages.pages()[n]);
+        }
         let viewport = ctx.input(|i| (i.viewport().inner_rect, i.viewport().maximized, i.viewport().minimized));
         if let (Some(r), Some(false) | None, Some(false) | None) = viewport
             && r.width() >= WINDOW[0] - 1.0
@@ -355,6 +387,7 @@ impl<P: Pages> eframe::App for Frame<P> {
         window::border(ui, full, p.line2);
         had_overlay |= self.pages.overlays(&ctx, &look);
         self.ask(&ctx, &look);
+        self.overlaid = had_overlay;
 
         // Alt+F4 and the taskbar's "close window" come through here.
         if ctx.input(|i| i.viewport().close_requested()) && !self.closing && self.changes() > 0 {
@@ -485,4 +518,36 @@ pub fn dialog(ctx: &egui::Context, look: &Look) -> egui::Modal {
         .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(80) });
     let modal = egui::Modal::new(Id::unique("dialog")).frame(frame);
     window::backdrop(ctx, modal, Color32::from_black_alpha(90))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn digits_pick_pages_unless_a_field_or_a_recording_has_the_keys() {
+        // what egui-winit reports for ctrl on Windows
+        let (none, ctrl) = (Modifiers::NONE, Modifiers::CTRL | Modifiers::COMMAND);
+        let pick = |key, mods, typing, held| digit_page(key, mods, 10, typing, held);
+        assert_eq!(pick(Key::Num1, none, false, false), Some(0));
+        assert_eq!(pick(Key::Num3, none, false, false), Some(2));
+        assert_eq!(pick(Key::Num9, none, false, false), Some(8));
+        assert_eq!(pick(Key::Num0, none, false, false), Some(9), "0 is the tenth");
+        assert_eq!(pick(Key::Num5, ctrl, false, false), Some(4));
+        // typing a number into a field
+        assert_eq!(pick(Key::Num3, none, true, false), None);
+        assert_eq!(pick(Key::Num5, ctrl, true, false), Some(4), "ctrl+digit works from a field");
+        // a key being recorded, a dialog or a popup
+        assert_eq!(pick(Key::Num3, none, false, true), None);
+        assert_eq!(pick(Key::Num5, ctrl, false, true), None);
+        // other chords are left alone: shift+3 is #, ctrl+alt is AltGr
+        for mods in [Modifiers::SHIFT, Modifiers::ALT, ctrl | Modifiers::SHIFT, ctrl | Modifiers::ALT] {
+            assert_eq!(pick(Key::Num3, mods, false, false), None, "{mods:?}");
+        }
+        assert_eq!(pick(Key::A, none, false, false), None);
+        // only pages that are there
+        assert_eq!(digit_page(Key::Num0, none, 9, false, false), None);
+        assert_eq!(digit_page(Key::Num7, none, 6, false, false), None);
+        assert_eq!(digit_page(Key::Num6, none, 6, false, false), Some(5));
+    }
 }
