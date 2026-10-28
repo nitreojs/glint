@@ -1,7 +1,10 @@
 //! Game events while the buffer runs (config `game_events`): a thread looks for a game
 //! [`GAMES`] knows every few seconds, follows its [`Source`] a few times a second while it runs,
 //! and keeps what happened for as long as the buffer reaches back; a saved clip takes the events
-//! it covers along in its file.
+//! it covers along in its file. The tray app can [`listen`] too, for auto-clip.
+//!
+//! A test run ([`instance::test_run`]) with `GLINT_GAME_EXE` set follows the game that exe is
+//! as if it ran from there, without a process: Deadlock's log beside a made-up install.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,9 +12,10 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use glint_core::events::{self, GAMES, Game, Now, Payload, Ring, Source};
+use glint_core::events::{self, GAMES, Game, GameEvent, Now, Payload, Ring, Source};
 use glint_core::log::log;
 use glint_core::wide::from_wstr;
+use glint_shell::instance;
 use glint_shell::time::local_time;
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -23,6 +27,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::PWSTR;
 
+use crate::buffer::Notify;
+
 /// How often a running game's source is polled.
 const POLL: Duration = Duration::from_millis(250);
 /// How often the processes are looked through for a game.
@@ -32,10 +38,14 @@ const LOOK: Duration = Duration::from_secs(3);
 const LATE_MS: i64 = 750;
 /// Kept beyond what a save covers (s).
 const SPARE_S: i64 = 30;
+/// A test run's stand-in for a running game's exe.
+const STAND_IN_VAR: &str = "GLINT_GAME_EXE";
 
 static RING: LazyLock<Mutex<Ring>> = LazyLock::new(|| Mutex::new(Ring::new(0)));
 /// A game is being followed: a save waits for its late events.
 static FOLLOWING: AtomicBool = AtomicBool::new(false);
+/// Who hears each poll's new events, as a `Vec<GameEvent>`.
+static LISTENER: Mutex<Option<Notify>> = Mutex::new(None);
 
 fn ring() -> MutexGuard<'static, Ring> {
     RING.lock().unwrap_or_else(|e| e.into_inner())
@@ -44,6 +54,12 @@ fn ring() -> MutexGuard<'static, Ring> {
 /// Keeps events for a buffer of `length` seconds.
 pub fn keep(length: u32) {
     ring().set_keep((length as i64 + SPARE_S) * 1000);
+}
+
+/// Has `to` hear the new events as they come, as a `Vec<GameEvent>` ([`Notify::post`]); `None`
+/// stops that.
+pub fn listen(to: Option<Notify>) {
+    *LISTENER.lock().unwrap_or_else(|e| e.into_inner()) = to;
 }
 
 /// Follows games until dropped; dropping it forgets the events kept.
@@ -71,7 +87,8 @@ impl Drop for Watcher {
 /// A game being followed.
 struct Running {
     game: &'static Game,
-    process: Process,
+    /// `None` for a test run's stand-in.
+    process: Option<Process>,
     source: Box<dyn Source>,
     /// Its source failed and said so; quiet until it works again.
     failing: bool,
@@ -104,13 +121,13 @@ fn watch(stopped: &Receiver<()>) {
         }
         match &mut running {
             None => {
-                running = find();
+                running = stand_in().or_else(find);
                 if let Some(r) = &running {
                     log(&format!("game events: following {}", r.game.name));
                     FOLLOWING.store(true, Ordering::Relaxed);
                 }
             }
-            Some(r) if r.process.exited() => {
+            Some(r) if r.process.as_ref().is_some_and(Process::exited) => {
                 log(&format!("game events: {} quit", r.game.name));
                 running = None;
                 FOLLOWING.store(false, Ordering::Relaxed);
@@ -126,6 +143,9 @@ fn watch(stopped: &Receiver<()>) {
                     Err(_) => {}
                 }
                 if !heard.is_empty() {
+                    if let Some(to) = *LISTENER.lock().unwrap_or_else(|e| e.into_inner()) {
+                        to.post::<Vec<GameEvent>>(heard.clone());
+                    }
                     let mut ring = ring();
                     for e in heard.drain(..) {
                         ring.push(e, now.unix_ms);
@@ -146,6 +166,19 @@ fn now() -> Now {
         minutes * 60 - (unix_s - unix_s.rem_euclid(60))
     });
     Now { unix_ms, offset }
+}
+
+/// A test run's stand-in for a running game ([`STAND_IN_VAR`]): the game whose exe it names, as
+/// if started now from there by an unknown player.
+fn stand_in() -> Option<Running> {
+    if !instance::test_run() {
+        return None;
+    }
+    let exe = PathBuf::from(std::env::var_os(STAND_IN_VAR)?);
+    let name = exe.file_name()?.to_string_lossy().into_owned();
+    let game = GAMES.iter().find(|g| name.eq_ignore_ascii_case(g.exe))?;
+    let source = (game.open)(&exe, now().unix_ms, None)?;
+    Some(Running { game, process: None, source, failing: false })
 }
 
 /// A running game [`GAMES`] knows, with its source.
@@ -174,7 +207,7 @@ fn open(game: &'static Game, pid: u32) -> Option<Running> {
     unsafe { GetProcessTimes(process.0, &mut created, &mut exited, &mut kernel, &mut user) }.ok()?;
     let player = crate::addon::steam_root().and_then(|steam| glint_core::events::steam::persona(&steam));
     let source = (game.open)(&exe, unix_ms(created), player.as_deref())?;
-    Some(Running { game, process, source, failing: false })
+    Some(Running { game, process: Some(process), source, failing: false })
 }
 
 /// The exe `process` runs.

@@ -2,6 +2,7 @@
 
 mod addon;
 mod app;
+mod autoclip;
 mod buffer;
 mod config;
 mod events;

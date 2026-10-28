@@ -1,8 +1,9 @@
 //! afterglow's tray app: a hidden window holding the tray icon and the save hotkey, and the
 //! buffer that runs behind it. Clicking the icon or pressing the hotkey saves the last stretch,
 //! a double click opens the gallery; the right-click menu pauses and resumes the buffer, opens
-//! the gallery, the folder and the settings. Updates come as glint's do
-//! ([`glint_shell::update`]): checked soon after start and hourly, a dot on the icon and
+//! the gallery, the folder and the settings. With auto-clip on, chosen game events save a clip
+//! too ([`crate::autoclip`]), quietly: no notes, a count in the tooltip. Updates come as glint's
+//! do ([`glint_shell::update`]): checked soon after start and hourly, a dot on the icon and
 //! "restart to update" in the menu once one is downloaded.
 
 use std::cell::RefCell;
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use glint_core::format::human_duration;
 use glint_core::geom::rect::Rect;
+use glint_core::events::GameEvent;
 use glint_core::record::replay::Clip;
 use glint_core::config::UpdateMode;
 use glint_core::icon::{add_badge, icon_pixels};
@@ -38,7 +40,9 @@ use windows::Win32::UI::Shell::{NIN_BALLOONUSERCLICK, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
+use crate::autoclip::{self, AutoClip};
 use crate::buffer::{self, Buffer, Notify};
+use crate::events;
 use crate::gallery;
 use crate::note::{self, Kind};
 use crate::config::{APP, Config, NAMES, Place};
@@ -57,10 +61,16 @@ pub const WM_PREVIEW_NOTE: u32 = WM_APP + 22;
 const WM_TRAY: u32 = WM_APP + 1;
 const WM_SAVED: u32 = WM_APP + 2;
 const WM_ENDED: u32 = WM_APP + 3;
+/// New game events, as a `Vec<GameEvent>` ([`events::listen`]).
+const WM_HEARD: u32 = WM_APP + 4;
 const SAVE_HOTKEY: i32 = 1;
 const RESTART_TIMER: usize = 1;
 const TIP_TIMER: usize = 2;
 const CLICK_TIMER: usize = 3;
+/// The waiting auto save is due.
+const AUTO_TIMER: usize = 4;
+/// How soon a due auto save looks again while another save is being written (ms).
+const AUTO_RETRY_MS: u32 = 500;
 
 /// This build of afterglow, as the updater knows it.
 pub const BUILD: Build = Build { product: AFTERGLOW, version: env!("CARGO_PKG_VERSION") };
@@ -71,7 +81,7 @@ const STUCK: Duration = Duration::from_secs(90);
 
 /// A save being written: how long the clip is ("0:42 of 1:00" when the memory cap cut it short),
 /// the monitor it's of, whether the cap cut it, the app it shows, how long it plays in
-/// milliseconds, and since when.
+/// milliseconds, since when, and whether auto-clip asked for it (no notes then).
 struct Saving {
     id: u64,
     long: String,
@@ -80,6 +90,7 @@ struct Saving {
     app: Option<Source>,
     ms: u32,
     since: Instant,
+    auto: bool,
 }
 
 /// A clip cut from the buffer, the monitor it shows, its file name below the output folder and
@@ -155,6 +166,10 @@ struct App {
     update: Updates,
     /// A downloaded update waits: the icon has a dot and the tooltip says so.
     update_ready: bool,
+    /// When game events save clips by themselves.
+    auto: AutoClip,
+    /// Clips auto-clip saved since start, for the tooltip.
+    auto_saves: u32,
     /// Quitting to restart into an update.
     exiting: bool,
 }
@@ -209,7 +224,13 @@ impl App {
         let (icon, tip) = match &self.buffer {
             Some(b) => {
                 let held = b.held().min(self.cfg.length as f64);
-                (self.on, format!("afterglow\nbuffering {} of {}{keys}", human_duration(held), human_duration(self.cfg.length as f64)))
+                let auto = match self.auto_saves {
+                    0 => String::new(),
+                    1 => "\n1 auto clip".into(),
+                    n => format!("\n{n} auto clips"),
+                };
+                let length = human_duration(self.cfg.length as f64);
+                (self.on, format!("afterglow\nbuffering {} of {length}{keys}{auto}", human_duration(held)))
             }
             None if self.paused => (self.off, "afterglow\npaused".to_string()),
             None if self.away => (self.off, "afterglow\nwaiting for you to come back".to_string()),
@@ -236,6 +257,7 @@ impl App {
                 }
                 self.buffer = Some(b);
                 self.failures = 0;
+                self.buffer_changed();
             }
             Err(e) => {
                 log(&format!("can't start the buffer: {e}"));
@@ -259,6 +281,71 @@ impl App {
         if let Some(b) = self.buffer.take() {
             b.stop();
         }
+        self.buffer_changed();
+    }
+
+    /// Auto-clip follows the buffer: what waited is dropped when it stops, and a new one holds
+    /// nothing from before it.
+    fn buffer_changed(&mut self) {
+        self.auto.pause(self.buffer.is_none(), autoclip::now_ms());
+        self.arm_auto();
+    }
+
+    /// Auto-clip as the settings have it, hearing game events only while it's on.
+    fn configure_auto(&mut self) {
+        let on = self.cfg.auto_clip && self.cfg.game_events;
+        self.auto.configure(on, &self.cfg.auto_clip_events, self.cfg.length);
+        events::listen(on.then(|| Notify::new(self.hwnd, WM_HEARD)));
+        self.arm_auto();
+    }
+
+    /// New game events: the ones auto-clip takes wait for their save.
+    fn heard(&mut self, heard: Vec<GameEvent>) {
+        let now = autoclip::now_ms();
+        for e in &heard {
+            if let Some(t) = self.auto.hear(e, now) {
+                let due = self.auto.due().map_or(0, |d| d - now) as f64 / 1000.0;
+                log(&format!("auto-clip: {} ({} waiting), saving in {due:.1} s", t.name(), self.auto.waiting()));
+            }
+        }
+        self.arm_auto();
+    }
+
+    /// Times the waiting auto save, if there is one.
+    fn arm_auto(&self) {
+        unsafe {
+            match self.auto.due() {
+                Some(due) => {
+                    let wait = (due - autoclip::now_ms()).clamp(0, u32::MAX as i64) as u32;
+                    SetTimer(Some(self.hwnd), AUTO_TIMER, wait, None);
+                }
+                None => {
+                    let _ = KillTimer(Some(self.hwnd), AUTO_TIMER);
+                }
+            }
+        }
+    }
+
+    /// The waiting auto save is due: cut and written, quietly, once no other save is being
+    /// written or about to be.
+    fn auto_save(&mut self) {
+        if self.save_running() || self.clicked.is_some() {
+            unsafe {
+                SetTimer(Some(self.hwnd), AUTO_TIMER, AUTO_RETRY_MS, None);
+            }
+            return;
+        }
+        let Some(label) = self.auto.take(autoclip::now_ms()) else { return self.arm_auto() };
+        match self.cut() {
+            Some(mut cut) => {
+                log(&format!("auto-clip: saving ({label})"));
+                let mut name = cut.name.into_os_string();
+                name.push(format!("_{label}"));
+                cut.name = name.into();
+                self.write(cut, true);
+            }
+            None => log("auto-clip: nothing buffered yet"),
+        }
     }
 
     /// The last stretch of the buffer, cut now, named after now and the app in front.
@@ -275,7 +362,7 @@ impl App {
 
     fn save(&mut self) {
         match self.cut() {
-            Some(cut) => self.write(cut),
+            Some(cut) => self.write(cut, false),
             None => self.nothing_yet(),
         }
     }
@@ -311,7 +398,8 @@ impl App {
         self.saving.as_ref().is_some_and(|s| s.since.elapsed() < STUCK)
     }
 
-    fn write(&mut self, Cut { clip, monitor, name, app }: Cut) {
+    /// Writes `cut`; an `auto` save shows no notes and needs no notification (the user games).
+    fn write(&mut self, Cut { clip, monitor, name, app }: Cut, auto: bool) {
         if let Some(s) = &self.saving {
             if s.since.elapsed() < STUCK {
                 log("save asked for while one is still being written");
@@ -320,6 +408,9 @@ impl App {
             }
             log(&format!("save #{} never finished ({:.0} s): saving anyway", s.id, s.since.elapsed().as_secs_f64()));
         }
+        // what this one covers is in it: auto-clip neither saves it again nor right after
+        self.auto.saved(autoclip::now_ms());
+        self.arm_auto();
         let secs = clip.duration as f64 / 1e7;
         self.sample = false;
         self.saves += 1;
@@ -331,7 +422,7 @@ impl App {
             let length = human_duration(self.cfg.length as f64);
             log(&format!("the memory cap ({} MB) held {secs:.1} s of {} s", self.cfg.max_memory_mb, self.cfg.length));
             long = format!("{long} of {length}");
-            if !std::mem::replace(&mut self.told_cap, true) {
+            if !auto && !std::mem::replace(&mut self.told_cap, true) {
                 let text = format!(
                     "{} MB held only {} of the {length} asked for. raise memory in settings → video, or lower the quality.",
                     self.cfg.max_memory_mb,
@@ -340,8 +431,11 @@ impl App {
                 self.notify("afterglow: the memory cap cut the clip short", &text, false);
             }
         }
-        note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
-        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, ms: (secs * 1000.0).round() as u32, since: Instant::now() });
+        if !auto {
+            note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
+        }
+        let ms = (secs * 1000.0).round() as u32;
+        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, ms, since: Instant::now(), auto });
         buffer::save(id, clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
     }
 
@@ -350,16 +444,22 @@ impl App {
             log(&format!("save #{id} finished after it was given up on: {result:?}"));
             return;
         }
-        let Some(Saving { long, monitor, capped, app, ms, since, .. }) = self.saving.take() else { return };
+        let Some(Saving { long, monitor, capped, app, ms, since, auto, .. }) = self.saving.take() else { return };
         match result {
             Ok(path) => {
                 log(&format!("save #{id} done in {:.1} s: {}", since.elapsed().as_secs_f64(), path.display()));
                 gallery::remember(&path, app.as_ref(), ms);
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let kind = if capped { Kind::Warning } else { Kind::Saved };
-                note::show(monitor, self.cfg.note_position, kind, &format!("saved the last {long}"), &name);
+                if auto {
+                    self.auto_saves += 1;
+                    self.refresh_tray();
+                } else {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let kind = if capped { Kind::Warning } else { Kind::Saved };
+                    note::show(monitor, self.cfg.note_position, kind, &format!("saved the last {long}"), &name);
+                }
                 self.last_saved = Some(path);
             }
+            Err(e) if auto => log(&format!("auto-clip: save #{id} failed: {e}")),
             Err(e) => {
                 log(&format!("save #{id} failed: {e}"));
                 note::show(monitor, self.cfg.note_position, Kind::Failed, "couldn't save", "see the notification for why");
@@ -417,6 +517,7 @@ impl App {
                 let hotkey = cfg.save_hotkey != self.cfg.save_hotkey;
                 let updates = (cfg.update_mode, cfg.update_beta) != (self.cfg.update_mode, self.cfg.update_beta);
                 self.cfg = cfg;
+                self.configure_auto();
                 if updates {
                     self.updates_reconfigured();
                 }
@@ -492,8 +593,11 @@ impl App {
             Err(e) => log(&format!("buffer failed: {e}")),
         }
         // one we stopped is gone already, or replaced by a newer one
-        if generation == self.generation && self.buffer.take().is_some() && !self.paused {
-            self.retry_later();
+        if generation == self.generation && self.buffer.take().is_some() {
+            self.buffer_changed();
+            if !self.paused {
+                self.retry_later();
+            }
         }
         self.refresh_tray();
     }
@@ -517,9 +621,9 @@ impl Host for App {
         Ok(Setting::System)
     }
 
-    /// No save is being written and no click is about to cut one.
+    /// No save is being written, no click is about to cut one and no auto save waits.
     fn idle(&self) -> bool {
-        !self.save_running() && self.clicked.is_none() && !self.exiting
+        !self.save_running() && self.clicked.is_none() && self.auto.due().is_none() && !self.exiting
     }
 
     fn notify_update(&mut self, title: &str, text: &str, error: bool, click: Click) {
@@ -677,6 +781,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_NOTE_CAPTURABLE => return LRESULT(note::set_capturable(wp.0 == 1) as isize),
+        WM_HEARD => {
+            let heard = unsafe { buffer::take::<Vec<GameEvent>>(lp) };
+            with_app(|a| a.heard(heard));
+            return LRESULT(0);
+        }
+        WM_TIMER if wp.0 == AUTO_TIMER => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), AUTO_TIMER);
+            }
+            with_app(App::auto_save);
+            return LRESULT(0);
+        }
         WM_SAVED => {
             let (id, result) = unsafe { buffer::take::<(u64, Result<PathBuf, String>)>(lp) };
             with_app(|a| a.saved(id, result));
@@ -700,7 +816,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             with_app(|a| {
                 match a.clicked.take() {
-                    Some(Some(cut)) => a.write(cut),
+                    Some(Some(cut)) => a.write(cut, false),
                     Some(None) => a.nothing_yet(),
                     None => {}
                 }
@@ -736,6 +852,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     }
                     destroy(app.on);
                     destroy(app.off);
+                    events::listen(None);
                 }
             });
             unsafe { PostQuitMessage(0) };
@@ -825,6 +942,8 @@ pub fn run() {
         balloon: Balloon::LastClip,
         update: Updates::new(BUILD),
         update_ready: false,
+        auto: AutoClip::new(),
+        auto_saves: 0,
         exiting: false,
     };
     app.grab_hotkey();
@@ -838,6 +957,7 @@ pub fn run() {
     if let Some(old) = &updated_from {
         log(&format!("updated from {old} to {}", BUILD.current()));
     }
+    app.configure_auto();
     app.start();
     if let Some(e) = &update_error {
         app.notify_update("afterglow: couldn't update", e, true, Click::Log);

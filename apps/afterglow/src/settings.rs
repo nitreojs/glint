@@ -16,7 +16,7 @@ use glint_ui::capture::{Recorder, held_names, key_names};
 use glint_ui::naming;
 use glint_ui::settings::{self as frame, Pages};
 use glint_ui::updates::{self, Updater};
-use glint_ui::widgets::{self, Hotkey, HotkeyState, Kind, Look, anim, ease, glide, hint, mix, row};
+use glint_ui::widgets::{self, Hotkey, HotkeyState, Kind, Look, anim, ease, glide, hint, mix, nested_row, row};
 use windows::Win32::UI::Shell::ShellExecuteW;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, SW_SHOWNORMAL};
 use windows::core::{HSTRING, w};
@@ -24,6 +24,7 @@ use windows::core::{HSTRING, w};
 use glint_shell::afterglow::MAIN_CLASS;
 
 use crate::addon::{self, Status};
+use crate::autoclip::{AFTER_MS, Trigger, cooldown};
 use crate::app::{AMBER, BUILD, WM_HOTKEY_PAUSE, WM_PREVIEW_NOTE, WM_RELOAD};
 use crate::config::{APP, Config, LENGTHS, MEMORY_CAPS, NAMES, Place, default_output_dir};
 
@@ -45,6 +46,14 @@ pub enum Page {
 
 const PAGES: [Page; 7] = [Page::General, Page::Video, Page::Audio, Page::Output, Page::Games, Page::Updates, Page::About];
 const BETA: &str = "beta";
+/// What auto-clip can save after, as the settings word them.
+const TRIGGERS: [(Trigger, &str); 5] = [
+    (Trigger::Kills, "your kills"),
+    (Trigger::Streaks, "first blood and streaks"),
+    (Trigger::Deaths, "your deaths"),
+    (Trigger::Objectives, "objectives you took"),
+    (Trigger::Results, "the match result"),
+];
 
 /// Opens the window, or brings the open one forward.
 pub fn run() {
@@ -208,6 +217,38 @@ impl Settings {
             }
             let (text, warn) = self.addon_hint();
             hint(ui, text, if warn { look.p.warn } else { look.p.t3 });
+        });
+        let text = if self.cfg.auto_clip { "saves after what you pick, nothing on screen" } else { "only when you save" };
+        if widgets::toggle_row(ui, look, "auto-clip", &mut self.cfg.auto_clip, text).changed() && self.cfg.auto_clip {
+            self.cfg.game_events = true;
+        }
+        widgets::reveal(ui, Id::unique("auto-clip-events"), self.cfg.auto_clip, |ui| self.auto_clip_events(ui, look));
+    }
+
+    /// The events auto-clip saves after, and what they need.
+    fn auto_clip_events(&mut self, ui: &mut Ui, look: &Look) {
+        nested_row(ui, look, "after", 1.0, |ui| {
+            ui.spacing_mut().item_spacing.y = 10.0;
+            for (t, text) in TRIGGERS {
+                let mut on = self.cfg.auto_clip_events.contains(&t);
+                if widgets::checkbox(ui, look, &mut on, text).changed() {
+                    self.cfg.auto_clip_events.retain(|&x| x != t);
+                    if on {
+                        self.cfg.auto_clip_events.push(t);
+                        self.cfg.auto_clip_events.sort_by_key(|&x| Trigger::ALL.iter().position(|&a| a == x));
+                    }
+                }
+            }
+            ui.spacing_mut().item_spacing.y = 6.0;
+            let p = look.p;
+            if self.cfg.auto_clip_events.is_empty() {
+                hint(ui, "with none picked, nothing saves by itself", p.warn);
+            } else if !self.cfg.deadlock_addon {
+                hint(ui, "needs deadlock events above", p.warn);
+            } else {
+                let every = cooldown(self.cfg.length as i64 * 1000) / 1000;
+                hint(ui, format!("{} s after, a fight in one clip, one every {every} s at most", AFTER_MS / 1000), p.t3);
+            }
         });
     }
 
@@ -421,7 +462,12 @@ impl Settings {
             }
             Page::Audio => n(a.audio_sources == b.audio_sources) + n(a.audio_track_names == b.audio_track_names),
             Page::Output => n(a.output_dir == b.output_dir) + n(a.file_name == b.file_name),
-            Page::Games => n(a.deadlock_addon == b.deadlock_addon) + n(a.game_events == b.game_events),
+            Page::Games => {
+                n(a.deadlock_addon == b.deadlock_addon)
+                    + n(a.game_events == b.game_events)
+                    + n(a.auto_clip == b.auto_clip)
+                    + n(a.auto_clip_events == b.auto_clip_events)
+            }
             Page::Updates => n(a.update_mode == b.update_mode) + n(a.update_beta == b.update_beta),
             Page::About => 0,
         }
@@ -500,6 +546,8 @@ impl Pages for Settings {
             Page::Games => {
                 c.deadlock_addon = d.deadlock_addon;
                 c.game_events = d.game_events;
+                c.auto_clip = d.auto_clip;
+                c.auto_clip_events = d.auto_clip_events;
             }
             Page::Updates => {
                 c.update_mode = d.update_mode;
@@ -691,6 +739,7 @@ mod tests {
             let mut cfg = Config::default();
             cfg.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 1) });
             cfg.audio_sources.push(AudioSource::new(SourceKind::Mic, 2));
+            cfg.auto_clip = true;
             let mut app = Frame::new(Settings::new(cfg.clone(), None, no_updates()), (WINDOW, WINDOW));
             let mut time = 0.0;
             for page in PAGES {
@@ -792,9 +841,11 @@ mod tests {
         assert_eq!(s.changes(Page::Games), 0);
         s.cfg.deadlock_addon = true;
         s.cfg.game_events = true;
-        assert_eq!((s.changes(Page::Games), s.changes(Page::General)), (2, 0), "both are the games page's");
+        s.cfg.auto_clip = true;
+        s.cfg.auto_clip_events = vec![Trigger::Deaths];
+        assert_eq!((s.changes(Page::Games), s.changes(Page::General)), (4, 0), "all are the games page's");
         assert_eq!((s.badge(Page::Games), s.badge(Page::General)), (Some("beta"), None));
         s.reset(Page::Games);
-        assert!(!s.cfg.deadlock_addon && !s.cfg.game_events);
+        assert_eq!(s.cfg, Config::default());
     }
 }

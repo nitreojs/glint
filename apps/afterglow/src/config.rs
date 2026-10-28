@@ -11,6 +11,8 @@ use glint_core::naming::{Names, pattern_problem};
 use glint_core::paths::app_dir_for;
 use serde::Deserialize;
 
+use crate::autoclip::Trigger;
+
 pub const APP: &str = "afterglow";
 /// Lengths the settings offer, in seconds.
 pub const LENGTHS: [u32; 5] = [30, 60, 120, 300, 600];
@@ -52,6 +54,9 @@ pub struct Config {
     /// Keep afterglow's addon installed in Deadlock, which tells the local player's kills,
     /// deaths and assists ([`crate::addon`]).
     pub deadlock_addon: bool,
+    /// Save a clip by itself a few seconds after one of `auto_clip_events` ([`crate::autoclip`]).
+    pub auto_clip: bool,
+    pub auto_clip_events: Vec<Trigger>,
     /// What afterglow does about its new releases on GitHub.
     pub update_mode: UpdateMode,
     /// Also take pre-releases.
@@ -80,6 +85,8 @@ impl Default for Config {
             note_position: Place::TopRight,
             game_events: false,
             deadlock_addon: false,
+            auto_clip: false,
+            auto_clip_events: vec![Trigger::Kills, Trigger::Streaks, Trigger::Objectives],
             update_mode: UpdateMode::Auto,
             update_beta: false,
         }
@@ -243,6 +250,12 @@ game_events = {game_events}
 # lists it), only while the game is closed; false takes it out again.
 deadlock_addon = {deadlock_addon}
 
+# Save a clip by itself a few seconds after these happen in a followed game (game_events), nothing
+# on screen; events close together make one clip: "kills", "streaks" (first blood, kill streaks),
+# "deaths" (all three your own), "objectives" (ones you took), "results" (the match's end).
+auto_clip = {auto_clip}
+auto_clip_events = [{auto_clip_events}]
+
 # Updates from github.com/nitreojs/glint (afterglow's releases), checked soon after start and
 # every hour, signature-checked before they're used: "auto" downloads them in the background and
 # installs on the next start (or when you click the notification), "notify" only tells you,
@@ -272,6 +285,8 @@ audio_track_names = [{names}]
             place = self.note_position.name(),
             game_events = self.game_events,
             deadlock_addon = self.deadlock_addon,
+            auto_clip = self.auto_clip,
+            auto_clip_events = self.auto_clip_events.iter().map(|t| q(t.name())).collect::<Vec<_>>().join(", "),
             update_beta = self.update_beta,
             names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
@@ -367,6 +382,8 @@ mod tests {
             launch_at_startup: true,
             note_position: Place::Bottom,
             game_events: true,
+            auto_clip: true,
+            auto_clip_events: vec![Trigger::Deaths, Trigger::Results],
             buffer: false,
             update_mode: UpdateMode::Notify,
             update_beta: true,
