@@ -4,6 +4,7 @@ use glint_core::geom::rect::Rect;
 use glint_core::log::log;
 use glint_core::record::Codec;
 use glint_core::record::clicks::Shape;
+use glint_core::record::effort;
 use glint_core::record::keys::KeyFrame;
 use glint_core::record::mix::{RATE, frames_to_hns};
 use glint_core::record::mp4::{name_tracks, tag_colours};
@@ -168,16 +169,18 @@ impl Composer {
     }
 }
 
-/// What the encoder records, with `p`'s settings.
+/// What the encoder records, with `p`'s settings: the effort lowered where the slower presets
+/// can't keep up (see [`effort::fit`]).
 pub(super) fn video_config(p: &Params) -> VideoConfig {
     let r = p.region;
+    let (width, height) = (r.w as u32, r.h as u32);
     VideoConfig {
         codec: p.codec,
-        width: r.w as u32,
-        height: r.h as u32,
+        width,
+        height,
         fps: p.fps,
         qp: p.qp,
-        effort: p.effort,
+        effort: effort::fit(p.effort, p.codec, width, height, p.fps),
         keyframe_secs: p.keyframe_secs,
         bitrate: p.bitrate,
     }
@@ -186,7 +189,7 @@ pub(super) fn video_config(p: &Params) -> VideoConfig {
 pub(super) fn log_start(p: &Params, encoder: &str, tracks: usize) {
     let c = video_config(p);
     log(&format!(
-        "recording {}x{}@{:.3} {:?} {} effort={}{} -> {} [{encoder}]",
+        "recording {}x{}@{:.3} {:?} {} effort={}{}{} -> {} [{encoder}]",
         c.width,
         c.height,
         c.fps,
@@ -196,6 +199,10 @@ pub(super) fn log_start(p: &Params, encoder: &str, tracks: usize) {
             None => format!("qp={}", c.qp),
         },
         c.effort,
+        match c.effort < p.effort {
+            true => format!(" (not {}: its preset can't keep up at this size and rate)", p.effort),
+            false => String::new(),
+        },
         match tracks {
             0 => String::new(),
             n => format!(" + {n} aac track(s)"),

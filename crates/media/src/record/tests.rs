@@ -10,7 +10,10 @@ use glint_core::geom::rect::Rect;
 use glint_core::record::Codec;
 use glint_core::record::mix::RATE;
 use glint_core::record::negotiate::{Engine, Force, Input, Route};
-use glint_core::record::pipeline::{Encoded, Frames, Output, Packet, PacketSink, Stream, VideoConfig};
+use glint_core::record::pipeline::{
+    Backend, CaptureStats, Encoded, Event, Frames, Outcome, Output, Packet, PacketSink, Parts, Recorder, Role, Stream, Summary, VideoConfig,
+    open_audio,
+};
 use glint_core::record::pointer::{PointerKind, PointerShape};
 use glint_core::record::replay::{Limits, ReplaySink};
 use windows::Win32::Graphics::Direct3D11::*;
@@ -25,7 +28,7 @@ use super::Params;
 use super::encoder::{Composer, sink_writer, video_config};
 use super::gpu::Gpu;
 use super::packets::{AacEncoder, MfVideoEncoder, Mp4Sink};
-use super::win::{INFINITE, adapter, create_device, texture_desc};
+use super::win::{INFINITE, RING, adapter, create_device, hns, qpc, texture_desc};
 use crate::clip::media::{probe, still};
 use crate::rect::WinRect;
 
@@ -708,3 +711,420 @@ fn the_recorder_takes_the_forced_routes_from_the_environment() {
     }
 }
 
+
+// Big frames at the monitor's rate through the whole recorder: a scrolling synthetic capture
+// paced like Desktop Duplication, with another encoder session on the GPU (afterglow's).
+
+/// A text-like page twice the region's height, copied into a shared ring a few lines further
+/// down each frame: what scrolling looks like to the encoder.
+struct Scroller {
+    size: (u32, u32),
+    fps: f64,
+    ctx: ID3D11DeviceContext,
+    page: ID3D11Texture2D,
+    ring: Vec<(ID3D11Texture2D, IDXGIKeyedMutex)>,
+    handles: Vec<HANDLE>,
+    _device: ID3D11Device,
+}
+
+// d3d11 objects are free-threaded; after the move only the capture thread touches them.
+unsafe impl Send for Scroller {}
+
+impl Scroller {
+    fn new((w, h): (u32, u32), fps: f64) -> Scroller {
+        unsafe {
+            let (device, ctx) = create_device(&adapter(0).unwrap(), D3D11_CREATE_DEVICE_FLAG(0)).unwrap();
+            let mut x = 0x9E37_79B9u32;
+            let cols = w.div_ceil(4);
+            // 4×4 cells, a quarter of them dark: small text on a light background
+            let cells: Vec<u32> = (0..cols * (2 * h).div_ceil(4))
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    let v = if x.is_multiple_of(4) { x >> 24 & 0x7F } else { 0xF0 | (x >> 24 & 0x0F) };
+                    0xFF00_0000 | v << 16 | v << 8 | v
+                })
+                .collect();
+            let px: Vec<u32> = (0..w * 2 * h).map(|i| cells[((i / w / 4) * cols + i % w / 4) as usize]).collect();
+            let page_rect = Rect { x: 0, y: 0, w: w as i32, h: 2 * h as i32 };
+            let data = D3D11_SUBRESOURCE_DATA { pSysMem: px.as_ptr() as _, SysMemPitch: w * 4, SysMemSlicePitch: 0 };
+            let mut page = None;
+            device
+                .CreateTexture2D(&texture_desc(page_rect, D3D11_BIND_SHADER_RESOURCE, D3D11_RESOURCE_MISC_FLAG(0)), Some(&data), Some(&mut page))
+                .unwrap();
+            let r = Rect { x: 0, y: 0, w: w as i32, h: h as i32 };
+            let (mut ring, mut handles) = (Vec::new(), Vec::new());
+            for _ in 0..RING {
+                let desc = texture_desc(r, D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX);
+                let mut tex = None;
+                device.CreateTexture2D(&desc, None, Some(&mut tex)).unwrap();
+                let tex = tex.unwrap();
+                handles.push(tex.cast::<IDXGIResource>().unwrap().GetSharedHandle().unwrap());
+                ring.push((tex.clone(), tex.cast().unwrap()));
+            }
+            Scroller { size: (w, h), fps, ctx, page: page.unwrap(), ring, handles, _device: device }
+        }
+    }
+
+    /// Frame `i` into ring texture `slot`, for the compositor.
+    fn put(&self, slot: usize, i: u64) -> Result<(), String> {
+        let (w, h) = self.size;
+        let top = (i * 6 % h as u64) as u32;
+        let (tex, km) = &self.ring[slot];
+        unsafe {
+            km.AcquireSync(0, INFINITE).map_err(|e| e.to_string())?;
+            let b = D3D11_BOX { left: 0, top, front: 0, right: w, bottom: top + h, back: 1 };
+            self.ctx.CopySubresourceRegion(tex, 0, 0, 0, 0, &self.page, 0, Some(&b));
+            km.ReleaseSync(1).map_err(|e| e.to_string())
+        }
+    }
+}
+
+impl glint_core::record::pipeline::Capture for Scroller {
+    type Image = usize;
+
+    /// A frame every 1/fps s while a ring texture is free (a drop when none is), like capture.
+    fn run(
+        &mut self,
+        stop: &std::sync::atomic::AtomicBool,
+        out: &std::sync::mpsc::Sender<Event<usize>>,
+        free: &std::sync::mpsc::Receiver<usize>,
+    ) -> Result<CaptureStats, String> {
+        let mut stats = CaptureStats::default();
+        let mut idle: Vec<usize> = (0..self.ring.len()).collect();
+        let start = Instant::now();
+        for i in 0u64.. {
+            let due = start + std::time::Duration::from_secs_f64(i as f64 / self.fps);
+            if let Some(d) = due.checked_duration_since(Instant::now()) {
+                std::thread::sleep(d);
+            }
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            idle.extend(free.try_iter());
+            let Some(slot) = idle.pop() else {
+                stats.dropped += 1;
+                continue;
+            };
+            self.put(slot, i)?;
+            if out.send(Event::Frame { image: Some(slot), at: hns(qpc()), cursor: None }).is_err() {
+                break;
+            }
+        }
+        Ok(stats)
+    }
+}
+
+/// Time spent in one call of the encoder thread.
+#[derive(Clone, Copy, Debug, Default)]
+struct Spent {
+    calls: u64,
+    total: std::time::Duration,
+    worst: std::time::Duration,
+}
+
+impl Spent {
+    fn time<T>(&mut self, f: impl FnOnce() -> T) -> T {
+        let start = Instant::now();
+        let r = f();
+        let d = start.elapsed();
+        self.calls += 1;
+        self.total += d;
+        self.worst = self.worst.max(d);
+        r
+    }
+}
+
+impl std::fmt::Display for Spent {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let mean = self.total.as_secs_f64() * 1e3 / self.calls.max(1) as f64;
+        write!(f, "{mean:.3} ms mean, {:.1} ms worst ({} calls)", self.worst.as_secs_f64() * 1e3, self.calls)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Calls {
+    latch: Spent,
+    alloc: Spent,
+    compose: Spent,
+    write: Spent,
+    /// Allocations that found the pool empty.
+    empty: u64,
+}
+
+/// The compositor and output, timing each call.
+struct Timed<T> {
+    inner: T,
+    calls: std::sync::Arc<std::sync::Mutex<Calls>>,
+}
+
+impl Frames for Timed<Composer> {
+    type Image = usize;
+    type Frame = IMFSample;
+
+    fn latch(&mut self, image: &usize) -> Result<(), String> {
+        let inner = &mut self.inner;
+        self.calls.lock().unwrap().latch.time(|| inner.latch(image))
+    }
+
+    fn set_pointer(&mut self, shape: &PointerShape) {
+        self.inner.set_pointer(shape)
+    }
+
+    fn alloc(&mut self) -> Result<Option<IMFSample>, String> {
+        let inner = &mut self.inner;
+        let mut calls = self.calls.lock().unwrap();
+        let r = calls.alloc.time(|| inner.alloc());
+        calls.empty += matches!(r, Ok(None)) as u64;
+        r
+    }
+
+    fn compose(&mut self, frame: &IMFSample, cursor: Option<(i32, i32)>, clicks: &[glint_core::record::clicks::Shape], keys: Option<glint_core::record::keys::KeyFrame>) -> Result<(), String> {
+        let inner = &mut self.inner;
+        self.calls.lock().unwrap().compose.time(|| inner.compose(frame, cursor, clicks, keys))
+    }
+}
+
+impl<O: Output<Frame = IMFSample>> Output for Timed<O> {
+    type Frame = IMFSample;
+
+    fn video(&mut self, frame: IMFSample, time: i64, duration: i64) -> Result<(), String> {
+        let inner = &mut self.inner;
+        self.calls.lock().unwrap().write.time(|| inner.video(frame, time, duration))
+    }
+
+    fn audio(&mut self, track: usize, at: i64, pcm: &[i16]) -> Result<(), String> {
+        self.inner.audio(track, at, pcm)
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        self.inner.finish()
+    }
+}
+
+/// Drops what an encoder makes.
+struct Discard;
+
+impl PacketSink for Discard {
+    fn add_stream(&mut self, _: Stream) -> Result<usize, String> {
+        Ok(0)
+    }
+
+    fn write(&mut self, _: usize, _: Packet) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn finalize(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+enum Out {
+    Sink(super::encoder::SinkWriter),
+    Packets(Encoded<MfVideoEncoder, AacEncoder, Discard>),
+}
+
+impl Output for Out {
+    type Frame = IMFSample;
+
+    fn video(&mut self, frame: IMFSample, time: i64, duration: i64) -> Result<(), String> {
+        match self {
+            Out::Sink(o) => o.video(frame, time, duration),
+            Out::Packets(o) => o.video(frame, time, duration),
+        }
+    }
+
+    fn audio(&mut self, track: usize, at: i64, pcm: &[i16]) -> Result<(), String> {
+        match self {
+            Out::Sink(o) => o.audio(track, at, pcm),
+            Out::Packets(o) => o.audio(track, at, pcm),
+        }
+    }
+
+    fn finish(&mut self) -> Result<(), String> {
+        match self {
+            Out::Sink(o) => o.finish(),
+            Out::Packets(o) => o.finish(),
+        }
+    }
+}
+
+/// The recorder on a [`Scroller`]: the sink writer into `params.path`, or with `packets` the
+/// packet path into nothing (afterglow's encoder, its buffer aside).
+struct Bench {
+    params: Params,
+    packets: bool,
+    calls: std::sync::Arc<std::sync::Mutex<Calls>>,
+}
+
+impl Backend for Bench {
+    type Capture = Scroller;
+    type Frames = Timed<Composer>;
+    type Output = Timed<Out>;
+    type Audio = super::audio::Source;
+    type Mouse = super::mouse::Hook;
+    type Keys = super::keys::Hook;
+    type Guard = <super::win::Windows as Backend>::Guard;
+
+    fn enter(role: Role) -> Self::Guard {
+        <super::win::Windows as Backend>::enter(role)
+    }
+
+    fn now() -> i64 {
+        hns(qpc())
+    }
+
+    fn open(self) -> Result<Parts<Self>, String> {
+        let p = self.params;
+        let size = (p.region.w as u32, p.region.h as u32);
+        let capture = Scroller::new(size, p.fps);
+        unsafe {
+            let gpu = Gpu::open(&adapter(0)?, size)?;
+            let (output, route) = match self.packets {
+                true => {
+                    let out = Encoded::new(MfVideoEncoder::new(&gpu, Force::default()), &video_config(&p), Vec::new(), Discard)?;
+                    let route = out.video_encoder().route().ok_or("no route")?;
+                    (Out::Packets(out), route)
+                }
+                false => {
+                    let (out, route, _, _) = sink_writer(&p, &gpu, Force::default(), Vec::new())?;
+                    (Out::Sink(out), route)
+                }
+            };
+            let frames = Composer::new(&p, &capture.handles, gpu, route)?;
+            Ok(Parts {
+                capture,
+                frames: Timed { inner: frames, calls: self.calls.clone() },
+                output: Timed { inner: output, calls: self.calls },
+                audio: open_audio(&[], &[]),
+                fps: p.fps,
+                path: p.path.clone(),
+                clicks: None,
+                keys: None,
+                notices: Vec::new(),
+            })
+        }
+    }
+}
+
+/// A running [`Bench`] recorder.
+struct Running {
+    rec: Recorder,
+    done: std::sync::mpsc::Receiver<Result<Outcome, String>>,
+    calls: std::sync::Arc<std::sync::Mutex<Calls>>,
+}
+
+fn bench_start(params: Params, packets: bool) -> Running {
+    glint_core::log::set_sink(|m| eprintln!("log: {m}"));
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Calls::default()));
+    let (tx, done) = std::sync::mpsc::channel();
+    let bench = Bench { params, packets, calls: calls.clone() };
+    let rec = glint_core::record::pipeline::start(bench, move |r| tx.send(r).unwrap()).and_then(|s| s.wait()).unwrap();
+    Running { rec, done, calls }
+}
+
+impl Running {
+    fn stop(self) -> (Summary, Calls) {
+        self.rec.stop();
+        let Ok(Outcome::Saved(s)) = self.done.recv_timeout(std::time::Duration::from_secs(30)).unwrap() else { panic!("not saved") };
+        let calls = *self.calls.lock().unwrap();
+        (s, calls)
+    }
+}
+
+/// The user's settings at `size`: H.264, qp 20, `effort`, at `fps`.
+fn big_params(size: (u32, u32), fps: f64, effort: u32, path: &Path) -> Params {
+    Params { fps, qp: 20, effort, draw_cursor: false, ..params(Codec::H264, size, path) }
+}
+
+/// `secs` of the sink writer recording `size` at `fps` and `effort` (through the whole recorder,
+/// the effort fitted as for a recording), with afterglow's encoder (packet path, effort 20, same
+/// size and rate) running alongside. Returns the recording's and afterglow's summaries.
+fn record_big(size: (u32, u32), fps: f64, effort: u32, secs: f64) -> (Summary, Summary) {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        MFStartup(MF_VERSION, MFSTARTUP_FULL).unwrap();
+    }
+    let path = temp_mp4(&format!("big-{effort}"));
+    let afterglow = bench_start(big_params(size, fps, 20, Path::new("unused.mp4")), true);
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let main = bench_start(big_params(size, fps, effort, &path), false);
+    std::thread::sleep(std::time::Duration::from_secs_f64(secs));
+    let (s, calls) = main.stop();
+    let (beside, _) = afterglow.stop();
+    let info = probe(&path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    eprintln!(
+        "{}x{}@{fps} effort {effort} beside afterglow: {} frames, {} dropped ({} with the sample pool empty; afterglow: {}), {:.2} s, file {:.2} s",
+        size.0,
+        size.1,
+        calls.write.calls,
+        s.dropped,
+        calls.empty,
+        beside.dropped,
+        s.duration_s,
+        info.duration as f64 / 1e7
+    );
+    eprintln!("  latch {}\n  alloc {}\n  compose {}\n  write {}", calls.latch, calls.alloc, calls.compose, calls.write);
+    (s, beside)
+}
+
+/// Frames per second the sink writer takes at `size`, `codec` and `effort`, scrolling, as fast
+/// as it goes, and the file's size. Configured for 30 fps, where no effort is too slow (the rate
+/// it's configured for doesn't change the encoder's speed).
+fn sink_writer_throughput(size: (u32, u32), codec: Codec, effort: u32, frames: u64) -> (f64, u64) {
+    let path = temp_mp4(&format!("rate-{effort}"));
+    let p = Params { codec, ..big_params(size, 30.0, effort, &path) };
+    let gpu = gpu_sized(size);
+    let scroller = Scroller::new(size, 30.0);
+    let frame_hns = 10_000_000 / 30;
+    let fps = unsafe {
+        let (mut out, route, _, _) = sink_writer(&p, &gpu, Force::default(), Vec::new()).unwrap();
+        let mut composer = Composer::new(&p, &scroller.handles, gpu, route).unwrap();
+        let start = Instant::now();
+        for i in 0..frames {
+            scroller.put(0, i).unwrap();
+            composer.latch(&0).unwrap();
+            let sample = loop {
+                match composer.alloc().unwrap() {
+                    Some(s) => break s,
+                    None => std::thread::sleep(std::time::Duration::from_micros(200)),
+                }
+            };
+            composer.compose(&sample, None, &[], None).unwrap();
+            out.video(sample, i as i64 * frame_hns, frame_hns).unwrap();
+        }
+        out.finish().unwrap();
+        frames as f64 / start.elapsed().as_secs_f64()
+    };
+    let bytes = std::fs::metadata(&path).unwrap().len();
+    let _ = std::fs::remove_file(&path);
+    (fps, bytes)
+}
+
+#[test]
+#[ignore = "needs a hardware video encoder; prints how fast it goes at 3440x1440 per effort (see record::effort)"]
+fn sink_writer_throughput_at_3440x1440() {
+    let size = (3440, 1440);
+    for alongside in [false, true] {
+        let afterglow = alongside.then(|| bench_start(big_params(size, 144.0, 20, Path::new("unused.mp4")), true));
+        for codec in [Codec::H264, Codec::Hevc] {
+            for effort in [100, 50, 25] {
+                let (fps, bytes) = sink_writer_throughput(size, codec, effort, 600);
+                let alongside = if alongside { " beside afterglow" } else { "" };
+                eprintln!("{codec:?} effort {effort}{alongside}: {fps:.0} fps, {:.1} MB", bytes as f64 / 1e6);
+            }
+        }
+        if let Some(a) = afterglow {
+            a.stop();
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a hardware video encoder; records 3440x1440 at 144 fps for a few seconds"]
+fn big_frames_at_144_fps_record_without_drops_beside_afterglow() {
+    let (s, beside) = record_big((3440, 1440), 144.0, 100, 8.0);
+    assert_eq!((s.dropped, beside.dropped), (0, 0));
+}
