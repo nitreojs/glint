@@ -22,6 +22,7 @@ mod sections;
 pub use hotkey_capture::{CAPTURE_ARG, capture_keys};
 use hotkey_capture::{HotkeyField, release_tray_hotkeys};
 use sections::output::Mover;
+use sections::toolbar::ToolbarRows;
 use sections::uploads::Uploaders;
 use sections::{SECTIONS, Section};
 
@@ -56,6 +57,8 @@ struct SettingsApp {
     mover: Mover,
     /// What's typed in the custom accent field; `cfg.accent` follows it while it's a colour.
     accent_text: String,
+    /// The editor toolbar page's list.
+    toolbar: ToolbarRows,
 }
 
 fn repaint() {
@@ -76,6 +79,7 @@ impl SettingsApp {
             updater,
             audio: AudioEditor::default(),
             mover: Mover::default(),
+            toolbar: ToolbarRows::default(),
         }
     }
 }
@@ -115,6 +119,7 @@ impl Pages for SettingsApp {
             Section::Overlays => self.overlays_page(ui, look),
             Section::Audio => self.audio(ui, look),
             Section::Screenshots => self.screenshots(ui, look),
+            Section::Toolbar => self.toolbar_page(ui, look),
             Section::Uploads => self.uploads(ui, look),
             Section::Output => self.output(ui, look),
             Section::Updates => {
@@ -129,7 +134,7 @@ impl Pages for SettingsApp {
     }
 
     fn can_save(&self) -> bool {
-        !self.keys.listening() && pattern_problem(&self.cfg.file_name).is_none()
+        !self.keys.listening() && !self.toolbar.listening() && pattern_problem(&self.cfg.file_name).is_none()
     }
 
     /// Writes config.toml and tells the tray app; returns whether it worked.
@@ -163,15 +168,17 @@ impl Pages for SettingsApp {
 
     fn leave(&mut self) {
         self.stop_listening();
+        self.toolbar.stop();
         self.audio.leave();
     }
 
     fn tick(&mut self) {
         self.poll_capture();
+        self.toolbar.tick();
     }
 
     fn busy(&self) -> bool {
-        self.keys.listening() || self.audio.busy()
+        self.keys.listening() || self.toolbar.busy() || self.audio.busy()
     }
 
     fn overlays(&mut self, ctx: &egui::Context, look: &Look) -> bool {
@@ -623,6 +630,82 @@ mod tests {
 
     fn picks(items: &[(&str, bool)]) -> Vec<(String, bool)> {
         items.iter().map(|&(l, on)| (l.to_owned(), on)).collect()
+    }
+
+    fn key(key: Key) -> egui::Event {
+        egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }
+    }
+
+    #[test]
+    fn toolbar_rows_drag_into_order_hide_and_take_new_keys() {
+        use egui::accesskit::Role;
+        use glint_core::config::toolbar::{Keys, Slot, ToolKeys, default_slots};
+        let mut h = Harness::new();
+        h.ctx.enable_accesskit();
+        h.screen = vec2(WINDOW[0], 1000.0);
+        h.app.go(Section::Toolbar);
+        h.settle();
+        let at = |h: &mut Harness, role: Role, name: &str| {
+            h.frame(Vec::new(), "");
+            let b = find(&h.tree, role, name).and_then(|n| n.bounds()).unwrap_or_else(|| panic!("{name}"));
+            pos2(((b.x0 + b.x1) / 2.0) as f32, ((b.y0 + b.y1) / 2.0) as f32)
+        };
+        let tools = |h: &Harness| h.app.pages.cfg.toolbar.clone();
+        let (t, s) = (Slot::Tool, Slot::Separator);
+
+        // pen dragged below arrow
+        let (pen, arrow) = (at(&mut h, Role::ListItem, "pen"), at(&mut h, Role::ListItem, "arrow"));
+        h.drag(pen - vec2(80.0, 0.0), arrow + vec2(-80.0, 12.0));
+        assert_eq!(tools(&h)[..4], [t(1), t(2), t(0), t(3)]);
+        assert_eq!(Section::Toolbar.changes(&h.app.pages.cfg, &h.app.pages.saved), 1);
+
+        // pixelate hidden: it's left out, its row stays where it was
+        let pixelate = at(&mut h, Role::CheckBox, "show pixelate");
+        h.click(pixelate);
+        assert!(!tools(&h).contains(&t(5)));
+        let mut rows: Vec<(f64, String)> = h
+            .tree
+            .iter()
+            .filter(|(_, n)| n.role() == Role::ListItem)
+            .filter_map(|(_, n)| Some((n.bounds()?.y0, n.label()?.to_owned())))
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        assert_eq!(rows[5].1, "pixelate", "{rows:?}");
+
+        // pen's letter: Q is refused, E is eraser's, so they swap; Esc cancels without closing
+        let letter = at(&mut h, Role::Button, "pen letter");
+        h.click(letter);
+        assert!(h.app.pages.busy());
+        h.frame(vec![key(Key::Q)], "");
+        assert!(h.app.pages.toolbar.listening(), "still waiting after Q");
+        h.frame(vec![key(Key::E)], "");
+        h.settle();
+        let keys = |h: &Harness, t: usize| h.app.pages.cfg.toolbar_keys.0[t];
+        assert_eq!((keys(&h, 0).letter, keys(&h, 6).letter), (Some(b'E'), Some(b'P')));
+        assert!(find(&h.tree, Role::Label, "smart eraser has p now").is_some());
+        let digit = at(&mut h, Role::Button, "grab digit");
+        h.click(digit);
+        h.frame(vec![key(Key::Escape)], "");
+        h.settle();
+        assert!(!h.app.pages.busy() && !h.app.closing() && !h.app.asking(), "esc only cancels");
+        assert_eq!(keys(&h, 10), Keys { digit: None, letter: Some(b'G') });
+        h.click(digit);
+        h.frame(vec![key(Key::Num6)], "");
+        h.settle();
+        assert_eq!((keys(&h, 10).digit, keys(&h, 5).digit), (Some(b'6'), None), "pixelate's 6 moved to grab");
+
+        // a separator comes in at the top, then goes down between arrow and pen
+        let add = at(&mut h, Role::Link, "add separator");
+        h.click(add);
+        h.settle();
+        let (sep, pen) = (at(&mut h, Role::ListItem, "separator"), at(&mut h, Role::ListItem, "pen"));
+        h.drag(sep - vec2(80.0, 0.0), pen - vec2(80.0, 14.0));
+        assert_eq!(tools(&h)[..5], [t(1), t(2), s, t(0), t(3)]);
+
+        Section::Toolbar.reset(&mut h.app.pages.cfg);
+        h.settle();
+        assert_eq!((tools(&h), h.app.pages.cfg.toolbar_keys), (default_slots(), ToolKeys::default()));
+        assert_eq!(h.tree.iter().filter(|(_, n)| n.role() == Role::ListItem).count(), 12, "the separator went with the reset");
     }
 
     #[test]

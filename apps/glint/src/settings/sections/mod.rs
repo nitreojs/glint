@@ -7,6 +7,7 @@ pub(super) mod general;
 pub(super) mod output;
 mod recording;
 mod screenshots;
+pub(super) mod toolbar;
 pub(super) mod uploads;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -16,18 +17,20 @@ pub(super) enum Section {
     Overlays,
     Audio,
     Screenshots,
+    Toolbar,
     Uploads,
     Output,
     Updates,
     About,
 }
 
-pub(super) const SECTIONS: [Section; 9] = [
+pub(super) const SECTIONS: [Section; 10] = [
     Section::General,
     Section::Recording,
     Section::Overlays,
     Section::Audio,
     Section::Screenshots,
+    Section::Toolbar,
     Section::Uploads,
     Section::Output,
     Section::Updates,
@@ -42,6 +45,7 @@ impl Section {
             Section::Overlays => "overlays",
             Section::Audio => "audio",
             Section::Screenshots => "screenshots",
+            Section::Toolbar => "toolbar",
             Section::Uploads => "uploads",
             Section::Output => "output",
             Section::Updates => "updates",
@@ -97,6 +101,7 @@ impl Section {
                     + n(a.screenshot_save == b.screenshot_save)
                     + n(a.screenshot_upload == b.screenshot_upload)
             }
+            Section::Toolbar => n(a.toolbar == b.toolbar) + n(a.toolbar_keys == b.toolbar_keys),
             Section::Uploads => {
                 n(a.upload_destination == b.upload_destination)
                     + n(a.litterbox_expiry == b.litterbox_expiry)
@@ -157,6 +162,10 @@ impl Section {
                 cfg.screenshot_copy = d.screenshot_copy;
                 cfg.screenshot_save = d.screenshot_save;
                 cfg.screenshot_upload = d.screenshot_upload;
+            }
+            Section::Toolbar => {
+                cfg.toolbar = d.toolbar;
+                cfg.toolbar_keys = d.toolbar_keys;
             }
             Section::Uploads => {
                 cfg.upload_destination = d.upload_destination;
