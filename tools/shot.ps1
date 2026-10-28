@@ -39,6 +39,7 @@ public static void PostKey(IntPtr hwnd, uint vk, char c) {
 }
 $script:ShotMessage = [GlintShot.Win]::RegisterWindowMessageW('glint-shot')
 $script:DropMessage = [GlintShot.Win]::RegisterWindowMessageW('glint-drop')
+$script:KeyMessage = [GlintShot.Win]::RegisterWindowMessageW('glint-key')
 
 # Starts `exe` with `arguments` quietly (GLINT_QUIET=1), shots going to `shots`, with its own
 # APPDATA and LOCALAPPDATA when given; waits for its window titled `title` and returns
@@ -167,8 +168,16 @@ function Click-Element([IntPtr]$hwnd, [string]$name, [string]$type) {
 }
 
 # A key pressed and let go, posted: `vk` a virtual-key code, `char` what it types (0: nothing).
-function Send-Key([IntPtr]$hwnd, [int]$vk, [int]$char = 0) {
+# `ctrl` holds ctrl around it: posted keys never mark it held, so `glint-key` does
+# (crates/ui/src/window/shot.rs; GLINT_SHOT_DIR windows only).
+function Send-Key([IntPtr]$hwnd, [int]$vk, [int]$char = 0, [switch]$ctrl) {
+    if (-not $ctrl) { return [GlintShot.Win]::PostKey($hwnd, $vk, [char]$char) }
+    $scan = [long][GlintShot.Win]::MapVirtualKeyW(0x11, 0) -shl 16
+    [void][GlintShot.Win]::PostMessageW($hwnd, $script:KeyMessage, [IntPtr]0x11, [IntPtr]1)
+    [void][GlintShot.Win]::PostMessageW($hwnd, 0x0100, [IntPtr]0x11, [IntPtr](1 -bor $scan))                 # WM_KEYDOWN VK_CONTROL
     [GlintShot.Win]::PostKey($hwnd, $vk, [char]$char)
+    [void][GlintShot.Win]::PostMessageW($hwnd, $script:KeyMessage, [IntPtr]0x11, [IntPtr]0)
+    [void][GlintShot.Win]::PostMessageW($hwnd, 0x0101, [IntPtr]0x11, [IntPtr](1 -bor $scan -bor 0xC0000000L)) # WM_KEYUP
 }
 
 # Types `text` into whatever has egui's focus (click the field first), posted.

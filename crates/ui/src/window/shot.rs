@@ -9,6 +9,10 @@
 //! drop target reports a real drag (which needs the real cursor): egui's input then holds it in
 //! `hovered_files` / `dropped_files` the same way.
 //!
+//! Modifiers the same way: `glint-key` with a virtual key in WPARAM marks it held (LPARAM 1) or
+//! let go (0) in the window thread's key state, which winit reads for ctrl, shift and alt; posted
+//! key messages never touch it. Post it held before the posted keys and let go after them.
+//!
 //! Such a window keeps the pointer where the last posted `WM_MOUSEMOVE` put it: Windows answers
 //! the first move with a `WM_MOUSELEAVE` at once (the real cursor is elsewhere), which would drop
 //! the posted click that follows.
@@ -21,6 +25,7 @@ use eframe::egui::{ColorImage, Context, DroppedFile, DroppedFileHandle, HoveredF
 use windows::Win32::Foundation::{LPARAM, WPARAM};
 use windows::Win32::System::DataExchange::{GlobalDeleteAtom, GlobalGetAtomNameW};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
 use windows::Win32::UI::WindowsAndMessaging::RegisterWindowMessageW;
 use windows::core::w;
 
@@ -37,9 +42,10 @@ static DROP_MESSAGE: LazyLock<u32> = LazyLock::new(|| unsafe { RegisterWindowMes
 /// The file `glint-drop` holds over the window, and those it dropped not yet handed to egui.
 static HELD: Mutex<Option<PathBuf>> = Mutex::new(None);
 static DROPPED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static KEY_MESSAGE: LazyLock<u32> = LazyLock::new(|| unsafe { RegisterWindowMessageW(w!("glint-key")) });
 
 /// From the window procedure: whether `msg` is the shot mode's to handle (a shot asked for,
-/// which is then taken next frame, a file dragged, or the pointer leaving).
+/// which is then taken next frame, a file dragged, a key marked held, or the pointer leaving).
 pub(super) fn message(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
     if DIR.is_none() {
         return false;
@@ -59,6 +65,13 @@ pub(super) fn message(msg: u32, wp: WPARAM, lp: LPARAM) -> bool {
     } else if msg == *MESSAGE {
         let name = atom_name(wp).unwrap_or_else(|| format!("shot-{}", COUNT.fetch_add(1, Ordering::Relaxed) + 1));
         ASKED.lock().unwrap_or_else(|e| e.into_inner()).push(name);
+    } else if msg == *KEY_MESSAGE {
+        let mut state = [0u8; 256];
+        if wp.0 < state.len() && unsafe { GetKeyboardState(&mut state) }.is_ok() {
+            state[wp.0] = if lp.0 == 1 { 0x80 } else { 0 };
+            let _ = unsafe { SetKeyboardState(&state) };
+        }
+        return true;
     } else {
         return false;
     }
