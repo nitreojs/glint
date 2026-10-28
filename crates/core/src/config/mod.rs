@@ -29,6 +29,11 @@ pub struct Config {
     pub explorer_menu: bool,
     pub freeze_screen: bool,
     pub ui_elements: UiElements,
+    /// While selecting over a still screen: dashed lines through the cursor across every monitor.
+    pub crosshair: bool,
+    /// While selecting over a still screen: the pixels around the cursor magnified, with their
+    /// position and colour.
+    pub magnifier: bool,
     pub notify_success: bool,
     pub output_dir: String,
     /// File name pattern without the extension; see [`crate::naming::expand`].
@@ -205,6 +210,8 @@ impl Default for Config {
             explorer_menu: true,
             freeze_screen: true,
             ui_elements: UiElements::Shift,
+            crosshair: false,
+            magnifier: false,
             notify_success: true,
             output_dir: String::new(),
             file_name: GLINT.default.into(),
@@ -430,6 +437,13 @@ freeze_screen = {freeze_screen}
 # "always", or "off".
 ui_elements = "{ui_elements}"
 
+# While selecting over a still screen (freeze_screen, or draw-first screenshots): dashed lines
+# through the mouse across every monitor, to line edges up (crosshair), and the pixels around it
+# magnified with their position and colour (magnifier). While dragging they follow the moving
+# corner, snapped.
+crosshair = {crosshair}
+magnifier = {magnifier}
+
 # Tray notifications after a screenshot or recording is saved (true), or only when
 # something goes wrong (false).
 notify_success = {notify_success}
@@ -559,6 +573,8 @@ update_beta = {update_beta}
             launch_at_startup = self.launch_at_startup,
             explorer_menu = self.explorer_menu,
             freeze_screen = self.freeze_screen,
+            crosshair = self.crosshair,
+            magnifier = self.magnifier,
             notify_success = self.notify_success,
             output_dir = q(&self.output_dir),
             file_name = q(&self.file_name),
@@ -653,6 +669,8 @@ mod tests {
             explorer_menu: false,
             freeze_screen: false,
             ui_elements: UiElements::Always,
+            crosshair: true,
+            magnifier: true,
             notify_success: false,
             output_dir: r#"D:\clips\"quoted" dir\"#.into(),
             file_name: "{app}/clip {date} at {time}".into(),
@@ -758,6 +776,23 @@ mod tests {
         assert_eq!(parsed("off").unwrap(), UiElements::Off);
         assert!(parsed("ctrl").is_err());
         assert_eq!(Config::default().ui_elements, UiElements::Shift);
+    }
+
+    #[test]
+    fn selection_aids_round_trip_and_old_files_leave_them_off() {
+        for crosshair in [false, true] {
+            for magnifier in [false, true] {
+                let cfg = Config { crosshair, magnifier, ..Config::default() };
+                let back = Config::parse(&cfg.render()).unwrap();
+                assert_eq!((back.crosshair, back.magnifier), (crosshair, magnifier));
+            }
+        }
+        let text = Config::default().render();
+        assert!(text.contains("snapped.\ncrosshair = false\nmagnifier = false\n"), "{text}");
+        let old = Config::parse("freeze_screen = true\nui_elements = \"always\"").unwrap();
+        assert_eq!((old.crosshair, old.magnifier), (false, false));
+        let one = Config::parse("magnifier = true").unwrap();
+        assert_eq!((one.crosshair, one.magnifier), (false, true));
     }
 
     #[test]
