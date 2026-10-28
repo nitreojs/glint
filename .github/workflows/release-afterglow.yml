@@ -68,4 +68,9 @@ jobs:
         run: |
           prerelease=()
           if [[ "${GITHUB_REF_NAME#afterglow-}" == *-* ]]; then prerelease=(--prerelease); fi
-          gh release create "$GITHUB_REF_NAME" dist/* --title "afterglow ${GITHUB_REF_NAME#afterglow-}" --generate-notes --verify-tag "${prerelease[@]}"
+          # the notes start at the previous afterglow release, not glint's; "latest" stays glint's,
+          # which the readme's download link points at
+          since=()
+          prev=$(gh release list --limit 100 --json tagName -q '[.[].tagName | select(startswith("afterglow-v"))] | .[0] // ""')
+          if [[ -n "$prev" ]]; then since=(--notes-start-tag "$prev"); fi
+          gh release create "$GITHUB_REF_NAME" dist/* --title "afterglow ${GITHUB_REF_NAME#afterglow-}" --generate-notes "${since[@]}" --latest=false --verify-tag "${prerelease[@]}"
