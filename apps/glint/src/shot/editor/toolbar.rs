@@ -1,3 +1,6 @@
+use std::sync::Mutex;
+
+use glint_core::config::toolbar::{Keys, Slot, ToolKeys, default_slots};
 use glint_core::geom::rect::Rect;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
 use windows::Win32::Graphics::DirectWrite::IDWriteTextFormat;
@@ -11,6 +14,34 @@ pub(super) const BAR_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.92);
 pub(super) const WHITE: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
 const COLOR_TIPS: [&str; 5] =
     ["red  ·  Shift+1", "yellow  ·  Shift+2", "green  ·  Shift+3", "blue  ·  Shift+4", "white  ·  Shift+5"];
+
+/// The toolbar the next editor opens with: what the settings say, or the default.
+static LAYOUT: Mutex<Option<(Vec<Slot>, ToolKeys)>> = Mutex::new(None);
+
+/// The tools, separators and keys editors open with from now on (the settings', read as a
+/// shot starts).
+pub(crate) fn use_toolbar(slots: Vec<Slot>, keys: ToolKeys) {
+    if let Ok(mut layout) = LAYOUT.lock() {
+        *layout = Some((slots, keys));
+    }
+}
+
+pub(super) fn layout() -> (Vec<Slot>, ToolKeys) {
+    LAYOUT.lock().ok().and_then(|l| l.clone()).unwrap_or_else(|| (default_slots(), ToolKeys::default()))
+}
+
+/// A tool's tooltip: its name and its keys ("pen  ·  1 / P").
+pub(super) fn tool_tip(tool: Tool, keys: Keys) -> String {
+    let keys: Vec<String> = [keys.digit, keys.letter].into_iter().flatten().map(|k| (k as char).to_string()).collect();
+    let mut tip = tool.label().to_owned();
+    if !keys.is_empty() {
+        tip = format!("{tip}  ·  {}", keys.join(" / "));
+    }
+    if tool == Tool::Image {
+        tip.push_str("  ·  Ctrl+V pastes");
+    }
+    tip
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Item {
@@ -55,7 +86,7 @@ impl Item {
     pub(super) fn tip(self) -> Option<&'static str> {
         Some(match self {
             Item::Region => "region  ·  Q",
-            Item::Tool(t) => TOOLS.iter().find(|(tool, ..)| *tool == t).map(|(_, tip, ..)| *tip)?,
+            Item::Tool(_) => return None,
             Item::Color(i) => COLOR_TIPS[i],
             Item::Custom(_) => "custom colour",
             Item::Picker => "pick a colour",
@@ -85,12 +116,20 @@ impl Item {
 }
 
 /// Toolbar groups, left to right; a separator goes between groups. `region`: canvas mode's region
-/// tool; `customs`: how many custom colours sit between the palette and the picker swatch.
-fn groups(region: bool, customs: usize) -> Vec<Vec<Item>> {
+/// tool; `customs`: how many custom colours sit between the palette and the picker swatch;
+/// `slots`: the tools shown, with separators splitting them into groups of their own.
+fn groups(region: bool, customs: usize, slots: &[Slot]) -> Vec<Vec<Item>> {
     let mut groups = if region { vec![vec![Item::Region]] } else { Vec::new() };
+    for part in slots.split(|s| *s == Slot::Separator) {
+        let tools = part.iter().filter_map(|s| match s {
+            Slot::Tool(t) => TOOLS.get(*t).map(|&t| Item::Tool(t)),
+            Slot::Separator => None,
+        });
+        groups.push(tools.collect());
+    }
+    groups.retain(|g| !g.is_empty());
     let colours = (0..PALETTE.len()).map(Item::Color).chain((0..customs).map(Item::Custom)).chain([Item::Picker]);
     groups.extend([
-        TOOLS.iter().map(|(t, ..)| Item::Tool(*t)).collect(),
         colours.collect(),
         (0..3).map(Item::Size).collect(),
         vec![Item::Undo, Item::Redo],
@@ -104,7 +143,7 @@ impl Editor {
     /// no selection, docked at the top of the monitor under the mouse, or summoned to the mouse.
     pub(super) fn place_bar(&mut self) {
         let (cell, pad, gap) = (self.px(32.0) as i32, self.px(4.0) as i32, self.px(9.0) as i32);
-        let groups = groups(self.region, self.customs.len());
+        let groups = groups(self.region, self.customs.len(), &self.slots);
         let n: i32 = groups.iter().map(|g| g.len() as i32).sum();
         let w = pad * 2 + n * cell + gap * (groups.len() as i32 - 1);
         let h = cell + pad * 2;
@@ -164,7 +203,7 @@ impl Editor {
         let (b, s) = (self.bar, self.scale);
         let (pressed, size, color) = (self.pressed(), self.current(), self.shown_ink());
         let (can_undo, can_redo) = (!self.history.is_empty(), !self.future.is_empty());
-        let groups = groups(self.region, self.customs.len());
+        let groups = groups(self.region, self.customs.len(), &self.slots);
         let (w, h) = (b.w as f32, b.h as f32);
         c.round_rect(0.0, 0.0, w, h, 10.0 * s, BAR_BG);
         // Separators between groups.

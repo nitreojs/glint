@@ -230,6 +230,7 @@ impl App {
     fn start_selection(&mut self, shot: bool) {
         self.front = front_window();
         self.reload();
+        crate::shot::editor::use_toolbar(self.cfg.toolbar.clone(), self.cfg.toolbar_keys);
         let outputs = match monitors::enumerate() {
             Ok(o) if !o.is_empty() => o,
             Ok(_) => return self.notify("glint", "No monitors found.", true, ClickTarget::None),

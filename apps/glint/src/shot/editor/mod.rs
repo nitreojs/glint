@@ -3,7 +3,8 @@
 //! cursors, grabs (a piece of the frozen screen, from anywhere on it, as a picture in the
 //! shot) and the clipboard (pictures pasted with Ctrl+V or picked from a strip of recent ones),
 //! five colours plus a picker for any other (the last few picked stay as swatches), three sizes,
-//! undo and redo, and copy / save / upload / pin / done / cancel. The
+//! undo and redo, and copy / save / upload / pin / done / cancel. Which tools show, in what order,
+//! split into which groups, and their keys come from the settings ([`use_toolbar`]). The
 //! selection keeps handles for resizing (Ctrl moves it instead) and can be dragged while no tool
 //! is active. In canvas mode ([`Editor::canvas`]) there is no selection until one is picked: the
 //! toolbar is docked at the top of the monitor under the mouse (Tab brings it to
@@ -29,6 +30,7 @@ use std::cell::Cell;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use glint_core::config::toolbar::{Slot, ToolKeys};
 use glint_core::geom::rect::Rect;
 use glint_core::geom::snap;
 use glint_media::rect::WinRect;
@@ -64,6 +66,7 @@ pub(crate) use paste::{Recent, load_recents};
 use text::{Style, Typesetter};
 use textbar::{FRAME, FontPicker, Panel};
 use toolbar::{Item, nearest};
+pub(crate) use toolbar::use_toolbar;
 use typing::Typing;
 
 const NOTICE: Duration = Duration::from_millis(1200);
@@ -214,6 +217,9 @@ pub(crate) struct Editor {
     /// The colour picker, while it's open.
     picker: Option<Picker>,
     strength: [f32; TOOLS.len()],
+    /// The toolbar's tools and separators, and the tools' keys (only shown tools' keys work).
+    slots: Vec<Slot>,
+    keys: ToolKeys,
     drag: Option<Drag>,
     typing: Option<Typing>,
     /// A UTF-16 high surrogate waiting for its pair.
@@ -292,8 +298,9 @@ impl Editor {
         // the font list's families are read in the background, before it's opened
         fonts::start();
         let (text_style, text_size) = text::last_style().unwrap_or((Style::default(), 24.0));
-        let mut strength = TOOLS.map(|(t, ..)| t.strength().map_or(0.0, |s| s.presets[1]));
+        let mut strength = TOOLS.map(|t| t.strength().map_or(0.0, |s| s.presets[1]));
         strength[Tool::Text as usize] = text_size;
+        let (slots, keys) = toolbar::layout();
         let mut ed = Editor {
             sel,
             cutout,
@@ -318,6 +325,8 @@ impl Editor {
             customs: palette::recent_customs(),
             picker: None,
             strength,
+            slots,
+            keys,
             drag: None,
             typing: None,
             surrogate: None,
@@ -626,8 +635,21 @@ impl Editor {
     fn tip(&self, item: Item) -> Option<String> {
         match (item, self.current()) {
             (Item::Size(n), Some((_, s, _))) => Some(format!("{}  ·  {}", s.name, s.presets[n])),
+            (Item::Tool(t), _) => Some(toolbar::tool_tip(t, self.keys.0[t as usize])),
             _ => item.tip().map(str::to_owned),
         }
+    }
+
+    /// The shown tool a key (a virtual-key code) picks, by its letter or its digit.
+    fn tool_for_key(&self, vk: u32) -> Option<Tool> {
+        const VK_NUMPAD0: u32 = 0x60;
+        let key = match vk {
+            0x30..=0x39 | 0x41..=0x5A => vk as u8,
+            VK_NUMPAD0..=0x69 => b'0' + (vk - VK_NUMPAD0) as u8,
+            _ => return None,
+        };
+        let t = self.keys.owner(key)?;
+        self.slots.contains(&Slot::Tool(t)).then_some(TOOLS[t])
     }
 
     fn pill_text(&self) -> Option<(Item, String)> {
@@ -1396,8 +1418,8 @@ impl Editor {
                 Some(i) if (i as usize) < PALETTE.len() => self.activate(Item::Color(i as usize)),
                 _ => Event::None,
             },
-            (_, false) => match TOOLS.iter().find(|(_, _, letter, digit)| tool_key(vk, *digit, *letter)) {
-                Some((tool, ..)) => self.activate(Item::Tool(*tool)),
+            (_, false) => match self.tool_for_key(vk) {
+                Some(tool) => self.activate(Item::Tool(tool)),
                 None => Event::None,
             },
             _ => Event::None,
@@ -1479,12 +1501,6 @@ fn snap_resized(r: Rect, edges: Edges, at: (i32, i32), to: &snap::Edges, th: i32
         y1 = y(y1).max(y0 + 1);
     }
     Rect::from_points(x0, y0, x1, y1)
-}
-
-fn tool_key(vk: u32, digit: Option<u32>, letter: u8) -> bool {
-    const VK_0: u32 = 0x30;
-    const VK_NUMPAD0: u32 = 0x60;
-    vk == letter as u32 || digit.is_some_and(|d| vk == VK_0 + d || vk == VK_NUMPAD0 + d)
 }
 
 #[cfg(test)]
@@ -2102,5 +2118,35 @@ mod tests {
             times[n * 9 / 10],
             times[n - 1]
         );
+    }
+
+    #[test]
+    fn the_toolbar_shows_only_the_chosen_tools_and_their_keys() {
+        use glint_core::config::toolbar::KeyKind;
+        let mut ed = editor();
+        let tools = |ed: &Editor| ed.cells.iter().filter_map(|(i, _)| if let Item::Tool(t) = i { Some(*t) } else { None }).collect::<Vec<_>>();
+        assert_eq!(tools(&ed), TOOLS, "today's toolbar by default");
+        assert_eq!(ed.tip(Item::Tool(Tool::Eraser)).as_deref(), Some("smart eraser  ·  9 / E"));
+        assert_eq!(ed.tip(Item::Tool(Tool::Image)).as_deref(), Some("clipboard  ·  V  ·  Ctrl+V pastes"));
+
+        // text and step, a separator, pen; pen takes T (text gets P), the rest are hidden
+        ed.slots = vec![Slot::Tool(7), Slot::Tool(8), Slot::Separator, Slot::Tool(0)];
+        assert_eq!(ed.keys.set(0, KeyKind::Letter, Some(b'T')), Some(7));
+        ed.cells.clear();
+        ed.place_bar();
+        assert_eq!(tools(&ed), [Tool::Text, Tool::Step, Tool::Pen]);
+        let cell = |t: Tool| ed.cells.iter().find(|(i, _)| *i == Item::Tool(t)).unwrap().1;
+        assert_eq!(cell(Tool::Step).x, cell(Tool::Text).right(), "one group");
+        assert_eq!(cell(Tool::Pen).x - cell(Tool::Step).right(), 9, "a separator's gap");
+        assert_eq!(ed.tip(Item::Tool(Tool::Pen)).as_deref(), Some("pen  ·  1 / T"));
+
+        for (vk, tool) in [(0x54, Some(Tool::Pen)), (0x50, Some(Tool::Text)), (0x31, Some(Tool::Pen)), (0x68, Some(Tool::Step))] {
+            ed.key(vk, false, false);
+            assert_eq!(ed.tool, tool, "key {vk:#x}");
+        }
+        for vk in [0x58, 0x36, 0x45, 0x39] {
+            assert!(matches!(ed.key(vk, false, false), Event::None), "a hidden tool's key {vk:#x} does nothing");
+            assert_eq!(ed.tool, Some(Tool::Step));
+        }
     }
 }

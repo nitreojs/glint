@@ -4,6 +4,7 @@
 use std::rc::Rc;
 use std::sync::Arc;
 
+use glint_core::config::toolbar::KeyKind;
 use glint_shell::gfx::Painter;
 use glint_shell::paste::Image;
 
@@ -556,6 +557,19 @@ fn review_shots() {
     ed.hover = None;
     let area = ed.bar.inflate(16);
     shoot(&mut ed, "colour-customs", area);
+
+    // the toolbar as it comes, then laid out in the settings: groups, three tools hidden, eraser on 6
+    let mut ed = new();
+    ed.hover = Some(Item::Tool(Tool::Eraser));
+    let area = ed.bar.inflate(16);
+    shoot(&mut ed, "toolbar-default", Rect { h: area.h + 40, ..area });
+    let (t, s) = (Slot::Tool, Slot::Separator);
+    ed.slots = vec![t(0), t(1), t(2), s, t(3), t(4), s, t(7), t(8), s, t(6), t(10)];
+    ed.keys.set(6, KeyKind::Digit, Some(b'6'));
+    ed.cells.clear();
+    ed.place_bar();
+    let area = ed.bar.inflate(16);
+    shoot(&mut ed, "toolbar-custom", Rect { h: area.h + 40, ..area });
 }
 
 #[test]

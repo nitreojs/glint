@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use glint_core::config::color::contrast;
+use glint_core::config::toolbar;
 use glint_core::geom::rect::Rect;
 use glint_shell::paste::Image;
 use windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F;
@@ -26,20 +27,20 @@ pub(super) enum Tool {
     Image,
 }
 
-/// Tools in toolbar order with their tooltip, letter key and digit key.
-pub(super) const TOOLS: [(Tool, &str, u8, Option<u32>); 12] = [
-    (Tool::Pen, "pen  ·  1 / P", b'P', Some(1)),
-    (Tool::Highlighter, "highlighter  ·  2 / H", b'H', Some(2)),
-    (Tool::Arrow, "arrow  ·  3 / A", b'A', Some(3)),
-    (Tool::Rectangle, "rectangle  ·  4 / R", b'R', Some(4)),
-    (Tool::Blur, "blur  ·  5 / B", b'B', Some(5)),
-    (Tool::Pixelate, "pixelate  ·  6 / X", b'X', Some(6)),
-    (Tool::Eraser, "smart eraser  ·  9 / E", b'E', Some(9)),
-    (Tool::Text, "text  ·  7 / T", b'T', Some(7)),
-    (Tool::Step, "step  ·  8 / N", b'N', Some(8)),
-    (Tool::Cursor, "cursor  ·  0 / M", b'M', Some(0)),
-    (Tool::Grab, "grab a piece of the screen  ·  G", b'G', None),
-    (Tool::Image, "clipboard  ·  V  ·  Ctrl+V pastes", b'V', None),
+/// Every tool, in the order of `Tool` and of the config's names ([`toolbar::TOOLS`]).
+pub(super) const TOOLS: [Tool; toolbar::TOOLS.len()] = [
+    Tool::Pen,
+    Tool::Highlighter,
+    Tool::Arrow,
+    Tool::Rectangle,
+    Tool::Blur,
+    Tool::Pixelate,
+    Tool::Eraser,
+    Tool::Text,
+    Tool::Step,
+    Tool::Cursor,
+    Tool::Grab,
+    Tool::Image,
 ];
 
 #[derive(Clone, Copy)]
@@ -52,6 +53,24 @@ pub(super) struct Strength {
 }
 
 impl Tool {
+    /// What its tooltip calls it, before its keys.
+    pub(super) fn label(self) -> &'static str {
+        match self {
+            Tool::Pen => "pen",
+            Tool::Highlighter => "highlighter",
+            Tool::Arrow => "arrow",
+            Tool::Rectangle => "rectangle",
+            Tool::Blur => "blur",
+            Tool::Pixelate => "pixelate",
+            Tool::Eraser => "smart eraser",
+            Tool::Text => "text",
+            Tool::Step => "step",
+            Tool::Cursor => "cursor",
+            Tool::Grab => "grab a piece of the screen",
+            Tool::Image => "clipboard",
+        }
+    }
+
     pub(super) fn strength(self) -> Option<Strength> {
         let (presets, step, min, max, name) = match self {
             Tool::Pen | Tool::Arrow | Tool::Rectangle => ([2.0, 4.0, 8.0], 1.0, 1.0, 40.0, "width"),
