@@ -10,7 +10,8 @@ screenshots and screen recording for windows, living in your tray<br>
 <picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-screenshots-light.png"><img src="docs/readme/head-screenshots.png" alt="draw on it, type on it, blur the rest" width="880"></picture>
 
 `ctrl+printscreen`, drag over the thing, done<br>
-or don't stop there: pens, arrows, boxes, numbered steps, text in any font you have, blur and pixelate for the stuff nobody should see
+or don't stop there: pens, arrows, boxes, numbered steps, text in any font you have, blur and pixelate for the stuff nobody should see<br>
+the toolbar is yours: hide what you never use, put the rest in your order and groups, give them your keys
 
 <img src="docs/readme/1-screenshot.avif" alt="taking a screenshot and marking it up" width="880">
 
@@ -31,7 +32,7 @@ paste pictures in with `ctrl+v`, pin the result above every window
 it records straight off the gpu with your mic and system sound, and can show your clicks and keys
 
 then trim it, crop it, mute a track, squeeze it under a size<br>
-if nothing has to be re-encoded, it isn't: the cut is lossless and glint says so
+if nothing has to be re-encoded, it isn't: the cut is lossless, starts on the exact frame, and glint says so
 
 <img src="docs/readme/3-record.avif" alt="recording a region and trimming it" width="880">
 
@@ -49,7 +50,7 @@ hover to play, search by app or game or day, drag straight into a chat
 <picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-afterglow-light.png"><img src="docs/readme/head-afterglow.png" alt="it was recording the whole time" width="880"></picture>
 
 **afterglow** is glint's little sibling for games: it keeps the last minute of your screen and sound, and `alt+f10` saves it<br>
-clips open in glint's editor, and in deadlock it even knows when you got a kill (beta)
+clips open in glint's editor, and in deadlock it even knows when you got a kill, and can clip it by itself (beta)
 
 ### get it
 
