@@ -83,6 +83,17 @@ impl SettingsApp {
             };
             hint(ui, text, look.p.t3);
         });
+        // over the live screen there are no pixels to read; draw-first screenshots always freeze
+        let frozen = self.cfg.freeze_screen;
+        let still = |on: bool, text: &'static str| match (on, frozen) {
+            (false, _) => "off",
+            (true, true) => text,
+            (true, false) => "over a still screen only",
+        };
+        let text = still(self.cfg.crosshair, "dashed lines through the cursor");
+        toggle_row(ui, look, "crosshair", &mut self.cfg.crosshair, text);
+        let text = still(self.cfg.magnifier, "zoomed pixels, position and colour");
+        toggle_row(ui, look, "magnifier", &mut self.cfg.magnifier, text);
     }
 
     fn accent_row(&mut self, ui: &mut Ui, look: &Look) {

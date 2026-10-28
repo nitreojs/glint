@@ -67,6 +67,8 @@ impl Section {
                     + n(a.explorer_menu == b.explorer_menu)
                     + n(a.freeze_screen == b.freeze_screen)
                     + n(a.ui_elements == b.ui_elements)
+                    + n(a.crosshair == b.crosshair)
+                    + n(a.magnifier == b.magnifier)
                     + n(a.notify_success == b.notify_success)
                     + n(a.accent_rgb() == b.accent_rgb() && a.accent_custom_rgb() == b.accent_custom_rgb())
             }
@@ -129,6 +131,8 @@ impl Section {
                 cfg.explorer_menu = d.explorer_menu;
                 cfg.freeze_screen = d.freeze_screen;
                 cfg.ui_elements = d.ui_elements;
+                cfg.crosshair = d.crosshair;
+                cfg.magnifier = d.magnifier;
                 cfg.notify_success = d.notify_success;
                 cfg.accent = d.accent;
                 cfg.accent_custom = d.accent_custom;
