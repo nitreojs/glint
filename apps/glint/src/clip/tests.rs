@@ -1,7 +1,7 @@
 use eframe::App;
 use eframe::egui::{Event, PointerButton, Pos2};
 use glint_core::clip::export::Format;
-use glint_core::clip::info::Track;
+use glint_core::clip::info::{Snap, Track};
 use glint_core::clip::index::Samples;
 use glint_core::clip::math::SECOND;
 use glint_core::clip::keys::KeySize;
@@ -22,6 +22,7 @@ fn info(tracks: usize, clicks: Option<Payload>, keys: Option<keys::Payload>) -> 
         tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: names[k % 3].into() }).collect(),
         clicks,
         keys,
+        snap: Some(Snap::Setup),
     }
 }
 
@@ -412,7 +413,7 @@ fn the_preview_smooths_below_200_percent_and_decodes_room_to_shrink() {
     assert!(!crisp(0.5, true) && !crisp(0.5, false) && !crisp(1.5, false) && !crisp(1.999 - 0.01, false));
     assert!(!crisp(2.6, true), "fitting a small video up stays smooth");
     assert!(crisp(2.0, false) && crisp(8.0, false), "zooming in to 200 % and past shows pixels");
-    let info = Info { duration: SECOND, size: (1920, 1080), fps: 60.0, codec: None, tracks: Vec::new(), clicks: None, keys: None };
+    let info = Info { duration: SECOND, size: (1920, 1080), fps: 60.0, codec: None, tracks: Vec::new(), clicks: None, keys: None, snap: None };
     assert_eq!(decode_size(&info, vec2(480.0, 270.0)), (960, 540));
     assert_eq!(decode_size(&info, vec2(1200.0, 675.0)), (1920, 1080));
     assert_eq!(decode_size(&info, vec2(3840.0, 2160.0)), (1920, 1080));
@@ -787,7 +788,7 @@ fn the_panel_says_when_the_export_is_lossless_and_why_not() {
         true
     });
     h.settle();
-    assert!(h.has("starts 1.0 s early, on a keyframe"));
+    assert!(h.has("starts 1.0 s early: its encoding can't be matched"));
 
     h.app.saved.export.height = Some(720);
     h.settle();
@@ -807,6 +808,27 @@ fn the_panel_says_when_the_export_is_lossless_and_why_not() {
     assert!(h.app.edit.crop.is_none() && h.has("30 fps") && !h.has("cropped,"));
     h.click(h.at_last("30 fps"));
     assert!(h.app.saved.export.fps.is_none() && h.has("lossless"));
+}
+
+#[test]
+fn a_cut_off_a_keyframe_stays_lossless_but_for_its_start() {
+    let mut h = Harness::opened(Info { snap: None, ..info(1, None, None) }, Some(index(1)));
+    fn cut(h: &mut Harness, start: i64, end: i64) {
+        let frame = h.app.frame_len();
+        h.app.change(|e| {
+            e.range.set_end(end, 42 * SECOND, frame);
+            e.range.set_start(start, frame);
+            true
+        });
+        h.settle();
+    }
+    cut(&mut h, 36 * SECOND / 10, 20 * SECOND);
+    assert!(h.has("lossless") && h.has("· 0.4 s re-encoded at the cut"), "the next keyframe is at 4 s");
+    assert!(h.starts("starts ").is_none(), "it starts on the frame");
+    cut(&mut h, 4 * SECOND, 20 * SECOND);
+    assert!(h.has("lossless") && h.has("· no re-encode"));
+    cut(&mut h, 9 * SECOND / 2, 11 * SECOND / 2);
+    assert!(h.has("re-encodes ·") && h.has("no keyframe inside the cut") && !h.has("lossless"));
 }
 
 #[test]

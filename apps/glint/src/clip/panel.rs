@@ -8,6 +8,7 @@ use glint_core::clip::clicks::{ClickColor, ClickSize};
 use glint_core::clip::keys::KeySize;
 use glint_core::clip::crop::Crop;
 use glint_core::clip::export::{self, CodecChoice, Compress, Format, Job, MB, Reencode, TARGETS_MB, Video, VideoJob};
+use glint_core::clip::info::Snap;
 use glint_core::clip::math::{GIF_FPS, GIF_WARN_BYTES, SECOND, fmt_short};
 use glint_core::record::Codec;
 use glint_core::record::keys::Position;
@@ -136,6 +137,34 @@ fn undo_label(r: Reencode) -> Option<&'static str> {
     })
 }
 
+/// Why a copy starts on the keyframe before the trim, in a few words.
+fn snap_label(s: Snap) -> &'static str {
+    match s {
+        Snap::Setup => "its encoding can't be matched",
+        Snap::Reordered => "it has b-frames",
+        Snap::Codec => "windows lacks its codec",
+    }
+}
+
+/// `t` in seconds, with a tenth (a hundredth under 0.1 s).
+fn secs(t: i64) -> String {
+    let s = t as f64 / SECOND as f64;
+    if s < 0.1 { format!("{s:.2} s") } else { format!("{s:.1} s") }
+}
+
+/// What a copied picture does at its cuts, for the line under the estimate.
+#[derive(Clone, Copy)]
+struct Cuts {
+    /// How much sooner than the trim start it starts, on a keyframe.
+    early: i64,
+    /// How much is encoded again at the cuts, and at how many.
+    anew: i64,
+    at: usize,
+    /// All of it: no keyframe falls inside the cut.
+    all: bool,
+    snap: Option<Snap>,
+}
+
 impl ClipApp {
     pub(super) fn panel(&mut self, ui: &mut Ui, look: &Look, rect: Rect) {
         let p = look.p;
@@ -170,22 +199,26 @@ impl ClipApp {
             let sub = format!("{} of {} · {}", fmt_short(job.len()), fmt_short(src.info.duration), sound_line(job, tracks));
             painter.text(est.left_top() + vec2(0.0, EST_H), Align2::LEFT_BOTTOM, sub, sans(12.0), p.t3);
             if let Job::Video(v) = job {
-                lines = Some((why, v.early()));
+                let anew = v.cut_anew();
+                let at = v.pieces.iter().filter(|pc| pc.key > pc.lead).count();
+                lines = Some((why, Cuts { early: v.early(), anew, at, all: anew > 0 && anew >= job.len(), snap: export::snap(&src) }));
             }
         }
-        if let Some((why, early)) = lines {
+        if let Some((why, cuts)) = lines {
             let area = Rect::from_min_max(est.left_top() + vec2(0.0, EST_H + WHY_GAP), est.right_bottom());
-            self.why_line(ui, look, area, why, early);
+            self.why_line(ui, look, area, why, cuts);
         }
         self.save_button(ui, look, save_row, gif);
     }
 
     /// Whether the video is copied as recorded or made anew, and why, each reason a click away
-    /// from undone; under a copy, how much earlier than the trim it starts.
-    fn why_line(&mut self, ui: &mut Ui, look: &Look, area: Rect, why: &[Reencode], early: i64) {
+    /// from undone; under a copy, how much of it is encoded again at the cuts, or how much earlier
+    /// than the trim it starts.
+    fn why_line(&mut self, ui: &mut Ui, look: &Look, area: Rect, why: &[Reencode], cuts: Cuts) {
         let p = look.p;
         // a changed line fades in rather than snapping
-        let key = Id::unique("clip-why").with(format!("{why:?}")).with(early > self.frame_len());
+        let state = (cuts.early > self.frame_len(), cuts.anew > 0, cuts.all);
+        let key = Id::unique("clip-why").with(format!("{why:?}")).with(state);
         let since = ui.ctx().data_mut(|d| {
             let at = d.get_temp_mut_or_insert_with(Id::unique("clip-why-at"), || (key, self.now));
             if at.0 != key {
@@ -201,20 +234,41 @@ impl ClipApp {
         painter.set_opacity(fade);
         let line = |k: usize| area.top() + WHY_LINE * (k as f32 + 0.5);
         let font = sans(12.0);
+        if why.is_empty() && cuts.all {
+            let x = painter.text(pos2(area.left(), line(0)), Align2::LEFT_CENTER, "re-encodes ·", font.clone(), p.t3).right() + 5.0;
+            let r = painter.text(pos2(x, line(0)), Align2::LEFT_CENTER, "no keyframe inside the cut", font, p.t2);
+            ui.interact(r, Id::unique("clip-no-key"), Sense::hover())
+                .on_hover_text("only frames from a keyframe on can be copied, and none falls inside this cut");
+            return;
+        }
         if why.is_empty() {
             let (x, y) = (area.left(), line(0));
             let check = vec![pos2(x + 1.0, y), pos2(x + 4.5, y + 3.5), pos2(x + 11.0, y - 3.5)];
             painter.add(Shape::line(check, Stroke::new(1.6, p.acc)));
             let word = painter.text(pos2(x + 17.0, y), Align2::LEFT_CENTER, "lossless", font.clone(), p.t1);
-            painter.text(pos2(word.right() + 5.0, y), Align2::LEFT_CENTER, "· no re-encode", font.clone(), p.t3);
+            let (rest, tip) = if cuts.anew > 0 {
+                let s = if cuts.at > 1 { "s" } else { "" };
+                let rest = format!("· {} re-encoded at the cut{s}", secs(cuts.anew));
+                (rest, "copied as recorded, frame for frame, but for the few from each cut to the next keyframe")
+            } else {
+                ("· no re-encode".to_string(), "the video is copied as recorded, frame for frame")
+            };
+            painter.text(pos2(word.right() + 5.0, y), Align2::LEFT_CENTER, rest, font.clone(), p.t3);
             ui.interact(word.union(Rect::from_center_size(pos2(x + 6.0, y), vec2(12.0, 12.0))), Id::unique("clip-lossless"), Sense::hover())
-                .on_hover_text("the video is copied as recorded, frame for frame");
-            if early > self.frame_len() {
-                let secs = early as f64 / SECOND as f64;
-                let text = format!("starts {secs:.1} s early, on a keyframe");
+                .on_hover_text(tip);
+            if cuts.early > self.frame_len() {
+                let (text, tip) = match cuts.snap.map(snap_label) {
+                    Some(why) => (
+                        format!("starts {} early: {why}", secs(cuts.early)),
+                        format!("{why}, so a copy can't start on any frame: it starts on the keyframe just before your trim start"),
+                    ),
+                    None => (
+                        format!("starts {} early, on a keyframe", secs(cuts.early)),
+                        "a copy can only start on a keyframe: the one just before your trim start".to_string(),
+                    ),
+                };
                 let r = painter.text(pos2(x, line(1)), Align2::LEFT_CENTER, text, font, p.t3);
-                ui.interact(r, Id::unique("clip-early"), Sense::hover())
-                    .on_hover_text("a copy can only start on a keyframe: the one just before your trim start");
+                ui.interact(r, Id::unique("clip-early"), Sense::hover()).on_hover_text(tip);
             }
             return;
         }
