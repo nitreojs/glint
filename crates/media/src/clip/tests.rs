@@ -70,7 +70,7 @@ fn the_fast_path_copies_drops_a_muted_track_and_cuts() {
     let src = fixture("fast", "1280x720", "30", &["-g", "30"]);
     let out = src.with_file_name(format!("glint-clip-fast-out-{}.mp4", std::process::id()));
     let mut edit = Edit::new(3 * SECOND, 2);
-    edit.range = Range { start: SECOND / 2, end: 3 * SECOND };
+    edit.range = Range { start: 0, end: 3 * SECOND };
     assert!(edit.split(3 * SECOND / 2, 1) && edit.split(2 * SECOND, 1));
     assert!(edit.toggle_removed(1));
     edit.lanes[1].muted = true;
@@ -423,6 +423,226 @@ fn an_uneven_recording_scales_down_to_a_steady_lower_rate() {
     assert_eq!(facts[..4], ["h264", "640", "360", "60/1"], "{facts:?}");
 }
 
+// ---- smart cut: need ffmpeg and ffprobe on PATH ---------------------------------------------------
+
+/// Where the smart cut tests keep their (large) files: `GLINT_TEST_DIR`, or the temp folder.
+fn test_dir() -> PathBuf {
+    std::env::var_os("GLINT_TEST_DIR").map_or_else(std::env::temp_dir, PathBuf::from)
+}
+
+/// `secs` of 60 fps 1080p with sound, from ffmpeg's `encoder` with a keyframe every 2 s and no b-frames.
+fn long_fixture(name: &str, encoder: &str, secs: u32) -> PathBuf {
+    let path = test_dir().join(format!("glint-smart-{name}-{}.mp4", std::process::id()));
+    let p = path.to_string_lossy().into_owned();
+    let video = format!("testsrc2=size=1920x1080:rate=60:duration={secs}");
+    let sound = format!("sine=frequency=440:sample_rate=48000:duration={secs}");
+    let args = [
+        "-y", "-v", "error", "-f", "lavfi", "-i", &video, "-f", "lavfi", "-i", &sound, "-map", "0", "-map", "1", "-c:v", encoder,
+        "-g", "120", "-bf", "0", "-b:v", "12M", "-pix_fmt", "yuv420p", "-tag:v", if encoder.starts_with("hevc") { "hvc1" } else { "avc1" },
+        "-c:a", "aac", "-b:a", "192k", &p,
+    ];
+    tool("ffmpeg", &args);
+    path
+}
+
+/// Each frame ffmpeg decodes from `path`: its time in seconds and the md5 of its picture.
+fn frame_md5s(path: &Path) -> Vec<(f64, String)> {
+    let p = path.to_string_lossy();
+    let args = ["-v", "error", "-i", &p, "-map", "0:v:0", "-fps_mode", "passthrough", "-enc_time_base", "demux", "-f", "framemd5", "-"];
+    let out = tool("ffmpeg", &args);
+    let mut tb = 1.0;
+    let mut frames = Vec::new();
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("#tb 0: ") {
+            let (n, d) = rest.split_once('/').unwrap();
+            tb = n.trim().parse::<f64>().unwrap() / d.trim().parse::<f64>().unwrap();
+        } else if !line.starts_with('#') {
+            let cols: Vec<&str> = line.split(',').map(str::trim).collect();
+            frames.push((cols[2].parse::<f64>().unwrap() * tb, cols[5].to_string()));
+        }
+    }
+    frames
+}
+
+const THUMB: usize = 128 * 72;
+
+/// Each frame of `path` as a small grey picture.
+fn thumbs(path: &Path) -> Vec<Vec<u8>> {
+    let p = path.to_string_lossy();
+    let args = ["-v", "error", "-i", &p, "-map", "0:v:0", "-fps_mode", "passthrough", "-vf", "scale=128:72,format=gray", "-f", "rawvideo", "-"];
+    let out = std::process::Command::new("ffmpeg").args(args).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    out.stdout.chunks_exact(THUMB).map(<[u8]>::to_vec).collect()
+}
+
+fn psnr(a: &[u8], b: &[u8]) -> f64 {
+    let mse = a.iter().zip(b).map(|(&x, &y)| (x as f64 - y as f64).powi(2)).sum::<f64>() / a.len() as f64;
+    10.0 * (255.0f64.powi(2) / mse.max(1e-9)).log10()
+}
+
+/// The times of `path`'s video keyframes, in seconds.
+fn key_times(path: &Path) -> Vec<f64> {
+    let p = path.to_string_lossy();
+    let out = tool("ffprobe", &["-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", &p]);
+    let mut keys: Vec<f64> = out.lines().filter(|l| l.contains(",K")).filter_map(|l| l.split(',').next()?.parse().ok()).collect();
+    keys.sort_by(f64::total_cmp);
+    keys
+}
+
+/// Checks a smart cut of `src` from `start` to `end` (seconds) written to `out`: it starts on the frame
+/// shown at `start`, decodes cleanly in ffmpeg and media foundation, its frames from the first copied
+/// keyframe on are the recording's own, those before it look like the ones they stand for (not their
+/// neighbours), and the sound runs as long as the picture. Returns how many frames were encoded anew.
+fn assert_smart_cut(src: &Path, out: &Path, start: f64, end: f64) -> usize {
+    let p = out.to_string_lossy();
+    let args = ["-v", "error", "-i", &p, "-fps_mode", "passthrough", "-enc_time_base", "demux", "-f", "null", "-"];
+    let errors = std::process::Command::new("ffmpeg").args(args).output().unwrap();
+    assert!(errors.status.success() && errors.stderr.is_empty(), "ffmpeg: {}", String::from_utf8_lossy(&errors.stderr));
+
+    let (src_frames, out_frames) = (frame_md5s(src), frame_md5s(out));
+    let s0 = src_frames.iter().rposition(|f| f.0 <= start + 1e-6).unwrap();
+    let e0 = src_frames.iter().position(|f| f.0 >= end - 1e-6).unwrap_or(src_frames.len());
+    assert_eq!(out_frames.len(), e0 - s0, "one frame for each the cut shows");
+    let key = key_times(src).into_iter().find(|&k| k >= src_frames[s0].0 - 1e-6).filter(|&k| k < end);
+    let k0 = key.map_or(e0, |k| src_frames.iter().position(|f| (f.0 - k).abs() < 1e-6).unwrap());
+    for (i, (o, s)) in out_frames.iter().zip(&src_frames[s0..e0]).enumerate() {
+        let at = (s.0 - start).max(0.0);
+        assert!((o.0 - at).abs() < 0.002, "frame {i} at {} for {at}", o.0);
+        if s0 + i >= k0 {
+            assert_eq!(o.1, s.1, "frame {i} (source {}) is copied as it was", s0 + i);
+        }
+    }
+    let (src_thumbs, out_thumbs) = (thumbs(src), thumbs(out));
+    for i in 0..k0 - s0 {
+        let own = psnr(&out_thumbs[i], &src_thumbs[s0 + i]);
+        assert!(own > 30.0, "re-encoded frame {i}: {own:.1} dB");
+        for n in [(s0 + i).wrapping_sub(1), s0 + i + 1].into_iter().filter(|&n| n < src_thumbs.len()) {
+            let other = psnr(&out_thumbs[i], &src_thumbs[n]);
+            assert!(own >= other - 0.5, "re-encoded frame {i} looks like source {n} ({other:.1} dB) more than its own ({own:.1} dB)");
+        }
+    }
+
+    let _com = Com::init();
+    let info = media::probe(out).unwrap();
+    if info.snap != Some(glint_core::clip::info::Snap::Codec) {
+        let reader = media::open(out, None).unwrap();
+        media::video_only(&reader, windows::Win32::Media::MediaFoundation::MFVideoFormat_NV12, info.size).unwrap();
+        let mut decoded = 0;
+        while media::next_video(&reader).unwrap().is_some() {
+            decoded += 1;
+        }
+        assert_eq!(decoded, e0 - s0, "media foundation decodes every frame");
+    }
+
+    let lengths: Vec<f64> = probe(out, "stream=duration").iter().map(|d| d.parse().unwrap()).collect();
+    for d in &lengths[1..] {
+        assert!((d - lengths[0]).abs() < 0.03, "the sound runs as long as the picture: {lengths:?}");
+    }
+    k0 - s0
+}
+
+fn smart_cut(name: &str, encoder: &str) {
+    glint_core::log::set_sink(|m| eprintln!("log: {m}"));
+    let src = long_fixture(name, encoder, 12);
+    let out = |what: &str| src.with_file_name(format!("glint-smart-{name}-{what}-{}.mp4", std::process::id()));
+    let cut = |start: f64, end: f64, settings: &export::Settings, out: &Path| {
+        let mut edit = Edit::new(12 * SECOND, 1);
+        let at = |s: f64| (s * SECOND as f64).round() as i64;
+        edit.range = Range { start: at(start), end: at(end) };
+        let t = std::time::Instant::now();
+        let (job, _) = export_to(&src, &edit, settings, out);
+        (job, t.elapsed())
+    };
+    let plain = export::Settings::default();
+
+    let (snap, reordered) = {
+        let _com = Com::init();
+        (media::probe(&src).unwrap().snap, index::read(&src).unwrap().video.reordered)
+    };
+    if snap == Some(glint_core::clip::info::Snap::Codec) {
+        // windows can't decode or encode it here: the copy starts on the keyframe before, as recorded
+        let (job, _) = cut(1.3, 11.2, &plain, &out("snap"));
+        let Job::Video(v) = &job else { panic!("{job:?}") };
+        assert!(v.video == Video::Copy && v.cut_anew() == 0 && v.pieces[0].lead == 0, "{job:?}");
+        assert_eq!(assert_smart_cut(&src, &out("snap"), 0.0, 11.2), 0);
+        eprintln!("{name}: windows has no codec for it here, so only the copy from the keyframe before was checked");
+        let _ = std::fs::remove_file(out("snap"));
+        let _ = std::fs::remove_file(&src);
+        return;
+    }
+    // off a keyframe: encoded up to the one at 2 s, then copied
+    let (job, smart_time) = cut(1.3, 11.2, &plain, &out("mid"));
+    let Job::Video(v) = &job else { panic!("{job:?}") };
+    assert!(v.video == Video::Copy && v.cut_anew() > 0, "{name}: {snap:?} {reordered} {job:?}");
+    let anew = assert_smart_cut(&src, &out("mid"), 1.3, 11.2);
+    assert_eq!(anew, 42, "1.3 s to 2 s at 60 fps");
+    let (job, full_time) = cut(1.3, 11.2, &export::Settings { kbps: Some(12_000), ..plain }, &out("full"));
+    assert!(matches!(&job, Job::Video(VideoJob { video: Video::Encode { .. }, .. })));
+    eprintln!("{name}: smart cut {smart_time:?}, full re-encode {full_time:?}");
+    assert!(smart_time < full_time / 2, "{name}: smart {smart_time:?} vs full {full_time:?}");
+
+    // on a keyframe: a plain copy, packets and sound as recorded
+    let (job, _) = cut(4.0, 9.0, &plain, &out("key"));
+    let Job::Video(v) = &job else { panic!("{job:?}") };
+    assert!(v.video == Video::Copy && v.cut_anew() == 0 && v.copies(&v.tracks[0]), "{job:?}");
+    assert_eq!(first_packet_size(&out("key"), 0.0), first_packet_size(&src, 4.0));
+    assert_eq!(assert_smart_cut(&src, &out("key"), 4.0, 9.0), 0);
+
+    // inside one keyframe's stretch: all of it encoded
+    cut(4.5, 5.5, &plain, &out("gop"));
+    assert_eq!(assert_smart_cut(&src, &out("gop"), 4.5, 5.5), 60);
+    // from the very start, to the very end
+    cut(0.0, 3.0, &plain, &out("start"));
+    assert_eq!(assert_smart_cut(&src, &out("start"), 0.0, 3.0), 0);
+    cut(10.5, 12.0, &plain, &out("end"));
+    assert_eq!(assert_smart_cut(&src, &out("end"), 10.5, 12.0), 90);
+
+    for what in ["mid", "full", "key", "gop", "start", "end"] {
+        let _ = std::fs::remove_file(out(what));
+    }
+    let _ = std::fs::remove_file(&src);
+}
+
+#[test]
+#[ignore = "needs ffmpeg with nvenc and ffprobe on PATH; writes and deletes big files (GLINT_TEST_DIR)"]
+fn an_h264_smart_cut_starts_on_its_frame_and_copies_the_rest() {
+    smart_cut("h264", "h264_nvenc");
+}
+
+#[test]
+#[ignore = "needs ffmpeg with nvenc, ffprobe and windows' hevc codecs; writes and deletes big files (GLINT_TEST_DIR)"]
+fn an_hevc_smart_cut_starts_on_its_frame_and_copies_the_rest() {
+    smart_cut("hevc", "hevc_nvenc");
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH and a recording in GLINT_SMART_SRC; writes next to GLINT_TEST_DIR"]
+fn a_real_recording_smart_cuts() {
+    let src = PathBuf::from(std::env::var_os("GLINT_SMART_SRC").expect("set GLINT_SMART_SRC to a glint or afterglow recording"));
+    let out = test_dir().join(format!("glint-smart-real-{}.mp4", std::process::id()));
+    let info = {
+        let _com = Com::init();
+        media::probe(&src).unwrap()
+    };
+    assert_eq!(info.snap, None, "the recording can be smart-cut");
+    let (start, end) = (10.3, 30.7);
+    let mut edit = Edit::new(info.duration, info.tracks.len());
+    edit.range = Range { start: (start * SECOND as f64) as i64, end: (end * SECOND as f64) as i64 };
+    let t = std::time::Instant::now();
+    let (job, _) = export_to(&src, &edit, &export::Settings::default(), &out);
+    let smart_time = t.elapsed();
+    let anew = assert_smart_cut(&src, &out, start, end);
+    let full = out.with_extension("full.mp4");
+    let t = std::time::Instant::now();
+    export_to(&src, &edit, &export::Settings { kbps: Some(20_000), ..export::Settings::default() }, &full);
+    let full_time = t.elapsed();
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&full);
+    let Job::Video(v) = &job else { panic!("{job:?}") };
+    eprintln!("{anew} frames ({:.2} s) encoded anew; smart cut {smart_time:?}, full re-encode {full_time:?}", v.cut_anew() as f64 / SECOND as f64);
+    assert!(anew > 0 && smart_time < full_time / 2);
+}
+
 #[test]
 fn windows_always_decodes_h264() {
     let _com = Com::init();
@@ -435,8 +655,8 @@ const UNEVEN_SIZE: u32 = 128;
 
 /// A small h.264 file that only gets a frame when "the screen changed", on a 144 fps clock like a game
 /// recording: frame `i` comes `GAPS[i % 12]` ticks after the one before and shows its number as the grey of its
-/// two halves (ones on the left, twelves on the right).
-fn uneven_file(path: &Path, frames: usize) {
+/// two halves (ones on the left, twelves on the right). With `gop`, a keyframe comes every that many frames.
+fn uneven_file(path: &Path, frames: usize, gop: Option<u32>) {
     use windows::Win32::Media::MediaFoundation::*;
     const GAPS: [i64; 12] = [1, 2, 1, 3, 6, 1, 4, 2, 5, 1, 1, 7];
     let n = UNEVEN_SIZE;
@@ -455,7 +675,13 @@ fn uneven_file(path: &Path, frames: usize) {
         let out = video_type(&MFVideoFormat_H264);
         out.SetUINT32(&MF_MT_AVG_BITRATE, 2_000_000).unwrap();
         let stream = writer.AddStream(&out).unwrap();
-        writer.SetInputMediaType(stream, &video_type(&MFVideoFormat_NV12), None).unwrap();
+        let enc = gop.map(|g| {
+            let a = media::attributes(2).unwrap();
+            a.SetUINT32(&CODECAPI_AVEncMPVGOPSize, g).unwrap();
+            a.SetUINT32(&CODECAPI_AVEncMPVDefaultBPictureCount, 0).unwrap();
+            a
+        });
+        writer.SetInputMediaType(stream, &video_type(&MFVideoFormat_NV12), enc.as_ref()).unwrap();
         writer.BeginWriting().unwrap();
         let at = |k: i64| k * SECOND / 144;
         let mut k = 0;
@@ -524,7 +750,7 @@ fn uneven_frames_keep_their_own_times_and_a_lower_rate_picks_them_by_time() {
     let src = dir.join(format!("glint-clip-vfr-{}.mp4", std::process::id()));
     let same_out = dir.join(format!("glint-clip-vfr-same-{}.mp4", std::process::id()));
     let low_out = dir.join(format!("glint-clip-vfr-30-{}.mp4", std::process::id()));
-    uneven_file(&src, 96);
+    uneven_file(&src, 96, None);
     let info = media::probe(&src).unwrap();
     let index = index::read(&src).unwrap();
     let source = Source { info: &info, index: Some(&index), bytes: std::fs::metadata(&src).unwrap().len(), accent: ACCENT };
@@ -565,5 +791,69 @@ fn uneven_frames_keep_their_own_times_and_a_lower_rate_picks_them_by_time() {
         assert!((t - grid).abs() <= 1, "frame {k} at {t}");
         let newest = decoded.iter().rev().find(|f| f.0 <= grid).unwrap().1;
         assert_eq!(shown, newest, "at {grid} the frame shown should be the newest one by then");
+    }
+}
+
+/// The video samples of `path` as stored, in order, with their times.
+fn packets(path: &Path) -> Vec<(i64, Vec<u8>)> {
+    let reader = media::open(path, None).unwrap();
+    unsafe {
+        reader.SetStreamSelection(media::ALL, false).unwrap();
+        reader.SetStreamSelection(media::VIDEO, true).unwrap();
+    }
+    let mut out = Vec::new();
+    while let media::Got::Sample { ts, sample, .. } = media::read(&reader, media::VIDEO).unwrap() {
+        let bytes = unsafe {
+            let buf = sample.ConvertToContiguousBuffer().unwrap();
+            let (mut p, mut len) = (std::ptr::null_mut(), 0u32);
+            buf.Lock(&mut p, None, Some(&mut len)).unwrap();
+            let v = std::slice::from_raw_parts(p, len as usize).to_vec();
+            buf.Unlock().unwrap();
+            v
+        };
+        out.push((ts, bytes));
+    }
+    out
+}
+
+#[test]
+fn a_smart_cut_starts_on_its_frame_and_copies_the_rest_as_recorded() {
+    use glint_core::clip::nal;
+    let _com = Com::init();
+    let dir = std::env::temp_dir();
+    let src = dir.join(format!("glint-clip-smart-{}.mp4", std::process::id()));
+    let out = dir.join(format!("glint-clip-smart-out-{}.mp4", std::process::id()));
+    uneven_file(&src, 96, Some(32));
+    let info = media::probe(&src).unwrap();
+    let index = index::read(&src).unwrap();
+    let source = Source { info: &info, index: Some(&index), bytes: std::fs::metadata(&src).unwrap().len(), accent: ACCENT };
+    let frames = numbered_frames(&src);
+    let mut edit = Edit::new(info.duration, 0);
+    // just after frame 10 starts, so it's the one shown; copied from the keyframe at 32
+    let (start, end) = (frames[10].0 + 1, frames[80].0);
+    edit.range = Range { start, end };
+    let job = export::plan(&edit, &export::Settings::default(), &source);
+    let (pm, c) = (AtomicU32::new(0), AtomicBool::new(false));
+    let done = trim::export_in_software(&src, &info, &job, &out, &Progress { permille: &pm, cancel: &c });
+    let (cut, src_packets, out_packets) = (numbered_frames(&out), packets(&src), packets(&out));
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+
+    assert_eq!(info.snap, None, "media foundation's own h.264 can be cut on any frame");
+    assert_eq!(index.video.keys, [frames[0].0, frames[32].0, frames[64].0]);
+    let Job::Video(v) = &job else { panic!("{job:?}") };
+    assert_eq!((v.video, v.pieces[0].lead, v.pieces[0].key), (Video::Copy, start, frames[32].0), "{job:?}");
+    assert_eq!(done, Ok(true));
+    assert_eq!(cut.iter().map(|f| f.1).collect::<Vec<_>>(), (10..80).collect::<Vec<_>>(), "it starts on frame 10");
+    for (k, (t, _)) in cut.iter().enumerate().skip(1) {
+        let want = frames[10 + k].0 - start;
+        assert!((t - want).abs() <= SECOND / 1000, "frame {} at {t}, recorded {want} after the cut", 10 + k);
+    }
+    let copied = &out_packets[22..];
+    assert_eq!(copied.len(), 80 - 32);
+    // the mp4 sink keeps parameter sets out of the samples, so a keyframe is compared by its other units
+    let picture = |p: &[u8]| nal::units(p).into_iter().filter(|u| !matches!(u[0] & 0x1F, 7 | 8)).map(<[u8]>::to_vec).collect::<Vec<_>>();
+    for (k, (o, s)) in copied.iter().zip(&src_packets[32..80]).enumerate() {
+        assert!(picture(&o.1) == picture(&s.1), "packet {} is copied as recorded", 32 + k);
     }
 }

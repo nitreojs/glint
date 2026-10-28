@@ -7,5 +7,6 @@ pub mod index;
 pub mod info;
 pub mod keys;
 pub mod math;
+pub mod nal;
 pub mod pcm;
 pub mod viewer;

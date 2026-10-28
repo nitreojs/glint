@@ -2,7 +2,6 @@ use std::path::Path;
 
 use glint_core::clip::info::{Info, Track};
 use glint_core::log::log;
-use glint_core::record::Codec;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -229,11 +228,8 @@ pub fn probe(path: &Path) -> Result<Info, String> {
             Ok((n, d)) if n > 0 && d > 0 => n as f64 / d as f64,
             _ => 30.0,
         };
-        let codec = match native.GetGUID(&MF_MT_SUBTYPE) {
-            Ok(g) if g == MFVideoFormat_H264 => Some(Codec::H264),
-            Ok(g) if g == MFVideoFormat_HEVC => Some(Codec::Hevc),
-            _ => None,
-        };
+        let codec = super::smart::codec(&native);
+        let snap = super::smart::snap(&reader, VIDEO, &native);
         let duration = length(&reader)?;
         let tracks = tracks(path, &reader);
         let clicks = glint_core::record::clicks::load(path).unwrap_or_else(|e| {
@@ -244,7 +240,7 @@ pub fn probe(path: &Path) -> Result<Info, String> {
             log(&format!("clip: the keystrokes in {} can't be read: {e}", path.display()));
             None
         });
-        Ok(Info { duration, size, fps, codec, tracks, clicks, keys })
+        Ok(Info { duration, size, fps, codec, tracks, clicks, keys, snap })
     }
 }
 

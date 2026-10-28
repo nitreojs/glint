@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use super::clicks::ClickLook;
 use super::crop::Crop;
 use super::edit::{Edit, FULL_VOLUME};
-use super::index::Index;
-use super::info::Info;
+use super::index::{Index, Samples};
+use super::info::{Info, Snap};
 use super::keys::KeyLook;
 use super::math::{Range, SECOND, gif_estimate, gif_frames};
 use crate::record::Codec;
@@ -33,10 +33,11 @@ const HEVC_SHARE: f64 = 0.7;
 /// Other sizes and frame rates scale like [`bitrate_scaled`].
 const CEILING_BPS: f64 = 19_000_000.0;
 /// The qp a re-encode holds when nothing asks for a size or a bitrate and the source's rate is under
-/// [`CEILING_BPS`]: a notch above "compress · light", so it looks like the source. Carrying a low
-/// average bitrate over instead starves the frames after a keyframe (a still screen recording at
-/// 1.3 Mbps opened blocky for 0.1 s: SSIM 0.94, at this qp 0.999, and the file came out smaller).
-const KEEP_QP: u32 = 18;
+/// [`CEILING_BPS`], and a smart cut's new start: a notch above "compress · light", so it looks like
+/// the source. Carrying a low average bitrate over instead starves the frames after a keyframe (a
+/// still screen recording at 1.3 Mbps opened blocky for 0.1 s: SSIM 0.94, at this qp 0.999, and the
+/// file came out smaller; a smart cut's start at 1.5× its stretch's rate measured 30 dB PSNR).
+pub const KEEP_QP: u32 = 18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -217,12 +218,35 @@ impl Source<'_> {
     }
 }
 
-/// One kept range; the output starts at `lead`, the keyframe a copied piece has to begin on.
+/// Why a copy of `src` can't start on any frame and starts on the keyframe before instead; none when
+/// it can (a smart cut).
+pub fn snap(src: &Source) -> Option<Snap> {
+    src.info.snap.or(src.index.is_some_and(|i| i.video.reordered).then_some(Snap::Reordered))
+}
+
+/// One kept range copied from the frame shown at its start: when that isn't a keyframe, the
+/// frames up to the next one are encoded again (`key`) and the rest copied (a smart cut).
+fn smart_piece(video: Option<&Samples>, r: Range) -> Piece {
+    let Some(video) = video else { return Piece { lead: r.start, start: r.start, end: r.end, key: r.start } };
+    let shown = video.shown_at(r.start);
+    if shown.is_some_and(|t| video.keys.binary_search(&t).is_ok()) {
+        let lead = shown.unwrap_or(r.start);
+        return Piece { lead, start: r.start, end: r.end, key: lead };
+    }
+    let next = video.keys[video.keys.partition_point(|&k| k <= r.start)..].first().copied();
+    Piece { lead: r.start, start: r.start, end: r.end, key: next.unwrap_or(r.end).min(r.end) }
+}
+
+/// One kept range; the output starts at `lead`. A copied piece starts on a keyframe: `lead` itself
+/// (at or before `start`), or `key` after it when the frames from `lead` up to there are encoded
+/// again (a smart cut; `key` is `end` when no keyframe comes before it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Piece {
     pub lead: i64,
     pub start: i64,
     pub end: i64,
+    /// Where packets start being copied; `lead` when they all are, and for an encoded video.
+    pub key: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -309,15 +333,21 @@ impl VideoJob {
     }
 
     /// `t`'s packets go into the file as they are: a recorded track, not mixed with others, at its own
-    /// volume. Anything else is decoded and encoded again.
+    /// volume, under a picture that isn't cut anew at its starts (a smart cut cuts the sound to the
+    /// sample instead). Anything else is decoded and encoded again.
     pub fn copies(&self, t: &Sound) -> bool {
-        t.source.is_some() && !self.combine && t.volume == FULL_VOLUME
+        t.source.is_some() && !self.combine && t.volume == FULL_VOLUME && self.cut_anew() == 0
     }
 
     /// How much sooner than the trim start a copied file starts: its first piece begins on the
     /// keyframe before. 0 for an encoded one, which starts on the frame.
     pub fn early(&self) -> i64 {
         self.pieces.first().map_or(0, |p| p.start - p.lead)
+    }
+
+    /// How much of a copied picture is encoded again so its pieces start on their own frames.
+    pub fn cut_anew(&self) -> i64 {
+        self.pieces.iter().map(|p| p.key - p.lead).sum()
     }
 }
 
@@ -488,7 +518,16 @@ pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>)
     .flatten()
     .collect();
     if why.is_empty() {
-        let pieces = kept.iter().map(|r| Piece { lead: lead(src.keys(), r.start), start: r.start, end: r.end }).collect();
+        let video = src.index.map(|i| &i.video);
+        let pieces = match snap(src) {
+            None => kept.iter().map(|&r| smart_piece(video, r)).collect(),
+            Some(_) => (kept.iter())
+                .map(|r| {
+                    let lead = lead(src.keys(), r.start);
+                    Piece { lead, start: r.start, end: r.end, key: lead }
+                })
+                .collect(),
+        };
         let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target, burn: None, keys: None };
         match s.target_mb {
             Some(mb) if estimate(&Job::Video(copy.clone()), src) > mb as u64 * MB => {}
@@ -497,7 +536,7 @@ pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>)
     }
     let why = if why.is_empty() { vec![Reencode::Size(s.target_mb.unwrap_or_default())] } else { why };
     let out = scaled(base, height);
-    let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end }).collect();
+    let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end, key: r.start }).collect();
     let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn, keys };
     // with a qp, `bitrate` is only what the estimate expects
     let (bitrate, qp) = match (kbps, target, compress) {
@@ -595,6 +634,7 @@ mod tests {
             tracks: (0..tracks).map(|k| Track { stream: k as u32 + 1, name: format!("t{k}") }).collect(),
             clicks: None,
             keys: None,
+            snap: Some(Snap::Setup),
         }
     }
 
@@ -736,7 +776,7 @@ mod tests {
         let plain = Settings::default();
         let Job::Video(v) = plan(&e, &plain, &source) else { panic!() };
         assert_eq!(v.video, Video::Copy);
-        assert_eq!(v.pieces, [Piece { lead: 2 * S, start: 3 * S, end: 15 * S }]);
+        assert_eq!(v.pieces, [Piece { lead: 2 * S, start: 3 * S, end: 15 * S, key: 2 * S }]);
         assert!(!v.whole(&info));
         let Job::Video(v) = plan(&Edit::new(20 * S, 2), &plain, &source) else { panic!() };
         assert!(v.whole(&info));
@@ -758,6 +798,60 @@ mod tests {
         let gif = Settings { format: Format::Gif, height: Some(360), ..plain };
         let Job::Gif(g) = plan(&cropped, &gif, &source) else { panic!() };
         assert_eq!((g.size, g.fps, g.kept.len()), ((332, 360), 15, 1));
+    }
+
+    #[test]
+    fn smart_cuts_start_on_the_frame_and_copy_from_the_next_keyframe() {
+        let info = Info { snap: None, ..info(1) };
+        let idx = index(1);
+        let source = src(&info, Some(&idx));
+        let plain = Settings::default();
+        let cut = |start: i64, end: i64| {
+            let mut e = Edit::new(20 * S, 1);
+            e.range = Range { start, end };
+            let Job::Video(v) = plan(&e, &plain, &source) else { panic!() };
+            assert_eq!(v.video, Video::Copy);
+            v
+        };
+        let v = cut(3 * S, 15 * S);
+        assert_eq!(v.pieces, [Piece { lead: 3 * S, start: 3 * S, end: 15 * S, key: 4 * S }]);
+        assert_eq!((v.cut_anew(), v.early()), (S, 0));
+        assert!(!v.copies(&v.tracks[0]), "the sound is cut to the sample with the picture");
+        assert_eq!(estimate(&Job::Video(v), &source), muxed(12 * 30 * 50_000 + 12 * AAC_BYTES_PER_SECOND));
+
+        let on_key = cut(4 * S, 15 * S);
+        assert_eq!(on_key.pieces[0], Piece { lead: 4 * S, start: 4 * S, end: 15 * S, key: 4 * S }, "nothing to encode");
+        assert!(on_key.copies(&on_key.tracks[0]));
+        let in_key_frame = cut(4 * S + S / 60, 15 * S);
+        assert_eq!(in_key_frame.pieces[0].lead, 4 * S, "the keyframe is the frame shown there");
+        assert_eq!(in_key_frame.cut_anew(), 0);
+        let one_gop = cut(4 * S + S / 2, 5 * S + S / 2);
+        assert_eq!(one_gop.pieces[0].key, 5 * S + S / 2, "no keyframe inside: all of it is encoded");
+        assert_eq!(one_gop.cut_anew(), S);
+        let tail = cut(19 * S + S / 2, 20 * S);
+        assert_eq!((tail.pieces[0].key, tail.cut_anew()), (20 * S, S / 2));
+        assert!(cut(0, 20 * S).whole(&info));
+
+        let mut two = Edit::new(20 * S, 1);
+        assert!(two.split(7 * S, 1) && two.split(9 * S, 1) && two.toggle_removed(1));
+        let Job::Video(v) = plan(&two, &plain, &source) else { panic!() };
+        assert_eq!(v.pieces.iter().map(|p| (p.lead, p.key)).collect::<Vec<_>>(), [(0, 0), (9 * S, 10 * S)]);
+    }
+
+    #[test]
+    fn copies_that_cant_be_cut_anew_start_on_the_keyframe_before() {
+        let mut idx = index(1);
+        let e = edit(1);
+        let plain = Settings::default();
+        for (why, reordered) in [(Some(Snap::Codec), false), (Some(Snap::Setup), false), (None, true)] {
+            idx.video.reordered = reordered;
+            let info = Info { snap: why, ..info(1) };
+            let source = src(&info, Some(&idx));
+            assert_eq!(snap(&source), why.or(Some(Snap::Reordered)));
+            let Job::Video(v) = plan(&e, &plain, &source) else { panic!() };
+            assert_eq!(v.pieces, [Piece { lead: 2 * S, start: 3 * S, end: 15 * S, key: 2 * S }]);
+            assert!(v.copies(&v.tracks[0]));
+        }
     }
 
     #[test]

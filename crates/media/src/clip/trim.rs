@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use glint_core::clip::crop::Crop;
 use glint_core::clip::edit::gain;
-use glint_core::clip::export::{AAC_BYTES_PER_SECOND, Job, Video, VideoJob};
+use glint_core::clip::export::{AAC_BYTES_PER_SECOND, Job, Piece, Video, VideoJob};
 use glint_core::clip::info::Info;
 use glint_core::clip::math::{Range, SECOND};
 use glint_core::clip::pcm::{self, Lane};
@@ -16,6 +16,7 @@ use super::burn::{Burner, KeyBurner};
 use super::gif;
 use super::media::{self, ANY, Got, Gpu, attributes, pack};
 use super::process::Processor;
+use super::smart;
 use crate::record::Ctx;
 
 pub struct Progress<'a> {
@@ -83,7 +84,9 @@ fn passes(src: &Path, info: &Info, job: &Job, out: &Path, effort: u32, p: &Progr
 }
 
 fn video(src: &Path, info: &Info, job: &VideoJob, out: &Path, effort: u32, p: &Progress, gpu: bool) -> Result<bool, String> {
-    let res = if job.video == Video::Copy || !gpu {
+    let res = if job.video == Video::Copy {
+        copy(src, info, job, out, effort, p, gpu)
+    } else if !gpu {
         run(src, info, job, out, effort, p, None)
     } else {
         match Gpu::new() {
@@ -110,6 +113,24 @@ fn video(src: &Path, info: &Info, job: &VideoJob, out: &Path, effort: u32, p: &P
         let _ = std::fs::remove_file(out);
     }
     res
+}
+
+/// A copy of the video, cut anew at its pieces' starts where they ask for it (a smart cut); when
+/// that can't be done, one whose pieces start on the keyframes before instead.
+fn copy(src: &Path, info: &Info, job: &VideoJob, out: &Path, effort: u32, p: &Progress, gpu: bool) -> Result<bool, String> {
+    if job.cut_anew() == 0 {
+        return run(src, info, job, out, effort, p, None);
+    }
+    let gpu = gpu.then(Gpu::new).and_then(|g| g.map_err(|e| log(&format!("no gpu for the smart cut: {e}"))).ok());
+    match run(src, info, job, out, effort, p, gpu.as_ref()) {
+        Err(e) if !p.cancelled() => {
+            log(&format!("clip: the smart cut failed, starting on keyframes instead: {e}"));
+            let _ = std::fs::remove_file(out);
+            let pieces = job.pieces.iter().map(|pc| Piece { lead: pc.start, key: pc.start, ..*pc }).collect();
+            run(src, info, &VideoJob { pieces, ..job.clone() }, out, effort, p, None)
+        }
+        r => r,
+    }
 }
 
 struct Held {
@@ -288,6 +309,8 @@ fn run(
     p: &Progress,
     gpu: Option<&Gpu>,
 ) -> Result<bool, String> {
+    // a copy reads and writes packets; its gpu only encodes the starts of a smart cut
+    let (cut_gpu, gpu) = if job.video == Video::Copy { (gpu, None) } else { (None, gpu) };
     unsafe {
         let reader = media::open(src, gpu)?;
         let streams = media::streams(&reader);
@@ -309,11 +332,16 @@ fn run(
         let mut burner = None;
         let mut key_burner = None;
         let mut ticks = 0;
+        // the recording as a smart cut matches it, when one cuts anew
+        let recorded = match job.video {
+            Video::Copy if job.cut_anew() > 0 => Some(smart::Recorded::of(&reader, video, &streams[video as usize].2)?),
+            _ => None,
+        };
         targets[video as usize] = Some(match job.video {
             Video::Copy => {
-                let native = &streams[video as usize].2;
-                let w = writer.AddStream(native).ctx("can't copy the video")?;
-                writer.SetInputMediaType(w, native, None).ctx("can't copy the video")?;
+                let native = smart::copy_type(&reader, video, &streams[video as usize].2)?;
+                let w = writer.AddStream(&native).ctx("can't copy the video")?;
+                writer.SetInputMediaType(w, &native, None).ctx("can't copy the video")?;
                 Target::Remux(w)
             }
             Video::Encode { crop, size, bitrate, fps, codec, qp } => {
@@ -405,8 +433,28 @@ fn run(
         let mut copied_to = vec![0i64; streams.len()];
         let mut any_video = false;
         let mut base = 0;
+        let codec = recorded.as_ref().map(|r| r.codec);
+        // copied video samples so far, and those carrying hidden parameter sets
+        let mut remuxed = 0u32;
+        let mut hidden_in = Vec::new();
+        // the parameter sets a decoder of the copy holds by now: the recording's, or a new start's
+        let own_sets = recorded.as_ref().map_or_else(Vec::new, |r| r.sets.clone());
+        let mut sets = own_sets.clone();
         for piece in &job.pieces {
+            // a smart-cut piece: its start, encoded anew, and where its packets start being copied
+            let mut head = Vec::new();
+            let mut head_sets = Vec::new();
+            let mut copy_from = None;
             let lead = match job.video {
+                Video::Copy if piece.key > piece.lead => {
+                    let rec = recorded.as_ref().ok_or("no recording to match")?;
+                    let (key, bps) = smart::next_key(&reader, video, piece.lead, piece.end)?;
+                    if key > piece.lead {
+                        (head, head_sets) = smart::head(src, rec, info, (piece.lead, key), bps, cut_gpu, p)?;
+                    }
+                    copy_from = Some(key);
+                    piece.lead
+                }
                 Video::Copy => match keyframe(&reader, video, piece.start)? {
                     Some(k) if k < piece.end => k,
                     _ => continue,
@@ -425,6 +473,23 @@ fn run(
             let mut pending: Option<IMFSample> = None;
             let mut tick = 0i64;
             let out_ts = |ts: i64| ts - seg.start + base;
+            if let (Some(Target::Remux(w)), Some(codec)) = (targets[video as usize], codec) {
+                for (k, f) in head.iter().enumerate() {
+                    let sample = if k == 0 && head_sets != sets {
+                        hidden_in.push(remuxed);
+                        sets = head_sets.clone();
+                        smart::with_sets(codec, &f.sample, &sets)?
+                    } else {
+                        f.sample.clone()
+                    };
+                    write(w, &sample, out_ts(f.ts), Some(f.dur))?;
+                    remuxed += 1;
+                    started = true;
+                }
+                p.set(out_ts(copy_from.unwrap_or(lead)), total);
+            }
+            let copy_from = copy_from.unwrap_or(seg.start);
+            let mut after_head = !head.is_empty();
             while !active.is_empty() {
                 if p.cancelled() {
                     return Ok(false);
@@ -482,12 +547,29 @@ fn run(
                         mix.flush(&writer, ready.min(end))?;
                     }
                     Target::Remux(w) => {
-                        if !done && ts >= seg.start {
+                        if !done && ts >= copy_from {
+                            let sample = match codec {
+                                Some(codec) if after_head || sets != own_sets => {
+                                    after_head = false;
+                                    if !smart::starts_anew(codec, &sample)? {
+                                        return Err("the keyframe after the cut isn't an idr picture".into());
+                                    }
+                                    if sets == own_sets {
+                                        sample
+                                    } else {
+                                        hidden_in.push(remuxed);
+                                        sets = own_sets.clone();
+                                        smart::with_sets(codec, &sample, &sets)?
+                                    }
+                                }
+                                _ => sample,
+                            };
                             if let Ok(dts) = sample.GetUINT64(&MFSampleExtension_DecodeTimestamp) {
                                 let shifted = dts as i64 - seg.start + base;
                                 sample.SetUINT64(&MFSampleExtension_DecodeTimestamp, shifted as u64).ctx("dts")?;
                             }
                             write(w, &sample, out_ts(ts), None)?;
+                            remuxed += 1;
                             started = true;
                             p.set(out_ts(ts), total);
                         }
@@ -546,6 +628,9 @@ fn run(
             return Err("the selection has no frames".into());
         }
         writer.Finalize().ctx("IMFSinkWriter::Finalize")?;
+        if let (false, Some(codec)) = (hidden_in.is_empty(), codec) {
+            glint_core::clip::index::reveal_sets(out, codec, &hidden_in)?;
+        }
         drop(processor);
         if !names.is_empty()
             && let Err(e) = glint_core::record::mp4::name_tracks(out, &names)
