@@ -8,8 +8,8 @@ use windows::Win32::Graphics::Gdi::{BitBlt, SRCCOPY};
 use super::{Purpose, RING};
 use glint_shell::gfx::{Canvas, Dib, Painter, rgba};
 
-const PILL_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.86);
-const PILL_TEXT: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
+pub(super) const PILL_BG: D2D1_COLOR_F = rgba(16, 16, 20, 0.86);
+pub(super) const PILL_TEXT: D2D1_COLOR_F = rgba(255, 255, 255, 0.96);
 
 /// A pre-rendered pill (label or hint) and where it sits, in client coordinates.
 pub(super) struct Pill {

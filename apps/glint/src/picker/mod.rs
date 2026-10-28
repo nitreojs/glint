@@ -5,6 +5,7 @@
 //! picks it; Ctrl+click collects several into one pick; dragging selects a region, across
 //! monitors if need be (the selection shows undimmed, its moving corner snaps to visible edges
 //! nearby unless Alt is held, Ctrl moves the whole box); Ctrl+A selects every monitor at once.
+//! Over a still screen a crosshair and a magnifier can help line things up ([`aids`]).
 //! Esc / right-click cancels. For screenshots the picked region then opens in the markup editor
 //! ([`crate::shot::editor`]) on the same frozen screen. In draw-first mode the editor is up from
 //! the start, toolbar and all, and while its region tool is on (the default) the picker picks over
@@ -51,6 +52,9 @@ use crate::platform::windows::{client_rect, visible_windows};
 use crate::shot::Shot;
 use crate::shot::editor::{self, Editor};
 
+mod aids;
+#[cfg(test)]
+mod checks;
 mod frozen;
 mod glide;
 mod live;
@@ -61,6 +65,20 @@ use frozen::Frozen;
 use glide::{FLIP_MS, GLIDE_MS, Glide, Ticker, WM_GLIDE};
 use live::Live;
 use pill::{Pill, hint_due, hint_rects, hint_text, label_spot, pill_size, render_pill};
+
+pub(crate) use aids::Aids;
+
+/// How the picker works, from the settings.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Options {
+    /// A still image of the screen, else the live screen dimmed.
+    pub freeze: bool,
+    /// When hovering highlights UI elements inside windows instead of the windows.
+    pub elements: UiElements,
+    /// A screenshot keeps the cursor, as a mark the editor can move or delete.
+    pub with_cursor: bool,
+    pub aids: Aids,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct Selection {
@@ -195,6 +213,11 @@ struct State {
     arrow: Option<Arc<CursorImage>>,
     /// The clipboard strip's pictures as the loader finds them, and whether it's done.
     recents: Option<Recents>,
+    /// Which selection aids are on, their sizes and pieces (made only when one is on), and where
+    /// they show (nowhere when off).
+    aids: Aids,
+    aid_kit: Option<aids::Kit>,
+    aids_shown: aids::Shown,
 }
 
 /// The clipboard strip's pictures as the loader finds them, and whether it's done.
@@ -240,18 +263,9 @@ fn held(vk: u16) -> bool {
     unsafe { GetKeyState(vk as i32) < 0 }
 }
 
-/// Fades the picker in. `msg` is posted to `owner` with the result. `elements` says when hovering
-/// highlights UI elements inside windows instead of the windows. `with_cursor`: a screenshot keeps
-/// the cursor, as a mark the editor can move or delete.
-pub(crate) fn open(
-    owner: HWND,
-    msg: u32,
-    outputs: Vec<Monitor>,
-    purpose: Purpose,
-    freeze: bool,
-    elements: UiElements,
-    with_cursor: bool,
-) -> Result<HWND, String> {
+/// Fades the picker in. `msg` is posted to `owner` with the result.
+pub(crate) fn open(owner: HWND, msg: u32, outputs: Vec<Monitor>, purpose: Purpose, opts: Options) -> Result<HWND, String> {
+    let Options { freeze, elements, with_cursor, aids } = opts;
     let draw_first = matches!(purpose, Purpose::Shot { draw_first: true });
     let shot = matches!(purpose, Purpose::Shot { .. });
     // before the overlay's own cursor takes over
@@ -270,6 +284,10 @@ pub(crate) fn open(
         let clients: Vec<Option<Rect>> = windows.iter().map(|w| client_rect(w.0)).collect();
         let painter = Painter::new()?;
         let font = painter.font(13.0)?;
+        let aid_kit = aids.any().then(|| aids::Kit::new(&painter, &font, (area.w, area.h))).transpose().unwrap_or_else(|e| {
+            log(&format!("selection aids failed: {e}"));
+            None
+        });
         let hint = hint_text(purpose, outputs.len(), elements);
         let hints = if hint_due() { hint_rects(&painter, &font, &hint, &outputs, (area.x, area.y)) } else { Vec::new() };
         let screen = if freeze {
@@ -373,6 +391,9 @@ pub(crate) fn open(
                 shot_cursor: shot_cursor.map(|(img, at)| (Arc::new(img), (at.0 - area.x, at.1 - area.y))),
                 arrow,
                 recents: None,
+                aids,
+                aid_kit,
+                aids_shown: aids::Shown::default(),
             };
             if shot {
                 // the font list's families are read before it's ever opened, and it repaints as
@@ -400,6 +421,7 @@ pub(crate) fn open(
                 st.track(st.cursor);
                 st.update_selection(st.cursor);
             }
+            st.sync_aids();
             *s.borrow_mut() = Some(st);
         });
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -1193,7 +1215,41 @@ impl State {
         self.region && self.edit.as_ref().is_some_and(|e| e.bar.contains(p.0, p.1))
     }
 
+    /// Where the selection aids go now: at the cursor, or while dragging at the selection's moving
+    /// corner (as snapped and fitted), clear of the selection, the magnifier on the side the drag
+    /// heads for. None while the editor is up, over its toolbar, or over the live screen.
+    fn aids_layout(&self) -> aids::Shown {
+        let on_chrome = || {
+            self.edit.as_ref().is_some_and(|e| e.dragging() || e.chrome().iter().any(|c| c.contains(self.cursor.0, self.cursor.1)))
+        };
+        let picking = self.edit.is_none() || self.region;
+        let Some(kit) = self.aid_kit.as_ref().filter(|_| picking && self.pick_frozen().is_some() && !(self.region && on_chrome())) else {
+            return aids::Shown::default();
+        };
+        let drag = self.drag_start.filter(|_| self.dragging).zip(self.target);
+        let (at, clear, toward) = match drag {
+            Some((start, t)) => {
+                let c = self.corner(self.cursor);
+                let (left, up) = (c.0 < start.0, c.1 < start.1);
+                let at = (if left { t.x } else { t.right() - 1 }, if up { t.y } else { t.bottom() - 1 });
+                (at, Some(t.inflate(RING)), (left, up))
+            }
+            None => (self.cursor, None, (false, false)),
+        };
+        let screen = Rect { x: 0, y: 0, w: self.size.0, h: self.size.1 };
+        aids::layout(self.aids, at, clear, toward, screen, &self.monitors(), &kit.m)
+    }
+
+    /// Every message but WM_PAINT can move what the aids show.
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Action {
+        let action = self.handle_msg(msg, wp, lp);
+        if msg != WM_PAINT && !self.done {
+            self.sync_aids();
+        }
+        action
+    }
+
+    fn handle_msg(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Action {
         if msg == WM_PAINT {
             unsafe { self.paint() };
             return Action::Handled;

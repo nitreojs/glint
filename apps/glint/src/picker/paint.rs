@@ -7,6 +7,7 @@ use glint_media::rect::WinRect;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Gdi::*;
 
+use super::aids;
 use super::frozen::Frozen;
 use super::pill::Pill;
 use super::{RING, Screen, State, rgn};
@@ -31,28 +32,28 @@ impl State {
             return self.schedule_live_sync();
         }
         unsafe {
-            let damage = CreateRectRgn(0, 0, 0, 0);
+            let damage = selection_damage((&old.0, old.1), (&self.lit, self.sel), &self.monitors());
             let add = |r: HRGN| {
                 CombineRgn(Some(damage), Some(damage), Some(r), RGN_OR);
                 let _ = DeleteObject(r.into());
             };
-            // Pixels that switch between dimmed and bright, and every ring.
-            let monitors = self.monitors();
-            let [a, a_white, a_black] = regions(&old.0, old.1, &monitors);
-            let [b, b_white, b_black] = regions(&self.lit, self.sel, &monitors);
-            add(combine(a, b, RGN_XOR));
-            for r in [a, b] {
-                let _ = DeleteObject(r.into());
-            }
-            for r in [a_white, a_black, b_white, b_black] {
-                add(r);
-            }
             for l in labels {
                 add(rgn(l));
             }
             let _ = InvalidateRgn(self.hwnd, Some(damage), false);
             let _ = DeleteObject(damage.into());
         }
+    }
+
+    /// Moves the selection aids to where they go now, invalidating the pixels they leave and take.
+    pub(super) fn sync_aids(&mut self) {
+        let now = self.aids_layout();
+        if now == self.aids_shown {
+            return;
+        }
+        let old = std::mem::replace(&mut self.aids_shown, now);
+        let gone: Vec<Rect> = old.rects().chain(self.aids_shown.rects()).collect();
+        self.invalidate(&gone);
     }
 
     pub(super) fn schedule_live_sync(&self) {
@@ -137,6 +138,7 @@ impl State {
                     let brushes = [self.white, self.black];
                     let mut holes = chrome.clone();
                     holes.extend(label.map(|l| l.rect));
+                    holes.extend(self.aids_shown.rects());
                     paint_pick(hdc, rp, (0, 0), f, &self.lit, self.sel, &holes, &monitors, brushes);
                     if let Some(ed) = &self.edit {
                         for &c in &chrome {
@@ -156,6 +158,12 @@ impl State {
                             let _ = BitBlt(hdc, c.x, c.y, c.w, c.h, Some(back.dc), 0, 0, SRCCOPY);
                         }
                     }
+                    let base = |dc: HDC, r: Rect, org: (i32, i32)| {
+                        paint_pick(dc, r, org, f, &self.lit, self.sel, &[], &monitors, brushes)
+                    };
+                    if let Some(kit) = &self.aid_kit {
+                        aids::paint(hdc, rp, &self.aids_shown, kit, &f.bright, &base, label, &chrome);
+                    }
                 }
             }
             if let Some(l) = label
@@ -163,7 +171,7 @@ impl State {
             {
                 let r = l.rect;
                 let saved = SaveDC(hdc);
-                for c in &chrome {
+                for c in chrome.iter().chain(self.aids_shown.loupe().as_ref()) {
                     ExcludeClipRect(hdc, c.x, c.y, c.right(), c.bottom());
                 }
                 let _ = BitBlt(hdc, r.x, r.y, r.w, r.h, Some(dib.dc), 0, 0, SRCCOPY);
@@ -176,6 +184,23 @@ impl State {
             super::schedule_tick(self.hwnd, &self.tick_due, ed);
         }
     }
+}
+
+/// The pixels that change when the lit rects and selection go from `old` to `new`: those
+/// switching between dimmed and bright, and every ring.
+pub(super) fn selection_damage(old: (&[Rect], Option<Rect>), new: (&[Rect], Option<Rect>), monitors: &[Rect]) -> HRGN {
+    let [a, a_white, a_black] = regions(old.0, old.1, monitors);
+    let [b, b_white, b_black] = regions(new.0, new.1, monitors);
+    let damage = combine(a, b, RGN_XOR);
+    unsafe {
+        for r in [a_white, a_black, b_white, b_black] {
+            CombineRgn(Some(damage), Some(damage), Some(r), RGN_OR);
+        }
+        for r in [a, b, a_white, a_black, b_white, b_black] {
+            let _ = DeleteObject(r.into());
+        }
+    }
+    damage
 }
 
 /// The union of `rects`, each grown by `by`.
@@ -234,7 +259,7 @@ fn regions(chosen: &[Rect], sel: Option<Rect>, monitors: &[Rect]) -> [HRGN; 3] {
 /// Pick mode: the lit rects and the selection bright inside their rings, dimmed screen elsewhere,
 /// `holes` left out. Draws client `rp` at `rp - org` on `hdc`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn paint_pick(
+pub(super) unsafe fn paint_pick(
     hdc: HDC,
     rp: Rect,
     org: (i32, i32),

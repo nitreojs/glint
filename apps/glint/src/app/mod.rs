@@ -240,9 +240,13 @@ impl App {
             true => Purpose::Shot { draw_first: self.cfg.screenshot_style == ShotStyle::Sharex },
             false => Purpose::Record { min: self.cfg.codec.codec().min_size() },
         };
-        let (freeze, elements) = (self.cfg.freeze_screen, self.cfg.ui_elements);
-        let with_cursor = self.cfg.screenshot_cursor;
-        match picker::open(self.hwnd, WM_APP_SELECTION, outputs, purpose, freeze, elements, with_cursor) {
+        let opts = picker::Options {
+            freeze: self.cfg.freeze_screen,
+            elements: self.cfg.ui_elements,
+            with_cursor: self.cfg.screenshot_cursor,
+            aids: picker::Aids { crosshair: self.cfg.crosshair, magnifier: self.cfg.magnifier },
+        };
+        match picker::open(self.hwnd, WM_APP_SELECTION, outputs, purpose, opts) {
             Ok(h) => self.state = State::Selecting(h),
             Err(e) => self.notify("glint: can't open the selection overlay", &e, true, ClickTarget::Log),
         }
