@@ -299,6 +299,46 @@ impl ClipApp {
         }
     }
 
+    pub(super) fn cleanup_dialog(&mut self, ctx: &egui::Context, look: &Look) {
+        let Some(originals) = &self.confirm_cleanup else { return };
+        let p = look.p;
+        let frame = egui::Frame::new()
+            .fill(p.surf)
+            .stroke(Stroke::new(1.0, p.line2))
+            .corner_radius(8)
+            .inner_margin(egui::Margin::same(20))
+            .shadow(egui::epaint::Shadow { offset: [0, 8], blur: 28, spread: 0, color: Color32::from_black_alpha(80) });
+        let modal = egui::Modal::new(Id::unique("clip-cleanup-dialog")).frame(frame);
+        let modal = glint_ui::window::backdrop(ctx, modal, Color32::from_black_alpha(90));
+        let (mut keep, mut recycle, mut cancel) = (false, false, false);
+        let resp = modal.show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.spacing_mut().item_spacing = vec2(8.0, 8.0);
+            ui.label(RichText::new("keep the originals?").font(semibold(15.0)).color(p.t1));
+            hint(ui, "your saved edits stay. originals can go to the recycle bin.", p.t3);
+            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                for path in originals {
+                    let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+                    hint(ui, name, p.t3);
+                }
+            });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                keep = widgets::button(ui, look, "keep both", Kind::Primary, 30.0, true).clicked();
+                recycle = widgets::button(ui, look, "keep trimmed only", Kind::Secondary, 30.0, true).clicked();
+                cancel = widgets::button(ui, look, "cancel", Kind::Secondary, 30.0, true).clicked();
+            });
+        });
+        if keep {
+            self.confirm_cleanup = None;
+            self.close(ctx);
+        } else if recycle {
+            self.recycle_trimmed(ctx);
+        } else if cancel || resp.should_close() {
+            self.confirm_cleanup = None;
+        }
+    }
+
     pub(super) fn delete_dialog(&mut self, ctx: &egui::Context, look: &Look) {
         if !self.confirm_delete {
             return;

@@ -145,6 +145,9 @@ impl ClipApp {
     /// The file held over the window, if any (the first video of those held); a dropped video
     /// opens.
     pub(super) fn files(&mut self, ctx: &egui::Context) -> Option<Held> {
+        if self.confirm_cleanup.is_some() {
+            return None;
+        }
         let (held, dropped): (Vec<PathBuf>, Vec<PathBuf>) = ctx.input(|i| {
             (
                 i.raw.hovered_files.iter().filter_map(|f| f.path.clone()).collect(),
@@ -191,6 +194,9 @@ impl ClipApp {
 
     /// Opens what [`ClipApp::open`] read, once it's read.
     pub(super) fn poll_opening(&mut self, ctx: &egui::Context) {
+        if self.confirm_cleanup.is_some() || self.closing {
+            return;
+        }
         let Some(o) = &self.opening else { return };
         if !o.thread.is_finished() {
             ctx.request_repaint_after(Duration::from_millis(30));
@@ -208,8 +214,10 @@ impl ClipApp {
     /// Puts `opened` in the window in place of what's there, the window, settings and export
     /// choices staying; edits not saved on the file it replaces are kept for "back".
     pub(super) fn swap_in(&mut self, ctx: &egui::Context, opened: Opened, restore: Option<Edit>) {
+        self.check_trim();
         let left = (self.start.is_none() && self.edit != self.pristine).then(|| (self.path.clone(), self.edit.clone(), self.name.clone()));
-        let mut fresh = ClipApp::new(Some(opened), self.effort, self.host.clone(), self.saved.clone(), self.accent);
+        let mut fresh = ClipApp::new(Some(opened), self.effort, self.after_trim, self.host.clone(), self.saved.clone(), self.accent);
+        fresh.trimmed = std::mem::take(&mut self.trimmed);
         (fresh.hwnd, fresh.live, fresh.hevc, fresh.light, fresh.keyboard, fresh.now) =
             (self.hwnd, self.live, self.hevc, self.light, self.keyboard, self.now);
         if let Some(edit) = restore {

@@ -73,7 +73,7 @@ impl Harness {
         let ctx = egui::Context::default();
         glint_ui::theme::fonts(&ctx);
         let cfg = Config::default();
-        let app = ClipApp::new(file, cfg.effort, cfg.upload_destination.trim().to_string(), Saved::default(), [0xE5, 0x40, 0x2F]);
+        let app = ClipApp::new(file, cfg.effort, cfg.after_trim, cfg.upload_destination.trim().to_string(), Saved::default(), [0xE5, 0x40, 0x2F]);
         let mut h = Harness {
             ctx,
             app,

@@ -34,6 +34,9 @@ it records straight off the gpu with your mic and system sound, and can show you
 then trim it, crop it, mute a track, squeeze it under a size<br>
 if nothing has to be re-encoded, it isn't: the cut is lossless, starts on the exact frame, and glint says so
 
+in **settings → recording → after trimming**, keep both files (the default), keep only the trimmed copy, or ask each time<br>
+originals go to the recycle bin when the editor closes, only after an edited copy has saved successfully and still exists; unsaved changes or a later failed/cancelled export keep the original
+
 <img src="docs/readme/3-record.avif" alt="recording a region and trimming it" width="880">
 
 <br>

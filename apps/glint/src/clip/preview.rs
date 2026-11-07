@@ -105,7 +105,7 @@ impl ClipApp {
         let playing = self.play != Play::Paused;
         resp.widget_info(|| WidgetInfo::labeled(Role::Button, true, if playing { "pause" } else { "play" }));
 
-        let blocked = self.sheet || self.menu || self.confirm_delete;
+        let blocked = self.sheet || self.menu || self.confirm_delete || self.confirm_cleanup.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| rect.contains(*at));
         if let Some(at) = hover
             && !blocked

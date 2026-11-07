@@ -19,7 +19,7 @@ use glint_core::clip::info::Info;
 use glint_core::clip::math::frame_len;
 use glint_core::clip::viewer::Viewer;
 use glint_core::clip::{export, index, math};
-use glint_core::config::Config;
+use glint_core::config::{AfterTrim, Config};
 use glint_core::gallery::Maker;
 use glint_core::history::{self, Entry, Kind as HistoryKind};
 use glint_core::icon::icon_rgba;
@@ -37,6 +37,7 @@ use windows::Win32::Media::MediaFoundation::MFVideoFormat_HEVC;
 
 mod actions;
 mod clicklane;
+mod closing;
 mod keylane;
 mod overlay;
 mod panel;
@@ -142,7 +143,7 @@ pub fn run(path: Option<PathBuf>) {
             if let (Some(h), Some(r)) = (hwnd, saved.rect) {
                 glint_ui::window::place(h, r);
             }
-            let mut app = ClipApp::new(file, cfg.effort, cfg.upload_destination.trim().to_string(), saved, accent);
+            let mut app = ClipApp::new(file, cfg.effort, cfg.after_trim, cfg.upload_destination.trim().to_string(), saved, accent);
             (app.hwnd, app.live, app.hevc) = (hwnd, true, hevc);
             Ok(Box::new(app))
         }),
@@ -175,6 +176,8 @@ struct Task {
     dest: Option<PathBuf>,
     then: Then,
     copy: bool,
+    /// The exact edit being saved, only when original cleanup is enabled.
+    edit: Option<Edit>,
     /// Compressing: what the exported stretch takes in the source, to compare the result with.
     before: Option<u64>,
     permille: Arc<AtomicU32>,
@@ -226,6 +229,10 @@ struct ClipApp {
     index: Option<Index>,
     file_bytes: u64,
     effort: u32,
+    after_trim: AfterTrim,
+    trimmed: Vec<closing::Trimmed>,
+    confirm_cleanup: Option<Vec<PathBuf>>,
+    closing: bool,
     hwnd: Option<HWND>,
     live: bool,
     player: Option<Player>,
@@ -318,7 +325,7 @@ fn decode_size(info: &Info, px: egui::Vec2) -> (u32, u32) {
 
 impl ClipApp {
     /// The editor on `file`, or on the start screen without one.
-    fn new(file: Option<Opened>, effort: u32, host: String, saved: Saved, accent: [u8; 3]) -> Self {
+    fn new(file: Option<Opened>, effort: u32, after_trim: AfterTrim, host: String, saved: Saved, accent: [u8; 3]) -> Self {
         let start = file.is_none().then(start::Start::default);
         let Opened { path, info, index } = file.unwrap_or(Opened { path: PathBuf::new(), info: Err(String::new()), index: None });
         let duration = info.as_ref().map_or(0, |i| i.duration);
@@ -340,6 +347,10 @@ impl ClipApp {
             index,
             file_bytes,
             effort,
+            after_trim,
+            trimmed: Vec::new(),
+            confirm_cleanup: None,
+            closing: false,
             hwnd: None,
             live: false,
             player: None,
@@ -715,6 +726,8 @@ impl ClipApp {
             }
             None => self.default_out(gif),
         };
+        self.forget_trim();
+        let edit = (self.after_trim != AfterTrim::KeepBoth && !whole).then(|| self.edit.clone());
         self.pause();
         let permille = Arc::new(AtomicU32::new(0));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -730,7 +743,7 @@ impl ClipApp {
             }
         });
         self.toast = None;
-        self.task = Some(Task { out, dest, then, copy: whole, before, permille, cancel, thread: Some(thread) });
+        self.task = Some(Task { out, dest, then, copy: whole, edit, before, permille, cancel, thread: Some(thread) });
     }
 
     fn poll_task(&mut self, ctx: &egui::Context) {
@@ -766,6 +779,11 @@ impl ClipApp {
         };
         match res {
             Ok(path) => {
+                if !task.cancel.load(Ordering::Relaxed)
+                    && let Some(edit) = task.edit
+                {
+                    self.remember_trim(&path, edit);
+                }
                 let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 // the export shows what the clip it's cut from shows, whichever app saved that
                 let histories = Maker::ALL.map(|m| m.history(&appdata()));
@@ -856,11 +874,7 @@ impl ClipApp {
     }
 
     fn delete(&mut self, ctx: &egui::Context) {
-        self.pause();
-        self.player = None;
-        self.audio = None;
-        self.scan = None;
-        self.waves = None;
+        self.release_media();
         match glint_shell::explorer::recycle(self.owner(), &self.path) {
             Ok(()) => {
                 self.gone = true;
@@ -1073,6 +1087,10 @@ impl eframe::App for ClipApp {
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.viewport().close_requested()) && !self.closing {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.request_close(&ctx);
+        }
         glint_ui::window::shots(&ctx);
         self.now = ctx.input(|i| i.time);
         let light = ctx.system_theme() == Some(egui::Theme::Light);
@@ -1102,7 +1120,7 @@ impl eframe::App for ClipApp {
         let bar = Rect::from_min_size(full.min, vec2(full.width(), BAR_H));
         match widgets::title_bar(ui, &look, bar, "glint", "clip", active, radius) {
             TitleAction::Minimize => ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-            TitleAction::Close => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            TitleAction::Close => self.request_close(&ctx),
             TitleAction::None => {}
         }
         ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, p.line));
@@ -1110,7 +1128,7 @@ impl eframe::App for ClipApp {
         let body = Rect::from_min_max(pos2(full.left(), bar.bottom()), full.max);
         let held = self.files(&ctx);
         self.poll_opening(&ctx);
-        if !self.confirm_delete && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
+        if !self.confirm_delete && self.confirm_cleanup.is_none() && ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::O)) {
             self.browse();
         }
         if self.start.is_some() {
@@ -1118,7 +1136,7 @@ impl eframe::App for ClipApp {
             glint_ui::window::border(ui, full, p.line2);
             self.show_toast(&ctx, &look, body);
             if esc {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.request_close(&ctx);
             }
             return;
         }
@@ -1138,11 +1156,11 @@ impl eframe::App for ClipApp {
             pos2(main.right(), (line.top() - 4.0).max(file.bottom() + GAP + 80.0)),
         );
 
-        let modal = self.confirm_delete;
+        let modal = self.confirm_delete || self.confirm_cleanup.is_some();
         if self.info.is_ok() && !modal {
             self.keys(&ctx);
         }
-        if self.live && self.info.is_ok() {
+        if self.live && self.info.is_ok() && self.confirm_cleanup.is_none() && !self.closing {
             let (shown, settled) = self.decode_target(&ctx, preview);
             self.start_media(&ctx, shown, settled);
         }
@@ -1166,6 +1184,7 @@ impl eframe::App for ClipApp {
         self.drop_overlay(&ctx, &look, body, held.as_ref());
         self.show_toast(&ctx, &look, body);
         self.delete_dialog(&ctx, &look);
+        self.cleanup_dialog(&ctx, &look);
 
         if esc && !modal {
             if self.renaming.is_some() {
@@ -1185,7 +1204,7 @@ impl eframe::App for ClipApp {
             } else if self.cropping.is_some() {
                 self.toggle_crop();
             } else if !self.busy() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                self.request_close(&ctx);
             }
         }
     }

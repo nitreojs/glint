@@ -1,5 +1,5 @@
 use eframe::egui::{Id, Ui};
-use glint_core::config::{ClickMode, CodecName, Config, IndicatorInside, Keystrokes};
+use glint_core::config::{AfterTrim, ClickMode, CodecName, Config, IndicatorInside, Keystrokes};
 use glint_core::record::keys::Position;
 use glint_ui::widgets::{self, Look, hint, nested_row, row, toggle_row};
 
@@ -144,6 +144,20 @@ impl SettingsApp {
         let text = if self.cfg.draw_cursor { "shown in captures" } else { "hidden" };
         toggle_row(ui, look, "mouse cursor", &mut self.cfg.draw_cursor, text);
         toggle_row(ui, look, "when it stops", &mut self.cfg.open_trimmer, "open the trimmer");
+        row(ui, look, "after trimming", 7.0, |ui| {
+            let choices = [
+                (AfterTrim::KeepBoth, "keep both"),
+                (AfterTrim::KeepTrimmed, "keep trimmed only"),
+                (AfterTrim::Ask, "ask each time"),
+            ];
+            widgets::segmented(ui, look, &mut self.cfg.after_trim, &choices, None);
+            let text = match self.cfg.after_trim {
+                AfterTrim::KeepBoth => "keep the original and the saved edit",
+                AfterTrim::KeepTrimmed => "on editor close, move the original to the recycle bin only after a successful save",
+                AfterTrim::Ask => "on editor close, choose whether to keep the original after a successful save",
+            };
+            hint(ui, text, t3);
+        });
     }
 
     /// Click highlights and keystrokes: what's drawn over the video rather than how it's encoded.

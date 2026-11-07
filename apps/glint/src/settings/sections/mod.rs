@@ -81,6 +81,7 @@ impl Section {
                     + n(a.indicator_inside == b.indicator_inside)
                     + n(a.draw_cursor == b.draw_cursor)
                     + n(a.open_trimmer == b.open_trimmer)
+                    + n(a.after_trim == b.after_trim)
             }
             // "in the video" is one row for both overlays' modes
             Section::Overlays => {
@@ -146,6 +147,7 @@ impl Section {
                 cfg.indicator_inside = d.indicator_inside;
                 cfg.draw_cursor = d.draw_cursor;
                 cfg.open_trimmer = d.open_trimmer;
+                cfg.after_trim = d.after_trim;
             }
             Section::Overlays => {
                 cfg.click_highlights = d.click_highlights;

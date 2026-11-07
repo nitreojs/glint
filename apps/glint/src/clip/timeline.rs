@@ -253,7 +253,8 @@ impl ClipApp {
         self.view.clamp(dur, min_span);
         let light = self.light == Some(true);
 
-        let menus = self.sheet || self.menu || self.confirm_delete || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
+        let menus = self.sheet || self.menu || self.confirm_delete || self.confirm_cleanup.is_some()
+            || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| area.contains(*at));
         let ctrl = ui.input(|i| i.modifiers.ctrl);
         let body = ui.interact(Rect::from_min_max(area.min, rows.span.max), Id::unique("clip-track"), Sense::click_and_drag());

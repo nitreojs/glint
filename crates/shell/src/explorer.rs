@@ -1,4 +1,3 @@
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use windows::Win32::Foundation::HWND;
@@ -6,12 +5,12 @@ use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize,
 };
 use windows::Win32::UI::Shell::{
-    FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOLDERID_Documents, FOLDERID_Videos,
-    FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, IFileOpenDialog, ILCreateFromPathW, ILFree, IShellItem,
-    KF_FLAG_DEFAULT, SHCreateItemFromParsingName, SHFILEOPSTRUCTW, SHFileOperationW, SHGetKnownFolderPath,
-    SHOpenFolderAndSelectItems, SIGDN_FILESYSPATH,
+    FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
+    FOLDERID_Documents, FOLDERID_Videos, FOS_FORCEFILESYSTEM, FOS_PICKFOLDERS, FileOpenDialog, FileOperation,
+    IFileOpenDialog, IFileOperation, ILCreateFromPathW, ILFree, IShellItem, KF_FLAG_DEFAULT,
+    SHCreateItemFromParsingName, SHGetKnownFolderPath, SHOpenFolderAndSelectItems, SIGDN_FILESYSPATH,
 };
-use windows::core::{GUID, HSTRING, PCWSTR};
+use windows::core::{GUID, HSTRING};
 
 /// One of the user's known folders (Documents, Videos…).
 pub fn known_folder(id: &GUID) -> Option<PathBuf> {
@@ -71,19 +70,28 @@ pub fn reveal(path: &Path) {
     }
 }
 
-/// Moves `path` to the Recycle Bin.
+/// Moves `path` to the Recycle Bin, without falling back to permanent deletion.
 pub fn recycle(owner: HWND, path: &Path) -> Result<(), String> {
-    let from: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
-    let mut op = SHFILEOPSTRUCTW {
-        hwnd: owner,
-        wFunc: FO_DELETE,
-        pFrom: PCWSTR(from.as_ptr()),
-        fFlags: (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT).0 as u16,
-        ..Default::default()
-    };
-    match unsafe { SHFileOperationW(&mut op) } {
-        0 if !op.fAnyOperationsAborted.as_bool() => Ok(()),
-        0 => Err("the deletion was cancelled".into()),
-        code => Err(format!("windows couldn't move it to the recycle bin (error {code:#x})")),
+    // Shell parsing rejects the verbatim prefix that fs::canonicalize adds on Windows.
+    let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+    unsafe {
+        let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let result = (|| -> windows::core::Result<bool> {
+            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+            op.SetOwnerWindow(owner)?;
+            op.SetOperationFlags(FOFX_RECYCLEONDELETE | FOFX_EARLYFAILURE | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT)?;
+            let item: IShellItem = SHCreateItemFromParsingName(&HSTRING::from(path.as_os_str()), None)?;
+            op.DeleteItem(&item, None)?;
+            op.PerformOperations()?;
+            Ok(op.GetAnyOperationsAborted()?.as_bool())
+        })();
+        if com {
+            CoUninitialize();
+        }
+        match result {
+            Ok(false) => Ok(()),
+            Ok(true) => Err("the recycling was cancelled".into()),
+            Err(e) => Err(format!("windows couldn't move it to the recycle bin: {e}")),
+        }
     }
 }

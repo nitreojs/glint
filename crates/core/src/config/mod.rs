@@ -53,6 +53,8 @@ pub struct Config {
     pub countdown: u32,
     pub indicator_inside: IndicatorInside,
     pub open_trimmer: bool,
+    /// What happens to originals when the editor closes after saving an edited copy.
+    pub after_trim: AfterTrim,
     pub screenshot_style: ShotStyle,
     pub screenshot_format: ShotFormat,
     /// Screenshots keep the mouse cursor (the editor can move or delete it).
@@ -131,6 +133,15 @@ pub enum IndicatorInside {
     Hide,
     /// Shown but excluded from capture, which pauses NVIDIA Instant Replay and similar apps.
     Show,
+}
+
+/// What happens to an original after an edited copy has been saved.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum AfterTrim {
+    KeepBoth,
+    KeepTrimmed,
+    Ask,
 }
 
 /// What happens to click highlights.
@@ -230,6 +241,7 @@ impl Default for Config {
             countdown: 0,
             indicator_inside: IndicatorInside::Hide,
             open_trimmer: false,
+            after_trim: AfterTrim::KeepBoth,
             screenshot_style: ShotStyle::Select,
             screenshot_format: ShotFormat::Png,
             screenshot_cursor: false,
@@ -377,6 +389,11 @@ impl Config {
             IndicatorInside::Hide => "hide",
             IndicatorInside::Show => "show",
         };
+        let after_trim = match self.after_trim {
+            AfterTrim::KeepBoth => "keep-both",
+            AfterTrim::KeepTrimmed => "keep-trimmed",
+            AfterTrim::Ask => "ask",
+        };
         let clicks = match self.clicks {
             ClickMode::Editable => "editable",
             ClickMode::BurnIn => "burn-in",
@@ -512,6 +529,11 @@ indicator_inside = "{indicator_inside}"
 
 # Open the trimmer (trim, cut, crop, mute tracks, save a smaller video or a gif) after every recording is saved.
 open_trimmer = {open_trimmer}
+
+# When the editor closes after saving an edited copy: "keep-both", "keep-trimmed" (move the
+# original to the Recycle Bin), or "ask". Unsaved, cancelled or failed exports never qualify.
+# The saved copy must still exist; later unsaved changes keep the original. Never permanently deletes.
+after_trim = "{after_trim}"
 
 # Screenshots: "select" picks a region first, then opens the editor; "sharex" opens the
 # editor on the whole frozen screen first (pick a region with Q). Recordings always select first.
@@ -693,6 +715,7 @@ mod tests {
             countdown: 5,
             indicator_inside: IndicatorInside::Show,
             open_trimmer: true,
+            after_trim: AfterTrim::Ask,
             screenshot_style: ShotStyle::Sharex,
             screenshot_format: ShotFormat::Jpg,
             screenshot_cursor: true,
@@ -720,6 +743,16 @@ mod tests {
         let back: Config = toml::from_str(&cfg.render()).unwrap();
         assert_eq!(back, cfg);
         assert_eq!(toml::from_str::<Config>(&Config::default().render()).unwrap(), Config::default());
+    }
+
+    #[test]
+    fn after_trim_settings_round_trip_and_old_configs_keep_originals() {
+        for after_trim in [AfterTrim::KeepBoth, AfterTrim::KeepTrimmed, AfterTrim::Ask] {
+            let cfg = Config { after_trim, ..Config::default() };
+            assert_eq!(Config::parse(&cfg.render()).unwrap().after_trim, after_trim);
+        }
+        assert_eq!(Config::parse("open_trimmer = true").unwrap().after_trim, AfterTrim::KeepBoth);
+        assert!(Config::parse("after_trim = \"delete\"").is_err());
     }
 
     #[test]
