@@ -433,6 +433,15 @@ fn review_shots() {
         ed
     };
 
+    // The crop does not clip drawing: show the live stroke outside, then the committed mark.
+    let mut ed = Editor::new(Rect { x: 400, y: 200, w: 500, h: 400 }, None, vec![screen], 1.0);
+    ed.tool = Some(Tool::Pen);
+    ed.mouse_down((200, 400), 0);
+    ed.mouse_move((600, 400));
+    shoot(&mut ed, "outside-crop-live", screen);
+    ed.mouse_up((600, 400));
+    shoot(&mut ed, "outside-crop-committed", screen);
+
     // a pasted picture with its handles
     let mut ed = new();
     let mut pic = Image { w: 360, h: 220, px: Vec::new() };

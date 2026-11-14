@@ -168,6 +168,7 @@ struct Look {
 
 pub(crate) struct Frame {
     canvas: Rect,
+    selection: Rect,
     picked: Option<(usize, Rect)>,
     caret: Vec<Rect>,
     pick: Option<Rect>,
@@ -242,9 +243,9 @@ pub(crate) struct Editor {
     hover: Option<Item>,
     notice: Option<(String, Instant)>,
     scale: f32,
-    /// The selection with its committed effects, and what it was built from.
+    /// The frozen desktop with its committed effects, and what it was built from.
     base: Option<(Rect, Vec<Mark>, Dib)>,
-    /// What shows inside the selection: `base` plus shapes. Rebuilt when `view_dirty`.
+    /// The desktop with shapes and the area outside the capture dimmed. Rebuilt when `view_dirty`.
     view: Option<Dib>,
     view_dirty: bool,
     /// Part of the view (client coordinates) to redraw when only the dragged mark changed.
@@ -451,6 +452,15 @@ impl Editor {
         self.drag.is_some()
     }
 
+    /// The fitted pixel on the moving edge/corner while resizing a capture, and its outward side.
+    pub(crate) fn resize_aid(&self) -> Option<((i32, i32), (bool, bool))> {
+        let Some(Drag::Resize { edges, .. }) = self.drag.as_ref().filter(|_| !self.ctrl) else { return None };
+        let s = self.sel;
+        let x = if edges.l { s.x } else if edges.r { s.right() - 1 } else { self.mouse.0.clamp(s.x, s.right() - 1) };
+        let y = if edges.t { s.y } else if edges.b { s.bottom() - 1 } else { self.mouse.1.clamp(s.y, s.bottom() - 1) };
+        Some(((x, y), (edges.l, edges.t)))
+    }
+
     /// What the finished shot covers: the selection, or with none the monitor under the mouse.
     fn output_rect(&self) -> Rect {
         if self.selected { self.sel } else { nearest(&self.monitors, self.mouse) }
@@ -471,7 +481,12 @@ impl Editor {
     }
 
     fn drawn(&self) -> Rect {
-        self.sel.inflate(self.px(8.0) as i32)
+        let drawing = match &self.drag {
+            Some(Drag::Mark { mark, .. }) if !matches!(mark, Mark::Grab { .. }) => Some(mark),
+            _ => None,
+        };
+        self.marks.iter().chain(drawing).fold(self.sel, |r, m| hull(r, m.ink(self.scale)))
+            .intersect(&self.area).unwrap_or(self.sel).inflate(self.px(8.0) as i32)
     }
 
     /// The toolbar, its panels and the pill, over everything else.
@@ -545,6 +560,7 @@ impl Editor {
     pub(crate) fn frame(&self) -> Frame {
         Frame {
             canvas: self.drawn(),
+            selection: self.sel,
             picked: self.picked.zip(self.picked_extent()),
             caret: self.overlay(),
             pick: self.pick,
@@ -559,7 +575,11 @@ impl Editor {
     pub(crate) fn damage(&self, before: &Frame) -> Vec<Rect> {
         let now = self.frame();
         let mut v = Vec::new();
-        if now.canvas != before.canvas || now.rev != before.rev {
+        if now.selection != before.selection {
+            let pad = self.px(8.0) as i32;
+            v.extend([before.selection.inflate(pad), now.selection.inflate(pad)]);
+        }
+        if now.rev != before.rev {
             v.extend([before.canvas, now.canvas]);
         } else if self.view_dirty || self.patch.is_some() {
             v.extend(&before.ink);
@@ -726,14 +746,13 @@ impl Editor {
                 return Hit::Handle(edges);
             }
         }
-        if !s.contains(p.0, p.1) {
-            // a grab can start anywhere on the frozen screen
-            let grabs = self.tool == Some(Tool::Grab) && self.area.contains(p.0, p.1);
-            return if grabs { Hit::Inside } else { Hit::Outside };
+        if !self.area.contains(p.0, p.1) {
+            return Hit::Outside;
         }
         match self.mark_at(at, false) {
             Some(i) => Hit::Mark(i),
-            None => Hit::Inside,
+            None if s.contains(p.0, p.1) || self.tool.is_some() => Hit::Inside,
+            None => Hit::Outside,
         }
     }
 
@@ -786,8 +805,7 @@ impl Editor {
         let inside = |r: &Rect| r.contains(p.0, p.1);
         let window = || self.windows.iter().find(|(w, _)| inside(w)).map(|&(w, client)| client.filter(inside).unwrap_or(w));
         let r = self.element.filter(inside).or_else(window).unwrap_or_else(|| nearest(&self.monitors, p));
-        let clip = if self.selected && self.tool != Some(Tool::Grab) { self.sel } else { self.area };
-        r.intersect(&clip).filter(|r| r.w >= MIN_SIDE && r.h >= MIN_SIDE)
+        r.intersect(&self.area).filter(|r| r.w >= MIN_SIDE && r.h >= MIN_SIDE)
     }
 
     fn hover_pick(&self, p: (i32, i32)) -> Option<Rect> {
@@ -1030,8 +1048,9 @@ impl Editor {
         if sel == self.sel || !self.selected {
             return Event::None;
         }
+        let changed = hull(self.sel, sel);
+        self.patch = Some(self.patch.map_or(changed, |p| hull(p, changed)));
         self.sel = sel;
-        self.view_dirty = true;
         self.place_bar();
         Event::Repaint
     }
@@ -1324,7 +1343,7 @@ impl Editor {
             // an empty text is gone already
             return if self.marks.len() < n { Event::Repaint } else { self.delete_at(i) };
         }
-        let on_canvas = self.sel.contains(p.0, p.1) && !self.bar.contains(p.0, p.1);
+        let on_canvas = self.area.contains(p.0, p.1) && !self.chrome().iter().any(|r| r.contains(p.0, p.1));
         match self.mark_at((p.0 as f32, p.1 as f32), true).filter(|_| on_canvas) {
             Some(i) => self.delete_at(i),
             None if !self.selected => Event::Cancel,
@@ -1522,6 +1541,62 @@ mod tests {
         for u in text.encode_utf16() {
             ed.char(u);
         }
+    }
+
+    #[test]
+    fn resize_aids_follow_fitted_corners_and_edges_only() {
+        let mut ed = editor();
+        ed.mouse_down((400, 300), 0);
+        ed.mouse_move((450, 350));
+        assert_eq!(ed.resize_aid(), Some(((449, 349), (false, false))));
+        ed.set_mods(true, false, false);
+        assert_eq!(ed.resize_aid(), None, "Ctrl moves rather than resizes");
+        ed.set_mods(false, false, false);
+        ed.mouse_up((450, 350));
+        assert_eq!(ed.resize_aid(), None);
+        ed.mouse_down((0, 150), 0);
+        ed.mouse_move((20, 160));
+        assert_eq!(ed.resize_aid(), Some(((20, 160), (true, false))));
+        ed.mouse_up((20, 160));
+        ed.tool = Some(Tool::Pen);
+        ed.mouse_down((100, 100), 0);
+        assert_eq!(ed.resize_aid(), None, "drawing has no resize magnifier");
+    }
+
+    #[test]
+    fn outside_ink_is_previewed_editable_and_cropped_only_on_export() {
+        let painter = Painter::new().unwrap();
+        let font = painter.font(13.0).unwrap();
+        let screen = Rect { x: 0, y: 0, w: 800, h: 600 };
+        let crop = Rect { x: 200, y: 150, w: 300, h: 250 };
+        let mut bright = Dib::new(screen.w, screen.h).unwrap();
+        bright.pixels_mut().fill(0x0040_4040);
+        let dim = Dib::new(screen.w, screen.h).unwrap();
+        let window = Dib::new(screen.w, screen.h).unwrap();
+        let mut ed = Editor::new(crop, None, vec![screen], 1.0);
+        ed.tool = Some(Tool::Pen);
+        ed.color = PALETTE[0];
+        ed.mouse_down((100, 250), 0);
+        ed.mouse_move((300, 250));
+        ed.render(&bright, &painter, &font).unwrap();
+        ed.paint(window.dc, screen, &dim, &painter, &font).unwrap();
+        unsafe { let _ = windows::Win32::Graphics::Gdi::GdiFlush(); }
+        let ink = window.pixel(150, 250).unwrap() & 0x00FF_FFFF;
+        assert_ne!(ink, 0, "live ink outside the crop is painted");
+        assert_ne!(ink, 0x40_4040, "it is not just the desktop");
+        ed.mouse_up((300, 250));
+        ed.tool = None;
+        assert!(matches!(ed.hit((150, 250)), Hit::Mark(0)), "outside ink can be selected");
+        let (px, out, _) = ed.pixels(&bright, &painter).unwrap();
+        assert_eq!(out, crop);
+        assert_eq!(px.len(), (crop.w * crop.h) as usize);
+        assert_eq!(px[(100 * crop.w + 50) as usize] & 0x00FF_FFFF, ink, "the inside part is exported at crop coordinates");
+        ed.set_sel(Rect { x: 80, y: 150, w: 420, h: 250 });
+        let (px, out, _) = ed.pixels(&bright, &painter).unwrap();
+        assert_eq!(px[(100 * out.w + 70) as usize] & 0x00FF_FFFF, ink, "expanding the crop reveals retained ink");
+        ed.undo();
+        ed.render(&bright, &painter, &font).unwrap();
+        assert_eq!(ed.view.as_ref().unwrap().pixel(150, 250).unwrap() & 0x00FF_FFFF, 0x40_4040, "undo removes outside ink too");
     }
 
     fn texts(ed: &Editor) -> Vec<String> {
@@ -1921,9 +1996,9 @@ mod tests {
         ed.mouse_move((100, 60));
         assert_eq!(ed.pick, Some(window), "the title bar picks the whole window");
         ed.mouse_move((380, 280));
-        assert_eq!(ed.pick, Some(Rect { x: 350, y: 250, w: 50, h: 50 }), "clipped to the selection");
+        assert_eq!(ed.pick, Some(Rect { x: 350, y: 250, w: 200, h: 200 }), "the target is independent of the crop");
         ed.mouse_move((300, 20));
-        assert_eq!(ed.pick, Some(ed.sel), "off every window, the monitor");
+        assert_eq!(ed.pick, Some(ed.area), "off every window, the monitor");
 
         click(&mut ed, (100, 100));
         assert!(matches!(ed.marks[0], Mark::Blur { rect, .. } if rect == client), "a click covers the client area");
@@ -1932,7 +2007,7 @@ mod tests {
 
         ed.mouse_down((300, 20), 0);
         ed.mouse_move((302, 22));
-        assert_eq!(ed.pick, Some(ed.sel), "a wobble is still a click");
+        assert_eq!(ed.pick, Some(ed.area), "a wobble is still a click");
         ed.mouse_move((380, 60));
         assert_eq!(ed.pick, None, "a drag draws freely");
         ed.mouse_up((380, 60));
@@ -2015,7 +2090,7 @@ mod tests {
         ed.mouse_down((300, 200), 0);
         ed.mouse_move((340, 200));
         ed.mouse_up((340, 200));
-        assert_eq!(area_of(&ed.marks[0]), Rect { x: 100, y: 100, w: 240, h: 120 }, "corners keep the proportions");
+        assert_eq!(area_of(&ed.marks[0]), Rect { x: 100, y: 100, w: 240, h: 100 }, "corner deltas are independent");
         ed.undo();
         assert_eq!(area_of(&ed.marks[0]).w, 200);
 
@@ -2023,7 +2098,7 @@ mod tests {
         ed.mouse_down((600, 500), 0);
         ed.mouse_move((700, 600));
         ed.mouse_up((700, 600));
-        assert_eq!(ed.marks.len(), 2, "other tools stay inside the shot");
+        assert_eq!(area_of(&ed.marks[2]), Rect { x: 600, y: 500, w: 100, h: 100 }, "drawing is independent of the crop");
     }
 
     #[test]

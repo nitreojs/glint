@@ -380,18 +380,41 @@ pub fn segmented<T: Copy + PartialEq>(
 ) -> Response {
     let p = &look.p;
     let w = width.unwrap_or_else(|| ui.available_width());
-    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, 32.0), Sense::hover());
+    let n = options.len();
+    let gap = 2.0;
+    let available = (w - 6.0 - gap * n.saturating_sub(1) as f32).max(0.0);
+    let equal = available / n.max(1) as f32;
+    let mut labels: Vec<_> = options.iter().map(|(_, label)| {
+        let g = galley(ui, label, medium(13.0));
+        let width = g.size().x + 16.0;
+        (g, width)
+    }).collect();
+    let natural: f32 = labels.iter().map(|(_, width)| width).sum();
+    let fits_equal = labels.iter().all(|(_, width)| *width <= equal);
+    let mut height = 26.0_f32;
+    for ((g, width), (_, label)) in labels.iter_mut().zip(options) {
+        *width = if fits_equal { equal } else if natural <= available {
+            *width + (available - natural) / n as f32
+        } else {
+            *width * available / natural
+        };
+        if g.size().x > *width - 8.0 {
+            *g = ui.painter().layout((*label).to_owned(), medium(13.0), Color32::PLACEHOLDER, (*width - 8.0).max(1.0));
+        }
+        height = height.max(g.size().y + 10.0);
+    }
+    let (rect, mut resp) = ui.allocate_exact_size(vec2(w, height + 6.0), Sense::hover());
     let group = ui.new_child(UiBuilder::new().max_rect(rect).accessibility_role(Role::RadioGroup));
     ui.ctx().accesskit_node_builder(group.unique_id(), |n| n.set_bounds(bounds(rect)));
     in_row(ui, group.unique_id());
     ui.painter().rect(rect, 6, p.field, Stroke::new(1.0, p.line2), StrokeKind::Inside);
     let inner = rect.shrink(3.0);
-    let n = options.len();
-    let seg_w = (inner.width() - 2.0 * (n - 1) as f32) / n as f32;
     let mut focused = None;
     let mut cells = Vec::with_capacity(n);
+    let mut x = inner.left();
     for (i, (v, _)) in options.iter().enumerate() {
-        let r = Rect::from_min_size(pos2(inner.left() + i as f32 * (seg_w + 2.0), inner.top()), vec2(seg_w, 26.0));
+        let r = Rect::from_min_size(pos2(x, inner.top()), vec2(labels[i].1, height));
+        x = r.right() + gap;
         let cell = group.interact(r, resp.id.with(i), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
         if cell.clicked() && *value != *v {
             *value = *v;
@@ -414,22 +437,23 @@ pub fn segmented<T: Copy + PartialEq>(
             ui.memory_mut(|m| m.request_focus(resp.id.with(j)));
         }
     }
-    // The selected segment's highlight slides; labels light up as it passes. It glides as a share
-    // of the row, so a segment coming or going (a preset row's "custom") moves it along the row
-    // instead of from where its old index lands among the new segments.
+    // Animate in shares of the row so a resize or a new preset preserves the highlight's position.
     let selected = options.iter().position(|(v, _)| *v == *value).unwrap_or(0);
-    let left = glide(ui, resp.id.with("left"), selected as f32 / n as f32, 0.16);
-    let share = glide(ui, resp.id.with("share"), 1.0 / n as f32, 0.16);
-    let pos = left * n as f32;
+    let target = cells.get(selected).map_or(inner, |(rect, _)| *rect);
+    let left = glide(ui, resp.id.with("left"), (target.left() - inner.left()) / inner.width(), 0.16);
+    let share = glide(ui, resp.id.with("share"), target.width() / inner.width(), 0.16);
     let painter = ui.painter();
-    let step = inner.width() + 2.0;
-    let highlight = Rect::from_min_size(pos2(inner.left() + left * step, inner.top()), vec2(share * step - 2.0, 26.0));
+    let highlight = Rect::from_min_size(
+        pos2(inner.left() + left * inner.width(), inner.top()), vec2(share * inner.width(), height),
+    );
     painter.rect(highlight, 4, p.ctlh, Stroke::new(1.0, p.line2), StrokeKind::Inside);
     for (i, ((v, label), (r, cell))) in options.iter().zip(&cells).enumerate() {
-        let near = (1.0 - (pos - i as f32).abs()).clamp(0.0, 1.0);
+        let distance = (highlight.center().x - r.center().x).abs() / r.width().max(1.0);
+        let near = (1.0 - distance).clamp(0.0, 1.0);
         let h = anim(ui, cell.id.with("hov"), cell.hovered(), 0.08);
-        let font = if i == selected { medium(13.0) } else { sans(13.0) };
-        painter.text(r.center(), Align2::CENTER_CENTER, *label, font, mix(p.t2, p.t1, near.max(h)));
+        let color = mix(p.t2, p.t1, near.max(h));
+        let g = &labels[i].0;
+        painter.with_clip_rect(*r).galley(r.center() - g.size() / 2.0, g.clone(), color);
         cell.widget_info(|| WidgetInfo::selected(Role::RadioButton, true, *v == *value, *label));
     }
     if look.keyboard && focused.is_some() {
@@ -805,6 +829,37 @@ mod tests {
     use super::*;
     use crate::theme::fonts;
     use crate::widgets::palette;
+
+    #[test]
+    fn long_segment_labels_fit_their_click_targets() {
+        let ctx = egui::Context::default();
+        fonts(&ctx);
+        ctx.enable_accesskit();
+        let look = Look { p: palette(false, [0xE5, 0x40, 0x2F]), keyboard: false };
+        let choices = [(0, "keep both"), (1, "keep trimmed only"), (2, "ask each time")];
+        for width in [210.0, 300.0, 420.0] {
+            for mut selected in 0..3 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(width + 16.0, 200.0))),
+                    ..Default::default()
+                };
+                let out = ctx.run_ui(input, |ui| {
+                    segmented(ui, &look, &mut selected, &choices, Some(width));
+                });
+                let tree = out.platform_output.accesskit_update.unwrap();
+                for (_, label) in choices {
+                    let cell = tree.nodes.iter().find(|(_, n)| n.role() == Role::RadioButton && n.label() == Some(label))
+                        .and_then(|(_, n)| n.bounds()).expect(label);
+                    let text = out.shapes.iter().find_map(|c| match &c.shape {
+                        Shape::Text(t) if t.galley.text() == label => Some(Rect::from_min_size(t.pos, t.galley.size())),
+                        _ => None,
+                    }).expect(label);
+                    let cell = Rect::from_min_max(pos2(cell.x0 as f32, cell.y0 as f32), pos2(cell.x1 as f32, cell.y1 as f32));
+                    assert!(cell.expand(0.5).contains_rect(text), "{label} at {width}: {text:?} outside {cell:?}");
+                }
+            }
+        }
+    }
 
     /// Where the slider's thumb is drawn (its centre x) after a frame showing `value`.
     fn thumb(ctx: &egui::Context, value: u32, time: f64) -> f32 {

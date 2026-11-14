@@ -107,9 +107,9 @@ impl State {
             self.last_paint.set(Instant::now());
             let rp = Rect::from_win(&ps.rcPaint);
             let label = self.label.as_ref();
-            // Draw-first's region tool: the toolbar and its pills stay over the picker.
+            // Editor chrome stays above the picker, label and aids in either selection mode.
             let chrome: Vec<Rect> = match &self.edit {
-                Some(ed) if self.region => ed.chrome().into_iter().filter_map(|c| c.intersect(&rp)).collect(),
+                Some(ed) => ed.chrome().into_iter().filter_map(|c| c.intersect(&rp)).collect(),
                 _ => Vec::new(),
             };
 
@@ -119,6 +119,7 @@ impl State {
                     let saved = SaveDC(hdc);
                     let mut holes = ed.extent();
                     holes.extend(label.map(|l| l.rect));
+                    holes.extend(self.aids_shown.rects());
                     for h in &holes {
                         ExcludeClipRect(hdc, h.x, h.y, h.right(), h.bottom());
                     }
@@ -129,10 +130,25 @@ impl State {
                     if let Some(l) = label {
                         ExcludeClipRect(hdc, l.rect.x, l.rect.y, l.rect.right(), l.rect.bottom());
                     }
+                    for r in self.aids_shown.rects() {
+                        ExcludeClipRect(hdc, r.x, r.y, r.right(), r.bottom());
+                    }
                     if let Err(e) = ed.paint(hdc, rp, &f.dim, &self.painter, &self.font) {
                         log(&format!("editor paint failed: {e}"));
                     }
                     let _ = RestoreDC(hdc, saved);
+                    let base = |dc: HDC, r: Rect, org: (i32, i32)| {
+                        let _ = BitBlt(dc, r.x - org.0, r.y - org.1, r.w, r.h, Some(f.dim.dc), r.x, r.y, SRCCOPY);
+                        let area = Rect { x: org.0, y: org.1, w: r.w, h: r.h };
+                        // Chrome is painted separately above the aids. Never bind a toolbar-sized
+                        // Direct2D target to a 1 px crosshair scratch bitmap.
+                        if let Err(e) = ed.draw_canvas(dc, area, r, &self.painter) {
+                            log(&format!("editor aid background failed: {e}"));
+                        }
+                    };
+                    if let Some(kit) = &self.aid_kit {
+                        aids::paint(hdc, rp, &self.aids_shown, kit, &f.bright, &base, label, &chrome);
+                    }
                 }
                 _ => {
                     let brushes = [self.white, self.black];

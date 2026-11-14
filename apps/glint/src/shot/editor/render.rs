@@ -55,7 +55,7 @@ impl Editor {
 
     /// Redraws the view, or only its `part` (client coordinates) when the base is still good.
     pub(super) fn render_view(&mut self, bright: &Dib, painter: &Painter, part: Option<Rect>) -> Result<(), String> {
-        let s = self.sel;
+        let s = self.area;
         let editing = match &self.drag {
             Some(Drag::Edit { index, .. }) if self.marks[*index].is_effect() => Some(*index),
             _ => None,
@@ -71,12 +71,6 @@ impl Editor {
             }
             for m in committed() {
                 apply_effect(&mut base, m, s, self.scale);
-            }
-            if let Some(cut) = &self.cutout {
-                let px = base.pixels_mut();
-                rows_outside(s, cut, |y, x0, x1| {
-                    px[index(s, y, x0)..index(s, y, x1)].iter_mut().for_each(|p| *p = dim(*p))
-                });
             }
             self.base = Some((s, committed().cloned().collect(), base));
         }
@@ -102,6 +96,12 @@ impl Editor {
         for m in drawing.into_iter().chain(editing.map(|i| &self.marks[i])).filter(|m| m.is_effect()) {
             apply_effect(view, m, s, self.scale);
         }
+        // The capture is a crop, not the canvas. Keep its surroundings dim without hiding ink.
+        let clear = self.cutout.as_deref().unwrap_or(std::slice::from_ref(&self.sel));
+        let px = view.pixels_mut();
+        rows_outside(r, clear, |y, x0, x1| {
+            px[index(s, y, x0)..index(s, y, x1)].iter_mut().for_each(|p| *p = dim(*p));
+        });
         let (shapes, scale, fonts) = (self.marks.iter().chain(drawing), self.scale, &self.fonts);
         let shift = (-r.x as f32, -r.y as f32);
         painter.draw_on(view.dc, l.to_win(), |c| draw_shapes(c, shapes, shift, scale, fonts, bright))?;
@@ -110,9 +110,9 @@ impl Editor {
                 let _ = GdiFlush();
             }
             let (src, dst) = (base.pixels(), view.pixels_mut());
-            rows_outside(r, cut, |y, x0, x1| {
+            rows_outside(r.intersect(&self.sel).unwrap_or_default(), cut, |y, x0, x1| {
                 let span = index(s, y, x0)..index(s, y, x1);
-                dst[span.clone()].copy_from_slice(&src[span])
+                dst[span.clone()].iter_mut().zip(&src[span]).for_each(|(dst, src)| *dst = dim(*src));
             });
         }
         Ok(())
@@ -157,7 +157,8 @@ impl Editor {
         let back = self.back.as_ref().expect("allocated above");
         unsafe {
             let _ = BitBlt(back.dc, 0, 0, area.w, area.h, Some(dim.dc), area.x, area.y, SRCCOPY);
-            self.draw(back.dc, area, rp, painter, font)?;
+            self.draw_canvas(back.dc, area, rp, painter)?;
+            self.draw_chrome(back.dc, area, rp, painter, font)?;
             let clip = CreateRectRgn(0, 0, 0, 0);
             for r in &extent {
                 let part = CreateRectRgn(r.x, r.y, r.right(), r.bottom());
@@ -173,22 +174,24 @@ impl Editor {
         Ok(())
     }
 
-    /// Draws the editor onto `dc`, which shows client `area`; overlays not reaching `rp` are skipped.
-    unsafe fn draw(
+    /// Draws the scene and selection onto `dc`, which shows client `area`, without editor chrome.
+    pub(crate) unsafe fn draw_canvas(
         &self,
         dc: HDC,
         area: Rect,
         rp: Rect,
         painter: &Painter,
-        font: &IDWriteTextFormat,
     ) -> Result<(), String> {
         let local = |r: Rect| r.offset(-area.x, -area.y);
         let visible = |r: Rect| r.intersect(&rp).is_some();
         unsafe {
             let (white, black) = (HBRUSH(GetStockObject(WHITE_BRUSH).0), HBRUSH(GetStockObject(BLACK_BRUSH).0));
-            let s = local(self.sel);
             if let Some(v) = &self.view {
-                let _ = BitBlt(dc, s.x, s.y, s.w, s.h, Some(v.dc), 0, 0, SRCCOPY);
+                let visible = self.drawn().intersect(&self.area).and_then(|r| r.intersect(&area));
+                if let Some(r) = visible {
+                    let dst = local(r);
+                    let _ = BitBlt(dc, dst.x, dst.y, r.w, r.h, Some(v.dc), r.x - self.area.x, r.y - self.area.y, SRCCOPY);
+                }
             }
             if self.selected {
                 // 1 px white inside 1 px black, outside the shot like the picker, except on
@@ -240,7 +243,7 @@ impl Editor {
                     }
                 }
             }
-            self.draw_chrome(dc, area, rp, painter, font)
+            Ok(())
         }
     }
 
@@ -299,8 +302,8 @@ impl Editor {
         self.render_view(bright, painter, None)?;
         let v = self.view.as_ref().expect("rendered above");
         let out = self.output_rect().intersect(&self.sel).unwrap_or(self.sel);
-        let (x0, x1) = ((out.x - self.sel.x) as usize, (out.right() - self.sel.x) as usize);
-        let rows = (out.y - self.sel.y) as usize..(out.bottom() - self.sel.y) as usize;
+        let (x0, x1) = ((out.x - self.area.x) as usize, (out.right() - self.area.x) as usize);
+        let rows = (out.y - self.area.y) as usize..(out.bottom() - self.area.y) as usize;
         let stride = v.w as usize;
         let mut px = Vec::with_capacity(out.w as usize * out.h as usize);
         for y in rows {

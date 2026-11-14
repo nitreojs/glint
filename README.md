@@ -11,7 +11,9 @@ screenshots and screen recording for windows, living in your tray<br>
 
 `ctrl+printscreen`, drag over the thing, done<br>
 or don't stop there: pens, arrows, boxes, numbered steps, text in any font you have, blur and pixelate for the stuff nobody should see<br>
-the toolbar is yours: hide what you never use, put the rest in your order and groups, give them your keys
+the toolbar is yours: hide what you never use, put the rest in your order and groups, give them your keys<br>
+draw anywhere on the frozen screen, even outside the selection; resize the selection to reframe it, with the magnifier beside the moving edge when enabled<br>
+only the selected area is copied or saved
 
 <img src="docs/readme/1-screenshot.avif" alt="taking a screenshot and marking it up" width="880">
 
@@ -20,6 +22,7 @@ the toolbar is yours: hide what you never use, put the rest in your order and gr
 <picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-grab-light.png"><img src="docs/readme/head-grab.png" alt="grab a piece, make it bigger" width="880"></picture>
 
 grab any piece of the screen and drop it right on top, as big as you want<br>
+drag its corners to resize freely; hold `shift` to keep its proportions<br>
 paste pictures in with `ctrl+v`, pin the result above every window
 
 <p align="center"><img src="docs/readme/2-grab.avif" alt="grabbing a piece of the screen and blowing it up" width="440"></p>

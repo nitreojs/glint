@@ -1217,15 +1217,25 @@ impl State {
 
     /// Where the selection aids go now: at the cursor, or while dragging at the selection's moving
     /// corner (as snapped and fitted), clear of the selection, the magnifier on the side the drag
-    /// heads for. None while the editor is up, over its toolbar, or over the live screen.
+    /// heads for, including an existing capture's resize handles. Hidden over chrome or live video.
     fn aids_layout(&self) -> aids::Shown {
+        let resizing = self.edit.as_ref().and_then(|e| e.resize_aid().map(|(at, toward)| (at, e.sel, toward)));
         let on_chrome = || {
             self.edit.as_ref().is_some_and(|e| e.dragging() || e.chrome().iter().any(|c| c.contains(self.cursor.0, self.cursor.1)))
         };
         let picking = self.edit.is_none() || self.region;
-        let Some(kit) = self.aid_kit.as_ref().filter(|_| picking && self.pick_frozen().is_some() && !(self.region && on_chrome())) else {
+        let Some(kit) = self.aid_kit.as_ref().filter(|_| {
+            self.pick_frozen().is_some() && (resizing.is_some() || (picking && !(self.region && on_chrome())))
+        }) else {
             return aids::Shown::default();
         };
+        let screen = Rect { x: 0, y: 0, w: self.size.0, h: self.size.1 };
+        if let Some((at, sel, toward)) = resizing {
+            let monitors = self.monitors();
+            let chrome = self.edit.as_ref().map_or_else(Vec::new, |ed| ed.chrome());
+            return aids::layout(self.aids, at, Some(sel.inflate(RING)), toward, screen, &monitors, &kit.m)
+                .near_resize(sel, &chrome, &monitors, &kit.m);
+        }
         let drag = self.drag_start.filter(|_| self.dragging).zip(self.target);
         let (at, clear, toward) = match drag {
             Some((start, t)) => {
@@ -1236,7 +1246,6 @@ impl State {
             }
             None => (self.cursor, None, (false, false)),
         };
-        let screen = Rect { x: 0, y: 0, w: self.size.0, h: self.size.1 };
         aids::layout(self.aids, at, clear, toward, screen, &self.monitors(), &kit.m)
     }
 

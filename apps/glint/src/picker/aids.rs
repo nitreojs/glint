@@ -276,6 +276,34 @@ impl Shown {
     pub(super) fn loupe(&self) -> Option<Rect> {
         self.loupe
     }
+
+    /// Keep resize aids beside the aimed-at pixel, preferring the outside of the crop.
+    /// Nearby alternatives avoid chrome and flip inward when the monitor edge leaves no room.
+    pub(super) fn near_resize(mut self, selection: Rect, chrome: &[Rect], monitors: &[Rect], m: &Metrics) -> Self {
+        let Some(block) = self.loupe else { return self };
+        let Some(mon) = monitors.iter().find(|r| r.contains(self.at.0, self.at.1)) else { return self };
+        let gap = m.gap * 2;
+        let (x, y) = self.at;
+        let (left, right) = (x - gap - block.w, x + 1 + gap);
+        let (top, bottom) = (y - gap - block.h, y + 1 + gap);
+        let (cx, cy) = (x - block.w / 2, y - block.h / 2);
+        let overlap = |a: Rect, b: Rect| a.intersect(&b).map_or(0, |r| i64::from(r.w) * i64::from(r.h));
+        self.loupe = [
+            (left, cy), (right, cy), (cx, top), (cx, bottom),
+            (left, top), (right, top), (left, bottom), (right, bottom),
+        ].into_iter().map(|(x, y)| Rect {
+            x: x.clamp(mon.x, (mon.right() - block.w).max(mon.x)),
+            y: y.clamp(mon.y, (mon.bottom() - block.h).max(mon.y)),
+            ..block
+        }).min_by_key(|&r| {
+            let covers_cursor = r.inflate(m.gap).contains(x, y);
+            let chrome: i64 = chrome.iter().map(|&c| overlap(r, c)).sum();
+            let dx = i64::from(r.x + r.w / 2 - x);
+            let dy = i64::from(r.y + r.h / 2 - y);
+            (covers_cursor, chrome, overlap(r, selection), dx * dx + dy * dy)
+        });
+        self
+    }
 }
 
 /// Where the aids go for the pixel `at` on `screen` (the whole overlay): the crosshair's lines
@@ -491,6 +519,49 @@ mod tests {
         assert_eq!(at((10, 10), (true, true)), Rect { x: 27, y: 27, w, h }, "flipped back at the top left");
         let none = layout(BOTH, (4000, 1200), None, (false, false), SCREEN, &[LEFT, RIGHT], &M);
         assert!(none.loupe().is_none() && !none.rows.is_empty(), "no monitor under it: lines only");
+    }
+
+    #[test]
+    fn resize_loupe_follows_nearby_without_covering_the_dragged_pixel() {
+        let selection = Rect { x: 800, y: 300, w: 1600, h: 900 };
+        let near = |r: Rect, at: (i32, i32)| {
+            let dx = (r.x - at.0).max(at.0 - r.right() + 1).max(0);
+            let dy = (r.y - at.1).max(at.1 - r.bottom() + 1).max(0);
+            assert!(dx <= M.gap * 2 + 1 && dy <= M.gap * 2 + 1, "{r:?} too far from {at:?}");
+            assert!(!r.inflate(M.gap).contains(at.0, at.1), "keeps the moving pixel clear");
+        };
+        for at in [
+            (800, 750), (2399, 750), (1600, 300), (1600, 1199),
+            (800, 300), (2399, 300), (800, 1199), (2399, 1199),
+        ] {
+            let shown = layout(BOTH, at, Some(selection), (false, false), SCREEN, &[LEFT], &M)
+                .near_resize(selection, &[], &[LEFT], &M);
+            let r = shown.loupe().unwrap();
+            assert_eq!(r.intersect(&LEFT), Some(r), "stays on its monitor");
+            assert!(r.intersect(&selection).is_none(), "prefers outside when there is room");
+            near(r, at);
+        }
+        let toolbar = Rect { x: 1200, y: 1220, w: 1000, h: 40 };
+        let at = (1600, 1199);
+        let shown = layout(BOTH, at, Some(selection), (false, false), SCREEN, &[LEFT], &M)
+            .near_resize(selection, &[toolbar], &[LEFT], &M);
+        assert!(shown.loupe().unwrap().intersect(&toolbar).is_none());
+        near(shown.loupe().unwrap(), at);
+        for at in [(RIGHT.x, 500), (RIGHT.right() - 1, 500), (RIGHT.x, 0), (RIGHT.right() - 1, RIGHT.bottom() - 1)] {
+            let shown = layout(BOTH, at, Some(RIGHT), (true, false), SCREEN, &[LEFT, RIGHT], &M)
+                .near_resize(RIGHT, &[], &[LEFT, RIGHT], &M);
+            let r = shown.loupe().unwrap();
+            assert_eq!(r.intersect(&RIGHT), Some(r), "screen-edge fallback stays on the same monitor");
+            near(r, at);
+        }
+        let moved = selection.offset(20, 20);
+        let a = layout(BOTH, (800, 750), None, (true, false), SCREEN, &[LEFT], &M)
+            .near_resize(selection, &[], &[LEFT], &M).loupe().unwrap();
+        let b = layout(BOTH, (820, 770), None, (true, false), SCREEN, &[LEFT], &M)
+            .near_resize(moved, &[], &[LEFT], &M).loupe().unwrap();
+        assert_eq!(b, a.offset(20, 20), "tracks the moving edge rather than a monitor corner");
+        assert!(layout(Aids::default(), (800, 750), None, (false, false), SCREEN, &[LEFT], &M)
+            .near_resize(selection, &[], &[LEFT], &M).loupe().is_none());
     }
 
     #[test]

@@ -412,8 +412,7 @@ impl Mark {
             (Mark::Arrow { from, .. }, Grip::From) => shift(from),
             (Mark::Arrow { to, .. }, Grip::To) => shift(to),
             (Mark::Step { tail: Some(t), .. }, Grip::To) => shift(t),
-            // a grab keeps its proportions from the corners
-            (Mark::Grab { src, rect }, Grip::Edge(e)) if (e.l || e.r) && (e.t || e.b) => {
+            (Mark::Grab { src, rect }, Grip::Edge(e)) if keep && (e.l || e.r) && (e.t || e.b) => {
                 let aspect = src.w.max(1) as f32 / src.h.max(1) as f32;
                 *rect = keep_aspect(resize(*rect, e, (dx, dy), b, MIN_SIDE), e, aspect);
             }
@@ -692,6 +691,31 @@ pub(super) fn arrow(c: &Canvas, from: (f32, f32), to: (f32, f32), width: f32, co
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grab_corners_follow_each_axis_and_shift_preserves_proportions() {
+        let src = Rect { x: 600, y: 500, w: 200, h: 100 };
+        let rect = Rect { x: 100, y: 100, w: 200, h: 100 };
+        let bounds = Rect { x: 0, y: 0, w: 1920, h: 1080 };
+        let mark = Mark::Grab { src, rect };
+        for l in [false, true] {
+            for t in [false, true] {
+                let edge = Edges { l, r: !l, t, b: !t };
+                for delta in [(40, 0), (0, 25), (40, 25)] {
+                    let resized = mark.resized(Grip::Edge(edge), delta, bounds, false);
+                    let expected = Rect {
+                        x: rect.x + if l { delta.0 } else { 0 },
+                        y: rect.y + if t { delta.1 } else { 0 },
+                        w: rect.w + if l { -delta.0 } else { delta.0 },
+                        h: rect.h + if t { -delta.1 } else { delta.1 },
+                    };
+                    assert_eq!(resized, Mark::Grab { src, rect: expected });
+                }
+                let kept = mark.resized(Grip::Edge(edge), (40, 0), bounds, true).bbox();
+                assert_eq!(kept.w, kept.h * 2, "Shift keeps the source proportions");
+            }
+        }
+    }
 
     #[test]
     fn marks_are_hit_on_their_ink() {

@@ -147,6 +147,63 @@ impl Scene {
     }
 }
 
+#[test]
+fn bottom_resize_aid_backgrounds_do_not_draw_chrome_into_tiny_buffers() {
+    let s = Scene::new(None);
+    let sel = Rect { x: 900, y: 450, w: 1200, h: 600 };
+    let mut ed = crate::shot::editor::Editor::new(sel, None, vec![SCREEN], 1.0);
+    ed.mouse_down((1500, sel.bottom()), 0);
+    for y in [1150, 1050, 1200, 900] {
+        ed.mouse_move((1500, y));
+        ed.render(&s.frozen.bright, &s.painter, &s.font).unwrap();
+        let bar = ed.bar;
+        // Crosshair columns cross the bottom toolbar. Their backing DC can be only 1 px wide.
+        for r in [
+            Rect { x: bar.x + bar.w / 2, y: bar.y, w: 1, h: bar.h },
+            Rect { x: bar.x, y: bar.y + bar.h / 2, w: bar.w, h: 1 },
+        ] {
+            let strip = Dib::new(r.w, r.h).unwrap();
+            unsafe {
+                let _ = BitBlt(strip.dc, 0, 0, r.w, r.h, Some(s.frozen.dim.dc), r.x, r.y, SRCCOPY);
+                ed.draw_canvas(strip.dc, r, r, &s.painter).unwrap();
+                let _ = GdiFlush();
+            }
+            for dy in 0..r.h {
+                for dx in 0..r.w {
+                    assert_eq!(
+                        strip.pixel(dx, dy).unwrap() & 0x00FF_FFFF,
+                        s.frozen.dim.pixel(r.x + dx, r.y + dy).unwrap() & 0x00FF_FFFF,
+                        "resize {y}, toolbar background at {dx},{dy} must not contain toolbar pixels",
+                    );
+                }
+            }
+        }
+        let clean = Dib::new(SCREEN.w, SCREEN.h).unwrap();
+        ed.paint(clean.dc, SCREEN, &s.frozen.dim, &s.painter, &s.font).unwrap();
+        let (at, toward) = ed.resize_aid().unwrap();
+        let chrome = ed.chrome();
+        let shown = s.layout(ON, at, Some((ed.sel, toward))).near_resize(ed.sel, &chrome, &[SCREEN], &s.kit.m);
+        unsafe {
+            let _ = BitBlt(s.window.dc, 0, 0, SCREEN.w, SCREEN.h, Some(clean.dc), 0, 0, SRCCOPY);
+            let base = |dc, r: Rect, _: (i32, i32)| {
+                let _ = BitBlt(dc, 0, 0, r.w, r.h, Some(s.frozen.dim.dc), r.x, r.y, SRCCOPY);
+                ed.draw_canvas(dc, r, r, &s.painter).unwrap();
+            };
+            aids::paint(s.window.dc, SCREEN, &shown, &s.kit, &s.frozen.bright, &base, None, &chrome);
+            let _ = GdiFlush();
+        }
+        for y in bar.y..bar.bottom() {
+            for x in bar.x..bar.right() {
+                assert_eq!(
+                    s.window.pixel(x, y).unwrap() & 0x00FF_FFFF,
+                    clean.pixel(x, y).unwrap() & 0x00FF_FFFF,
+                    "aids changed the bottom toolbar at {x},{y}",
+                );
+            }
+        }
+    }
+}
+
 /// Renders the aids to look at: `%TEMP%\glint-review\picker\*.png`.
 #[test]
 #[ignore = "writes review PNGs: cargo test --release -- --ignored review_aids"]
@@ -186,6 +243,34 @@ fn review_aids() {
             s.paint(SCREEN, Some(window), Some(&label), &shown);
             s.save(&dir, "whole-screen", SCREEN);
         }
+    }
+    // Post-selection editing uses the same aids, over the editor rather than the plain picker.
+    let s = Scene::new(None);
+    let sel = Rect { x: 900, y: 450, w: 1200, h: 600 };
+    for (name, from, to) in [
+        ("bottom", (1500, sel.bottom()), (1500, 1150)),
+        ("left", (sel.x, 750), (700, 750)),
+        ("right", (sel.right(), 750), (2400, 750)),
+    ] {
+        let mut ed = crate::shot::editor::Editor::new(sel, None, vec![SCREEN], 1.0);
+        ed.mouse_down(from, 0);
+        ed.mouse_move(to);
+        ed.render(&s.frozen.bright, &s.painter, &s.font).unwrap();
+        let (at, toward) = ed.resize_aid().unwrap();
+        let chrome = ed.chrome();
+        let shown = s.layout(ON, at, Some((ed.sel, toward))).near_resize(ed.sel, &chrome, &[SCREEN], &s.kit.m);
+        let label = s.label(ed.sel);
+        unsafe {
+            let _ = BitBlt(s.window.dc, 0, 0, SCREEN.w, SCREEN.h, Some(s.frozen.dim.dc), 0, 0, SRCCOPY);
+            ed.paint(s.window.dc, SCREEN, &s.frozen.dim, &s.painter, &s.font).unwrap();
+            let base = |dc, r: Rect, _: (i32, i32)| {
+                let _ = BitBlt(dc, 0, 0, r.w, r.h, Some(s.frozen.dim.dc), r.x, r.y, SRCCOPY);
+                ed.draw_canvas(dc, r, r, &s.painter).unwrap();
+            };
+            aids::paint(s.window.dc, SCREEN, &shown, &s.kit, &s.frozen.bright, &base, Some(&label), &chrome);
+            let _ = GdiFlush();
+        }
+        s.save(&dir, &format!("editor-resize-{name}"), SCREEN);
     }
     println!("review PNGs in {}", dir.display());
 }
