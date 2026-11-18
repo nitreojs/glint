@@ -365,11 +365,7 @@ impl ClipApp {
         let axis = Axis { left: inner.left(), width: inner.width(), view: v, dur, fps: info.fps, snapping };
         let click_lane = rows.clicks.and_then(|lane| self.clicks_input(ui, look, lane, &axis));
         let key_lane = rows.keys.and_then(|lane| self.keys_input(ui, look, lane, &axis));
-        let start_tip = if pieces.is_some() {
-            "drag to trim · snaps to keyframes so it saves instantly · ctrl + drag for an exact frame (the file then starts at the keyframe before it)"
-        } else {
-            "drag to trim · ctrl + drag: no snapping"
-        };
+        let trim_tip = "drag to trim · snaps to the playhead and nearby guides · ctrl + drag: no snapping";
         let grip = |t: i64, id: &str, tip: &str| {
             let x = x_of(t);
             visible(x).then(|| {
@@ -382,8 +378,8 @@ impl ClipApp {
                     .collect::<Vec<_>>()
             })
         };
-        let start = grip(self.edit.range.start, "clip-in", start_tip);
-        let end = grip(self.edit.range.end, "clip-out", "drag to trim · ctrl + drag: no snapping");
+        let start = grip(self.edit.range.start, "clip-in", trim_tip);
+        let end = grip(self.edit.range.end, "clip-out", trim_tip);
         let left = rows.bar.left() + rows.bar.width() * (v.start as f32 / dur as f32);
         let thumb = Rect::from_min_max(
             pos2(left, rows.bar.top()),
@@ -500,25 +496,26 @@ impl ClipApp {
         if let (Some(drag), Some(at)) = (self.drag, ui.input(|i| i.pointer.interact_pos())) {
             let raw = math::snap(t_of(at.x), info.fps);
             match drag {
-                Drag::Start { head } => {
-                    let t = match export::nearest_key(&keys, raw) {
-                        Some(k) if snapping => k,
-                        _ => self.snapped(raw, &[head], within, snapping),
+                Drag::Start { head } | Drag::End { head } => {
+                    let pointer = t_of(at.x);
+                    let t = if snapping && (pointer - head).abs() <= within {
+                        head
+                    } else if snapping {
+                        let key = matches!(drag, Drag::Start { .. }).then(|| export::nearest_key(&keys, raw)).flatten();
+                        self.snapped(raw, key.as_slice(), within, true)
+                    } else {
+                        raw
                     };
-                    let before = self.edit.range.start;
-                    self.edit.range.set_start(t, frame);
-                    if self.edit.range.start != before || self.pos != self.edit.range.start {
-                        self.pos = self.edit.range.start;
-                        self.seek(self.pos, false);
-                    }
-                }
-                Drag::End { head } => {
-                    let t = self.snapped(raw, &[head], within, snapping);
-                    let before = self.edit.range.end;
-                    self.edit.range.set_end(t, info.duration, frame);
-                    if self.edit.range.end != before || self.pos != self.edit.range.end - 1 {
-                        self.pos = self.edit.range.end - 1;
-                        self.seek(self.pos, false);
+                    let preview = if matches!(drag, Drag::Start { .. }) {
+                        self.edit.range.set_start(t, frame);
+                        self.edit.range.start
+                    } else {
+                        self.edit.range.set_end(t, info.duration, frame);
+                        self.edit.range.end - 1
+                    };
+                    if self.pos != preview || self.play != Play::Paused {
+                        self.pos = preview;
+                        self.seek(preview, false);
                     }
                 }
                 Drag::Head => {
@@ -536,6 +533,10 @@ impl ClipApp {
             }
         }
         if self.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+            if let Some(Drag::Start { head } | Drag::End { head }) = self.drag {
+                self.pos = head;
+                self.seek(head, false);
+            }
             if let Some(before) = self.before_drag.take() {
                 self.undo.record(before, &self.edit);
             }
@@ -546,7 +547,11 @@ impl ClipApp {
             value: Some(t as f64 / SECOND as f64),
             ..WidgetInfo::labeled(role, true, label)
         };
-        body.widget_info(|| timed(Role::Slider, "playhead", self.pos));
+        let timeline_pos = match self.drag {
+            Some(Drag::Start { head } | Drag::End { head }) => head,
+            _ => self.pos,
+        };
+        body.widget_info(|| timed(Role::Slider, "playhead", timeline_pos));
         if let Some(r) = start.as_ref().and_then(|r| r.first()) {
             r.widget_info(|| timed(Role::Slider, "trim start", self.edit.range.start));
         }
@@ -566,8 +571,8 @@ impl ClipApp {
         let head_t = match self.drag {
             _ if matches!(self.play, Play::Running { .. }) => self.playhead.play(now, self.pos),
             Some(Drag::Head | Drag::Start { .. } | Drag::End { .. }) => {
-                self.playhead.set(self.pos);
-                self.pos
+                self.playhead.set(timeline_pos);
+                timeline_pos
             }
             _ => {
                 self.playhead.glide(now, self.pos, animate, ease);

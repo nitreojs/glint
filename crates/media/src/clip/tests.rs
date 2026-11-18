@@ -616,6 +616,32 @@ fn an_hevc_smart_cut_starts_on_its_frame_and_copies_the_rest() {
 }
 
 #[test]
+#[ignore = "needs ffprobe on PATH and a four-track recording in GLINT_SMART_SRC"]
+fn a_four_track_mix_exports_to_the_end_of_a_recording() {
+    let src = PathBuf::from(std::env::var_os("GLINT_SMART_SRC").unwrap());
+    let _com = Com::init();
+    let info = media::probe(&src).unwrap();
+    assert_eq!(info.tracks.len(), 4);
+    let mut edit = Edit::new(info.duration, 4);
+    edit.range.start = info.duration - 14 * SECOND;
+    edit.set_volume(0, 80);
+    edit.set_volume(2, 10);
+
+    for compress in [None, Some(export::Compress::Medium)] {
+        let out = test_dir().join(format!("glint-mix-tail-{compress:?}-{}.mp4", std::process::id()));
+        export_to(&src, &edit, &export::Settings { compress, combine: true, ..Default::default() }, &out);
+        let streams = probe(&out, "stream=codec_type,duration");
+        assert_eq!(streams.len(), 2, "{streams:?}");
+        for (stream, kind) in streams.iter().zip(["video", "audio"]) {
+            let (ty, duration) = stream.split_once(',').unwrap();
+            assert_eq!(ty, kind);
+            assert!((duration.parse::<f64>().unwrap() - 14.0).abs() < 0.1, "{stream}");
+        }
+        std::fs::remove_file(out).unwrap();
+    }
+}
+
+#[test]
 #[ignore = "needs ffmpeg and ffprobe on PATH and a recording in GLINT_SMART_SRC; writes next to GLINT_TEST_DIR"]
 fn a_real_recording_smart_cuts() {
     let src = PathBuf::from(std::env::var_os("GLINT_SMART_SRC").expect("set GLINT_SMART_SRC to a glint or afterglow recording"));

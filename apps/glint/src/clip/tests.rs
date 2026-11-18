@@ -100,7 +100,8 @@ impl Harness {
             ..Default::default()
         };
         let (app, frame) = (&mut self.app, &mut self.frame);
-        let out = self.ctx.run_ui(input, |ui| app.ui(ui, frame));
+        let mut out = self.ctx.run_ui(input, |ui| app.ui(ui, frame));
+        out.textures_delta.clear();
         self.texts = out
             .shapes
             .iter()
@@ -329,6 +330,32 @@ fn crop_mode_opens_with_c_and_leaves_with_enter() {
     h.key(Key::Escape, true);
     h.settle();
     assert!(h.app.cropping.is_none() && h.app.edit.crop.is_none());
+}
+
+#[test]
+fn either_trim_edge_snaps_to_the_parked_playhead_between_keyframes() {
+    for start in [true, false] {
+        let mut h = Harness::opened(Info { snap: None, ..info(1, None, None) }, Some(index(1)));
+        let header = h.rect_of("sound · muted tracks won't be in the file");
+        let left = header.left() + 6.0;
+        let right = h.rect_of("mute all").right() - 6.0;
+        let y = header.center().y - 41.0;
+        let head = 3663 * SECOND / 100;
+        h.app.jump(head);
+        h.settle();
+        let from = pos2(if start { left } else { right }, y);
+        let to = pos2(left + (right - left) * (36.63 / 42.0) + 3.0, y);
+        let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
+        h.frame(vec![Event::PointerMoved(from), button(from, true)]);
+        h.frame(vec![Event::PointerMoved(from.lerp(to, 0.5))]);
+        assert_ne!(h.app.pos, head, "the preview follows the edge");
+        assert_eq!(h.app.playhead.at(h.app.now, widgets::ease), head, "the line stays parked");
+        h.frame(vec![Event::PointerMoved(to)]);
+        h.frame(vec![button(to, false)]);
+        let range = h.app.edit.range;
+        assert_eq!(if start { range.start } else { range.end }, head);
+        assert_eq!(h.app.pos, head, "release returns to the parked moment");
+    }
 }
 
 #[test]

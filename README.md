@@ -35,7 +35,9 @@ paste pictures in with `ctrl+v`, pin the result above every window
 it records straight off the gpu with your mic and system sound, and can show your clicks and keys
 
 then trim it, crop it, mute a track, squeeze it under a size<br>
-if nothing has to be re-encoded, it isn't: the cut is lossless, starts on the exact frame, and glint says so
+park the playhead and drag either trim edge to its line to cut there; hold ctrl to bypass snapping<br>
+if nothing has to be re-encoded, it isn't: the cut is lossless, starts on the exact frame, and glint says so<br>
+when combining sound, tracks that end early fall silent while the rest of the clip continues
 
 in **settings → recording → after trimming**, keep both files (the default), keep only the trimmed copy, or ask each time<br>
 originals go to the recycle bin when the editor closes, only after an edited copy has saved successfully and still exists; unsaved changes or a later failed/cancelled export keep the original

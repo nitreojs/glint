@@ -14,7 +14,7 @@ use windows::core::{GUID, HSTRING};
 
 use super::burn::{Burner, KeyBurner};
 use super::gif;
-use super::media::{self, ANY, Got, Gpu, attributes, pack};
+use super::media::{self, Got, Gpu, attributes, pack};
 use super::process::Processor;
 use super::smart;
 use crate::record::Ctx;
@@ -462,8 +462,11 @@ fn run(
                 Video::Encode { .. } => piece.start,
             };
             let seg = Range { start: lead, end: piece.end };
-            let mut active: Vec<u32> = (0..streams.len() as u32).filter(|&i| targets[i as usize].is_some()).collect();
-            for &i in &active {
+            let mut active: Vec<(u32, i64)> = (0..streams.len() as u32)
+                .filter(|&i| targets[i as usize].is_some())
+                .map(|i| (i, i64::MIN))
+                .collect();
+            for &(i, _) in &active {
                 reader.SetStreamSelection(i, true).ctx("SetStreamSelection")?;
             }
             media::seek(&reader, lead)?;
@@ -490,11 +493,16 @@ fn run(
             }
             let copy_from = copy_from.unwrap_or(seg.start);
             let mut after_head = !head.is_empty();
-            while !active.is_empty() {
+            // Deselecting a finished stream mid-read can make MF fail the next track's ReadSample.
+            while let Some((slot, &(stream, last_ts))) = active.iter().enumerate().min_by_key(|(_, (_, ts))| *ts) {
                 if p.cancelled() {
                     return Ok(false);
                 }
-                let (i, ts, sample) = match media::read(&reader, ANY)? {
+                let got = media::read(&reader, stream).map_err(|e| {
+                    let at = last_ts.max(lead) as f64 / SECOND as f64;
+                    format!("reading stream {stream} near {at:.3}s: {e}")
+                })?;
+                let (i, ts, sample) = match got {
                     Got::Sample { stream, ts, sample } => (stream, ts, sample),
                     Got::End(i) => {
                         match targets.get(i as usize).copied().flatten() {
@@ -514,11 +522,11 @@ fn run(
                             Some(Target::Mix(m, l)) => open[m][l] = false,
                             _ => {}
                         }
-                        active.retain(|&a| a != i);
-                        let _ = reader.SetStreamSelection(i, false);
+                        active.swap_remove(slot);
                         continue;
                     }
                 };
+                active[slot].1 = ts;
                 let Some(target) = targets.get(i as usize).copied().flatten() else { continue };
                 for s in &mut silences {
                     s.fill(&writer, out_ts(ts.clamp(seg.start, seg.end)))?;
@@ -607,8 +615,7 @@ fn run(
                     }
                 }
                 if done {
-                    active.retain(|&a| a != i);
-                    let _ = reader.SetStreamSelection(i, false);
+                    active.swap_remove(slot);
                 }
             }
             any_video |= started || held.is_some() || pending.is_some();
