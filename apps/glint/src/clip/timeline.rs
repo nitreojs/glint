@@ -2,8 +2,8 @@ use eframe::egui::{
     self, Color32, CornerRadius, CursorIcon, Id, Mesh, Order, Painter, Rect, Role, Sense, Shape, Stroke, StrokeKind, Ui,
     WidgetInfo, pos2, vec2,
 };
-use glint_core::clip::edit::{Edit, FULL_VOLUME, MAX_VOLUME, snap_to};
-use glint_core::clip::export::{self, Job, Video};
+use glint_core::clip::edit::{Edit, FULL_VOLUME, MAX_VOLUME, Segment, Speed, TimeMap};
+use glint_core::clip::export::{Job, Video};
 use glint_core::clip::info::Info;
 use glint_core::clip::math::{self, SECOND};
 use glint_ui::widgets::{Look, anim, ease, medium, mix, mono, motion, sans};
@@ -25,6 +25,7 @@ const CLICKS_H: f32 = 24.0;
 const KEYS_H: f32 = 24.0;
 const HANDLE_W: f32 = 6.0;
 const HANDLE_HIT: f32 = 14.0;
+const PIECE_DIM: Color32 = Color32::from_black_alpha(18);
 const RENAME_W: f32 = 140.0;
 const MENU_W: f32 = 180.0;
 const ITEM_H: f32 = 30.0;
@@ -32,6 +33,7 @@ const HEADER: &str = "sound · muted tracks won't be in the file";
 const MUTED: &str = "· muted, not exported";
 const ADD_TEXT: &str = "+ add empty track";
 const VOLUME_TIP: &str = "volume · drag, scroll or click · double-click for 100%";
+
 /// How far a drag (in percent, a pixel each) has to pull to leave 100 %.
 const DETENT: f32 = 6.0;
 /// Wheel points per percent: one notch (40 points) is 5 %.
@@ -40,7 +42,7 @@ const WHEEL_PX: f32 = 8.0;
 const SETTLE: f64 = 0.6;
 const POP_W: f32 = 240.0;
 const POP_H: f32 = 40.0;
-const SNAP_PX: f64 = 8.0;
+const SNAP_PX: f32 = 8.0;
 const MARKER: Color32 = Color32::from_rgb(0xF5, 0xC0, 0x4A);
 const WAVES: [Color32; 6] = [
     Color32::from_rgb(0x6A, 0xA7, 0xE8),
@@ -71,7 +73,73 @@ pub(super) enum Drag {
     Start { head: i64 },
     End { head: i64 },
     Head,
+    Stretch(Stretch),
     Scroll { grab: f32 },
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Edge {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct Stretch {
+    index: usize,
+    piece: Segment,
+    kept: math::Range,
+    edge: Edge,
+    from: f32,
+    units_per_point: f64,
+    view_start: i64,
+    output_len: i64,
+    anchor_offset: i64,
+}
+
+impl Stretch {
+    fn offset(piece: Segment, speed: Speed, source: i64) -> i64 {
+        let source = source - piece.start;
+        if source == piece.end - piece.start {
+            return speed.output_len(source);
+        }
+
+        speed.output_delta(source)
+    }
+
+    fn anchor(&self) -> i64 {
+        match self.edge {
+            Edge::Left => self.kept.end,
+            Edge::Right => self.kept.start,
+        }
+    }
+
+    fn moving_edge(&self) -> i64 {
+        match self.edge {
+            Edge::Left => self.kept.start,
+            Edge::Right => self.kept.end,
+        }
+    }
+
+    fn duration(piece: Segment, kept: math::Range, speed: Speed) -> i64 {
+        let start = Self::offset(piece, speed, kept.start);
+        let end = Self::offset(piece, speed, kept.end);
+
+        (end - start).max(1)
+    }
+
+    fn rate_at(&self, x: f32) -> Speed {
+        let delta = (f64::from(x - self.from) * self.units_per_point).round() as i64;
+        if delta == 0 {
+            return self.piece.speed;
+        }
+
+        let output = match self.edge {
+            Edge::Left => self.output_len.saturating_sub(delta),
+            Edge::Right => self.output_len.saturating_add(delta),
+        };
+
+        Speed::from_lengths(self.kept.len(), output.max(1))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -253,37 +321,144 @@ fn lane_slot(rows: &Rows, y: f32) -> usize {
     (((y - first.top() + GAP / 2.0) / pitch).floor().max(0.0) as usize).min(n - 1)
 }
 
+fn kept_bounds(piece: Segment, range: math::Range) -> math::Range {
+    math::Range { start: piece.start.max(range.start), end: piece.end.min(range.end) }
+}
+
+fn shift_press(ui: &Ui) -> Option<egui::Pos2> {
+    ui.input(|input| {
+        input.events.iter().rev().find_map(|event| match event {
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers }
+                if modifiers.shift => Some(*pos),
+            _ => None,
+        })
+    })
+}
+
 impl ClipApp {
-    fn snapped(&self, t: i64, extra: &[i64], within: i64, on: bool) -> i64 {
-        if !on {
-            return t;
+    fn parked_piece(&self) -> Option<usize> {
+        if self.play != Play::Paused
+            || self.edit.segments.len() < 2
+            || !(self.edit.range.start..self.edit.range.end).contains(&self.pos)
+        {
+            return None;
         }
-        let targets = (self.edit.markers.iter().copied())
-            .chain(self.cuts.iter().copied())
-            .chain(self.edit.splits())
-            .chain([0, self.duration()])
-            .chain(extra.iter().copied());
-        snap_to(t, targets, within)
+
+        let index = self.edit.segment_at(self.pos);
+
+        (!self.edit.segments[index].removed).then_some(index)
     }
 
-    pub(super) fn timeline(&mut self, ui: &mut Ui, look: &Look, area: Rect, lane_h: f32) {
+    fn stretch_edge(&self, x: f32, x_of: impl Fn(i64) -> f32) -> Option<(usize, math::Range, Edge)> {
+        let edit = &self.edit;
+        let within_range = x.clamp(x_of(edit.range.start), x_of(edit.range.end));
+        let index = edit.segments.partition_point(|piece| {
+            piece.end < edit.range.end && x_of(piece.end) <= within_range
+        });
+        let piece = *edit.segments.get(index)?;
+        let kept = kept_bounds(piece, edit.range);
+        if piece.removed || kept.start >= kept.end {
+            return None;
+        }
+
+        let left = (x - x_of(kept.start)).abs();
+        let right = (x - x_of(kept.end)).abs();
+        if left.min(right) > HANDLE_HIT / 2.0 {
+            return None;
+        }
+
+        let (edge, cut) = if left <= right {
+            (Edge::Left, kept.start)
+        } else {
+            (Edge::Right, kept.end)
+        };
+
+        if edit.range.start < cut && cut < edit.range.end
+            && let Some(parked) = self.parked_piece()
+        {
+            let target = edit.segments[parked];
+            let other_edge = match edge {
+                Edge::Left if target.end == cut => Some(Edge::Right),
+                Edge::Right if target.start == cut => Some(Edge::Left),
+                _ => None,
+            };
+            if let Some(edge) = other_edge
+                && self.pos > target.start
+            {
+                return Some((parked, kept_bounds(target, edit.range), edge));
+            }
+        }
+
+        Some((index, kept, edge))
+    }
+
+    fn snapped(&self, axis: &Axis<'_>, x: f32, t: i64, extra: &[i64], keys: &[i64]) -> i64 {
+        if !axis.snapping {
+            return t;
+        }
+
+        let min = axis.t(x - SNAP_PX);
+        let max = axis.t(x + SNAP_PX);
+        let first = keys.partition_point(|&key| key < min);
+        let last = keys.partition_point(|&key| key <= max);
+        let targets = self.edit.markers.iter().copied()
+            .chain(self.cuts.iter().copied())
+            .chain(self.edit.splits())
+            .chain([0, axis.source_dur])
+            .chain(extra.iter().copied())
+            .chain(keys[first..last].iter().copied());
+
+        targets.filter(|&s| (min..=max).contains(&s))
+            .map(|s| (s, (axis.x(s) - x).abs()))
+            .filter(|&(_, distance)| distance <= SNAP_PX)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map_or(t, |(s, _)| s)
+    }
+
+    fn update_stretch(&mut self, stretch: &Stretch, x: f32) -> bool {
+        let Some(piece) = self.edit.segments.get(stretch.index) else { return false };
+        if piece.removed || piece.start != stretch.piece.start || piece.end != stretch.piece.end {
+            return false;
+        }
+
+        let speed = stretch.rate_at(x);
+        if !self.edit.set_speed(stretch.index, speed) {
+            return false;
+        }
+
+        self.pause();
+        self.view.start = stretch.view_start
+            + (Stretch::offset(stretch.piece, speed, stretch.anchor()) - stretch.anchor_offset);
+
+        true
+    }
+
+    pub(super) fn timeline(&mut self, ui: &mut Ui, look: &Look, area: Rect, lane_h: f32, follow: Option<i64>) {
         let p = look.p;
+        let stretching = matches!(self.drag, Some(Drag::Stretch(_)));
         let Some(info) = self.info().cloned() else {
             ui.painter().rect_filled(Rect::from_min_size(area.min + vec2(0.0, TOP), vec2(area.width(), VIDEO_H)), 6, p.ctl);
             return;
         };
         let rows = rows(area, self.edit.lanes.len(), lane_h, self.edit.clicks.is_some(), self.edit.keys.is_some());
-        let dur = info.duration.max(1);
+        let source_dur = info.duration.max(1);
+        let mut map = TimeMap::new(&self.edit);
+        let mut dur = map.duration().max(1);
         let frame = math::frame_len(info.fps);
         let inner = area.shrink2(vec2(6.0, 0.0));
         let min_span = (frame * 12).max(SECOND / 5);
-        self.view.clamp(dur, min_span);
+        if !stretching {
+            self.view.clamp(dur, min_span);
+            if let Some(source) = follow {
+                self.view.follow(map.to_edit(source), dur);
+            }
+        }
         let light = self.light == Some(true);
 
         let menus = self.sheet || self.menu || self.confirm_delete || self.confirm_cleanup.is_some()
             || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| area.contains(*at));
-        let ctrl = ui.input(|i| i.modifiers.ctrl);
+        let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
         let body = ui.interact(Rect::from_min_max(area.min, rows.span.max), Id::unique("clip-track"), Sense::click_and_drag());
         let lanes = self.edit.lanes.clone();
         let renaming = self.renaming.as_ref().map(|(k, _)| *k);
@@ -336,6 +511,7 @@ impl ClipApp {
         let over_head = hover.is_some_and(|at| chips.iter().any(|c| c.zone.contains(at)));
         if let Some(at) = hover
             && !menus
+            && !stretching
             && !over_head
             && self.volume_pop.is_none()
         {
@@ -351,49 +527,83 @@ impl ClipApp {
             }
         }
 
+        let (primary_down, pointer) = ui.input(|i| (i.pointer.primary_down(), i.pointer.interact_pos()));
+        let stretch_changed = if let (Some(Drag::Stretch(stretch)), Some(at)) = (self.drag, pointer) {
+            self.update_stretch(&stretch, at.x)
+        } else {
+            false
+        };
+        if stretch_changed {
+            map = TimeMap::new(&self.edit);
+            dur = map.duration().max(1);
+        }
+
         let v = self.view;
-        let x_of = move |t: i64| v.x(t, inner.left(), inner.width());
-        let t_raw = move |x: f32| v.start + (((x - inner.left()) / inner.width()) as f64 * v.span as f64) as i64;
-        let t_of = move |x: f32| t_raw(x).clamp(0, dur);
-        if self.edit.segments.len() > 1 && !menus
+        let axis = Axis {
+            left: inner.left(),
+            width: inner.width(),
+            view: v,
+            map: &map,
+            source_dur,
+            fps: info.fps,
+            snapping: !ctrl,
+        };
+        let x_of = |t| axis.x(t);
+        let t_raw = |x| axis.t(x);
+        let t_of = |x| t_raw(x).clamp(0, source_dur);
+        if !menus && !stretching
             && let Some(at) = body.hover_pos().or_else(|| body.interact_pointer_pos())
             && rows.video.contains(at)
         {
+            let index = self.edit.segment_at(t_of(at.x));
+            let segment = self.edit.segments[index];
+
             let seam = self.edit.segments.windows(2).enumerate()
                 .map(|(left, pair)| (left + 1, (x_of(pair[1].start) - at.x).abs()))
                 .filter(|(_, distance)| *distance <= 5.0)
                 .min_by(|a, b| a.1.total_cmp(&b.1));
+            let many = self.edit.segments.len() > 1;
             if let Some((right, _)) = seam {
-                let kept = !self.edit.segments[right - 1].removed && !self.edit.segments[right].removed;
-                body.clone().on_hover_text_at_pointer(if kept { "right-click the split to merge these pieces" } else { "restore both pieces to merge them" });
-                if kept && body.secondary_clicked() && self.change(|e| e.merge_kept(right)) {
+                let left_piece = &self.edit.segments[right - 1];
+                let right_piece = &self.edit.segments[right];
+                let (can_merge, tip) = if left_piece.removed || right_piece.removed {
+                    (false, "restore both pieces to merge them")
+                } else if left_piece.speed != right_piece.speed {
+                    (false, "set both pieces to the same speed to merge them")
+                } else {
+                    (true, "shift-drag to change speed · park playhead between cuts to pick a piece · right-click to merge")
+                };
+                body.clone().on_hover_text_at_pointer(tip);
+                if can_merge && body.secondary_clicked() && self.change(|e| e.merge_kept(right)) {
                     self.selected = None;
                 }
             } else {
-                let i = self.edit.segment_at(t_of(at.x));
-                let tip = if self.edit.segments[i].removed { "right-click to restore this piece" } else { "right-click to remove this piece" };
+                let tip = if segment.removed {
+                    "right-click to restore this piece"
+                } else if many {
+                    "shift-drag an edge to change speed · right-click to remove"
+                } else {
+                    "shift-drag an edge to change speed"
+                };
                 body.clone().on_hover_text_at_pointer(tip);
-                if body.secondary_clicked() {
-                    self.toggle_piece(i);
+                if many && body.secondary_clicked() {
+                    self.toggle_piece(index);
                 }
             }
         }
         let visible = move |x: f32| x >= inner.left() - 6.0 && x <= inner.right() + 6.0;
-        let within = (SNAP_PX / inner.width() as f64 * v.span as f64) as i64;
-        let snapping = !ctrl;
         let zoomed = v.span < dur;
         let pieces = match self.job() {
             Some(Job::Video(j)) if j.video == Video::Copy => Some(j.pieces),
             _ => None,
         };
-        let keys: Vec<i64> = if pieces.is_some() { self.index.as_ref().map_or(Vec::new(), |i| i.video.keys.clone()) } else { Vec::new() };
 
-        let markers: Vec<(usize, egui::Response)> = (self.edit.markers.iter().copied().enumerate())
+        let markers: Vec<(usize, i64, egui::Response)> = (self.edit.markers.iter().copied().enumerate())
             .filter(|(_, m)| visible(x_of(*m)))
             .map(|(i, m)| {
                 let r = Rect::from_center_size(pos2(x_of(m), area.top() + 7.0), vec2(14.0, 14.0));
                 let resp = ui.interact(r, Id::unique(("clip-marker", i)), Sense::click());
-                (i, resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("click jumps here · right-click removes"))
+                (i, m, resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("click jumps here · right-click removes"))
             })
             .collect();
         let all_muted = lanes.iter().all(|l| l.muted);
@@ -412,10 +622,9 @@ impl ClipApp {
             .on_hover_cursor(CursorIcon::PointingHand)
             .on_hover_text("a silent track, for editors and sites that expect a set number of tracks");
         add.widget_info(|| WidgetInfo::labeled(Role::Button, true, ADD_TEXT));
-        let axis = Axis { left: inner.left(), width: inner.width(), view: v, dur, fps: info.fps, snapping };
         let click_lane = rows.clicks.and_then(|lane| self.clicks_input(ui, look, lane, &axis));
         let key_lane = rows.keys.and_then(|lane| self.keys_input(ui, look, lane, &axis));
-        let trim_tip = "drag to trim · snaps to the playhead and nearby guides · ctrl + drag: no snapping";
+        let trim_tip = "drag to trim · shift-drag in the thumbnail strip to change speed · ctrl + drag: no snapping";
         let grip = |t: i64, id: &str, tip: &str| {
             let x = x_of(t);
             visible(x).then(|| {
@@ -438,10 +647,10 @@ impl ClipApp {
         let scroll = zoomed.then(|| ui.interact(rows.bar.expand2(vec2(0.0, 4.0)), Id::unique("clip-scroll"), Sense::drag()));
 
         let mut removed = None;
-        for (i, r) in &markers {
+        for (i, t, r) in &markers {
             if r.clicked() {
                 self.selected = Some(Selected::Marker(*i));
-                self.jump(self.edit.markers[*i]);
+                self.jump(*t);
             }
             if r.secondary_clicked() {
                 removed = Some(*i);
@@ -516,8 +725,45 @@ impl ClipApp {
         }
 
         let head = self.pos;
-        let pressed = |r: &Option<Vec<egui::Response>>| r.as_ref().is_some_and(|r| r.iter().any(|r| r.drag_started()));
-        if pressed(&start) {
+        let shift_edge = if !menus && self.drag.is_none() {
+            shift_press(ui)
+                .filter(|at| rows.video.contains(*at))
+                .filter(|_| {
+                    body.is_pointer_button_down_on()
+                        || [&start, &end].into_iter().flatten().flatten().any(|r| r.is_pointer_button_down_on())
+                })
+                .and_then(|at| {
+                    self.stretch_edge(at.x, x_of)
+                        .map(|(index, kept, edge)| (at.x, index, kept, edge))
+                })
+        } else {
+            None
+        };
+        let pressed = |r: &Option<Vec<egui::Response>>| {
+            r.as_ref().is_some_and(|r| r.iter().any(|r| r.drag_started()))
+        };
+        if stretching {
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        } else if let Some((from, index, kept, edge)) = shift_edge {
+            let piece = self.edit.segments[index];
+            let anchor = if edge == Edge::Left { kept.end } else { kept.start };
+            let stretch = Stretch {
+                index,
+                piece,
+                kept,
+                edge,
+                from,
+                units_per_point: v.span as f64 / f64::from(inner.width()),
+                view_start: v.start,
+                output_len: Stretch::duration(piece, kept, piece.speed),
+                anchor_offset: Stretch::offset(piece, piece.speed, anchor),
+            };
+            self.pause();
+            self.settle_volume(true);
+            self.before_drag = Some(self.edit.clone());
+            self.drag = Some(Drag::Stretch(stretch));
+            ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+        } else if pressed(&start) {
             self.drag = Some(Drag::Start { head });
             self.before_drag = Some(self.edit.clone());
         } else if pressed(&end) {
@@ -543,18 +789,20 @@ impl ClipApp {
             }
         }
 
-        if let (Some(drag), Some(at)) = (self.drag, ui.input(|i| i.pointer.interact_pos())) {
-            let raw = math::snap(t_of(at.x), info.fps);
+        if let (Some(drag), Some(at)) = (self.drag, pointer) {
             match drag {
                 Drag::Start { head } | Drag::End { head } => {
-                    let pointer = t_of(at.x);
-                    let t = if snapping && (pointer - head).abs() <= within {
+                    let raw = math::snap(t_of(at.x), info.fps);
+                    let t = if axis.snapping && (x_of(head) - at.x).abs() <= SNAP_PX {
                         head
-                    } else if snapping {
-                        let key = matches!(drag, Drag::Start { .. }).then(|| export::nearest_key(&keys, raw)).flatten();
-                        self.snapped(raw, key.as_slice(), within, true)
                     } else {
-                        raw
+                        let keys = if axis.snapping && pieces.is_some() && matches!(drag, Drag::Start { .. }) {
+                            self.index.as_ref().map_or(&[][..], |i| i.video.keys.as_slice())
+                        } else {
+                            &[]
+                        };
+
+                        self.snapped(&axis, at.x, raw, &[], keys)
                     };
                     let preview = if matches!(drag, Drag::Start { .. }) {
                         self.edit.range.set_start(t, frame);
@@ -570,7 +818,8 @@ impl ClipApp {
                 }
                 Drag::Head => {
                     let range = [self.edit.range.start, self.edit.range.end];
-                    let t = self.snapped(raw, &range, within, snapping).min(info.duration - 1);
+                    let raw = math::snap(t_of(at.x), info.fps);
+                    let t = self.snapped(&axis, at.x, raw, &range, &[]).min(source_dur - 1);
                     if t != self.pos {
                         self.pos = t;
                         self.seek(t, false);
@@ -580,9 +829,15 @@ impl ClipApp {
                     self.view.start = ((at.x - grab - rows.bar.left()) / rows.bar.width() * dur as f32) as i64;
                     self.view.clamp(dur, min_span);
                 }
+                Drag::Stretch(_) => {}
             }
         }
-        if self.drag.is_some() && !ui.input(|i| i.pointer.any_down()) {
+        let released = if matches!(self.drag, Some(Drag::Stretch(_))) {
+            !primary_down
+        } else {
+            !ui.input(|i| i.pointer.any_down())
+        };
+        if self.drag.is_some() && released {
             if let Some(Drag::Start { head } | Drag::End { head }) = self.drag {
                 self.pos = head;
                 self.seek(head, false);
@@ -592,10 +847,34 @@ impl ClipApp {
             }
             self.drag = None;
         }
-        let timed = |role: Role, label: &str, t: i64| WidgetInfo {
-            current_text_value: Some(math::fmt_time(t)),
-            value: Some(t as f64 / SECOND as f64),
-            ..WidgetInfo::labeled(role, true, label)
+        let focus = match self.drag {
+            Some(Drag::Stretch(stretch)) => Some(stretch.index),
+            None if !menus => {
+                if shift
+                    && let Some(at) = hover.filter(|at| rows.video.contains(*at))
+                    && (body.contains_pointer()
+                        || [&start, &end].into_iter().flatten().flatten().any(|r| r.contains_pointer()))
+                {
+                    self.stretch_edge(at.x, x_of).map(|(index, _, _)| {
+                        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
+
+                        index
+                    })
+                } else {
+                    self.parked_piece()
+                }
+            }
+            _ => None,
+        };
+
+        let timed = |role: Role, label: &str, source: i64| {
+            let time = map.to_edit(source);
+
+            WidgetInfo {
+                current_text_value: Some(math::fmt_time(time)),
+                value: Some(time as f64 / SECOND as f64),
+                ..WidgetInfo::labeled(role, true, label)
+            }
         };
         let timeline_pos = match self.drag {
             Some(Drag::Start { head } | Drag::End { head }) => head,
@@ -608,9 +887,9 @@ impl ClipApp {
         if let Some(r) = end.as_ref().and_then(|r| r.first()) {
             r.widget_info(|| timed(Role::Slider, "trim end", self.edit.range.end));
         }
-        for (i, r) in &markers {
-            if let Some(&t) = self.edit.markers.get(*i) {
-                r.widget_info(|| timed(Role::Button, "marker", t));
+        for (i, t, r) in &markers {
+            if Some(*i) != removed {
+                r.widget_info(|| timed(Role::Button, "marker", *t));
             }
         }
         if let Some(s) = &scroll {
@@ -655,10 +934,10 @@ impl ClipApp {
             let [tw, th] = first.size();
             let h = rows.video.height() - 2.0;
             let w = (h * tw as f32 / th.max(1) as f32).max(8.0);
-            let every = scan::interval(dur);
+            let every = scan::interval(source_dur);
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             let tint = Color32::WHITE.gamma_multiply(if light { 0.95 } else { 0.85 });
-            let (x_start, x_end) = (x_of(0), x_of(dur));
+            let (x_start, x_end) = (x_of(0), x_of(source_dur));
             let mut x = x_start.max(inner.left() - w);
             x -= (x - x_start).rem_euclid(w);
             while x < inner.right().min(x_end) {
@@ -679,11 +958,20 @@ impl ClipApp {
                 painter.vline(x, rows.video.top()..=rows.video.top() + 4.0, Stroke::new(1.0, p.t3));
             }
         }
-        if keys.len() > 1 && inner.width() / (keys.len() as f32 * v.span as f32 / dur as f32) > 4.0 {
-            for &k in &keys {
-                let x = x_of(k);
-                if visible(x) {
-                    painter.vline(x, rows.video.bottom() - 4.0..=rows.video.bottom(), Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.55)));
+        if pieces.is_some()
+            && let Some(keys) = self.index.as_ref().map(|i| &i.video.keys)
+            && keys.len() > 1
+        {
+            let first = keys.partition_point(|&key| key < t_raw(inner.left() - 6.0));
+            let end = keys.partition_point(|&key| key <= t_raw(inner.right() + 6.0));
+            let visible_keys = &keys[first..end];
+            if inner.width() > 4.0 * visible_keys.len() as f32 {
+                for &key in visible_keys {
+                    painter.vline(
+                        x_of(key),
+                        rows.video.bottom() - 4.0..=rows.video.bottom(),
+                        Stroke::new(1.0, Color32::WHITE.gamma_multiply(0.55)),
+                    );
                 }
             }
         }
@@ -697,7 +985,7 @@ impl ClipApp {
             fades.push(fade);
             let clip = lane_clip(*l);
             clip.rect_filled(*l, 6, p.ctl.gamma_multiply(fade));
-            let (x_start, stop) = (inner.left().max(x_of(0)), inner.right().min(x_of(dur)));
+            let (x_start, stop) = (inner.left().max(x_of(0)), inner.right().min(x_of(source_dur)));
             let Some(source) = lanes[k].source else {
                 let mut x = x_start;
                 while x < stop {
@@ -715,16 +1003,15 @@ impl ClipApp {
             let mut mesh = Mesh::default();
             let (cy, room, top) = (l.center().y, l.height() * 0.8, l.height() - 2.0);
             let mut x = x_start;
-            while x < stop {
-                let (b0, b1) = ((t_raw(x).max(0) / BUCKET) as usize, (t_raw(x + 2.0).max(0) / BUCKET) as usize);
-                if b0 >= peaks.len() {
-                    break;
-                }
+            let mut b0 = (t_raw(x).max(0) / BUCKET) as usize;
+            while x < stop && b0 < peaks.len() {
+                let next_x = x + 2.0;
+                let b1 = (t_raw(next_x).max(0) / BUCKET) as usize;
                 let peak = peaks[b0..b1.clamp(b0 + 1, peaks.len())].iter().copied().max().unwrap_or(0);
                 let level = peak as f32 / 255.0 * gain;
                 let h = (level * room).clamp(1.0, top);
                 mesh.add_colored_rect(Rect::from_min_size(pos2(x, cy - h / 2.0), vec2(1.5, h)), if level > 1.0 { hot } else { color });
-                x += 2.0;
+                (x, b0) = (next_x, b1);
             }
             clip.add(Shape::mesh(mesh));
         }
@@ -739,11 +1026,24 @@ impl ClipApp {
         let phase = hatch_phase(now, animate, ui.ctx().pixels_per_point());
         let stripes = Color32::from_gray(if light { 110 } else { 96 });
         let track_clip = painter.clip_rect();
+        let focus_span = focus.map(|_| (x_of(self.edit.range.start), x_of(self.edit.range.end)));
         let mut hatch_visible = false;
-        for s in &self.edit.segments {
+        for (index, s) in self.edit.segments.iter().enumerate() {
             let (left, right) = (x_of(s.start), x_of(s.end));
             if right <= track_clip.left() || left >= track_clip.right() {
                 continue;
+            }
+            if focus != Some(index)
+                && !s.removed
+                && let Some((start, end)) = focus_span
+            {
+                let (left, right) = (left.max(start), right.min(end));
+                if right > left {
+                    for band in std::iter::once(rows.video).chain(rows.lanes.iter().copied()) {
+                        let rect = Rect::from_min_max(pos2(left, band.top()), pos2(right, band.bottom()));
+                        lane_clip(band).rect_filled(rect, 0, PIECE_DIM);
+                    }
+                }
             }
             let opacity = ease(anim(ui, Id::unique(("clip-removed", s.start)), s.removed, 0.24));
             if opacity <= 0.0 {
@@ -785,6 +1085,26 @@ impl ClipApp {
                     clip.vline(x, band.y_range(), Stroke::new(6.0, Color32::BLACK));
                     clip.vline(x, band.y_range(), Stroke::new(4.0, p.acc));
                 }
+            }
+        }
+
+        let video = lane_clip(rows.video.shrink(1.0));
+        for segment in self.edit.segments.iter().filter(|s| !s.removed && s.speed != Speed::NORMAL) {
+            let left = x_of(segment.start.max(self.edit.range.start)).max(video.clip_rect().left());
+            let right = x_of(segment.end.min(self.edit.range.end)).min(video.clip_rect().right());
+            if right <= left {
+                continue;
+            }
+
+            let top = rows.video.top() + 4.0;
+            let text = video.layout_no_wrap(segment.speed.label(), mono(11.0), p.t1);
+            let size = text.size() + vec2(10.0, 4.0);
+            if size.x + 8.0 <= right - left {
+                let badge = Rect::from_min_size(pos2(left + 4.0, top), size);
+                video.rect_filled(badge, 4, p.surf);
+                video.galley(badge.min + vec2(5.0, 2.0), text, p.t1);
+            } else {
+                video.hline(left..=right, top + 1.0, Stroke::new(2.0, p.acc));
             }
         }
 
@@ -872,8 +1192,12 @@ impl ClipApp {
         let h = anim(ui, add.id.with("hov"), add.hovered(), 0.12);
         painter.text(add_r.left_center(), egui::Align2::LEFT_CENTER, ADD_TEXT, sans(12.0), mix(p.t3, p.t1, h));
 
-        for (i, resp) in &markers {
-            let x = x_of(self.edit.markers[*i]);
+        for (i, t, resp) in &markers {
+            if Some(*i) == removed {
+                continue;
+            }
+
+            let x = x_of(*t);
             let chosen = self.selected == Some(Selected::Marker(*i));
             let c = pos2(x, area.top() + 7.0);
             painter.circle_filled(c, if resp.hovered() { 6.0 } else { 5.0 }, MARKER);
@@ -894,6 +1218,22 @@ impl ClipApp {
                 painter.rect_filled(bar.expand(2.0 + 2.0 * h), 3.0 + 2.0 * h, p.acc.gamma_multiply(0.15 + 0.07 * h));
                 painter.rect_filled(bar, 3, mix(p.acc, p.acch, h));
             }
+        }
+        if let (Some(Drag::Stretch(stretch)), Some(at)) = (self.drag, pointer)
+            && let Some(piece) = self.edit.segments.get(stretch.index)
+        {
+            let edge = x_of(stretch.moving_edge());
+            let speed = piece.speed;
+            let duration = math::fmt_time(speed.output_len(stretch.kept.len()));
+            let label = painter.layout_no_wrap(format!("{} · {duration}", speed.label()), mono(11.0), p.t1);
+            let size = label.size() + vec2(12.0, 6.0);
+            let left = (at.x - size.x / 2.0).clamp(rows.video.left(), (rows.video.right() - size.x).max(rows.video.left()));
+            let badge = Rect::from_min_size(pos2(left, rows.video.bottom() - size.y - 4.0), size);
+            if visible(edge) {
+                painter.vline(edge, rows.video.y_range(), Stroke::new(2.0, p.acch));
+            }
+            painter.rect_filled(badge, 4, p.surf);
+            painter.galley(badge.min + vec2(6.0, 3.0), label, p.t1);
         }
         let x = x_of(head_t);
         if visible(x) {
@@ -1199,7 +1539,7 @@ mod tests {
 
         let mut frame = ctx.run_ui(input, |ui| {
             app.keys(ui.ctx());
-            app.timeline(ui, &look, area, LANE_MAX);
+            app.timeline(ui, &look, area, LANE_MAX, None);
         });
         frame.textures_delta.clear();
         assert_eq!(app.edit.splits().next(), Some(app.pos));

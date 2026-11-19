@@ -111,6 +111,7 @@ fn why_label(r: Reencode) -> String {
         Reencode::Clicks => "clicks drawn in".into(),
         Reencode::Keys => "keys drawn in".into(),
         Reencode::Crop => "cropped".into(),
+        Reencode::Speed => "speed changed".into(),
         Reencode::Height(h) => format!("{h}p"),
         Reencode::Fps(f) => format!("{f} fps"),
         Reencode::Compress => "compress".into(),
@@ -127,6 +128,7 @@ fn undo_label(r: Reencode) -> Option<&'static str> {
         Reencode::Clicks => "hide clicks",
         Reencode::Keys => "hide keys",
         Reencode::Crop => "reset the crop",
+        Reencode::Speed => "reset pieces to 1× speed",
         Reencode::Height(_) => "original resolution",
         Reencode::Fps(_) => "original frame rate",
         Reencode::Compress => "don't compress",
@@ -330,6 +332,9 @@ impl ClipApp {
             Reencode::Crop => {
                 self.cropping = None;
                 self.change(|e| e.crop.take().is_some());
+            }
+            Reencode::Speed => {
+                self.reset_piece_speeds();
             }
             Reencode::Height(_) => s.height = None,
             Reencode::Fps(_) => s.fps = None,

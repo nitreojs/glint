@@ -72,7 +72,7 @@ impl ClipApp {
         }
     }
 
-    pub(super) fn keys_input(&mut self, ui: &mut Ui, look: &Look, lane: Rect, axis: &Axis) -> Option<Lane> {
+    pub(super) fn keys_input(&mut self, ui: &mut Ui, look: &Look, lane: Rect, axis: &Axis<'_>) -> Option<Lane> {
         let keys = self.edit.keys.clone()?;
         let p = look.p;
         let bg = ui.interact(lane, Id::unique("clip-keys-lane"), Sense::click_and_drag());
@@ -86,7 +86,8 @@ impl ClipApp {
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("drag to move it in time · right-click to delete it or change where it sits");
                 let chosen = self.key_sel.contains(&i);
-                let name = format!("{} at {}", keys::label(k), math::fmt_time(k.at));
+                let time = math::fmt_time(axis.map.to_edit(k.at));
+                let name = format!("{} at {time}", keys::label(k));
                 resp.widget_info(|| WidgetInfo::selected(Role::Button, true, chosen, &name));
                 (i, resp)
             })
@@ -148,9 +149,13 @@ impl ClipApp {
                 if let Some(mut base) = self.before_drag.as_ref().and_then(|b| b.keys.clone())
                     && let Some(from) = base.list.get(grab).map(|k| k.at)
                 {
-                    let raw = from + axis.t(at.x) - axis.t(from_x);
-                    let to = if axis.snapping { math::snap(raw.clamp(0, axis.dur - 1), axis.fps) } else { raw };
-                    base.shift(&self.key_sel, to - from, axis.dur);
+                    let raw = axis.moved(from, from_x, at.x);
+                    let to = if axis.snapping {
+                        math::snap(raw.clamp(0, axis.source_dur - 1), axis.fps)
+                    } else {
+                        raw
+                    };
+                    base.shift(&self.key_sel, to - from, axis.source_dur);
                     self.edit.keys = Some(base);
                 }
             }
@@ -176,7 +181,7 @@ impl ClipApp {
         Some(Lane { rect: lane, chip, toggle, marks })
     }
 
-    pub(super) fn keys_paint(&self, ui: &Ui, look: &Look, lane: &Lane, axis: &Axis, painter: &Painter) {
+    pub(super) fn keys_paint(&self, ui: &Ui, look: &Look, lane: &Lane, axis: &Axis<'_>, painter: &Painter) {
         let Some(keys) = &self.edit.keys else { return };
         let p = look.p;
         let clip = painter.with_clip_rect(lane.rect.intersect(painter.clip_rect()));

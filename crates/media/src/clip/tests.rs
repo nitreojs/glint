@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use glint_core::clip::crop::Crop;
-use glint_core::clip::edit::Edit;
+use glint_core::clip::edit::{Edit, Speed};
 use glint_core::clip::export::{self, Format, Job, Source, Video, VideoJob};
 use glint_core::clip::index;
 use glint_core::clip::math::{Range, SECOND};
@@ -380,6 +380,190 @@ fn thirty_fps_at_3_mbps_drops_frames_on_the_grid() {
     }
     let off = (estimate as f64 - size as f64).abs() / size as f64;
     assert!(off < 0.15, "estimate {estimate} vs {size}");
+}
+
+fn tone_frequency(path: &Path, at: f64) -> f64 {
+    let p = path.to_string_lossy();
+    let at = at.to_string();
+    let args = [
+        "-v", "error", "-i", &p, "-ss", &at, "-t", "0.2", "-map", "0:a:0",
+        "-ac", "1", "-ar", "48000", "-f", "s16le", "-",
+    ];
+    let out = std::process::Command::new("ffmpeg").args(args).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let mut crossings = 0;
+    let mut previous = 0;
+    for sample in out.stdout.chunks_exact(2) {
+        let value = i16::from_le_bytes([sample[0], sample[1]]);
+        crossings += u32::from(value > 0 && previous <= 0);
+        previous = value;
+    }
+
+    crossings as f64 * 48_000.0 / (out.stdout.len() / 2) as f64
+}
+
+#[test]
+#[ignore = "needs Windows Media Foundation, ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn mixed_speeds_export_the_right_frames_and_sound_across_joins() {
+    let numbered = "geq=lum='16+14*if(lt(X,W/2),mod(N,16),floor(N/16))':cb=128:cr=128";
+    let pan = "pan=stereo|c0=c0|c1=0.5*c0";
+    let src = fixture("speed", "320x180", "60", &["-vf", numbered, "-g", "24", "-filter:a:1", pan]);
+    let source_ts = {
+        let _com = Com::init();
+        packet_times(&src)
+    };
+    let source_pixels = thumbs(&src);
+
+    let cs = SECOND / 100;
+    let mut edit = Edit::new(3 * SECOND, 2);
+    for at in [51, 72, 121, 202] {
+        assert!(edit.split(at * cs, 1));
+    }
+    assert!(edit.toggle_removed(1));
+    assert!(edit.set_speed(0, Speed::from_milli(671)));
+    assert!(edit.set_speed(3, Speed::from_milli(1_500)));
+    assert!(edit.set_speed(4, Speed::from_milli(2_000)));
+    edit.lanes[1].volume = 40;
+    edit.add_empty();
+
+    let mut end = 0;
+    let pieces = [(0, 51, 671), (72, 121, 1_000), (121, 202, 1_500), (202, 300, 2_000)]
+        .map(|(start, stop, step)| {
+            let source = Range { start: start * cs, end: stop * cs };
+            let output = Range { start: end, end: end + source.len() * 1_000 / step };
+            end = output.end;
+
+            (source, output, step)
+        });
+    let seconds = |t| t as f64 / SECOND as f64;
+    let duration = seconds(end);
+    let frame_at = |source| source_ts.partition_point(|&t| t <= source).saturating_sub(1);
+    let grid_frame = |t| {
+        let &(source, output, step) = pieces.iter().find(|&&(_, output, _)| t < output.end)?;
+        Some(frame_at(source.start + (t - output.start) * step / 1_000))
+    };
+
+    for fps in [None, Some(30)] {
+        let out = src.with_extension(if fps.is_some() { "grid.mp4" } else { "natural.mp4" });
+        let combine = fps.is_some();
+        let settings = export::Settings { fps, combine, ..export::Settings::default() };
+        let (job, _) = export_to(&src, &edit, &settings, &out);
+        let Job::Video(video) = &job else { panic!("{job:?}") };
+        assert!(matches!(video.video, Video::Encode { fps: actual, .. } if actual == fps));
+        assert_eq!(job.len(), end);
+        assert!(video.tracks.iter().all(|t| !video.copies(t)));
+
+        let mut expected = Vec::new();
+        if let Some(fps) = fps {
+            for k in 0i64.. {
+                let t = k * SECOND / i64::from(fps);
+                let Some(frame) = grid_frame(t) else {
+                    break;
+                };
+                expected.push((t, frame));
+            }
+        } else {
+            for (source, output, step) in pieces {
+                expected.push((output.start, frame_at(source.start)));
+                expected.extend(source_ts.iter().copied().enumerate()
+                    .filter(|&(_, t)| source.start < t && t < source.end)
+                    .map(|(n, t)| (output.start + (t - source.start) * 1_000 / step, n)));
+            }
+        }
+
+        let timestamps = frame_md5s(&out);
+        let pictures = thumbs(&out);
+        assert_eq!(timestamps.len(), expected.len(), "{fps:?}");
+        assert_eq!(pictures.len(), expected.len(), "{fps:?}");
+        let pts_tolerance = if combine { 0.000_001 } else { 0.000_02 };
+        for (k, (t, src_idx)) in expected.into_iter().enumerate() {
+            let expected_t = seconds(t);
+            assert!((timestamps[k].0 - expected_t).abs() < pts_tolerance, "{fps:?} frame {k} at {}", timestamps[k].0);
+            let score = psnr(&pictures[k], &source_pixels[src_idx]);
+            assert!(score > 33.0, "{fps:?} frame {k} at {expected_t:.6} should show source frame {src_idx}: {score}");
+        }
+
+        let lengths = probe(&out, "stream=codec_type,duration");
+        assert_eq!(lengths.len(), if combine { 3 } else { 4 });
+        for track in lengths {
+            let (_, actual) = track.split_once(',').unwrap();
+            let actual: f64 = actual.parse().unwrap();
+            assert!((actual - duration).abs() < 0.05, "{fps:?}: {track}");
+        }
+
+        let layout = probe(&out, "stream=codec_type,channels");
+        if combine {
+            assert_eq!(layout, ["video", "audio,2", "audio,2"]);
+            assert!(max_volume(&out, 1) < -90.0);
+        } else {
+            assert_eq!(layout, ["video", "audio,1", "audio,2", "audio,1"]);
+            assert!(max_volume(&out, 2) < -90.0);
+            let gain_db = max_volume(&out, 1) - max_volume(&src, 1);
+            assert!((gain_db - 20.0 * 0.4_f64.log10()).abs() < 2.0, "40% gain measured {gain_db} dB");
+            for (_, output, step) in pieces {
+                let at = seconds(output.start) + 0.12;
+                let want = 440.0 * step as f64 / 1_000.0;
+                let pitch = tone_frequency(&out, at);
+                assert!((pitch - want).abs() <= 5.0, "{pitch} Hz at {at}, expected {want} Hz");
+            }
+        }
+        let _ = std::fs::remove_file(&out);
+    }
+
+    let out = src.with_extension("gif");
+    let settings = export::Settings { format: Format::Gif, gif_fps: 10, ..export::Settings::default() };
+    let (job, _) = export_to(&src, &edit, &settings, &out);
+    let actual: f64 = probe(&out, "format=duration")[0].parse().unwrap();
+    let timestamps = frame_md5s(&out);
+    let pictures = thumbs(&out);
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&src);
+
+    assert_eq!(job.len(), end);
+    assert!((actual - duration).abs() < 0.02, "gif duration {actual}, expected {duration}");
+
+    let tick = SECOND / 10;
+    let expected: Vec<_> = (0..end).step_by(tick as usize).map(|t| (t, grid_frame(t).unwrap())).collect();
+    assert_eq!(timestamps.len(), expected.len());
+    assert_eq!(pictures.len(), expected.len());
+    for (((pts, _), picture), (t, src_idx)) in timestamps.iter().zip(pictures).zip(expected) {
+        assert!((pts - seconds(t)).abs() < 0.000_001, "gif frame at {pts}, expected {}", seconds(t));
+        let score = psnr(&picture, &source_pixels[src_idx]);
+        assert!(score > 30.0, "gif frame at {pts} should show source frame {src_idx}: {score}");
+    }
+}
+
+#[test]
+#[ignore = "needs Windows Media Foundation, ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn automatic_retime_keeps_compact_video_near_the_retained_budget() {
+    let src = std::env::temp_dir().join(format!("glint-clip-retime-size-{}.mp4", std::process::id()));
+    let out = src.with_extension("retimed.mp4");
+    tool("ffmpeg", &[
+        "-y", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=8",
+        "-c:v", "libx264", "-bf", "0", "-g", "30", "-pix_fmt", "yuv420p",
+        "-crf", "30", "-maxrate", "800k", "-bufsize", "800k", &src.to_string_lossy(),
+    ]);
+
+    let mut edit = Edit::new(8 * SECOND, 0);
+    edit.range = Range { start: SECOND, end: 7 * SECOND };
+    assert!(edit.split(3 * SECOND, 1));
+    assert!(edit.split(4 * SECOND, 1));
+    assert!(edit.toggle_removed(1));
+    assert!(edit.set_speed(0, Speed::from_milli(500)));
+    assert!(edit.set_speed(2, Speed::from_milli(2_000)));
+    let (job, estimate) = export_to(&src, &edit, &export::Settings::default(), &out);
+
+    let source_bytes = std::fs::metadata(&src).unwrap().len();
+    let output_bytes = std::fs::metadata(&out).unwrap().len();
+    let duration: f64 = probe(&out, "format=duration")[0].parse().unwrap();
+    let _ = std::fs::remove_file(&src);
+    let _ = std::fs::remove_file(&out);
+
+    assert!(matches!(job, Job::Video(VideoJob { video: Video::Encode { qp: None, .. }, .. })));
+    assert!((duration - 5.5).abs() < 0.08, "{duration}");
+    assert!(estimate < source_bytes, "estimated {estimate} vs {source_bytes} source bytes");
+    // hardware encoders can overshoot an average on a short clip
+    assert!(output_bytes <= 2 * estimate + 16_384, "wrote {output_bytes} bytes, estimated {estimate}");
 }
 
 #[test]

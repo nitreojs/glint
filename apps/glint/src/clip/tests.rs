@@ -1,5 +1,6 @@
 use eframe::App;
 use eframe::egui::{Event, PointerButton, Pos2};
+use glint_core::clip::edit::{Speed, TimeMap};
 use glint_core::clip::export::Format;
 use glint_core::clip::info::{Snap, Track};
 use glint_core::clip::index::Samples;
@@ -139,9 +140,20 @@ impl Harness {
     }
 
     fn click(&mut self, at: Pos2) {
-        let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Default::default() };
-        self.frame(vec![Event::PointerMoved(at), button(true)]);
+        self.click_with_modifiers(at, Modifiers::NONE);
+    }
+
+    fn click_with_modifiers(&mut self, at: Pos2, modifiers: Modifiers) {
+        let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers };
+        if modifiers != Modifiers::NONE {
+            self.frame(vec![Event::ModifiersChanged(modifiers), Event::PointerMoved(at), button(true)]);
+        } else {
+            self.frame(vec![Event::PointerMoved(at), button(true)]);
+        }
         self.frame(vec![button(false)]);
+        if modifiers != Modifiers::NONE {
+            self.frame(vec![Event::ModifiersChanged(Modifiers::NONE)]);
+        }
         self.settle();
     }
 
@@ -353,7 +365,10 @@ fn right_click_toggles_pieces_and_only_merges_kept_neighbors_at_a_split() {
     h.app.jump(21 * SECOND);
     h.key(Key::S, true);
     h.key(Key::S, false);
-    for (pointer, tip) in [(at(0.75), "right-click to remove this piece"), (seam, "right-click the split to merge these pieces")] {
+    for (pointer, tip) in [
+        (at(0.75), "shift-drag an edge to change speed · right-click to remove"),
+        (seam, "shift-drag to change speed · park playhead between cuts to pick a piece · right-click to merge"),
+    ] {
         h.frame(vec![Event::PointerMoved(pointer)]);
         for _ in 0..90 {
             h.frame(Vec::new());
@@ -383,6 +398,228 @@ fn right_click_toggles_pieces_and_only_merges_kept_neighbors_at_a_split() {
     h.settle();
     assert_eq!(h.app.edit.segments, split);
     assert_eq!(h.app.edit.kept(), retained);
+}
+
+#[test]
+fn shift_drag_at_either_side_of_a_split_stretches_only_the_piece_under_the_press() {
+    for (piece_index, target) in [(0, 671), (1, 1337)] {
+        let mut h = Harness::opened(info(1, None, None), Some(index(1)));
+        let header = h.rect_of("sound · muted tracks won't be in the file");
+        let left = header.left() + 6.0;
+        let width = h.rect_of("mute all").right() - 6.0 - left;
+        let y = header.center().y - 41.0;
+        let piece_len = 14 * SECOND;
+        let seam = piece_len;
+        let next_seam = 2 * piece_len;
+        assert!(h.app.edit.split(seam, 1));
+        assert!(h.app.edit.split(next_seam, 1));
+        h.app.jump(2 * SECOND);
+        h.settle();
+
+        let before = h.app.edit.clone();
+        let view = h.app.view;
+        let speed = Speed::from_milli(target);
+        let duration = speed.output_delta(piece_len);
+        let (side, anchor) = if piece_index == 0 { (-1.0, 0) } else { (1.0, next_seam) };
+        let from = pos2(view.x(seam, left, width) + 2.0 * side, y);
+        let to = from - vec2(side * width * ((duration - piece_len) as f64 / view.span as f64) as f32, 0.0);
+        let button = |pos, pressed, modifiers| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers };
+        h.app.toggle_play();
+        assert!(h.app.play != Play::Paused);
+
+        h.frame(vec![Event::ModifiersChanged(Modifiers::SHIFT), Event::PointerMoved(from), button(from, true, Modifiers::SHIFT)]);
+        assert!(matches!(h.app.drag, Some(Drag::Stretch(_))));
+        assert!(h.app.play == Play::Paused);
+        h.frame(vec![Event::PointerMoved(from.lerp(to, 0.5))]);
+        assert_ne!(h.app.edit.segments[piece_index].speed, Speed::NORMAL);
+        h.frame(vec![Event::ModifiersChanged(Modifiers::NONE), Event::PointerMoved(to)]);
+
+        let map = TimeMap::new(&h.app.edit);
+        assert_eq!(h.app.edit.segments[piece_index].speed, speed);
+        assert_eq!(map.to_edit(next_seam), next_seam + duration - piece_len);
+        assert_eq!(map.duration(), 42 * SECOND + duration - piece_len);
+        assert!((h.app.view.x(map.to_edit(anchor), left, width) - view.x(anchor, left, width)).abs() < 0.01);
+        assert_eq!(h.app.view.span, view.span);
+        assert_eq!(h.app.pos, 2 * SECOND);
+        let live = format!("{} · {}", speed.label(), math::fmt_time(duration));
+        assert!(h.has(&live), "{live}");
+
+        h.frame(vec![button(to, false, Modifiers::NONE)]);
+        assert!(h.app.drag.is_none() && !h.has(&live));
+        let mut expected = before.clone();
+        expected.segments[piece_index].speed = speed;
+        assert_eq!(h.app.edit, expected, "source bounds and all other edits stay unchanged");
+        h.settle();
+        h.right_click(pos2(h.app.view.x(map.to_edit(seam), left, width) + 2.0, y));
+        assert_eq!(h.app.edit, expected, "pieces at different speeds cannot merge");
+
+        assert!(h.app.undo.undo(&mut h.app.edit));
+        assert_eq!(h.app.edit, before);
+        assert!(!h.app.undo.undo(&mut h.app.edit), "one gesture makes one undo step");
+    }
+}
+
+#[test]
+fn a_parked_piece_wins_at_both_its_cuts_and_the_focus_matches_the_locked_drag() {
+    let cuts = [10 * SECOND, 20 * SECOND, 30 * SECOND];
+    for (cut, from_dx, drag_dx, target) in [
+        (cuts[0], -2.0, -20.0, 1),
+        (cuts[1], 2.0, 20.0, 1),
+        (cuts[2], 2.0, -20.0, 3),
+    ] {
+        let mut h = Harness::new(1);
+        let header = h.rect_of("sound · muted tracks won't be in the file");
+        let left = header.left() + 6.0;
+        let width = h.rect_of("mute all").right() - 6.0 - left;
+        let video_y = header.center().y - 41.0;
+        let audio_y = h.at("desktop").y;
+        for cut in cuts {
+            assert!(h.app.edit.split(cut, 1));
+        }
+        h.app.jump(15 * SECOND);
+        h.settle();
+
+        let assert_focus = |h: &Harness, target| {
+            let map = TimeMap::new(&h.app.edit);
+            for (index, source) in [5, 15, 25, 36].into_iter().enumerate() {
+                let x = h.app.view.x(map.to_edit(source * SECOND), left, width);
+                for y in [video_y, audio_y] {
+                    let dimmed = h.rects.iter().any(|(rect, fill)| {
+                        *fill == Color32::from_black_alpha(18) && rect.contains(pos2(x, y))
+                    });
+                    assert_eq!(dimmed, index != target, "piece {index} at {y}");
+                }
+            }
+        };
+        let from = pos2(h.app.view.x(cut, left, width) + from_dx, video_y);
+        let to = from + vec2(drag_dx, -35.0);
+        let button = |pos, pressed, modifiers| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers,
+        };
+
+        assert_focus(&h, 1);
+        h.frame(vec![Event::ModifiersChanged(Modifiers::SHIFT), Event::PointerMoved(from)]);
+        assert_focus(&h, target);
+        h.frame(vec![Event::ModifiersChanged(Modifiers::SHIFT), button(from, true, Modifiers::SHIFT)]);
+        assert!(matches!(h.app.drag, Some(Drag::Stretch(_))));
+        h.frame(vec![Event::ModifiersChanged(Modifiers::NONE), Event::PointerMoved(to)]);
+        assert_focus(&h, target);
+        for (index, piece) in h.app.edit.segments.iter().enumerate() {
+            assert_eq!(piece.speed != Speed::NORMAL, index == target, "piece {index}");
+        }
+        h.frame(vec![button(to, false, Modifiers::NONE)]);
+        assert!(h.app.drag.is_none());
+        assert_focus(&h, 1);
+    }
+}
+
+#[test]
+fn idle_piece_focus_leaves_single_removed_and_trimmed_content_alone_and_hides_in_playback() {
+    let mut h = Harness::new(1);
+    let x_of = h.timeline_x();
+    let video_y = h.at("sound · muted tracks won't be in the file").y - 41.0;
+    let dimmed = |h: &Harness, source| {
+        h.rects.iter().any(|(rect, fill)| {
+            *fill == Color32::from_black_alpha(18) && rect.contains(pos2(x_of(source), video_y))
+        })
+    };
+    let dim_count = |h: &Harness| {
+        h.rects.iter().filter(|(_, fill)| *fill == Color32::from_black_alpha(18)).count()
+    };
+
+    h.app.jump(15 * SECOND);
+    h.settle();
+    assert_eq!(dim_count(&h), 0);
+
+    assert!(h.app.edit.split(10 * SECOND, 1));
+    assert!(h.app.edit.split(20 * SECOND, 1));
+    assert!(h.app.edit.toggle_removed(0));
+    h.app.edit.range.set_end(38 * SECOND, 42 * SECOND, 1);
+    h.settle();
+
+    assert_eq!(dim_count(&h), 2, "only the other kept piece is dimmed, once per band");
+    assert!(!dimmed(&h, 5 * SECOND), "removal hatch is unchanged");
+    assert!(dimmed(&h, 30 * SECOND));
+    assert!(!dimmed(&h, 40 * SECOND), "trim shading is unchanged");
+
+    h.app.play = Play::Running { at: std::time::Instant::now(), from: 0 };
+    h.frame(Vec::new());
+    assert_eq!(dim_count(&h), 0);
+    h.app.pos = 30 * SECOND;
+    h.frame(Vec::new());
+    assert_eq!(dim_count(&h), 0, "the focus does not flicker as playback crosses a cut");
+
+    h.app.pause();
+    h.frame(Vec::new());
+    assert!(dimmed(&h, 15 * SECOND));
+    assert!(!dimmed(&h, 30 * SECOND));
+}
+
+#[test]
+fn shift_drag_on_either_trimmed_edge_uses_the_kept_duration_and_anchors_the_other_edge() {
+    for (edge, anchor, target, sign) in [
+        (12 * SECOND, 30 * SECOND, 671, -1.0),
+        (30 * SECOND, 12 * SECOND, 1337, 1.0),
+    ] {
+        let mut h = Harness::new(1);
+        let header = h.rect_of("sound · muted tracks won't be in the file");
+        let left = header.left() + 6.0;
+        let width = h.rect_of("mute all").right() - 6.0 - left;
+        let y = header.center().y - 41.0;
+        h.app.edit.range.set_start(12 * SECOND, 1);
+        h.app.edit.range.set_end(30 * SECOND, 42 * SECOND, 1);
+        h.settle();
+
+        let before = h.app.edit.clone();
+        let view = h.app.view;
+        let speed = Speed::from_milli(target);
+        let kept = before.range.len();
+        let delta = speed.output_delta(kept) - kept;
+        let from = pos2(view.x(edge, left, width) + sign * 2.0, y);
+        let to = from + vec2(sign * width * (delta as f64 / view.span as f64) as f32, 0.0);
+        let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT };
+
+        h.frame(vec![Event::ModifiersChanged(Modifiers::SHIFT), Event::PointerMoved(from), button(from, true)]);
+        h.frame(vec![Event::PointerMoved(to)]);
+
+        let map = TimeMap::new(&h.app.edit);
+        assert_eq!(h.app.edit.segments[0].speed, speed);
+        assert!((h.app.view.x(map.to_edit(anchor), left, width) - view.x(anchor, left, width)).abs() < 0.01);
+
+        h.frame(vec![button(to, false)]);
+        let mut expected = before;
+        expected.segments[0].speed = speed;
+        assert_eq!(h.app.edit, expected, "Shift-dragging a trim handle leaves the trim and source bounds intact");
+    }
+}
+
+#[test]
+fn shift_click_does_not_open_a_speed_picker_and_removed_edges_cannot_stretch() {
+    let mut h = Harness::new(1);
+    let header = h.rect_of("sound · muted tracks won't be in the file");
+    let left = header.left() + 6.0;
+    let right = h.rect_of("mute all").right() - 6.0;
+    let at = |frac| pos2(left + (right - left) * frac, header.center().y - 41.0);
+    assert!(h.app.edit.split(21 * SECOND, 1));
+    assert!(h.app.edit.toggle_removed(0));
+    h.settle();
+
+    let before = h.app.edit.clone();
+    h.click_with_modifiers(at(0.75), Modifiers::SHIFT);
+    assert!(!h.has("piece speed"));
+
+    let from = at(0.5) - vec2(2.0, 0.0);
+    let to = at(0.6);
+    let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT };
+    h.frame(vec![Event::ModifiersChanged(Modifiers::SHIFT), Event::PointerMoved(from), button(from, true)]);
+    h.frame(vec![Event::PointerMoved(to)]);
+    h.frame(vec![button(to, false)]);
+
+    assert_eq!(h.app.edit, before);
+    assert!(!h.app.undo.undo(&mut h.app.edit));
 }
 
 #[test]

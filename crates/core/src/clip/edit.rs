@@ -6,11 +6,125 @@ use super::math::Range;
 
 const UNDO_LIMIT: usize = 200;
 
+/// Playback rate in thousandths of the recording's speed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Speed(u32);
+
+impl Speed {
+    const MIN_MILLI: u32 = 50;
+    const MAX_MILLI: u32 = 16_000;
+    const SCALE: i128 = 1_000;
+
+    pub const NORMAL: Self = Self(Self::SCALE as u32);
+
+    pub const fn from_milli(milli: u32) -> Self {
+        Self(if milli < Self::MIN_MILLI {
+            Self::MIN_MILLI
+        } else if milli > Self::MAX_MILLI {
+            Self::MAX_MILLI
+        } else {
+            milli
+        })
+    }
+
+    pub const fn milli(self) -> u32 {
+        self.0
+    }
+
+    /// Rate that fits the source span into the requested output span, rounded to a thousandth.
+    pub fn from_lengths(source: i64, output: i64) -> Self {
+        if source <= 0 {
+            return Self::NORMAL;
+        }
+
+        if output <= 0 {
+            return Self(Self::MAX_MILLI);
+        }
+
+        let output = i128::from(output);
+        let milli = (i128::from(source) * Self::SCALE + output / 2) / output;
+
+        Self(milli.clamp(i128::from(Self::MIN_MILLI), i128::from(Self::MAX_MILLI)) as u32)
+    }
+
+    pub fn label(self) -> String {
+        let (whole, frac) = (self.0 / Self::NORMAL.0, self.0 % Self::NORMAL.0);
+        if frac == 0 {
+            format!("{whole}×")
+        } else if frac.is_multiple_of(100) {
+            format!("{whole}.{}×", frac / 100)
+        } else if frac.is_multiple_of(10) {
+            format!("{whole}.{:02}×", frac / 10)
+        } else {
+            format!("{whole}.{frac:03}×")
+        }
+    }
+
+    /// Source time elapsed over this much output time, rounded down.
+    pub fn source_delta(self, output: i64) -> i64 {
+        if self == Self::NORMAL {
+            return output;
+        }
+
+        saturate_time(self.source_ticks(i128::from(output)))
+    }
+
+    /// Output time elapsed over this much source time, rounded down.
+    pub fn output_delta(self, source: i64) -> i64 {
+        if self == Self::NORMAL {
+            return source;
+        }
+
+        saturate_time(self.output_ticks(i128::from(source)))
+    }
+
+    /// Duration of a piece, leaving at least one tick for any nonempty span.
+    pub fn output_len(self, source: i64) -> i64 {
+        if source <= 0 { 0 } else { self.output_delta(source).max(1) }
+    }
+
+    fn source_ticks(self, output: i128) -> i128 {
+        (output * i128::from(self.0)).div_euclid(Self::SCALE)
+    }
+
+    fn output_ticks(self, source: i128) -> i128 {
+        (source * Self::SCALE).div_euclid(i128::from(self.0))
+    }
+}
+
+impl Default for Speed {
+    fn default() -> Self {
+        Self::NORMAL
+    }
+}
+
+fn saturate_time(ticks: i128) -> i64 {
+    ticks.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimedRange {
+    pub range: Range,
+    pub speed: Speed,
+}
+
+impl TimedRange {
+    /// Length in output time.
+    pub fn len(self) -> i64 {
+        self.speed.output_len(self.range.len())
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.range.end <= self.range.start
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
     pub start: i64,
     pub end: i64,
     pub removed: bool,
+    pub speed: Speed,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +181,7 @@ impl Edit {
         let duration = duration.max(0);
         Edit {
             range: Range::full(duration),
-            segments: vec![Segment { start: 0, end: duration, removed: false }],
+            segments: vec![Segment { start: 0, end: duration, removed: false, speed: Speed::NORMAL }],
             markers: Vec::new(),
             lanes: (0..tracks).map(|k| Lane::of(Some(k))).collect(),
             crop: None,
@@ -95,11 +209,11 @@ impl Edit {
         true
     }
 
-    /// Removes the split before `right` without bringing any removed footage back.
+    /// Removes a split without restoring footage or changing playback speed.
     pub fn merge_kept(&mut self, right: usize) -> bool {
         let Some(left) = right.checked_sub(1) else { return false };
         let Some(pair) = self.segments.get(left..=right) else { return false };
-        if pair[0].removed || pair[1].removed {
+        if pair[0].removed || pair[1].removed || pair[0].speed != pair[1].speed {
             return false;
         }
         self.segments[left].end = pair[1].end;
@@ -108,37 +222,68 @@ impl Edit {
         true
     }
 
+    pub fn set_speed(&mut self, i: usize, speed: Speed) -> bool {
+        let Some(s) = self.segments.get_mut(i) else { return false };
+        if s.removed || s.speed == speed {
+            return false;
+        }
+        s.speed = speed;
+
+        true
+    }
+
     pub fn toggle_removed(&mut self, i: usize) -> bool {
         let Some(s) = self.segments.get(i).copied() else { return false };
         self.segments[i].removed = !s.removed;
-        if self.kept_len() == 0 {
+        if self.clipped_kept().next().is_none() {
             self.segments[i].removed = s.removed;
             return false;
         }
+
         true
     }
 
     pub fn kept(&self) -> Vec<Range> {
         let mut out: Vec<Range> = Vec::new();
-        for s in self.segments.iter().filter(|s| !s.removed) {
-            let (start, end) = (s.start.max(self.range.start), s.end.min(self.range.end));
-            if start >= end {
-                continue;
-            }
+        for TimedRange { range, .. } in self.clipped_kept() {
             match out.last_mut() {
-                Some(last) if last.end == start => last.end = end,
-                _ => out.push(Range { start, end }),
+                Some(last) if last.end == range.start => last.end = range.end,
+                _ => out.push(range),
             }
         }
+
         out
     }
 
-    pub(super) fn kept_len(&self) -> i64 {
-        self.kept().iter().map(|r| r.len()).sum()
+    pub fn timed(&self) -> Vec<TimedRange> {
+        self.timed_ranges().collect()
     }
 
-    pub fn next_kept(&self, t: i64) -> Option<i64> {
-        self.kept().into_iter().find(|r| t < r.end).map(|r| t.max(r.start))
+    /// The whole timed piece containing `t`, or the next piece after a trim or gap.
+    pub fn playback_piece(&self, t: i64) -> Option<TimedRange> {
+        self.timed_ranges().find(|piece| t < piece.range.end)
+    }
+
+    fn timed_ranges(&self) -> impl Iterator<Item = TimedRange> + '_ {
+        let mut kept = self.clipped_kept().peekable();
+
+        std::iter::from_fn(move || {
+            let mut piece = kept.next()?;
+            while let Some(next) = kept.next_if(|next| next.speed == piece.speed && next.range.start == piece.range.end) {
+                piece.range.end = next.range.end;
+            }
+
+            Some(piece)
+        })
+    }
+
+    fn clipped_kept(&self) -> impl Iterator<Item = TimedRange> + '_ {
+        self.segments.iter().filter(|s| !s.removed).filter_map(|s| {
+            let start = s.start.max(self.range.start);
+            let end = s.end.min(self.range.end);
+
+            (start < end).then_some(TimedRange { range: Range { start, end }, speed: s.speed })
+        })
     }
 
     pub(super) fn marker_near(&self, t: i64, within: i64) -> Option<usize> {
@@ -211,15 +356,75 @@ impl Edit {
     }
 }
 
-pub fn source_time(kept: &[Range], out: i64) -> Option<(usize, i64)> {
-    let mut base = 0;
-    for (i, r) in kept.iter().enumerate() {
-        if out < base + r.len() {
-            return Some((i, r.start + (out - base).max(0)));
+struct Stretch {
+    source: Range,
+    edited_start: i128,
+    edited_end: i128,
+    speed: Speed,
+}
+
+/// The editor's full time axis, including footage excluded by trims or removal.
+/// Unlike playback/export, it retains the width of every piece at its stored speed.
+pub struct TimeMap {
+    stretches: Vec<Stretch>,
+    duration: i64,
+}
+
+impl TimeMap {
+    pub fn new(edit: &Edit) -> Self {
+        let mut stretches = Vec::new();
+        let mut shift = 0;
+        for s in &edit.segments {
+            if s.speed == Speed::NORMAL || s.end <= s.start {
+                continue;
+            }
+
+            let source_len = i128::from(s.end) - i128::from(s.start);
+            let edited_len = s.speed.output_ticks(source_len).max(1);
+            let edited_start = i128::from(s.start) + shift;
+            stretches.push(Stretch {
+                source: Range { start: s.start, end: s.end },
+                edited_start,
+                edited_end: edited_start + edited_len,
+                speed: s.speed,
+            });
+            shift += edited_len - source_len;
         }
-        base += r.len();
+        let source_end = edit.segments.last().map_or(0, |s| s.end);
+
+        Self { stretches, duration: saturate_time(i128::from(source_end) + shift) }
     }
-    None
+
+    pub fn duration(&self) -> i64 {
+        self.duration
+    }
+
+    /// Edited position of a source timestamp. Outside the recording, time continues at 1×.
+    pub fn to_edit(&self, source: i64) -> i64 {
+        let at = self.stretches.partition_point(|s| s.source.start <= source);
+        let Some(s) = self.stretches[..at].last() else { return source };
+        let edited = if source < s.source.end {
+            s.edited_start + s.speed.output_ticks(i128::from(source) - i128::from(s.source.start))
+        } else {
+            s.edited_end + i128::from(source) - i128::from(s.source.end)
+        };
+
+        saturate_time(edited)
+    }
+
+    /// Source timestamp at an edited position, rounded down within a piece.
+    pub fn to_source(&self, edited: i64) -> i64 {
+        let ticks = i128::from(edited);
+        let at = self.stretches.partition_point(|s| s.edited_start <= ticks);
+        let Some(s) = self.stretches[..at].last() else { return edited };
+        let source = if ticks < s.edited_end {
+            i128::from(s.source.start) + s.speed.source_ticks(ticks - s.edited_start)
+        } else {
+            i128::from(s.source.end) + ticks - s.edited_end
+        };
+
+        saturate_time(source)
+    }
 }
 
 pub fn snap_to(t: i64, targets: impl IntoIterator<Item = i64>, within: i64) -> i64 {
@@ -302,11 +507,6 @@ mod tests {
         assert_eq!(e.kept(), [r(0, 2 * S), r(5 * S, 10 * S)]);
         e.range = r(S, 9 * S);
         assert_eq!(e.kept(), [r(S, 2 * S), r(5 * S, 9 * S)]);
-        assert_eq!(e.kept_len(), 5 * S);
-        assert_eq!(e.next_kept(0), Some(S));
-        assert_eq!(e.next_kept(3 * S), Some(5 * S));
-        assert_eq!(e.next_kept(6 * S), Some(6 * S));
-        assert_eq!(e.next_kept(9 * S), None);
     }
 
     #[test]
@@ -319,16 +519,6 @@ mod tests {
         assert!(e.toggle_removed(1));
         assert_eq!(e.kept(), [r(0, 5 * S)]);
         assert!(!e.toggle_removed(9));
-    }
-
-    #[test]
-    fn output_times_map_back_through_the_gaps() {
-        let kept = [r(S, 2 * S), r(5 * S, 9 * S)];
-        assert_eq!(source_time(&kept, 0), Some((0, S)));
-        assert_eq!(source_time(&kept, S - 1), Some((0, 2 * S - 1)));
-        assert_eq!(source_time(&kept, S), Some((1, 5 * S)));
-        assert_eq!(source_time(&kept, 3 * S), Some((1, 7 * S)));
-        assert_eq!(source_time(&kept, 5 * S), None);
     }
 
     #[test]

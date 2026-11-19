@@ -1,27 +1,27 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError};
-use std::thread::JoinHandle;
-use std::time::Duration;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::thread::{self, JoinHandle};
 
 use eframe::egui::{self, Color32, ColorImage};
 use glint_core::clip::math::SECOND;
 use glint_media::clip::media::{self, Com, Decoded};
 use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 
-const AHEAD: usize = 4;
+pub(super) const NO_CLOCK: i64 = i64::MIN;
+pub(super) const AHEAD: usize = 4;
 
 pub(super) struct Shown {
     pub epoch: u64,
     pub ts: i64,
     pub dur: i64,
-    pub image: ColorImage,
+    pub image: Arc<ColorImage>,
 }
 
 pub(super) enum Cmd {
-    Seek { t: i64, epoch: u64 },
-    Play(bool),
+    Seek { t: i64, epoch: u64, play: bool, clock: i64 },
+    Pause,
 }
 
 pub(super) struct Player {
@@ -39,11 +39,14 @@ impl Player {
         let (tx, cmds) = mpsc::channel();
         let (out, rx) = mpsc::channel();
         let queued = Arc::new(AtomicUsize::new(0));
-        let clock = Arc::new(AtomicI64::new(i64::MIN));
+        let clock = Arc::new(AtomicI64::new(NO_CLOCK));
         let (q, c) = (queued.clone(), clock.clone());
-        let thread = std::thread::spawn(move || {
+        let thread = thread::spawn(move || {
             let _com = Com::init();
-            let mut w = Worker { size, out, queued: q, clock: c, ctx, epoch: 0, head: None, head_sent: false };
+            let mut w = Worker {
+                size, out, queued: q, clock: c, ctx, epoch: 0,
+                head: None, ahead: None, sent: false, fresh: true, eof: false,
+            };
             if let Err(e) = w.run(&path, &cmds) {
                 let _ = w.out.send(Err(e));
                 w.ctx.request_repaint();
@@ -58,19 +61,28 @@ impl Player {
     }
 
     pub(super) fn send(&self, cmd: Cmd) {
-        if matches!(cmd, Cmd::Seek { .. } | Cmd::Play(false)) {
-            self.clock.store(i64::MIN, Ordering::Relaxed);
-        }
+        let clock = match cmd {
+            Cmd::Seek { clock, .. } => clock,
+            Cmd::Pause => NO_CLOCK,
+        };
+        self.set_clock(clock);
         if let Some(tx) = &self.tx {
             let _ = tx.send(cmd);
+            if let Some(worker) = &self.thread {
+                worker.thread().unpark();
+            }
         }
     }
 
     pub(super) fn poll(&self) -> Option<Result<Shown, String>> {
         let got = self.rx.try_recv().ok()?;
-        if got.is_ok() {
-            self.queued.fetch_sub(1, Ordering::Relaxed);
+        if got.is_ok()
+            && self.queued.fetch_sub(1, Ordering::Relaxed) == AHEAD
+            && let Some(worker) = &self.thread
+        {
+            worker.thread().unpark();
         }
+
         Some(got)
     }
 }
@@ -79,9 +91,33 @@ impl Drop for Player {
     fn drop(&mut self) {
         self.tx = None;
         if let Some(t) = self.thread.take() {
+            t.thread().unpark();
             let _ = t.join();
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum FrameAction {
+    Show,
+    ReadAhead,
+    Advance,
+}
+
+pub(super) fn frame_action(t: i64, ts: i64, dur: i64, ahead: Option<i64>, eof: bool) -> FrameAction {
+    if ahead.is_some_and(|next| next <= t) {
+        return FrameAction::Advance;
+    }
+    if ts >= t || (dur > 0 && ts.saturating_add(dur) > t) || ahead.is_some() || eof {
+        return FrameAction::Show;
+    }
+
+    FrameAction::ReadAhead
+}
+
+struct Frame {
+    decoded: Decoded,
+    image: Option<Arc<ColorImage>>,
 }
 
 struct Worker {
@@ -91,107 +127,128 @@ struct Worker {
     clock: Arc<AtomicI64>,
     ctx: egui::Context,
     epoch: u64,
-    head: Option<Decoded>,
-    head_sent: bool,
+    head: Option<Frame>,
+    ahead: Option<Decoded>,
+    sent: bool,
+    fresh: bool,
+    eof: bool,
 }
 
 impl Worker {
-    fn run(&mut self, path: &std::path::Path, cmds: &Receiver<Cmd>) -> Result<(), String> {
+    fn run(&mut self, path: &Path, cmds: &Receiver<Cmd>) -> Result<(), String> {
         let reader = media::rgb_reader(path, self.size)?;
         let mut playing = false;
+        let mut seek = None;
         loop {
-            let room = self.queued.load(Ordering::Relaxed) < AHEAD;
-            let cmd = if playing && room {
+            let mut reposition = false;
+            loop {
                 match cmds.try_recv() {
-                    Ok(c) => Some(c),
-                    Err(TryRecvError::Empty) => None,
+                    Ok(Cmd::Seek { t, epoch, play, .. }) => {
+                        self.epoch = epoch;
+                        playing = play;
+                        seek = Some(t);
+                        reposition = true;
+                    }
+                    Ok(Cmd::Pause) => {
+                        playing = false;
+                        seek = None;
+                        reposition = false;
+                    }
+                    Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return Ok(()),
                 }
-            } else if playing {
-                match cmds.recv_timeout(Duration::from_millis(4)) {
-                    Ok(c) => Some(c),
-                    Err(RecvTimeoutError::Timeout) => None,
-                    Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                }
-            } else {
-                match cmds.recv() {
-                    Ok(c) => Some(c),
-                    Err(_) => return Ok(()),
-                }
-            };
-            if let Some(first) = cmd {
-                let mut seek = None;
-                for c in std::iter::once(first).chain(cmds.try_iter()) {
-                    match c {
-                        Cmd::Seek { t, epoch } => seek = Some((t, epoch)),
-                        Cmd::Play(p) => playing = p,
-                    }
-                }
-                if let Some((t, epoch)) = seek {
-                    self.epoch = epoch;
-                    self.seek(&reader, t)?;
+            }
+            if reposition && let Some(t) = seek {
+                self.seek(&reader, t)?;
+            }
+            if (!playing && seek.is_none()) || self.queued.load(Ordering::Relaxed) >= AHEAD {
+                thread::park();
+                continue;
+            }
+            if self.head.is_none() || (seek.is_none() && self.sent) {
+                if !self.advance(&reader)? {
+                    playing = false;
+                    seek = None;
                 }
                 continue;
             }
-            if !playing || !room {
-                continue;
-            }
-            match self.head.take() {
-                Some(h) if !self.head_sent => self.show(h)?,
-                _ => match media::next_video(&reader)? {
-                    // over before it could be shown: skip the readback and the upload
-                    Some(f) if f.ts + f.dur < self.clock.load(Ordering::Relaxed) => {
-                        self.head = Some(f);
-                        self.head_sent = true;
-                    }
-                    Some(f) => self.show(f)?,
-                    None => playing = false,
-                },
+
+            let clock = self.clock.load(Ordering::Relaxed);
+            let t = seek.map_or(clock, |target| target.max(clock));
+            let f = &self.head.as_ref().unwrap().decoded;
+            match frame_action(t, f.ts, f.dur, self.ahead.as_ref().map(|f| f.ts), self.eof) {
+                FrameAction::Show => {
+                    self.show()?;
+                    self.sent = true;
+                    seek = None;
+                }
+                FrameAction::ReadAhead => self.ahead = self.read(&reader)?,
+                FrameAction::Advance => {
+                    self.advance(&reader)?;
+                }
             }
         }
     }
 
     fn seek(&mut self, reader: &IMFSourceReader, t: i64) -> Result<(), String> {
-        let best = match self.head.take() {
-            Some(h) if h.ts <= t && t - h.ts < SECOND => Some(h),
-            _ => {
-                media::seek(reader, t)?;
-                None
-            }
-        };
-        let (found, ahead) = media::decode_until(reader, t, best)?;
-        let Some(found) = found else { return Ok(()) };
-        match ahead {
-            Some(a) => {
-                self.send(&found)?;
-                self.head = Some(a);
-                self.head_sent = false;
-            }
-            None => self.show(found)?,
+        let near = |ts| ts <= t && t - ts < SECOND;
+        if self.ahead.as_ref().is_some_and(|f| near(f.ts)) {
+            self.advance(reader)?;
+        } else if !self.head.as_ref().is_some_and(|f| near(f.decoded.ts)) && !(self.fresh && t == 0) {
+            media::seek(reader, t)?;
+            self.head = None;
+            self.ahead = None;
+            self.eof = false;
+            self.fresh = false;
         }
+        self.sent = false;
+
         Ok(())
     }
 
-    fn show(&mut self, f: Decoded) -> Result<(), String> {
-        self.send(&f)?;
-        self.head = Some(f);
-        self.head_sent = true;
-        Ok(())
+    fn advance(&mut self, reader: &IMFSourceReader) -> Result<bool, String> {
+        let decoded = match self.ahead.take() {
+            Some(f) => Some(f),
+            None => self.read(reader)?,
+        };
+        let Some(decoded) = decoded else { return Ok(false) };
+        self.head = Some(Frame { decoded, image: None });
+        self.sent = false;
+
+        Ok(true)
     }
 
-    fn send(&self, f: &Decoded) -> Result<(), String> {
-        let (w, h) = (self.size.0 as usize, self.size.1 as usize);
-        let pixels = media::with_pixels(&f.sample, self.size.0, |rows| {
-            let mut px = Vec::with_capacity(w * h);
-            for y in 0..h {
-                px.extend(rows.row(y).chunks_exact(4).map(|c| Color32::from_rgb(c[2], c[1], c[0])));
-            }
-            px
-        })?;
-        let image = ColorImage::new([w, h], pixels);
+    fn read(&mut self, reader: &IMFSourceReader) -> Result<Option<Decoded>, String> {
+        if self.eof {
+            return Ok(None);
+        }
+        self.fresh = false;
+        let next = media::next_video(reader)?;
+        self.eof = next.is_none();
+
+        Ok(next)
+    }
+
+    fn show(&mut self) -> Result<(), String> {
+        let head = self.head.as_mut().unwrap();
+        let f = &head.decoded;
+        if head.image.is_none() {
+            let (w, h) = (self.size.0 as usize, self.size.1 as usize);
+            let pixels = media::with_pixels(&f.sample, self.size.0, |rows| {
+                let mut px = Vec::with_capacity(w * h);
+                for y in 0..h {
+                    px.extend(rows.row(y).chunks_exact(4).map(|c| Color32::from_rgb(c[2], c[1], c[0])));
+                }
+
+                px
+            })?;
+            head.image = Some(Arc::new(ColorImage::new([w, h], pixels)));
+        }
+        let image = head.image.as_ref().unwrap().clone();
         self.queued.fetch_add(1, Ordering::Relaxed);
         let _ = self.out.send(Ok(Shown { epoch: self.epoch, ts: f.ts, dur: f.dur, image }));
         self.ctx.request_repaint();
+
         Ok(())
     }
 }

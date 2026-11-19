@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use super::clicks::ClickLook;
 use super::crop::Crop;
-use super::edit::{Edit, FULL_VOLUME};
+use super::edit::{Edit, FULL_VOLUME, Speed, TimedRange};
 use super::index::{Index, Samples};
 use super::info::{Info, Snap};
 use super::keys::KeyLook;
@@ -32,11 +32,11 @@ const HEVC_SHARE: f64 = 0.7;
 /// there at ~12 Mbps, so carrying a near-lossless recording's rate any higher only grows the file.
 /// Other sizes and frame rates scale like [`bitrate_scaled`].
 const CEILING_BPS: f64 = 19_000_000.0;
-/// The qp a re-encode holds when nothing asks for a size or a bitrate and the source's rate is under
-/// [`CEILING_BPS`], and a smart cut's new start: a notch above "compress · light", so it looks like
-/// the source. Carrying a low average bitrate over instead starves the frames after a keyframe (a
-/// still screen recording at 1.3 Mbps opened blocky for 0.1 s: SSIM 0.94, at this qp 0.999, and the
-/// file came out smaller; a smart cut's start at 1.5× its stretch's rate measured 30 dB PSNR).
+/// The qp a non-retimed re-encode holds when nothing asks for a size or a bitrate and the source's
+/// rate is under [`CEILING_BPS`], and a smart cut's new start: a notch above "compress · light", so it
+/// looks like the source. Carrying a low average bitrate over instead starves the frames after a
+/// keyframe (a still screen recording at 1.3 Mbps opened blocky for 0.1 s: SSIM 0.94, at this qp 0.999,
+/// and the file came out smaller; a smart cut's start at 1.5× its stretch's rate measured 30 dB PSNR).
 pub const KEEP_QP: u32 = 18;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,7 +108,7 @@ pub struct Settings {
     /// Output height after the crop; None keeps it.
     pub height: Option<u32>,
     pub gif_fps: u32,
-    /// Video frame rate; None keeps the source's.
+    /// Video frame rate; None uses source frame timing adjusted by playback speed.
     pub fps: Option<u32>,
     /// A custom video bitrate; never set together with `target_mb` or `compress`.
     pub kbps: Option<u32>,
@@ -206,6 +206,32 @@ impl Source<'_> {
         bytes as f64 * 8.0 / self.secs()
     }
 
+    fn retained_video_bytes(&self, pieces: &[Piece]) -> f64 {
+        if let Some(video) = self.index.map(|i| &i.video).filter(|v| v.total() > 0) {
+            let mut prev_end = i64::MIN;
+            let mut bytes = 0;
+            for piece in pieces {
+                // the frame held at a cut may start before it; count it only once across pieces
+                let start = if piece.start == prev_end {
+                    prev_end
+                } else {
+                    video.shown_at(piece.start).unwrap_or(piece.start).max(prev_end)
+                };
+                bytes += video.bytes(start, piece.end);
+                prev_end = piece.end;
+            }
+
+            return bytes as f64;
+        }
+
+        let len = pieces.iter().map(|p| p.end - p.start).sum::<i64>();
+        let bytes = self.bytes_for(len) as f64;
+        let audio = AAC_BYTES_PER_SECOND as f64 * self.info.tracks.len() as f64 * len as f64 / SECOND as f64;
+
+        // imported audio can be much smaller than the recording preset
+        if audio < bytes { bytes - audio } else { bytes }
+    }
+
     fn audio_bytes(&self, track: usize, from: i64, to: i64) -> u64 {
         match self.index.and_then(|i| i.audio.get(track)) {
             Some(s) => s.bytes(from, to),
@@ -227,14 +253,16 @@ pub fn snap(src: &Source) -> Option<Snap> {
 /// One kept range copied from the frame shown at its start: when that isn't a keyframe, the
 /// frames up to the next one are encoded again (`key`) and the rest copied (a smart cut).
 fn smart_piece(video: Option<&Samples>, r: Range) -> Piece {
-    let Some(video) = video else { return Piece { lead: r.start, start: r.start, end: r.end, key: r.start } };
+    let Some(video) = video else {
+        return Piece { lead: r.start, start: r.start, end: r.end, key: r.start, speed: Speed::NORMAL };
+    };
     let shown = video.shown_at(r.start);
     if shown.is_some_and(|t| video.keys.binary_search(&t).is_ok()) {
         let lead = shown.unwrap_or(r.start);
-        return Piece { lead, start: r.start, end: r.end, key: lead };
+        return Piece { lead, start: r.start, end: r.end, key: lead, speed: Speed::NORMAL };
     }
     let next = video.keys[video.keys.partition_point(|&k| k <= r.start)..].first().copied();
-    Piece { lead: r.start, start: r.start, end: r.end, key: next.unwrap_or(r.end).min(r.end) }
+    Piece { lead: r.start, start: r.start, end: r.end, key: next.unwrap_or(r.end).min(r.end), speed: Speed::NORMAL }
 }
 
 /// One kept range; the output starts at `lead`. A copied piece starts on a keyframe: `lead` itself
@@ -247,13 +275,25 @@ pub struct Piece {
     pub end: i64,
     /// Where packets start being copied; `lead` when they all are, and for an encoded video.
     pub key: i64,
+    pub speed: Speed,
+}
+
+impl Piece {
+    /// Length in output time, including any material copied before `start`.
+    pub fn len(&self) -> i64 {
+        self.speed.output_len(self.end - self.lead)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.end <= self.lead
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Video {
     Copy,
-    /// `fps` None keeps the source's frame timing; otherwise frames land on that grid. With `qp` the encoder
-    /// holds that constant quality and `bitrate` only estimates the size.
+    /// `fps` None uses the source's frame timing adjusted by the piece's speed; otherwise frames
+    /// land on the selected grid. With `qp` the encoder holds that quality and `bitrate` only estimates the size.
     Encode { crop: Option<Crop>, size: (u32, u32), bitrate: u32, fps: Option<u32>, codec: Codec, qp: Option<u32> },
 }
 
@@ -290,13 +330,40 @@ pub struct VideoJob {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GifJob {
-    pub kept: Vec<Range>,
+    pub kept: Vec<TimedRange>,
     pub crop: Option<Crop>,
     pub size: (u32, u32),
     pub fps: u32,
     pub target: Option<u64>,
     pub burn: Option<Burn>,
     pub keys: Option<KeyBurn>,
+}
+
+impl GifJob {
+    pub fn len(&self) -> i64 {
+        self.kept.iter().map(|r| r.len()).fold(0, i64::saturating_add)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kept.iter().all(|r| r.is_empty())
+    }
+
+    /// The piece and source time shown at `out`; none at the end of the GIF or later.
+    pub fn source_time(&self, out: i64) -> Option<(usize, i64)> {
+        let out = out.max(0);
+        let mut start = 0_i64;
+        for (i, piece) in self.kept.iter().enumerate() {
+            let end = start.saturating_add(piece.len());
+            if out < end {
+                let delta = piece.speed.source_delta(out - start).min(piece.range.len() - 1);
+
+                return Some((i, piece.range.start + delta));
+            }
+            start = end;
+        }
+
+        None
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -309,17 +376,24 @@ impl Job {
     /// Length of the output.
     pub fn len(&self) -> i64 {
         match self {
-            Job::Video(v) => v.pieces.iter().map(|p| p.end - p.lead).sum(),
-            Job::Gif(g) => g.kept.iter().map(|r| r.len()).sum(),
+            Job::Video(v) => v.len(),
+            Job::Gif(g) => g.len(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        match self {
+            Job::Video(v) => v.pieces.iter().all(Piece::is_empty),
+            Job::Gif(g) => g.is_empty(),
+        }
     }
 }
 
 impl VideoJob {
+    fn len(&self) -> i64 {
+        self.pieces.iter().map(Piece::len).fold(0, i64::saturating_add)
+    }
+
     /// The output would be the recording itself.
     pub fn whole(&self, info: &Info) -> bool {
         self.video == Video::Copy
@@ -333,10 +407,13 @@ impl VideoJob {
     }
 
     /// `t`'s packets go into the file as they are: a recorded track, not mixed with others, at its own
-    /// volume, under a picture that isn't cut anew at its starts (a smart cut cuts the sound to the
-    /// sample instead). Anything else is decoded and encoded again.
+    /// volume, at recorded speed, under a picture that isn't cut anew at its starts (a smart cut
+    /// cuts the sound to the sample instead). Anything else is decoded and encoded again.
     pub fn copies(&self, t: &Sound) -> bool {
-        t.source.is_some() && !self.combine && t.volume == FULL_VOLUME && self.cut_anew() == 0
+        t.source.is_some()
+            && !self.combine
+            && t.volume == FULL_VOLUME
+            && self.pieces.iter().all(|p| p.speed == Speed::NORMAL && p.key == p.lead)
     }
 
     /// How much sooner than the trim start a copied file starts: its first piece begins on the
@@ -403,16 +480,16 @@ fn bitrate_scaled(bps: f64, pixels: f64, rate: f64) -> f64 {
 }
 
 /// The source's bitrate carried over to the output's pixels, frame rate and codec.
-fn carried_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> f64 {
-    let size = src.info.size;
+fn carried_bitrate(bps: f64, info: &Info, out: (u32, u32), fps: Option<u32>, codec: Codec) -> f64 {
+    let size = info.size;
     let pixels = out.0 as f64 * out.1 as f64 / (size.0.max(1) as f64 * size.1.max(1) as f64);
-    let rate = fps.map_or(1.0, |f| f as f64 / src.info.fps.max(1.0));
-    let share = match (src.info.codec.unwrap_or(Codec::H264), codec) {
+    let rate = fps.map_or(1.0, |f| f as f64 / info.fps.max(1.0));
+    let share = match (info.codec.unwrap_or(Codec::H264), codec) {
         (Codec::H264, Codec::Hevc) => HEVC_SHARE,
         (Codec::Hevc, Codec::H264) => 1.0 / HEVC_SHARE,
         _ => 1.0,
     };
-    bitrate_scaled(src.video_bps(), pixels.min(1.0), rate.min(1.0)) * share
+    bitrate_scaled(bps, pixels.min(1.0), rate.min(1.0)) * share
 }
 
 /// [`CEILING_BPS`] for the output's pixels, frame rate and codec.
@@ -429,11 +506,13 @@ fn sane_bps(bps: f64) -> u32 {
 
 /// [`carried_bitrate`], never above [`ceiling`].
 fn default_bitrate(src: &Source, out: (u32, u32), fps: Option<u32>, codec: Codec) -> u32 {
-    sane_bps(carried_bitrate(src, out, fps, codec).min(ceiling(src, out, fps, codec)))
+    let carried = carried_bitrate(src.video_bps(), src.info, out, fps, codec);
+
+    sane_bps(carried.min(ceiling(src, out, fps, codec)))
 }
 
 fn muxed(payload: u64) -> u64 {
-    (payload as f64 * MUXING) as u64 + MUXING_FIXED
+    ((payload as f64 * MUXING) as u64).saturating_add(MUXING_FIXED)
 }
 
 /// Why an export makes the picture anew instead of copying it as recorded.
@@ -445,6 +524,8 @@ pub enum Reencode {
     Clicks,
     /// Keys are drawn into the picture.
     Keys,
+    /// A retained piece plays at a different speed.
+    Speed,
     Crop,
     /// Scaled down to this height.
     Height(u32),
@@ -468,10 +549,11 @@ pub fn plan(edit: &Edit, s: &Settings, src: &Source) -> Job {
 /// [`plan`], and why its picture is made anew: empty exactly when the video is copied, lossless.
 pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>) {
     let size = src.info.size;
-    let kept = edit.kept();
+    let timed = edit.timed();
     let crop = edit.crop.filter(|c| !c.is_full(size)).map(|c| c.even(size));
     let base = base_size(size, crop);
     let target = s.target_mb.map(|mb| mb as u64 * MB);
+    let kept = if edit.clicks.is_some() || edit.keys.is_some() { edit.kept() } else { Vec::new() };
     let burn = edit.clicks.as_ref().and_then(|c| {
         let style = s.clicks.style(src.accent, c.scale);
         let clicks = c.burnt(&kept, &style);
@@ -483,17 +565,17 @@ pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>)
         (!list.is_empty()).then_some(KeyBurn { keys: list, style })
     });
     if s.format == Format::Gif {
-        let len = kept.iter().map(|r| r.len()).sum();
-        let mut out = scaled(base, s.height);
-        let frames = gif_frames(len, s.gif_fps);
-        let est = gif_estimate(out, frames) as f64;
+        let out = scaled(base, s.height);
+        let mut gif = GifJob { kept: timed, crop, size: out, fps: s.gif_fps, target, burn, keys };
+        let est = gif_estimate(out, gif_frames(gif.len(), gif.fps)) as f64;
         if let Some(t) = target
             && est > t as f64 * UNDER
         {
             let k = (t as f64 * UNDER / est).sqrt();
-            out = (even(out.0 as f64 * k).max(MIN_GIF), even(out.1 as f64 * k).max(MIN_GIF));
+            gif.size = (even(out.0 as f64 * k).max(MIN_GIF), even(out.1 as f64 * k).max(MIN_GIF));
         }
-        return (Job::Gif(GifJob { kept, crop, size: out, fps: s.gif_fps, target, burn, keys }), vec![Reencode::Gif]);
+
+        return (Job::Gif(gif), vec![Reencode::Gif]);
     }
     let tracks = sounds(edit, src.info);
     let combine = s.combine && tracks.iter().filter(|t| t.source.is_some()).count() > 1;
@@ -503,9 +585,11 @@ pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>)
     let compress = s.compress.filter(|_| kbps.is_none() && target.is_none());
     let codec = s.codec.resolve(src.info.codec);
     let same_codec = src.info.codec.is_none_or(|c| c == codec);
+    let retimed = timed.iter().any(|p| p.speed != Speed::NORMAL);
     let why: Vec<Reencode> = [
         burn.as_ref().map(|_| Reencode::Clicks),
         keys.as_ref().map(|_| Reencode::Keys),
+        retimed.then_some(Reencode::Speed),
         crop.map(|_| Reencode::Crop),
         height.map(Reencode::Height),
         fps.map(Reencode::Fps),
@@ -517,48 +601,72 @@ pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>)
     .into_iter()
     .flatten()
     .collect();
-    if why.is_empty() {
+    let tracks = if why.is_empty() {
         let video = src.index.map(|i| &i.video);
         let pieces = match snap(src) {
-            None => kept.iter().map(|&r| smart_piece(video, r)).collect(),
-            Some(_) => (kept.iter())
-                .map(|r| {
-                    let lead = lead(src.keys(), r.start);
-                    Piece { lead, start: r.start, end: r.end, key: lead }
+            None => timed.iter().map(|p| smart_piece(video, p.range)).collect(),
+            Some(_) => timed
+                .iter()
+                .map(|p| {
+                    let Range { start, end } = p.range;
+                    let lead = lead(src.keys(), start);
+
+                    Piece { lead, start, end, key: lead, speed: Speed::NORMAL }
                 })
                 .collect(),
         };
-        let copy = VideoJob { pieces, tracks: tracks.clone(), combine, video: Video::Copy, target, burn: None, keys: None };
-        match s.target_mb {
-            Some(mb) if estimate(&Job::Video(copy.clone()), src) > mb as u64 * MB => {}
-            _ => return (Job::Video(copy), why),
+        let copy = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn: None, keys: None };
+        if target.is_none_or(|t| estimate_video(&copy, src) <= t) {
+            return (Job::Video(copy), why);
         }
-    }
+
+        copy.tracks
+    } else {
+        tracks
+    };
     let why = if why.is_empty() { vec![Reencode::Size(s.target_mb.unwrap_or_default())] } else { why };
     let out = scaled(base, height);
-    let pieces: Vec<Piece> = kept.iter().map(|r| Piece { lead: r.start, start: r.start, end: r.end, key: r.start }).collect();
+    let pieces = timed
+        .into_iter()
+        .map(|p| {
+            let Range { start, end } = p.range;
+
+            Piece { lead: start, start, end, key: start, speed: p.speed }
+        })
+        .collect();
     let mut job = VideoJob { pieces, tracks, combine, video: Video::Copy, target, burn, keys };
     // with a qp, `bitrate` is only what the estimate expects
     let (bitrate, qp) = match (kbps, target, compress) {
         (Some(k), ..) => (k * 1000, None),
         (None, Some(t), _) => {
-            let fit = bitrate_for(t, Job::Video(job.clone()).len(), audio_bytes(&job, src));
+            let len = job.len();
+            let fit = bitrate_for(t, len, audio_bytes(&job, src, len));
+
             (default_bitrate(src, out, fps, codec).min(fit), None)
         }
-        (None, None, Some(c)) => (sane_bps(carried_bitrate(src, out, fps, codec) * c.share()), Some(c.qp())),
+        (None, None, Some(c)) => {
+            let carried = carried_bitrate(src.video_bps(), src.info, out, fps, codec);
+
+            (sane_bps(carried * c.share()), Some(c.qp()))
+        }
         (None, None, None) => {
-            let carried = carried_bitrate(src, out, fps, codec);
+            let bps = if retimed {
+                src.retained_video_bytes(&job.pieces) * 8.0 * SECOND as f64 / job.len().max(1) as f64
+            } else {
+                src.video_bps()
+            };
+            let carried = carried_bitrate(bps, src.info, out, fps, codec);
             let cap = ceiling(src, out, fps, codec);
-            if carried > cap { (sane_bps(cap), None) } else { (sane_bps(carried), Some(KEEP_QP)) }
+
+            if retimed || carried > cap { (sane_bps(carried.min(cap)), None) } else { (sane_bps(carried), Some(KEEP_QP)) }
         }
     };
     job.video = Video::Encode { crop, size: out, bitrate, fps, codec, qp };
     (Job::Video(job), why)
 }
 
-pub(super) fn audio_bytes(job: &VideoJob, src: &Source) -> u64 {
-    let len: i64 = job.pieces.iter().map(|p| p.end - p.lead).sum();
-    let per_second = |rate: u64| rate * len as u64 / SECOND as u64;
+fn audio_bytes(job: &VideoJob, src: &Source, len: i64) -> u64 {
+    let per_second = |rate: u64| (u128::from(rate) * len as u128 / SECOND as u128) as u64;
     let silence = job.tracks.iter().filter(|t| t.source.is_none()).count() as u64 * per_second(SILENCE_BYTES_PER_SECOND);
     if job.combine {
         return per_second(AAC_BYTES_PER_SECOND) + silence;
@@ -574,18 +682,27 @@ pub(super) fn audio_bytes(job: &VideoJob, src: &Source) -> u64 {
 
 pub fn estimate(job: &Job, src: &Source) -> u64 {
     match job {
-        Job::Gif(g) => gif_estimate(g.size, gif_frames(job.len(), g.fps)),
-        Job::Video(v) => {
-            let video = match v.video {
-                Video::Copy => {
-                    let samples = src.index.map(|i| &i.video);
-                    v.pieces.iter().map(|p| samples.map_or(0, |s| s.bytes(p.lead, p.end))).sum()
-                }
-                Video::Encode { bitrate, .. } => bitrate as u64 * job.len() as u64 / SECOND as u64 / 8,
-            };
-            muxed(video + audio_bytes(v, src))
-        }
+        Job::Gif(g) => gif_estimate(g.size, gif_frames(g.len(), g.fps)),
+        Job::Video(v) => estimate_video(v, src),
     }
+}
+
+fn estimate_video(job: &VideoJob, src: &Source) -> u64 {
+    let len = job.len();
+    let video = match job.video {
+        Video::Copy => {
+            let samples = src.index.map(|i| &i.video);
+
+            job.pieces.iter().map(|p| samples.map_or(0, |s| s.bytes(p.lead, p.end))).sum()
+        }
+        Video::Encode { bitrate, .. } => {
+            let bytes = u128::from(bitrate) * len as u128 / (8 * SECOND as u128);
+
+            u64::try_from(bytes).unwrap_or(u64::MAX)
+        }
+    };
+
+    muxed(video.saturating_add(audio_bytes(job, src, len)))
 }
 
 /// `≈ 18 MB`-style figure in the same megabytes as the targets.
@@ -625,7 +742,7 @@ mod tests {
 
     const S: i64 = SECOND;
 
-    fn info(tracks: usize) -> Info {
+    pub(super) fn info(tracks: usize) -> Info {
         Info {
             duration: 20 * S,
             size: (1920, 1080),
@@ -639,17 +756,17 @@ mod tests {
     }
 
     /// 30 fps, a keyframe every 2 s, 50 KB frames; audio 20 KB/s per track in 1/4 s packets.
-    fn index(tracks: usize) -> Index {
+    pub(super) fn index(tracks: usize) -> Index {
         let video = Samples::new((0..600).map(|i| (i * S / 30, 50_000, i % 60 == 0)).collect());
         let audio = (0..tracks).map(|_| Samples::new((0..80).map(|i| (i * S / 4, 5_000, true)).collect())).collect();
         Index { video, audio }
     }
 
-    fn src<'a>(info: &'a Info, index: Option<&'a Index>) -> Source<'a> {
+    pub(super) fn src<'a>(info: &'a Info, index: Option<&'a Index>) -> Source<'a> {
         Source { info, index, bytes: 31_000_000, accent: [0xE5, 0x40, 0x2F] }
     }
 
-    fn edit(tracks: usize) -> Edit {
+    pub(super) fn edit(tracks: usize) -> Edit {
         let mut e = Edit::new(20 * S, tracks);
         e.range = Range { start: 3 * S, end: 15 * S };
         e
@@ -776,7 +893,7 @@ mod tests {
         let plain = Settings::default();
         let Job::Video(v) = plan(&e, &plain, &source) else { panic!() };
         assert_eq!(v.video, Video::Copy);
-        assert_eq!(v.pieces, [Piece { lead: 2 * S, start: 3 * S, end: 15 * S, key: 2 * S }]);
+        assert_eq!(v.pieces, [Piece { lead: 2 * S, start: 3 * S, end: 15 * S, key: 2 * S, speed: Speed::NORMAL }]);
         assert!(!v.whole(&info));
         let Job::Video(v) = plan(&Edit::new(20 * S, 2), &plain, &source) else { panic!() };
         assert!(v.whole(&info));
@@ -814,13 +931,13 @@ mod tests {
             v
         };
         let v = cut(3 * S, 15 * S);
-        assert_eq!(v.pieces, [Piece { lead: 3 * S, start: 3 * S, end: 15 * S, key: 4 * S }]);
+        assert_eq!(v.pieces, [Piece { lead: 3 * S, start: 3 * S, end: 15 * S, key: 4 * S, speed: Speed::NORMAL }]);
         assert_eq!((v.cut_anew(), v.early()), (S, 0));
         assert!(!v.copies(&v.tracks[0]), "the sound is cut to the sample with the picture");
         assert_eq!(estimate(&Job::Video(v), &source), muxed(12 * 30 * 50_000 + 12 * AAC_BYTES_PER_SECOND));
 
         let on_key = cut(4 * S, 15 * S);
-        assert_eq!(on_key.pieces[0], Piece { lead: 4 * S, start: 4 * S, end: 15 * S, key: 4 * S }, "nothing to encode");
+        assert_eq!(on_key.pieces[0], Piece { lead: 4 * S, start: 4 * S, end: 15 * S, key: 4 * S, speed: Speed::NORMAL }, "nothing to encode");
         assert!(on_key.copies(&on_key.tracks[0]));
         let in_key_frame = cut(4 * S + S / 60, 15 * S);
         assert_eq!(in_key_frame.pieces[0].lead, 4 * S, "the keyframe is the frame shown there");
@@ -849,7 +966,7 @@ mod tests {
             let source = src(&info, Some(&idx));
             assert_eq!(snap(&source), why.or(Some(Snap::Reordered)));
             let Job::Video(v) = plan(&e, &plain, &source) else { panic!() };
-            assert_eq!(v.pieces, [Piece { lead: 2 * S, start: 3 * S, end: 15 * S, key: 2 * S }]);
+            assert_eq!(v.pieces, [Piece { lead: 2 * S, start: 3 * S, end: 15 * S, key: 2 * S, speed: Speed::NORMAL }]);
             assert!(v.copies(&v.tracks[0]));
         }
     }
@@ -1141,3 +1258,7 @@ mod tests {
         assert_eq!(saving_label(0, 1_000), None);
     }
 }
+
+#[cfg(test)]
+#[path = "export_speed_tests.rs"]
+mod speed_tests;

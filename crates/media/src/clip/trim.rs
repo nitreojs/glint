@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use glint_core::clip::crop::Crop;
-use glint_core::clip::edit::gain;
+use glint_core::clip::edit::{Speed, gain};
 use glint_core::clip::export::{AAC_BYTES_PER_SECOND, Job, Piece, Video, VideoJob};
 use glint_core::clip::info::Info;
 use glint_core::clip::math::{Range, SECOND};
@@ -12,6 +12,7 @@ use glint_core::record::Codec;
 use windows::Win32::Media::MediaFoundation::*;
 use windows::core::{GUID, HSTRING};
 
+use super::audio::{AudioSpan, PcmCursor};
 use super::burn::{Burner, KeyBurner};
 use super::gif;
 use super::media::{self, Got, Gpu, attributes, pack};
@@ -138,6 +139,23 @@ struct Held {
     sample: IMFSample,
 }
 
+#[derive(Clone, Copy)]
+struct PieceClock {
+    source: Range,
+    output: Range,
+    speed: Speed,
+}
+
+impl PieceClock {
+    fn output_at(self, source: i64) -> i64 {
+        if source >= self.source.end {
+            return self.output.end;
+        }
+
+        self.output.start + self.speed.output_delta(source.max(self.source.start) - self.source.start)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq)]
 enum Target {
     Encode(u32),
@@ -153,14 +171,18 @@ struct Input {
     gain: f32,
 }
 
-/// One aac track made from decoded sound: the combined mix, or a single track at a new volume.
+/// One AAC track made from decoded sound. The lanes hold absolute source frames; the writer runs
+/// on the edited timeline, with matching sample counts across piece and decoder packet boundaries.
 struct Mixdown {
     stream: u32,
     rate: u32,
+    channels: usize,
     inputs: Vec<Input>,
     written: i64,
+    source: PcmCursor,
+    decoded: Vec<f32>,
     scratch: Vec<f32>,
-    stereo: Vec<f32>,
+    bytes: Vec<u8>,
 }
 
 // the aac encoder only takes 12000, 16000, 20000 or 24000 bytes per second.
@@ -212,42 +234,81 @@ fn aac_rate(rate: u32) -> bool {
 }
 
 impl Mixdown {
-    unsafe fn new(writer: &IMFSinkWriter, rate: u32) -> Result<Mixdown, String> {
+    unsafe fn new(writer: &IMFSinkWriter, rate: u32, channels: usize) -> Result<Mixdown, String> {
         if !aac_rate(rate) {
             return Err(format!("audio at {rate} Hz can't be mixed or have its volume changed"));
         }
-        let stream = unsafe { aac_stream(writer, rate, 2, AAC_BYTES_PER_SECOND)? };
-        Ok(Mixdown { stream, rate, inputs: Vec::new(), written: 0, scratch: Vec::new(), stereo: Vec::new() })
+
+        let stream = unsafe { aac_stream(writer, rate, channels as u32, AAC_BYTES_PER_SECOND)? };
+        Ok(Mixdown {
+            stream,
+            rate,
+            channels,
+            inputs: Vec::new(),
+            written: 0,
+            source: PcmCursor::default(),
+            decoded: Vec::new(),
+            scratch: Vec::new(),
+            bytes: Vec::new(),
+        })
     }
 
-    fn push(&mut self, input: usize, sample: &IMFSample, at: i64, seg: Range, base: i64) -> Result<(), String> {
-        media::floats(sample, &mut self.scratch)?;
-        let channels = self.inputs[input].channels;
-        pcm::to_stereo(&self.scratch, channels, &mut self.stereo);
-        let n = self.stereo.len() as i64 / 2;
-        let first = pcm::frames(base, self.rate);
-        let f0 = pcm::frames(at - seg.start, self.rate);
-        let (lo, hi) = ((-f0).max(0), n.min(pcm::frames(base + seg.len(), self.rate) - first - f0));
-        if lo < hi {
-            self.inputs[input].lane.push(first + f0 + lo, &self.stereo[lo as usize * 2..hi as usize * 2]);
+    fn begin(&mut self, clock: PieceClock) -> AudioSpan {
+        let span = AudioSpan::new(clock.source, clock.output, clock.speed, self.rate);
+        self.source.reset(span.source.start);
+        for i in &mut self.inputs {
+            i.lane.reset(span.source.start);
         }
+
+        span
+    }
+
+    fn push(&mut self, input: usize, sample: &IMFSample, at: i64, span: AudioSpan) -> Result<(), String> {
+        let track = &mut self.inputs[input];
+        media::floats(sample, &mut self.decoded)?;
+        let first = pcm::frames(at, self.rate);
+        let lo = first.max(track.lane.end());
+        let hi = (first + (self.decoded.len() / track.channels) as i64).min(span.source.end);
+        if lo < hi {
+            let src = &self.decoded[(lo - first) as usize * track.channels..(hi - first) as usize * track.channels];
+            let stereo = if track.channels == 2 {
+                src
+            } else {
+                pcm::to_stereo(src, track.channels, &mut self.scratch);
+                &self.scratch
+            };
+            track.lane.pad_to(lo);
+            track.lane.push(lo, stereo);
+        }
+
         Ok(())
     }
 
-    unsafe fn flush(&mut self, writer: &IMFSinkWriter, upto: i64) -> Result<(), String> {
-        let n = upto - self.written;
-        if n <= 0 {
-            return Ok(());
+    unsafe fn flush(&mut self, writer: &IMFSinkWriter, span: AudioSpan, ready: i64) -> Result<(), String> {
+        let upto = span.available(ready);
+        while self.written < upto {
+            let to = upto.min(self.written + i64::from(self.rate / 10));
+            let window = span.window(self.written, to);
+            let first = self.source.mix(window, &mut self.scratch, |_, fresh| {
+                fresh.fill(0.0);
+                for i in &mut self.inputs {
+                    i.lane.take_into(fresh, i.gain);
+                }
+
+                Ok(())
+            })?;
+
+            self.bytes.clear();
+            for frame in span.samples(&self.scratch, first, self.written, to) {
+                for &s in &frame[..self.channels] {
+                    let sample = (pcm::soft_clip(s) * 32767.0).round() as i16;
+                    self.bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+            }
+            unsafe { write_pcm(writer, self.stream, self.rate, self.written, to, &self.bytes)? };
+            self.written = to;
         }
-        let mut out = vec![0.0; n as usize * 2];
-        for i in &mut self.inputs {
-            i.lane.take_into(&mut out, i.gain);
-        }
-        for s in &mut out {
-            *s = pcm::soft_clip(*s);
-        }
-        unsafe { write_pcm(writer, self.stream, self.rate, self.written, upto, &pcm::to_i16(&out))? };
-        self.written = upto;
+
         Ok(())
     }
 }
@@ -361,7 +422,7 @@ fn run(
         });
         let (silent_rate, silent_channels) = silence_format(&reader, info, job);
         let mut mixes: Vec<Mixdown> = Vec::new();
-        let mut combined = None;
+        let mut combined: Option<usize> = None;
         let mut silences = Vec::new();
         let mut names = Vec::with_capacity(job.tracks.len());
         for t in &job.tracks {
@@ -379,8 +440,8 @@ fn run(
                 names.push(t.name.clone());
                 Target::Copy(w)
             } else {
-                let m = match combined {
-                    Some(m) => m,
+                let (m, channels) = match combined {
+                    Some(m) => (m, media::float_output(&reader, i, mixes[m].rate)?),
                     None => {
                         let name = if job.combine {
                             let sources = job.tracks.iter().filter(|t| t.source.is_some());
@@ -389,13 +450,15 @@ fn run(
                             t.name.clone()
                         };
                         names.push(name);
-                        mixes.push(Mixdown::new(&writer, media::audio_rate(&reader, i))?);
-                        combined = job.combine.then_some(mixes.len() - 1);
-                        mixes.len() - 1
+                        let (rate, channels) = media::float_native(&reader, i)?;
+                        let output_channels = if job.combine { 2 } else { channels.min(2) };
+                        let m = mixes.len();
+                        mixes.push(Mixdown::new(&writer, rate, output_channels)?);
+                        combined = job.combine.then_some(m);
+                        (m, channels)
                     }
                 };
                 let mix = &mut mixes[m];
-                let channels = media::float_output(&reader, i, mix.rate)?;
                 mix.inputs.push(Input { channels, lane: Lane::new(0), gain: gain(t.volume) });
                 Target::Mix(m, mix.inputs.len() - 1)
             });
@@ -409,8 +472,14 @@ fn run(
             }
             writer.WriteSample(stream, sample).ctx("WriteSample")
         };
-        let encode = |stream: u32, sample: &IMFSample, ts: i64, dur: Option<i64>| {
-            write(stream, sample, up_to_tick(ts, ticks), dur)
+        let encode = |stream: u32, sample: &IMFSample, start: i64, end: i64| -> Result<bool, String> {
+            let (start, end) = (up_to_tick(start, ticks), up_to_tick(end, ticks));
+            if end <= start {
+                return Ok(false);
+            }
+
+            write(stream, sample, start, Some(end - start))?;
+            Ok(true)
         };
         let frame = |s: &IMFSample, t: i64| -> Result<IMFSample, String> {
             let out = match &processor {
@@ -429,7 +498,7 @@ fn run(
             Video::Encode { fps, .. } => fps,
             Video::Copy => None,
         };
-        let total: i64 = job.pieces.iter().map(|pc| pc.end - pc.lead).sum();
+        let total: i64 = job.pieces.iter().map(|pc| pc.len()).sum();
         let mut copied_to = vec![0i64; streams.len()];
         let mut any_video = false;
         let mut base = 0;
@@ -462,6 +531,9 @@ fn run(
                 Video::Encode { .. } => piece.start,
             };
             let seg = Range { start: lead, end: piece.end };
+            let len = if lead == piece.lead { piece.len() } else { seg.len() };
+            let clock = PieceClock { source: seg, output: Range { start: base, end: base + len }, speed: piece.speed };
+            let audio: Vec<_> = mixes.iter_mut().map(|m| m.begin(clock)).collect();
             let mut active: Vec<(u32, i64)> = (0..streams.len() as u32)
                 .filter(|&i| targets[i as usize].is_some())
                 .map(|i| (i, i64::MIN))
@@ -473,9 +545,50 @@ fn run(
             let mut open: Vec<Vec<bool>> = mixes.iter().map(|m| vec![true; m.inputs.len()]).collect();
             let mut held: Option<Held> = None;
             let mut started = false;
-            let mut pending: Option<IMFSample> = None;
-            let mut tick = 0i64;
-            let out_ts = |ts: i64| ts - seg.start + base;
+            let mut encoded = false;
+            let mut tick = grid.map_or(0, |fps| {
+                (base as i128 * i128::from(fps) + i128::from(SECOND) - 1).div_euclid(i128::from(SECOND)) as i64
+            });
+            let out_ts = |ts: i64| clock.output_at(ts);
+            let mut advance = |w: u32, ts: i64, next: Option<IMFSample>| -> Result<(), String> {
+                let stop = ts.min(seg.end);
+                if let Some(h) = &held
+                    && stop > seg.start
+                {
+                    if let Some(fps) = grid {
+                        let at = |k| (i128::from(k) * i128::from(SECOND) / i128::from(fps)) as i64;
+                        let eligible = |t| {
+                            t < clock.output.end
+                                && (stop == seg.end || piece.speed.source_delta(t - base) < stop - seg.start)
+                        };
+                        let mut t = at(tick);
+                        if eligible(t) {
+                            let rendered = frame(&h.sample, h.ts)?;
+                            loop {
+                                tick += 1;
+                                let next_t = at(tick);
+                                let end = next_t.min(total);
+                                if !eligible(next_t) {
+                                    encoded |= encode(w, &rendered, t, end)?;
+                                    break;
+                                }
+                                encoded |= encode(w, &copy_of(&rendered)?, t, end)?;
+                                t = next_t;
+                            }
+                        }
+                    } else {
+                        let from = if encoded { out_ts(h.ts) } else { base };
+                        let end = out_ts(stop);
+                        if end > from {
+                            encoded |= encode(w, &frame(&h.sample, h.ts)?, from, end)?;
+                        }
+                    }
+                }
+                held = next.map(|sample| Held { ts, sample });
+                p.set(out_ts(stop), total);
+
+                Ok(())
+            };
             if let (Some(Target::Remux(w)), Some(codec)) = (targets[video as usize], codec) {
                 for (k, f) in head.iter().enumerate() {
                     let sample = if k == 0 && head_sets != sets {
@@ -506,19 +619,7 @@ fn run(
                     Got::Sample { stream, ts, sample } => (stream, ts, sample),
                     Got::End(i) => {
                         match targets.get(i as usize).copied().flatten() {
-                            Some(Target::Encode(w)) => {
-                                if let (Some(fps), Some(prev)) = (grid, &pending) {
-                                    tick = on_grid(fps, tick, seg.len(), |t0, t1| {
-                                        encode(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0))
-                                    })?;
-                                    started = true;
-                                } else if let Some(h) = held.take() {
-                                    let d = media::duration(&h.sample);
-                                    let stop = if d > 0 { (h.ts + d).min(seg.end) } else { seg.end };
-                                    encode(w, &frame(&h.sample, seg.start)?, base, Some((stop - seg.start).max(1)))?;
-                                    started = true;
-                                }
-                            }
+                            Some(Target::Encode(w)) => advance(w, seg.end, None)?,
                             Some(Target::Mix(m, l)) => open[m][l] = false,
                             _ => {}
                         }
@@ -529,9 +630,9 @@ fn run(
                 active[slot].1 = ts;
                 let Some(target) = targets.get(i as usize).copied().flatten() else { continue };
                 for s in &mut silences {
-                    s.fill(&writer, out_ts(ts.clamp(seg.start, seg.end)))?;
+                    s.fill(&writer, out_ts(ts))?;
                 }
-                let mut done = ts >= seg.end;
+                let done = ts >= seg.end;
                 match target {
                     Target::Copy(w) if !done && ts >= seg.start => {
                         let at = out_ts(ts).max(copied_to[i as usize]);
@@ -541,18 +642,18 @@ fn run(
                     Target::Copy(_) => {}
                     Target::Mix(m, l) => {
                         let mix = &mut mixes[m];
+                        let span = audio[m];
                         if done {
                             open[m][l] = false;
                         } else {
-                            mix.push(l, &sample, ts, seg, base)?;
+                            mix.push(l, &sample, ts, span)?;
                         }
-                        let end = pcm::frames(base + seg.len(), mix.rate);
                         let ready = (mix.inputs.iter().zip(&open[m]))
                             .filter(|(_, o)| **o)
                             .map(|(i, _)| i.lane.end())
                             .min()
-                            .unwrap_or(end);
-                        mix.flush(&writer, ready.min(end))?;
+                            .unwrap_or(span.source.end);
+                        mix.flush(&writer, span, ready)?;
                     }
                     Target::Remux(w) => {
                         if !done && ts >= copy_from {
@@ -582,54 +683,21 @@ fn run(
                             p.set(out_ts(ts), total);
                         }
                     }
-                    Target::Encode(w) if grid.is_some() => {
-                        let fps = grid.unwrap_or(1);
-                        if let Some(prev) = &pending {
-                            let until = ts.min(seg.end) - seg.start;
-                            let before = tick;
-                            tick = on_grid(fps, tick, until, |t0, t1| encode(w, &copy_of(&frame(prev, seg.start + t0)?)?, base + t0, Some(t1 - t0)))?;
-                            started |= tick > before;
-                            p.set(base + until, total);
-                        }
-                        if !done {
-                            pending = Some(sample);
-                        }
-                    }
-                    Target::Encode(w) => {
-                        if !started {
-                            if ts <= seg.start {
-                                held = Some(Held { ts, sample });
-                                continue;
-                            }
-                            started = true;
-                            if let Some(h) = held.take() {
-                                encode(w, &frame(&h.sample, seg.start)?, base, Some(ts.min(seg.end) - seg.start))?;
-                            }
-                        }
-                        let dur = media::duration(&sample);
-                        done |= seg.end - ts < dur / 2;
-                        if !done {
-                            encode(w, &frame(&sample, ts)?, out_ts(ts), (dur > 0).then(|| dur.min(seg.end - ts)))?;
-                            p.set(out_ts(ts), total);
-                        }
-                    }
+                    Target::Encode(w) => advance(w, ts, (!done).then_some(sample))?,
                 }
                 if done {
                     active.swap_remove(slot);
                 }
             }
-            any_video |= started || held.is_some() || pending.is_some();
-            base += seg.len();
+            any_video |= started || encoded;
+            base = clock.output.end;
             for s in &mut silences {
                 s.fill(&writer, base)?;
             }
-            for mix in &mut mixes {
-                let end = pcm::frames(base, mix.rate);
-                for i in &mut mix.inputs {
-                    i.lane.pad_to(end);
-                }
-                mix.flush(&writer, end)?;
+            for (mix, span) in mixes.iter_mut().zip(audio) {
+                mix.flush(&writer, span, span.source.end)?;
             }
+            p.set(base, total);
         }
         if !any_video {
             return Err("the selection has no frames".into());
@@ -647,17 +715,6 @@ fn run(
         p.set(1, 1);
         Ok(true)
     }
-}
-
-/// Writes the frames of the `fps` grid from tick `k` up to `until` (from the piece's start) with `emit(start, end)`;
-/// returns the next tick.
-fn on_grid(fps: u32, mut k: i64, until: i64, mut emit: impl FnMut(i64, i64) -> Result<(), String>) -> Result<i64, String> {
-    let at = |k: i64| (k as i128 * SECOND as i128 / fps.max(1) as i128) as i64;
-    while at(k) < until {
-        emit(at(k), at(k + 1))?;
-        k += 1;
-    }
-    Ok(k)
 }
 
 /// A new sample over the same pixels, so one decoded frame can sit on several ticks with its own time.

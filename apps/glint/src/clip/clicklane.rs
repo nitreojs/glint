@@ -3,6 +3,7 @@ use eframe::egui::{
     pos2, vec2,
 };
 use glint_core::clip::clicks::visible;
+use glint_core::clip::edit::TimeMap;
 use glint_core::clip::math;
 use glint_core::record::clicks::{Button, Click, Shape, Style, state_at};
 use glint_ui::widgets::{Look, anim, ease, medium, mix, sans};
@@ -23,22 +24,33 @@ pub(super) enum ClickDrag {
     Space { i: usize, from: (f32, f32), at: Pos2 },
 }
 
-pub(super) struct Axis {
+pub(super) struct Axis<'a> {
     pub left: f32,
     pub width: f32,
     pub view: View,
-    pub dur: i64,
+    pub map: &'a TimeMap,
+    pub source_dur: i64,
     pub fps: f64,
     pub snapping: bool,
 }
 
-impl Axis {
+impl Axis<'_> {
     pub(super) fn x(&self, t: i64) -> f32 {
-        self.view.x(t, self.left, self.width)
+        self.view.x(self.map.to_edit(t), self.left, self.width)
+    }
+
+    pub(super) fn edited_at(&self, x: f32) -> i64 {
+        self.view.start + (((x - self.left) / self.width) as f64 * self.view.span as f64) as i64
     }
 
     pub(super) fn t(&self, x: f32) -> i64 {
-        self.view.start + (((x - self.left) / self.width) as f64 * self.view.span as f64) as i64
+        self.map.to_source(self.edited_at(x))
+    }
+
+    pub(super) fn moved(&self, source: i64, from_x: f32, to_x: f32) -> i64 {
+        let delta = (f64::from(to_x - from_x) / f64::from(self.width) * self.view.span as f64) as i64;
+
+        if delta == 0 { source } else { self.map.to_source(self.map.to_edit(source) + delta) }
     }
 
     pub(super) fn shows(&self, x: f32) -> bool {
@@ -113,7 +125,13 @@ impl ClipApp {
         }
     }
 
-    pub(super) fn clicks_input(&mut self, ui: &mut Ui, look: &Look, lane: Rect, axis: &Axis) -> Option<Lane> {
+    pub(super) fn clicks_input(
+        &mut self,
+        ui: &mut Ui,
+        look: &Look,
+        lane: Rect,
+        axis: &Axis<'_>,
+    ) -> Option<Lane> {
         let clicks = self.edit.clicks.clone()?;
         let p = look.p;
         let bg = ui.interact(lane, Id::unique("clip-clicks-lane"), Sense::click_and_drag());
@@ -127,7 +145,8 @@ impl ClipApp {
                     .on_hover_cursor(CursorIcon::PointingHand)
                     .on_hover_text("drag to move it in time · right-click to delete it or change the button");
                 let chosen = self.click_sel.contains(&i);
-                let name = format!("{} click at {}", button_name(c.button), math::fmt_time(c.down));
+                let time = math::fmt_time(axis.map.to_edit(c.down));
+                let name = format!("{} click at {time}", button_name(c.button));
                 resp.widget_info(|| WidgetInfo::selected(Role::Button, true, chosen, &name));
                 (i, resp)
             })
@@ -191,9 +210,13 @@ impl ClipApp {
                 if let Some(mut base) = self.before_drag.as_ref().and_then(|b| b.clicks.clone())
                     && let Some(from) = base.list.get(grab).map(|c| c.down)
                 {
-                    let raw = from + axis.t(at.x) - axis.t(from_x);
-                    let to = if axis.snapping { math::snap(raw.clamp(0, axis.dur - 1), axis.fps) } else { raw };
-                    base.shift(&self.click_sel, to - from, axis.dur);
+                    let raw = axis.moved(from, from_x, at.x);
+                    let to = if axis.snapping {
+                        math::snap(raw.clamp(0, axis.source_dur - 1), axis.fps)
+                    } else {
+                        raw
+                    };
+                    base.shift(&self.click_sel, to - from, axis.source_dur);
                     self.edit.clicks = Some(base);
                 }
             }
@@ -219,7 +242,7 @@ impl ClipApp {
         Some(Lane { rect: lane, chip, toggle, marks })
     }
 
-    pub(super) fn clicks_paint(&self, ui: &Ui, look: &Look, lane: &Lane, axis: &Axis, painter: &Painter) {
+    pub(super) fn clicks_paint(&self, ui: &Ui, look: &Look, lane: &Lane, axis: &Axis<'_>, painter: &Painter) {
         let (Some(clicks), Some(style)) = (&self.edit.clicks, self.click_style()) else { return };
         let p = look.p;
         let clip = painter.with_clip_rect(lane.rect.intersect(painter.clip_rect()));

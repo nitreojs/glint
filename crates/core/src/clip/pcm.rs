@@ -110,9 +110,6 @@ pub fn soft_clip(s: f32) -> f32 {
     (KNEE + room * ((a - KNEE) / room).tanh()).copysign(s)
 }
 
-pub fn to_i16(data: &[f32]) -> Vec<u8> {
-    data.iter().flat_map(|&s| ((s.clamp(-1.0, 1.0) * 32767.0).round() as i16).to_le_bytes()).collect()
-}
 
 #[cfg(test)]
 mod tests {
@@ -158,7 +155,6 @@ mod tests {
         assert_eq!(out, [0.1, 0.1, 0.2, 0.2]);
         to_stereo(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], 3, &mut out);
         assert_eq!(out, [1.0, 2.0, 4.0, 5.0]);
-        assert_eq!(to_i16(&[2.0, -1.0, 0.0]), [0xFF, 0x7F, 0x01, 0x80, 0, 0]);
     }
 
     #[test]

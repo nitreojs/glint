@@ -7,10 +7,9 @@ use color_quant::NeuQuant;
 use gif::{DisposalMethod, Encoder, Frame, Repeat};
 use glint_core::clip::clicks::{into_output, paint_bgrx};
 use glint_core::clip::crop::Crop;
-use glint_core::clip::edit::source_time;
 use glint_core::clip::export::GifJob;
 use glint_core::clip::info::Info;
-use glint_core::clip::math::{gif_delay, gif_frames, gif_tick};
+use glint_core::clip::math::{SECOND, gif_delay, gif_frames, gif_tick};
 use glint_core::record::clicks::{Shape, shapes_at};
 
 use super::media::{self, Decoded};
@@ -58,10 +57,11 @@ fn bgrx(f: &Decoded, a: Area, out: &mut Vec<u8>) -> Result<(), String> {
 }
 
 fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Result<bool, String> {
-    let (kept, size, fps) = (&job.kept[..], job.size, job.fps);
+    let (size, fps) = (job.size, job.fps);
     let area = area(info.size, job.crop, size);
     let (w, h) = (u16::try_from(size.0).map_err(|_| "too wide")?, u16::try_from(size.1).map_err(|_| "too tall")?);
-    let frames = gif_frames(kept.iter().map(|r| r.len()).sum(), fps);
+    let len = job.len();
+    let frames = gif_frames(len, fps);
     if frames == 0 {
         return Err("the selection is empty".into());
     }
@@ -86,14 +86,14 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
         if p.cancelled() {
             return Ok(false);
         }
-        let Some((_, t)) = source_time(kept, gif_tick(0, j * frames / picks, fps)) else { continue };
+        let Some((_, t)) = job.source_time(gif_tick(0, j * frames / picks, fps)) else { continue };
         media::seek(&reader, t)?;
         if let (Some(f), _) = media::decode_until(&reader, t, None)? {
             bgrx(&f, area, &mut px)?;
-            clicks_at(t, &mut shapes);
+            clicks_at(f.ts, &mut shapes);
             paint_bgrx(&mut px, size.0 as usize * 4, size, &shapes);
             if let (Some(kb), Some(surf)) = (&job.keys, &surface) {
-                let pills = keys::pills(&kb.keys, t, &kb.style, (size.0 as f32, size.1 as f32), surf.renderer());
+                let pills = keys::pills(&kb.keys, f.ts, &kb.style, (size.0 as f32, size.1 as f32), surf.renderer());
                 surf.draw(&mut px, size.0 as usize * 4, size, &pills)?;
             }
             sample.extend(px.chunks_exact(4).flat_map(|c| [c[2], c[1], c[0], 255]));
@@ -117,16 +117,16 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
     let (mut cur, mut next): (Option<Decoded>, Option<Decoded>) = (None, None);
     let mut eof = false;
     let mut shown_ts = None;
-    let mut drew = false;
     let mut segment = None;
     for k in 0..frames {
         if p.cancelled() {
             return Ok(false);
         }
-        let Some((s, t)) = source_time(kept, gif_tick(0, k, fps)) else { break };
+        let at = gif_tick(0, k, fps);
+        let Some((s, t)) = job.source_time(at) else { break };
         if segment != Some(s) {
             segment = Some(s);
-            media::seek(&reader, kept[s].start)?;
+            media::seek(&reader, job.kept[s].range.start)?;
             (cur, next, eof) = (None, None, false);
         }
         loop {
@@ -143,31 +143,31 @@ fn run(src: &Path, info: &Info, job: &GifJob, out: &Path, p: &Progress) -> Resul
             }
         }
         let Some(f) = &cur else { break };
-        let delay = gif_delay(k, fps);
-        clicks_at(t, &mut shapes);
-        let pills = match (&job.keys, &surface) {
-            (Some(kb), Some(surf)) => keys::pills(&kb.keys, t, &kb.style, (size.0 as f32, size.1 as f32), surf.renderer()),
-            _ => Vec::new(),
+        let delay = if k + 1 == frames {
+            let centis = |t| (t + SECOND / 200) / (SECOND / 100);
+            (centis(len) - centis(at)).max(1) as u16
+        } else {
+            gif_delay(k, fps)
         };
-        let overlay = !shapes.is_empty() || !pills.is_empty();
-        let changed = if shown_ts == Some(f.ts) && !overlay && !drew {
+        let changed = if shown_ts == Some(f.ts) {
             None
         } else {
             shown_ts = Some(f.ts);
             bgrx(f, area, &mut px)?;
+            clicks_at(f.ts, &mut shapes);
             paint_bgrx(&mut px, size.0 as usize * 4, size, &shapes);
-            if let Some(surf) = &surface
-                && !pills.is_empty()
-            {
-                surf.draw(&mut px, size.0 as usize * 4, size, &pills)?;
+            if let (Some(kb), Some(surf)) = (&job.keys, &surface) {
+                let pills = keys::pills(&kb.keys, f.ts, &kb.style, (size.0 as f32, size.1 as f32), surf.renderer());
+                if !pills.is_empty() {
+                    surf.draw(&mut px, size.0 as usize * 4, size, &pills)?;
+                }
             }
-            drew = overlay;
             dither.frame(&mut q, &px)
         };
-        if changed.is_none()
-            && let Some(prev) = &mut pending
+        if let (None, Some(prev)) = (&changed, &mut pending)
+            && let Some(total) = prev.delay.checked_add(delay)
         {
-            prev.delay = prev.delay.saturating_add(delay);
+            prev.delay = total;
         } else {
             if let Some(prev) = pending.take() {
                 enc.write_frame(&prev).map_err(|e| e.to_string())?;

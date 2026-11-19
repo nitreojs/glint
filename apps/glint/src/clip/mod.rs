@@ -11,7 +11,7 @@ use eframe::egui::{
 use glint_core::clip::clicks::Clicks;
 use glint_core::clip::keys::Keys;
 use glint_core::clip::crop::{Aspect, Crop, Grip};
-use glint_core::clip::edit::{Edit, Undo};
+use glint_core::clip::edit::{Edit, Speed, TimeMap, TimedRange, Undo};
 use glint_core::clip::export::{Format, Job, Reencode, Source, Video, VideoJob};
 use glint_core::clip::glide::Glide;
 use glint_core::clip::index::Index;
@@ -49,7 +49,7 @@ mod timeline;
 mod wave;
 
 use actions::Saved;
-use player::{Cmd, Player, Shown};
+use player::{Cmd, NO_CLOCK, Player, Shown};
 use scan::{Found, Scan};
 use clicklane::ClickDrag;
 use keylane::KeyDrag;
@@ -157,6 +157,66 @@ enum Play {
     Running { at: Instant, from: i64 },
 }
 
+struct Playback {
+    pieces: Arc<Vec<TimedRange>>,
+    audio_epoch: u64,
+    index: usize,
+    offset: i64,
+    elapsed: i64,
+}
+
+impl Playback {
+    fn from_source(mut pieces: Vec<TimedRange>, source: i64) -> Vec<TimedRange> {
+        let first = pieces.partition_point(|p| p.range.end <= source);
+        pieces.drain(..first);
+        if let Some(piece) = pieces.first_mut() {
+            piece.range.start = piece.range.start.max(source);
+        }
+
+        pieces
+    }
+
+    fn new(pieces: Vec<TimedRange>) -> Option<Self> {
+        if pieces.is_empty() {
+            return None;
+        }
+
+        Some(Self { pieces: Arc::new(pieces), audio_epoch: 0, index: 0, offset: 0, elapsed: 0 })
+    }
+
+    fn matches(&self, source: i64, pieces: &[TimedRange]) -> bool {
+        let [first, rest @ ..] = pieces else { return false };
+        let current = self.pieces[self.index];
+
+        first.range.start == source
+            && first.range.end == current.range.end
+            && first.speed == current.speed
+            && rest == &self.pieces[self.index + 1..]
+    }
+
+    fn advance(&mut self, elapsed: i64) -> (i64, bool, bool) {
+        self.elapsed = self.elapsed.max(elapsed);
+        let mut skipped = false;
+        loop {
+            let piece = self.pieces[self.index];
+            let len = piece.len();
+            let within = self.elapsed - self.offset;
+            if within < len {
+                let source = piece.range.start + piece.speed.source_delta(within);
+
+                return (source.min(piece.range.end - 1), skipped, false);
+            }
+
+            let Some(next) = self.pieces.get(self.index + 1) else {
+                return (piece.range.end, skipped, true);
+            };
+            skipped |= next.range.start != piece.range.end;
+            self.offset += len;
+            self.index += 1;
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Then {
     Nothing,
@@ -252,6 +312,7 @@ struct ClipApp {
     shown: Option<(i64, i64)>,
     pos: i64,
     play: Play,
+    playback: Option<Playback>,
     edit: Edit,
     undo: Undo<Edit>,
     before_drag: Option<Edit>,
@@ -370,6 +431,7 @@ impl ClipApp {
             shown: None,
             pos: 0,
             play: Play::Paused,
+            playback: None,
             pristine: edit.clone(),
             edit,
             undo: Undo::default(),
@@ -471,19 +533,42 @@ impl ClipApp {
     }
 
     fn seek(&mut self, t: i64, play: bool) {
-        self.epoch += 1;
-        self.queue.clear();
-        self.play = if play { Play::Starting } else { Play::Paused };
-        if let Some(p) = &self.player {
-            p.send(Cmd::Seek { t, epoch: self.epoch });
-            p.send(Cmd::Play(play));
+        let playback = play.then(|| Playback::from_source(self.edit.timed(), t)).and_then(Playback::new);
+        self.seek_with(t, playback);
+    }
+
+    fn seek_with(&mut self, t: i64, mut playback: Option<Playback>) {
+        let t = playback.as_ref().map_or(t, |p| p.pieces[0].range.start);
+        let playing = playback.is_some();
+        self.seek_video(t, playing, NO_CLOCK);
+        if let Some(playback) = &mut playback {
+            self.pos = t;
+            playback.audio_epoch = self.epoch;
         }
+        self.play = if playing { Play::Starting } else { Play::Paused };
         if let Some(a) = &self.audio {
-            if play {
-                a.play(t, self.epoch);
+            if let Some(playback) = &playback {
+                a.prepare(playback.pieces.clone(), playback.audio_epoch);
             } else {
                 a.stop();
             }
+        }
+        self.playback = playback;
+    }
+
+    fn seek_video(&mut self, t: i64, play: bool, clock: i64) {
+        self.epoch += 1;
+        self.queue.clear();
+        if let Some(p) = &self.player {
+            p.send(Cmd::Seek { t, epoch: self.epoch, play, clock });
+        }
+    }
+
+    fn refresh_playback(&mut self) {
+        let Some(playback) = &self.playback else { return };
+        let pieces = Playback::from_source(self.edit.timed(), self.pos);
+        if !playback.matches(self.pos, &pieces) {
+            self.seek_with(self.pos, Playback::new(pieces));
         }
     }
 
@@ -491,16 +576,17 @@ impl ClipApp {
         self.pos = t;
         let playing = self.play != Play::Paused;
         self.seek(t, playing);
-        self.view.reveal(t, self.duration());
+        self.reveal(self.pos);
     }
 
     fn pause(&mut self) {
         if self.play != Play::Paused {
             self.play = Play::Paused;
+            self.playback = None;
             self.epoch += 1;
             self.queue.clear();
             if let Some(p) = &self.player {
-                p.send(Cmd::Play(false));
+                p.send(Cmd::Pause);
             }
             if let Some(a) = &self.audio {
                 a.stop();
@@ -513,13 +599,10 @@ impl ClipApp {
             self.pause();
             return;
         }
-        let near_end = self.edit.kept().last().is_some_and(|r| self.pos >= r.end - self.frame_len());
-        let start = match self.edit.next_kept(self.pos) {
-            Some(t) if !near_end => t,
-            _ => self.edit.kept().first().map_or(0, |r| r.start),
-        };
-        self.pos = start;
-        self.seek(start, true);
+        let pieces = self.edit.timed();
+        let near_end = pieces.last().is_some_and(|p| self.pos >= p.range.end - self.frame_len());
+        let start = if near_end { pieces[0].range.start } else { self.pos };
+        self.seek_with(start, Playback::new(Playback::from_source(pieces, start)));
     }
 
     fn step(&mut self, forward: bool) {
@@ -530,15 +613,36 @@ impl ClipApp {
         }
         self.pos = t;
         self.seek(t, false);
-        self.view.reveal(t, self.duration());
+        self.reveal(t);
+    }
+
+    fn reveal(&mut self, source: i64) {
+        let map = TimeMap::new(&self.edit);
+        self.view.reveal(map.to_edit(source), map.duration());
     }
 
     fn change(&mut self, f: impl FnOnce(&mut Edit) -> bool) -> bool {
         self.settle_volume(true);
         let before = self.edit.clone();
         let changed = f(&mut self.edit);
+        if self.playback.is_some() && (before.range != self.edit.range || before.segments != self.edit.segments) {
+            self.refresh_playback();
+        }
         self.undo.record(before, &self.edit);
+
         changed
+    }
+
+    pub(super) fn reset_piece_speeds(&mut self) -> bool {
+        self.change(|e| {
+            let mut changed = false;
+            for piece in &mut e.segments {
+                changed |= piece.speed != Speed::NORMAL;
+                piece.speed = Speed::NORMAL;
+            }
+
+            changed
+        })
     }
 
     fn set_muted(&mut self, lane: usize, muted: bool) {
@@ -574,18 +678,22 @@ impl ClipApp {
         let want = decode_size(&info, shown_px);
         let resized = (want.0 as f32 - self.player_size.0 as f32).abs() > self.player_size.0 as f32 * 0.1;
         let settled = settled && !ctx.input(|i| i.pointer.any_down());
-        if self.player.is_none() || (resized && settled) {
-            self.player = None;
-            self.player_size = want;
-            self.player = Some(Player::start(self.path.clone(), want, ctx.clone()));
-            let playing = self.play != Play::Paused;
-            self.seek(self.pos, playing);
-        }
+        let first = self.player.is_none();
         if self.audio.is_none() && !info.tracks.is_empty() {
             let streams: Vec<u32> = info.tracks.iter().map(|t| t.stream).collect();
             self.audio = Some(Audio::start(self.path.clone(), streams.clone(), self.saved.volume));
             self.sync_gains();
             self.waves = Some(Waves::start(self.path.clone(), streams, ctx.clone()));
+        }
+        if first || (resized && settled) {
+            self.player = None;
+            self.player_size = want;
+            self.player = Some(Player::start(self.path.clone(), want, ctx.clone()));
+            match self.play {
+                Play::Running { .. } => self.seek_video(self.pos, true, self.pos),
+                Play::Starting if !first => self.seek_video(self.pos, true, NO_CLOCK),
+                _ => self.seek(self.pos, self.play != Play::Paused),
+            }
         }
         if self.scan.is_none() {
             self.cuts.clear();
@@ -610,12 +718,24 @@ impl ClipApp {
         }
     }
 
-    fn clock(&self, at: Instant, from: i64) -> i64 {
-        let wall = || from + (at.elapsed().as_secs_f64() * math::SECOND as f64) as i64;
-        match self.audio.as_ref().map(|a| a.clock(self.epoch)) {
-            Some(Clock::At(t)) => t.max(from),
-            Some(Clock::Waiting) => from,
-            Some(Clock::Wall) | None => wall(),
+    fn clock(&mut self, at: Instant, from: i64) -> i64 {
+        let now = Instant::now();
+        let Some(playback) = &self.playback else { return from };
+        let audio = self.audio.as_ref().map_or(Clock::Wall, |a| a.clock(playback.audio_epoch));
+        let elapsed = playback.elapsed;
+        match audio {
+            Clock::At(t) => {
+                let from = t.max(elapsed);
+                self.play = Play::Running { at: now, from };
+
+                from
+            }
+            Clock::Waiting => {
+                self.play = Play::Running { at: now, from: elapsed };
+
+                elapsed
+            }
+            Clock::Wall => from + (now.duration_since(at).as_nanos() / 100) as i64,
         }
     }
 
@@ -623,30 +743,51 @@ impl ClipApp {
         if self.nearest { TextureOptions::NEAREST } else { TextureOptions { mipmap_mode: Some(TextureFilter::Linear), ..TextureOptions::LINEAR } }
     }
 
-    fn poll_player(&mut self, ctx: &egui::Context) {
-        let Some(p) = &self.player else { return };
-        let mut fresh = Vec::new();
-        while let Some(got) = p.poll() {
+    fn poll_player(&mut self, ctx: &egui::Context) -> Option<i64> {
+        let p = self.player.as_ref()?;
+        while self.queue.len() < player::AHEAD
+            && let Some(got) = p.poll()
+        {
             match got {
-                Ok(s) if s.epoch == self.epoch => fresh.push(s),
+                Ok(s) if s.epoch == self.epoch => self.queue.push_back(s),
                 Ok(_) => {}
                 Err(e) => self.player_error = Some(e),
             }
         }
-        for s in fresh {
-            if self.play == Play::Starting {
-                self.play = Play::Running { at: Instant::now(), from: s.ts.max(self.pos) };
+
+        if self.play == Play::Starting
+            && !self.queue.is_empty()
+            && let Some(playback) = &self.playback
+        {
+            if let Some(a) = &self.audio {
+                a.play(playback.audio_epoch);
             }
-            self.queue.push_back(s);
+            self.play = Play::Running { at: Instant::now(), from: 0 };
         }
-        let now = match self.play {
-            Play::Running { at, from } => self.clock(at, from),
-            Play::Starting => i64::MIN,
-            Play::Paused => i64::MAX,
+        let mut done = false;
+        let (now, follow) = match self.play {
+            Play::Running { at, from } => {
+                let elapsed = self.clock(at, from);
+                let playback = self.playback.as_mut()?;
+                let (source, skipped, finished) = playback.advance(elapsed);
+                done = finished;
+                if skipped {
+                    self.playhead.set(source);
+                    if done {
+                        self.queue.clear();
+                    } else {
+                        self.seek_video(source, true, source);
+                    }
+                } else if let Some(p) = &self.player {
+                    p.set_clock(source);
+                }
+                self.pos = source;
+
+                (if done { source - 1 } else { source }, Some(source))
+            }
+            Play::Starting => (i64::MIN, None),
+            Play::Paused => (i64::MAX, None),
         };
-        if let (Play::Running { .. }, Some(p)) = (self.play, &self.player) {
-            p.set_clock(now);
-        }
         let mut latest = None;
         while self.queue.front().is_some_and(|s| s.ts <= now) {
             latest = self.queue.pop_front();
@@ -656,33 +797,22 @@ impl ClipApp {
             if self.play == Play::Paused && self.drag.is_none() {
                 self.pos = s.ts;
             }
-            let image = Arc::new(s.image);
-            let options = self.texture_options();
-            match &mut self.tex {
-                Some(t) => t.set(image.clone(), options),
-                None => self.tex = Some(ctx.load_texture("clip-frame", image.clone(), options)),
-            }
-            self.image = Some(image);
-        }
-        if let Play::Running { .. } = self.play {
-            match self.edit.next_kept(now) {
-                None => {
-                    self.pos = now.min(self.edit.range.end);
-                    self.pause();
+            if self.image.as_ref().is_none_or(|image| !Arc::ptr_eq(image, &s.image)) {
+                let options = self.texture_options();
+                match &mut self.tex {
+                    Some(t) => t.set(s.image.clone(), options),
+                    None => self.tex = Some(ctx.load_texture("clip-frame", s.image.clone(), options)),
                 }
-                Some(next) if next > now + self.frame_len() / 2 => {
-                    self.pos = next;
-                    self.playhead.set(next);
-                    self.seek(next, true);
-                    ctx.request_repaint();
-                }
-                Some(_) => {
-                    self.pos = now;
-                    self.view.follow(now, self.duration());
-                    ctx.request_repaint();
-                }
+                self.image = Some(s.image);
             }
         }
+        if done {
+            self.pause();
+        } else if matches!(self.play, Play::Running { .. }) {
+            ctx.request_repaint();
+        }
+
+        follow
     }
 
     fn set_nearest(&mut self, nearest: bool) {
@@ -718,7 +848,11 @@ impl ClipApp {
         }
         let gif = matches!(job, Job::Gif(_));
         let compressing = matches!(&job, Job::Video(VideoJob { video: Video::Encode { qp: Some(_), .. }, .. }));
-        let before = self.source().filter(|_| compressing).map(|s| s.bytes_for(job.len()));
+        let before = self.source().filter(|_| compressing).map(|s| {
+            let source_len = self.edit.kept().iter().map(|r| r.len()).sum();
+
+            s.bytes_for(source_len)
+        });
         let out = match &dest {
             Some(d) => {
                 let ext = d.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_else(|| "mp4".into());
@@ -1020,6 +1154,7 @@ impl ClipApp {
             self.key_menu = None;
             self.key_sel.clear();
             self.sync_gains();
+            self.refresh_playback();
         }
         if crop {
             self.toggle_crop();
@@ -1169,14 +1304,14 @@ impl eframe::App for ClipApp {
             let (shown, settled) = self.decode_target(&ctx, preview);
             self.start_media(&ctx, shown, settled);
         }
-        self.poll_player(&ctx);
+        let follow = self.poll_player(&ctx);
         self.poll_scan(&ctx);
         self.poll_task(&ctx);
         self.poll_upload(&ctx);
 
         self.file_row(ui, &look, file);
         self.preview(ui, &look, preview);
-        self.timeline(ui, &look, line, lane);
+        self.timeline(ui, &look, line, lane, follow);
         self.hint_row(ui, &look, hint);
         self.panel(ui, &look, side);
         glint_ui::window::border(ui, full, p.line2);
@@ -1214,6 +1349,9 @@ impl eframe::App for ClipApp {
         }
     }
 }
+
+#[cfg(test)]
+mod playback_tests;
 
 #[cfg(test)]
 mod tests;
