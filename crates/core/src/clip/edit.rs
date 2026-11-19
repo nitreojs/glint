@@ -95,6 +95,19 @@ impl Edit {
         true
     }
 
+    /// Removes the split before `right` without bringing any removed footage back.
+    pub fn merge_kept(&mut self, right: usize) -> bool {
+        let Some(left) = right.checked_sub(1) else { return false };
+        let Some(pair) = self.segments.get(left..=right) else { return false };
+        if pair[0].removed || pair[1].removed {
+            return false;
+        }
+        self.segments[left].end = pair[1].end;
+        self.segments.remove(right);
+
+        true
+    }
+
     pub fn toggle_removed(&mut self, i: usize) -> bool {
         let Some(s) = self.segments.get(i).copied() else { return false };
         self.segments[i].removed = !s.removed;

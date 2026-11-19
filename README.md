@@ -36,6 +36,9 @@ it records straight off the gpu with your mic and system sound, and can show you
 
 then trim it, crop it, mute a track, squeeze it under a size<br>
 park the playhead and drag either trim edge to its line to cut there; hold ctrl to bypass snapping<br>
+press **S** at each end of a section, then right-click that piece in the thumbnail strip to remove or restore it<br>
+hover over a split for a hint: right-click the line to merge two kept pieces; restore any removed piece first<br>
+removed pieces get a moving striped shade that fades in and out as you remove or restore them<br>
 if nothing has to be re-encoded, it isn't: the cut is lossless, starts on the exact frame, and glint says so<br>
 when combining sound, tracks that end early fall silent while the rest of the clip continues
 

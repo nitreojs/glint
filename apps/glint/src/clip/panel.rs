@@ -189,12 +189,18 @@ impl ClipApp {
         let planned = self.plan();
         let mut lines = None;
         if let (Some((job, why)), Some(src)) = (&planned, self.source()) {
-            let bytes = export::estimate(job, &src);
-            let over = self.saved.export.target_mb.is_some_and(|mb| bytes > mb as u64 * MB)
-                || matches!(job, Job::Gif(_)) && bytes > GIF_WARN_BYTES;
-            let color = mix(p.t1, p.warn, anim(ui, Id::unique("clip-est-over"), over, 0.3));
             let painter = ui.painter();
-            painter.text(est.left_top(), Align2::LEFT_TOP, format!("≈ {}", export::size_label(bytes)), semibold(26.0), color);
+            if matches!(job, Job::Video(VideoJob { video: Video::Encode { qp: Some(_), .. }, .. })) {
+                let r = painter.text(est.left_top(), Align2::LEFT_TOP, "size varies", semibold(26.0), p.t1);
+                ui.interact(r, Id::unique("clip-variable-size"), Sense::hover())
+                    .on_hover_text("constant quality uses as many bytes as the footage needs · choose a size limit for a byte budget");
+            } else {
+                let bytes = export::estimate(job, &src);
+                let over = self.saved.export.target_mb.is_some_and(|mb| bytes > mb as u64 * MB)
+                    || matches!(job, Job::Gif(_)) && bytes > GIF_WARN_BYTES;
+                let color = mix(p.t1, p.warn, anim(ui, Id::unique("clip-est-over"), over, 0.3));
+                painter.text(est.left_top(), Align2::LEFT_TOP, format!("≈ {}", export::size_label(bytes)), semibold(26.0), color);
+            }
             let tracks = src.info.tracks.len();
             let sub = format!("{} of {} · {}", fmt_short(job.len()), fmt_short(src.info.duration), sound_line(job, tracks));
             painter.text(est.left_top() + vec2(0.0, EST_H), Align2::LEFT_BOTTOM, sub, sans(12.0), p.t3);

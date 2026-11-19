@@ -117,12 +117,39 @@ impl View {
     }
 }
 
-fn hatch(painter: &Painter, r: Rect, color: Color32) {
-    let painter = painter.with_clip_rect(r.intersect(painter.clip_rect()));
-    let mut x = r.left() - r.height();
-    while x < r.right() {
-        painter.line_segment([pos2(x, r.bottom()), pos2(x + r.height(), r.top())], Stroke::new(1.0, color));
-        x += 7.0;
+const HATCH_STEP: f32 = 7.0;
+const HATCH_PAD: f32 = 1.0;
+
+fn hatch_phase(now: f64, animate: bool, pixels_per_point: f32) -> f32 {
+    if !animate {
+        return 0.0;
+    }
+    let scale = f64::from(pixels_per_point);
+    let pitch = (f64::from(HATCH_STEP) * scale).round().max(1.0);
+
+    ((now * 5.0 * scale).round().rem_euclid(pitch) / scale) as f32
+}
+
+fn hatch(painter: &Painter, r: Rect, color: Color32, phase: f32) {
+    let visible = r.intersect(painter.clip_rect());
+    if !visible.is_positive() {
+        return;
+    }
+
+    let painter = painter.with_clip_rect(visible);
+    let top = (visible.top() - HATCH_PAD).max(r.top());
+    let bottom = (visible.bottom() + HATCH_PAD).min(r.bottom());
+    let rise = bottom - top;
+    let first = visible.left() - rise - HATCH_PAD;
+    let last = visible.right() + HATCH_PAD;
+    let scale = painter.ctx().pixels_per_point();
+    let pitch = (HATCH_STEP * scale).round().max(1.0) / scale;
+    let anchor = f64::from(r.left()) + f64::from(r.top()) - f64::from(bottom) + f64::from(phase);
+    let mut x = first + (anchor - f64::from(first)).rem_euclid(f64::from(pitch)) as f32;
+
+    while x <= last {
+        painter.line_segment([pos2(x, bottom), pos2(x + rise, top)], Stroke::new(1.0, color));
+        x += pitch;
     }
 }
 
@@ -328,6 +355,29 @@ impl ClipApp {
         let x_of = move |t: i64| v.x(t, inner.left(), inner.width());
         let t_raw = move |x: f32| v.start + (((x - inner.left()) / inner.width()) as f64 * v.span as f64) as i64;
         let t_of = move |x: f32| t_raw(x).clamp(0, dur);
+        if self.edit.segments.len() > 1 && !menus
+            && let Some(at) = body.hover_pos().or_else(|| body.interact_pointer_pos())
+            && rows.video.contains(at)
+        {
+            let seam = self.edit.segments.windows(2).enumerate()
+                .map(|(left, pair)| (left + 1, (x_of(pair[1].start) - at.x).abs()))
+                .filter(|(_, distance)| *distance <= 5.0)
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((right, _)) = seam {
+                let kept = !self.edit.segments[right - 1].removed && !self.edit.segments[right].removed;
+                body.clone().on_hover_text_at_pointer(if kept { "right-click the split to merge these pieces" } else { "restore both pieces to merge them" });
+                if kept && body.secondary_clicked() && self.change(|e| e.merge_kept(right)) {
+                    self.selected = None;
+                }
+            } else {
+                let i = self.edit.segment_at(t_of(at.x));
+                let tip = if self.edit.segments[i].removed { "right-click to restore this piece" } else { "right-click to remove this piece" };
+                body.clone().on_hover_text_at_pointer(tip);
+                if body.secondary_clicked() {
+                    self.toggle_piece(i);
+                }
+            }
+        }
         let visible = move |x: f32| x >= inner.left() - 6.0 && x <= inner.right() + 6.0;
         let within = (SNAP_PX / inner.width() as f64 * v.span as f64) as i64;
         let snapping = !ctrl;
@@ -686,14 +736,39 @@ impl ClipApp {
             self.keys_paint(ui, look, lane, &axis, &painter);
         }
         let shade = Color32::from_black_alpha(if light { 70 } else { 158 });
+        let phase = hatch_phase(now, animate, ui.ctx().pixels_per_point());
+        let stripes = Color32::from_gray(if light { 110 } else { 96 });
+        let track_clip = painter.clip_rect();
+        let mut hatch_visible = false;
+        for s in &self.edit.segments {
+            let (left, right) = (x_of(s.start), x_of(s.end));
+            if right <= track_clip.left() || left >= track_clip.right() {
+                continue;
+            }
+            let opacity = ease(anim(ui, Id::unique(("clip-removed", s.start)), s.removed, 0.24));
+            if opacity <= 0.0 {
+                continue;
+            }
+            let fill = shade.gamma_multiply(opacity);
+            let stroke = stripes.gamma_multiply(opacity);
+            for band in &rows.bands {
+                let r = Rect::from_min_max(pos2(left, band.top()), pos2(right, band.bottom()));
+                let clip = lane_clip(*band);
+                let shaded = r.intersect(clip.clip_rect());
+                if shaded.is_positive() {
+                    clip.rect_filled(shaded, 0, fill);
+                    hatch(&clip, r, stroke, phase);
+                    hatch_visible = true;
+                }
+            }
+        }
+        if animate && hatch_visible {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(40));
+        }
+
         for band in &rows.bands {
             let clip = lane_clip(Rect::from_min_max(pos2(area.left(), band.top()), pos2(area.right(), band.bottom())));
             let span_rect = |a: i64, b: i64| Rect::from_min_max(pos2(x_of(a), band.top()), pos2(x_of(b), band.bottom()));
-            for s in self.edit.segments.iter().filter(|s| s.removed) {
-                let r = span_rect(s.start, s.end);
-                clip.rect_filled(r, 0, shade);
-                hatch(&clip, r, p.t3.gamma_multiply(0.6));
-            }
             let (x0, x1) = (x_of(trim_t[0]), x_of(trim_t[1]));
             clip.rect_filled(Rect::from_min_max(pos2(area.left(), band.top()), pos2(x0, band.bottom())), 0, shade);
             clip.rect_filled(Rect::from_min_max(pos2(x1, band.top()), pos2(area.right(), band.bottom())), 0, shade);
@@ -701,19 +776,14 @@ impl ClipApp {
                 for pc in pieces.iter().filter(|pc| pc.lead < pc.start) {
                     let r = span_rect(pc.lead, pc.start);
                     clip.rect_filled(r, 0, p.surf.gamma_multiply(0.35));
-                    hatch(&clip, r, p.acc.gamma_multiply(0.5));
+                    hatch(&clip, r, p.acc.gamma_multiply(0.5), 0.0);
                 }
-            }
-            if let Some(Selected::Segment(i)) = self.selected
-                && let Some(s) = self.edit.segments.get(i)
-            {
-                let r = span_rect(s.start, s.end).shrink2(vec2(1.5, 1.5));
-                clip.rect_stroke(r, 3, Stroke::new(2.0, p.t1), StrokeKind::Inside);
             }
             for t in self.edit.splits() {
                 let x = x_of(t);
                 if visible(x) {
-                    clip.vline(x, band.y_range(), Stroke::new(1.0, p.t2));
+                    clip.vline(x, band.y_range(), Stroke::new(6.0, Color32::BLACK));
+                    clip.vline(x, band.y_range(), Stroke::new(4.0, p.acc));
                 }
             }
         }
@@ -1027,7 +1097,130 @@ impl ClipApp {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{Config, Opened, Saved};
     use super::*;
+
+    fn painted_hatch(r: Rect, clip: Rect, now: f64, animate: bool) -> Vec<(Rect, [egui::Pos2; 2])> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(clip.expand(4.0)),
+            ..Default::default()
+        };
+
+        let mut frame = ctx.run_ui(input, |ui| {
+            hatch(&ui.painter().with_clip_rect(clip), r, MARKER, hatch_phase(now, animate, ctx.pixels_per_point()));
+        });
+        frame.textures_delta.clear();
+
+        frame.shapes.into_iter().filter_map(|c| match c.shape {
+            Shape::LineSegment { points, stroke } if stroke.color == MARKER => Some((c.clip_rect, points)),
+            _ => None,
+        }).collect()
+    }
+
+    #[test]
+    fn moving_stripes_preserve_pixel_coverage_at_fractional_display_scales() {
+        for scale in [1.0, 1.25, 1.5, 2.0] {
+            let pitch = (HATCH_STEP * scale).round();
+            for tick in 0..100 {
+                let pixels = hatch_phase(f64::from(tick) * 0.04, true, scale) * scale;
+                assert!((pixels - pixels.round()).abs() < 0.00001);
+                assert!((0.0..pitch).contains(&pixels));
+            }
+        }
+    }
+
+    #[test]
+    fn hatch_moves_and_wraps_inside_the_visible_clip() {
+        let r = Rect::from_min_max(pos2(-1_000_000_000.0, 0.0), pos2(120.0, 100_000_000.0));
+        let clip = Rect::from_min_max(pos2(100.0, 10.0), pos2(130.0, 30.0));
+        let visible = r.intersect(clip);
+        let at = |now, animate| painted_hatch(r, clip, now, animate);
+
+        let initial = at(0.0, true);
+        let shifted = at(0.2, true);
+        let wrapped = at(1.6, true);
+        let reduced_motion = at(0.2, false);
+        let offscreen = painted_hatch(r, clip.translate(vec2(20.0, 0.0)), 0.2, true);
+
+        assert_eq!(initial.len(), 6, "the visible clip bounds the stripe count");
+        assert_eq!(shifted.len(), initial.len());
+        assert_eq!(shifted, wrapped, "one stripe period wraps to the same geometry");
+        assert_eq!(reduced_motion, initial);
+        assert!(offscreen.is_empty());
+        for ((initial_clip, [bottom, top]), (shifted_clip, [moved_bottom, moved_top])) in initial.iter().zip(&shifted) {
+            assert_eq!(*initial_clip, visible);
+            assert_eq!(*shifted_clip, visible);
+            assert_eq!((bottom.y, top.y), (31.0, 9.0));
+            assert_eq!(top.x - bottom.x, bottom.y - top.y);
+            assert_eq!(*moved_bottom, *bottom + vec2(1.0, 0.0));
+            assert_eq!(*moved_top, *top + vec2(1.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn a_new_split_is_visible_on_both_sides_of_the_playhead() {
+        let ctx = egui::Context::default();
+        glint_ui::theme::fonts(&ctx);
+        let accent = [0xE5, 0x40, 0x2F];
+        let look = Look { p: glint_ui::widgets::palette(false, accent), keyboard: false };
+        let file = Opened {
+            path: Default::default(),
+            info: Ok(Info {
+                duration: 10 * SECOND,
+                size: (1920, 1080),
+                fps: 60.0,
+                codec: None,
+                tracks: Vec::new(),
+                clicks: None,
+                keys: None,
+                snap: None,
+            }),
+            index: None,
+        };
+        let cfg = Config::default();
+        let mut app = ClipApp::new(Some(file), cfg.effort, cfg.after_trim, String::new(), Saved::default(), accent);
+        app.pos = 5 * SECOND;
+        app.playhead.set(app.pos);
+        let area = Rect::from_min_size(pos2(16.0, 16.0), vec2(320.0, height(0, LANE_MAX, false, false)));
+        let video = rows(area, 0, LANE_MAX, false, false).video;
+        let x = area.center().x;
+        let input = egui::RawInput {
+            screen_rect: Some(area.expand(12.0)),
+            events: vec![egui::Event::Key {
+                key: egui::Key::S,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+
+        let mut frame = ctx.run_ui(input, |ui| {
+            app.keys(ui.ctx());
+            app.timeline(ui, &look, area, LANE_MAX);
+        });
+        frame.textures_delta.clear();
+        assert_eq!(app.edit.splits().next(), Some(app.pos));
+
+        let (head, head_width) = frame.shapes.iter().enumerate().find_map(|(i, c)| match &c.shape {
+            Shape::LineSegment { points: [top, bottom], stroke }
+                if top.x == x && bottom.x == x && top.y < video.top() && bottom.y >= video.bottom()
+                    && stroke.color == look.p.t1 => Some((i, stroke.width)),
+            _ => None,
+        }).expect("the playhead over the new split");
+        let seam = frame.shapes[..head].iter().any(|c| matches!(&c.shape,
+            Shape::LineSegment { points: [top, bottom], stroke }
+                if top.x == x && bottom.x == x && top.y == video.top() && bottom.y == video.bottom()
+                    && stroke.color == look.p.acc && stroke.width > head_width
+        ));
+        assert!(seam, "the vertical split stays visible behind the playhead");
+        assert!(!frame.shapes.iter().any(|c| matches!(&c.shape,
+            Shape::LineSegment { points: [left, right], .. }
+                if left.y == right.y && video.y_range().contains(left.y) && left.x < x && right.x > x
+        )), "no crossbar across the split");
+    }
 
     #[test]
     fn a_time_lands_on_its_x_in_the_visible_span() {

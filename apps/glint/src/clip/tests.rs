@@ -195,7 +195,6 @@ fn the_export_panel_shows_only_the_rows_that_apply() {
     assert!(h.has("more options") && !h.has("bitrate") && !h.has("codec"));
     assert!(h.has("1920×1080 · 60 fps · 0:42 · 3 sound tracks"));
     assert!(h.has("drag the red edges to trim · ") && h.has("all keys"));
-    assert!(h.starts("≈ ").is_some());
     assert_eq!(h.starts("0:42 of").as_deref(), Some("0:42 of 0:42 · 3 sound tracks"));
     assert!(h.texts.iter().all(|(t, _)| !t.contains("instantly")));
     assert!(h.has("re-encodes ·") && h.has("can't copy this file"), "no sample index to copy by");
@@ -231,6 +230,15 @@ fn the_export_panel_shows_only_the_rows_that_apply() {
 
     h.click(h.at("≤ 25 MB"));
     assert_eq!(h.app.saved.export.target_mb, Some(25));
+}
+
+#[test]
+fn switching_from_quality_to_a_size_budget_restores_the_numeric_estimate() {
+    let mut h = Harness::new(2);
+    h.click(h.at("compress"));
+    assert!(h.has("size varies") && h.starts("≈ ").is_none());
+    h.click(h.at("≤ 10 MB"));
+    assert!(h.starts("≈ ").is_some() && !h.has("size varies"));
 }
 
 #[test]
@@ -330,6 +338,51 @@ fn crop_mode_opens_with_c_and_leaves_with_enter() {
     h.key(Key::Escape, true);
     h.settle();
     assert!(h.app.cropping.is_none() && h.app.edit.crop.is_none());
+}
+
+#[test]
+fn right_click_toggles_pieces_and_only_merges_kept_neighbors_at_a_split() {
+    let mut h = Harness::new(1);
+    let header = h.rect_of("sound · muted tracks won't be in the file");
+    let left = header.left() + 6.0;
+    let right = h.rect_of("mute all").right() - 6.0;
+    let at = |fraction| pos2(left + (right - left) * fraction, header.center().y - 41.0);
+    let seam = at(0.5) + vec2(2.0, 0.0);
+    let retained = h.app.edit.kept();
+
+    h.app.jump(21 * SECOND);
+    h.key(Key::S, true);
+    h.key(Key::S, false);
+    for (pointer, tip) in [(at(0.75), "right-click to remove this piece"), (seam, "right-click the split to merge these pieces")] {
+        h.frame(vec![Event::PointerMoved(pointer)]);
+        for _ in 0..90 {
+            h.frame(Vec::new());
+        }
+        let label = h.rect_of(tip);
+        assert!((label.left() - pointer.x).abs() < 32.0 && label.top() >= pointer.y, "{label:?} at {pointer:?}");
+    }
+    h.click(at(0.25));
+    h.right_click(at(0.75));
+    assert!(!h.app.edit.segments[0].removed && h.app.edit.segments[1].removed);
+    let with_removed = h.app.edit.segments.clone();
+    h.right_click(seam);
+    assert_eq!(h.app.edit.segments, with_removed, "a blocked seam click doesn't merge or toggle");
+
+    h.right_click(at(0.25));
+    assert!(!h.app.edit.segments[0].removed, "the last kept piece cannot be removed");
+    h.right_click(at(0.75));
+    assert!(!h.app.edit.segments[1].removed);
+    let split = h.app.edit.segments.clone();
+    assert_eq!(h.app.edit.kept(), retained);
+
+    h.right_click(seam);
+    assert_eq!(h.app.edit.segments.len(), 1);
+    assert_eq!(h.app.edit.kept(), retained, "merging doesn't change the retained duration");
+
+    h.chord(Key::Z, Modifiers::COMMAND, true);
+    h.settle();
+    assert_eq!(h.app.edit.segments, split);
+    assert_eq!(h.app.edit.kept(), retained);
 }
 
 #[test]

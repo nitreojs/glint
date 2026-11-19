@@ -908,6 +908,12 @@ impl ClipApp {
         ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Space));
     }
 
+    fn toggle_piece(&mut self, i: usize) {
+        if !self.change(|e| e.toggle_removed(i)) {
+            self.toast(Note::Info("at least one piece has to stay".into()));
+        }
+    }
+
     fn keys(&mut self, ctx: &egui::Context) {
         if ctx.text_edit_focused() {
             return;
@@ -980,6 +986,7 @@ impl ClipApp {
         }
         if split && self.change(|e| e.split(pos, frame)) {
             self.selected = None;
+            self.toast(Note::Info(format!("split at {} · right-click a piece to remove it", math::fmt_time(pos))));
         }
         if delete && !self.click_sel.is_empty() {
             let picked = std::mem::take(&mut self.click_sel);
@@ -997,9 +1004,7 @@ impl ClipApp {
                     });
                     self.selected = None;
                 }
-                Some(Selected::Segment(i)) if !self.change(|e| e.toggle_removed(i)) => {
-                    self.toast(Note::Info("at least one piece has to stay".into()));
-                }
+                Some(Selected::Segment(i)) => self.toggle_piece(i),
                 _ => {}
             }
         }
