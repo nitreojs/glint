@@ -372,25 +372,31 @@ pub struct TimeMap {
 
 impl TimeMap {
     pub fn new(edit: &Edit) -> Self {
+        Self::from_segments(&edit.segments, None)
+    }
+
+    /// A presentation-only speed override lets the timeline ease a piece to its committed width.
+    pub fn from_segments(segments: &[Segment], visual: Option<(usize, Speed)>) -> Self {
         let mut stretches = Vec::new();
         let mut shift = 0;
-        for s in &edit.segments {
-            if s.speed == Speed::NORMAL || s.end <= s.start {
+        for (index, s) in segments.iter().enumerate() {
+            let speed = visual.filter(|(i, _)| *i == index).map_or(s.speed, |(_, speed)| speed);
+            if speed == Speed::NORMAL || s.end <= s.start {
                 continue;
             }
 
             let source_len = i128::from(s.end) - i128::from(s.start);
-            let edited_len = s.speed.output_ticks(source_len).max(1);
+            let edited_len = speed.output_ticks(source_len).max(1);
             let edited_start = i128::from(s.start) + shift;
             stretches.push(Stretch {
                 source: Range { start: s.start, end: s.end },
                 edited_start,
                 edited_end: edited_start + edited_len,
-                speed: s.speed,
+                speed,
             });
             shift += edited_len - source_len;
         }
-        let source_end = edit.segments.last().map_or(0, |s| s.end);
+        let source_end = segments.last().map_or(0, |s| s.end);
 
         Self { stretches, duration: saturate_time(i128::from(source_end) + shift) }
     }

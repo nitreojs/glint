@@ -243,7 +243,7 @@ fn video_retimes_picture_and_sound_and_sizes_the_edited_duration() {
 
     assert_eq!(why, [Reencode::Speed]);
     assert_eq!(job.len(), RETIMED_LEN);
-    assert_eq!((bitrate, qp), (9_290_323, None), "12 MB of retained video over the edited duration");
+    assert_eq!((bitrate, qp), (10_558_592, None), "12 MB of retained video over the geometric mean of source and edited duration");
     assert_eq!(video.pieces.iter().map(|p| p.len()).collect::<Vec<_>>(), [8 * S, S, 4 * S / 3]);
     assert_eq!(
         video.pieces.iter().map(|p| (p.lead, p.start, p.end, p.key, p.speed)).collect::<Vec<_>>(),
@@ -295,7 +295,7 @@ fn auto_retime_budgets_only_retained_indexed_video_bytes() {
     let source = src(&info, Some(&idx));
     let job = plan(&mixed_edit(), &Settings::default(), &source);
 
-    assert_eq!(video_rate(job), (1_486_452, None), "retained video totals 1.92 MB");
+    assert_eq!(video_rate(job), (1_689_375, None), "retained video totals 1.92 MB");
 }
 
 #[test]
@@ -312,7 +312,7 @@ fn auto_retime_counts_a_frame_held_across_cut_points_only_once() {
     let job = plan(&edit, &Settings::default(), &source);
 
     assert_eq!(job.len(), 5 * S / 2);
-    assert_eq!(video_rate(job), (960_000, None), "the trim shows the first two frames, not the one at its end");
+    assert_eq!(video_rate(job), (1_239_355, None), "the trim shows the first two frames, not the one at its end");
 }
 
 #[test]
@@ -326,11 +326,11 @@ fn auto_retime_without_video_samples_prorates_the_file_by_retained_source_time()
         let audio = 3 * AAC_BYTES_PER_SECOND * 41 / 2;
         let source = Source { bytes: 2_050_000 + audio, ..src(&info, idx) };
         let job = plan(&edit, &settings, &source);
-        assert_eq!(video_rate(job), (619_355, None), "8 seconds at 100 KB/s of video");
+        assert_eq!(video_rate(job), (703_906, None), "8 seconds at 100 KB/s of video");
 
         let compact = Source { bytes: 1_025_000, ..source };
         let job = plan(&edit, &settings, &compact);
-        assert_eq!(video_rate(job), (309_677, None), "the audio estimate exceeds this file's entire bitrate");
+        assert_eq!(video_rate(job), (351_953, None), "the audio estimate exceeds this file's entire bitrate");
     }
 }
 

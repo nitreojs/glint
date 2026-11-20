@@ -651,7 +651,10 @@ pub fn plan_why(edit: &Edit, s: &Settings, src: &Source) -> (Job, Vec<Reencode>)
         }
         (None, None, None) => {
             let bps = if retimed {
-                src.retained_video_bytes(&job.pieces) * 8.0 * SECOND as f64 / job.len().max(1) as f64
+                let source_len = job.pieces.iter().map(|p| (p.end - p.start) as f64).sum::<f64>().max(1.0);
+                let output_len = job.len().max(1) as f64;
+                // balance retained frames with duration without growing slow-motion files linearly
+                src.retained_video_bytes(&job.pieces) * 8.0 * SECOND as f64 / (source_len * output_len).sqrt()
             } else {
                 src.video_bps()
             };

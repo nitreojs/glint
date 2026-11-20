@@ -460,6 +460,42 @@ fn shift_drag_at_either_side_of_a_split_stretches_only_the_piece_under_the_press
 }
 
 #[test]
+fn double_click_resets_only_the_recut_piece_and_undo_restores_its_exact_speed() {
+    let mut h = Harness::opened(info(1, None, None), Some(index(1)));
+    h.app.edit.set_speed(0, Speed::from_milli(444));
+    h.app.edit.split(10 * SECOND, 1);
+    h.app.edit.split(20 * SECOND, 1);
+    h.settle();
+    let before = h.app.edit.clone();
+    let header = h.rect_of("sound · muted tracks won't be in the file");
+    let left = header.left() + 6.0;
+    let width = h.rect_of("mute all").right() - 6.0 - left;
+    let map = TimeMap::new(&h.app.edit);
+    let at = pos2(h.app.view.x(map.to_edit(15 * SECOND), left, width), header.center().y - 41.0);
+    let slowed = h.starts("≈ ").unwrap_or_default();
+    let button = |pressed| Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    h.frame(vec![Event::PointerMoved(at), button(true)]);
+    h.frame(vec![button(false)]);
+    h.frame(vec![button(true)]);
+    h.frame(vec![button(false)]);
+    h.frame(Vec::new());
+    if glint_ui::widgets::motion() {
+        assert!(h.texts.iter().any(|(s, _)| s.strip_suffix('×').and_then(|v| v.parse::<f32>().ok()).is_some_and(|v| v > 0.444 && v < 1.0)));
+    }
+    h.settle();
+    let mut expected = before.clone();
+    expected.segments[1].speed = Speed::NORMAL;
+    assert_eq!(h.app.edit, expected);
+    let reset = h.starts("≈ ").unwrap_or_default();
+    assert_ne!(slowed, reset, "the estimate on screen follows the piece's speed");
+    assert!(h.app.undo.undo(&mut h.app.edit));
+    h.settle();
+    assert_eq!(h.starts("≈ ").unwrap_or_default(), slowed, "the estimate follows undo back");
+    assert_eq!(h.app.edit, before);
+    assert!(!h.app.undo.undo(&mut h.app.edit));
+}
+
+#[test]
 fn a_parked_piece_wins_at_both_its_cuts_and_the_focus_matches_the_locked_drag() {
     let cuts = [10 * SECOND, 20 * SECOND, 30 * SECOND];
     for (cut, from_dx, drag_dx, target) in [
@@ -485,7 +521,7 @@ fn a_parked_piece_wins_at_both_its_cuts_and_the_focus_matches_the_locked_drag() 
                 let x = h.app.view.x(map.to_edit(source * SECOND), left, width);
                 for y in [video_y, audio_y] {
                     let dimmed = h.rects.iter().any(|(rect, fill)| {
-                        *fill == Color32::from_black_alpha(18) && rect.contains(pos2(x, y))
+                        *fill == Color32::from_black_alpha(64) && rect.contains(pos2(x, y))
                     });
                     assert_eq!(dimmed, index != target, "piece {index} at {y}");
                 }
@@ -523,11 +559,11 @@ fn idle_piece_focus_leaves_single_removed_and_trimmed_content_alone_and_hides_in
     let video_y = h.at("sound · muted tracks won't be in the file").y - 41.0;
     let dimmed = |h: &Harness, source| {
         h.rects.iter().any(|(rect, fill)| {
-            *fill == Color32::from_black_alpha(18) && rect.contains(pos2(x_of(source), video_y))
+            *fill == Color32::from_black_alpha(64) && rect.contains(pos2(x_of(source), video_y))
         })
     };
     let dim_count = |h: &Harness| {
-        h.rects.iter().filter(|(_, fill)| *fill == Color32::from_black_alpha(18)).count()
+        h.rects.iter().filter(|(_, fill)| *fill == Color32::from_black_alpha(64)).count()
     };
 
     h.app.jump(15 * SECOND);
@@ -594,6 +630,71 @@ fn shift_drag_on_either_trimmed_edge_uses_the_kept_duration_and_anchors_the_othe
         expected.segments[0].speed = speed;
         assert_eq!(h.app.edit, expected, "Shift-dragging a trim handle leaves the trim and source bounds intact");
     }
+}
+#[test]
+fn speed_drags_ease_the_painted_edge_into_the_fitted_timeline() {
+    let mut h = Harness::new(1);
+    let header = h.rect_of("sound · muted tracks won't be in the file");
+    let left = header.left() + 6.0;
+    let width = h.rect_of("mute all").right() - 6.0 - left;
+    let video_y = header.center().y - 41.0;
+
+    let from = pos2(left + width - 2.0, video_y);
+    let to = pos2(left + 4.0, video_y);
+    let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::SHIFT };
+
+    h.frame(vec![Event::ModifiersChanged(Modifiers::SHIFT), Event::PointerMoved(from), button(from, true)]);
+    h.frame(vec![Event::PointerMoved(to)]);
+    assert!(matches!(h.app.drag, Some(Drag::Stretch(_))));
+    h.frame(vec![button(to, false)]);
+
+    let shade_edge = |h: &Harness| {
+        h.rects
+            .iter()
+            .filter(|(rect, fill)| *fill == Color32::from_black_alpha(158) && rect.y_range().contains(video_y))
+            .map(|(rect, _)| rect.left())
+            .max_by(f32::total_cmp)
+            .expect("the painted trim shade")
+    };
+    assert!(h.app.refit.is_some(), "refit animation should start after Shift-drag release");
+    let released = shade_edge(&h);
+    assert!(released < left + width * 0.2, "the extreme speed-up leaves most of the strip empty at release: {released}");
+
+    for _ in 0..4 {
+        h.frame(Vec::new());
+    }
+    let mid = shade_edge(&h);
+    assert!(h.app.refit.is_some(), "animation should still be active ~64ms in");
+    assert!(mid > released + (left + width - released) * 0.5, "most of the visible travel should happen early: {released} -> {mid}");
+    assert!(mid < left + width * 0.95, "the visible clip edge should not snap to the final fit early: {mid}");
+
+    for _ in 0..12 {
+        h.frame(Vec::new());
+    }
+
+    assert!(h.app.refit.is_none(), "refit should complete after 180ms");
+    let done = shade_edge(&h);
+    assert!(done > mid, "the visible clip edge should finish filling the strip: {mid} -> {done}");
+    assert!(done > left + width * 0.95, "the final fitted edge should reach the end of the strip: {done}");
+
+    h.app.edit.range.set_end(21 * SECOND, 42 * SECOND, 1);
+    h.settle();
+    let fitted = shade_edge(&h);
+    let from = pos2(fitted - 2.0, video_y);
+    let to = from + vec2(width / 4.0, 0.0);
+    h.frame(vec![Event::PointerMoved(from), button(from, true)]);
+    h.frame(vec![Event::PointerMoved(to)]);
+    h.frame(vec![button(to, false)]);
+    let released = shade_edge(&h);
+    assert!(released > fitted + width * 0.2, "slowing down stretches the piece under the pointer");
+
+    for _ in 0..4 {
+        h.frame(Vec::new());
+    }
+    let mid = shade_edge(&h);
+    assert!(fitted + 5.0 < mid && mid < released - 5.0, "the painted edge moves back as the view fits");
+    h.settle();
+    assert!((shade_edge(&h) - fitted).abs() < 1.0, "the full recording fits again");
 }
 
 #[test]

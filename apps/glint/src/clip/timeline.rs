@@ -25,7 +25,7 @@ const CLICKS_H: f32 = 24.0;
 const KEYS_H: f32 = 24.0;
 const HANDLE_W: f32 = 6.0;
 const HANDLE_HIT: f32 = 14.0;
-const PIECE_DIM: Color32 = Color32::from_black_alpha(18);
+const PIECE_DIM: Color32 = Color32::from_black_alpha(64);
 const RENAME_W: f32 = 140.0;
 const MENU_W: f32 = 180.0;
 const ITEM_H: f32 = 30.0;
@@ -92,6 +92,7 @@ pub(super) struct Stretch {
     from: f32,
     units_per_point: f64,
     view_start: i64,
+    fit_view: bool,
     output_len: i64,
     anchor_offset: i64,
 }
@@ -142,6 +143,14 @@ impl Stretch {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct ResetMotion {
+    index: usize,
+    piece: Segment,
+    view: View,
+    at: f64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct View {
     pub start: i64,
@@ -149,6 +158,25 @@ pub(super) struct View {
 }
 
 impl View {
+    fn between(self, to: View, t: f32) -> View {
+        let lerp = |a: i64, b: i64| (a as f64 + (b as f64 - a as f64) * f64::from(t)).round() as i64;
+
+        View { start: lerp(self.start, to.start), span: lerp(self.span, to.span) }
+    }
+
+    // Ease the painted positions, not the time span. At high speeds, easing the
+    // span keeps most of the visible movement bunched up at the end.
+    fn refit_between(self, to: View, t: f32) -> View {
+        let from_scale = (1.0 - f64::from(t)) / self.span as f64;
+        let to_scale = f64::from(t) / to.span as f64;
+        let span = (from_scale + to_scale).recip();
+
+        View {
+            start: ((self.start as f64 * from_scale + to.start as f64 * to_scale) * span).round() as i64,
+            span: span.round() as i64,
+        }
+    }
+
     pub(super) fn full(duration: i64) -> View {
         View { start: 0, span: duration.max(1) }
     }
@@ -442,12 +470,41 @@ impl ClipApp {
         };
         let rows = rows(area, self.edit.lanes.len(), lane_h, self.edit.clicks.is_some(), self.edit.keys.is_some());
         let source_dur = info.duration.max(1);
-        let mut map = TimeMap::new(&self.edit);
+        let interrupted = ui.input(|i| i.pointer.any_pressed() || i.events.iter().any(|e| matches!(e, egui::Event::Key { pressed: true, .. } | egui::Event::MouseWheel { .. })));
+        let transition = self.reset_motion.and_then(|m| {
+            let progress = ((self.now - m.at) / 0.18).clamp(0.0, 1.0) as f32;
+            if !motion() || progress >= 1.0 || interrupted || self.play != Play::Paused
+                || self.edit.segments.get(m.index) != Some(&Segment { speed: Speed::NORMAL, ..m.piece }) {
+                return None;
+            }
+            let t = ease(progress);
+            let len = m.piece.end - m.piece.start;
+            let from = m.piece.speed.output_len(len) as f64;
+            let speed = Speed::from_lengths(len, (from + (len as f64 - from) * f64::from(t)).round() as i64);
+            ui.ctx().request_repaint();
+
+            Some((m, speed, t))
+        });
+        if transition.is_none() {
+            self.reset_motion = None;
+        }
+        let visual = transition.map(|(m, speed, _)| (m.index, speed));
+        let mut map = TimeMap::from_segments(&self.edit.segments, visual);
         let mut dur = map.duration().max(1);
         let frame = math::frame_len(info.fps);
         let inner = area.shrink2(vec2(6.0, 0.0));
         let min_span = (frame * 12).max(SECOND / 5);
-        if !stretching {
+        if let Some((from, to, at)) = self.refit {
+            let t = ((self.now - at) / 0.18).clamp(0.0, 1.0) as f32;
+            if t >= 1.0 || interrupted || !motion() || self.play != Play::Paused {
+                self.view = to;
+                self.refit = None;
+            } else {
+                self.view = from.refit_between(to, ease(t));
+                ui.ctx().request_repaint();
+            }
+        }
+        if !stretching && transition.is_none() && self.refit.is_none() {
             self.view.clamp(dur, min_span);
             if let Some(source) = follow {
                 self.view.follow(map.to_edit(source), dur);
@@ -538,7 +595,7 @@ impl ClipApp {
             dur = map.duration().max(1);
         }
 
-        let v = self.view;
+        let v = transition.map_or(self.view, |(m, _, t)| m.view.between(self.view, t));
         let axis = Axis {
             left: inner.left(),
             width: inner.width(),
@@ -551,6 +608,7 @@ impl ClipApp {
         let x_of = |t| axis.x(t);
         let t_raw = |x| axis.t(x);
         let t_of = |x| t_raw(x).clamp(0, source_dur);
+        let mut reset_speed = None;
         if !menus && !stretching
             && let Some(at) = body.hover_pos().or_else(|| body.interact_pointer_pos())
             && rows.video.contains(at)
@@ -576,6 +634,19 @@ impl ClipApp {
                 body.clone().on_hover_text_at_pointer(tip);
                 if can_merge && body.secondary_clicked() && self.change(|e| e.merge_kept(right)) {
                     self.selected = None;
+                }
+            } else if !segment.removed && segment.speed != Speed::NORMAL
+                && (self.edit.range.start..self.edit.range.end).contains(&t_of(at.x)) {
+                let tip = if many {
+                    "double-click to reset to 1× · shift-drag an edge to change speed · right-click to remove"
+                } else {
+                    "double-click to reset to 1× · shift-drag an edge to change speed"
+                };
+                body.clone().on_hover_text_at_pointer(tip);
+                if !shift && self.drag.is_none() && body.double_clicked() {
+                    reset_speed = Some(index);
+                } else if many && body.secondary_clicked() {
+                    self.toggle_piece(index);
                 }
             } else {
                 let tip = if segment.removed {
@@ -755,6 +826,7 @@ impl ClipApp {
                 from,
                 units_per_point: v.span as f64 / f64::from(inner.width()),
                 view_start: v.start,
+                fit_view: !zoomed,
                 output_len: Stretch::duration(piece, kept, piece.speed),
                 anchor_offset: Stretch::offset(piece, piece.speed, anchor),
             };
@@ -775,7 +847,7 @@ impl ClipApp {
         {
             let grab = if thumb.x_range().contains(at.x) { at.x - thumb.left() } else { thumb.width() / 2.0 };
             self.drag = Some(Drag::Scroll { grab });
-        } else if body.drag_started() || body.clicked() {
+        } else if reset_speed.is_none() && (body.drag_started() || body.clicked()) {
             self.drag = Some(Drag::Head);
             self.click_focus = false;
             self.click_sel.clear();
@@ -844,6 +916,18 @@ impl ClipApp {
             }
             if let Some(before) = self.before_drag.take() {
                 self.undo.record(before, &self.edit);
+            }
+            if let Some(Drag::Stretch(stretch)) = self.drag {
+                let mut to = if stretch.fit_view { View::full(dur) } else { v };
+                to.clamp(dur, min_span);
+                if to != v {
+                    if motion() {
+                        self.refit = Some((v, to, self.now));
+                    } else {
+                        self.view = to;
+                    }
+                    ui.ctx().request_repaint();
+                }
             }
             self.drag = None;
         }
@@ -1089,7 +1173,15 @@ impl ClipApp {
         }
 
         let video = lane_clip(rows.video.shrink(1.0));
-        for segment in self.edit.segments.iter().filter(|s| !s.removed && s.speed != Speed::NORMAL) {
+        for (i, segment) in self.edit.segments.iter().enumerate() {
+            let returning = transition.filter(|(m, _, _)| m.index == i);
+            if segment.removed || (segment.speed == Speed::NORMAL && returning.is_none()) {
+                continue;
+            }
+            let mut video = video.clone();
+            if let Some((_, _, t)) = returning {
+                video.multiply_opacity(1.0 - t);
+            }
             let left = x_of(segment.start.max(self.edit.range.start)).max(video.clip_rect().left());
             let right = x_of(segment.end.min(self.edit.range.end)).min(video.clip_rect().right());
             if right <= left {
@@ -1097,7 +1189,8 @@ impl ClipApp {
             }
 
             let top = rows.video.top() + 4.0;
-            let text = video.layout_no_wrap(segment.speed.label(), mono(11.0), p.t1);
+            let speed = returning.map_or(segment.speed, |(_, speed, _)| speed);
+            let text = video.layout_no_wrap(speed.label(), mono(11.0), p.t1);
             let size = text.size() + vec2(10.0, 4.0);
             if size.x + 8.0 <= right - left {
                 let badge = Rect::from_min_size(pos2(left + 4.0, top), size);
@@ -1249,6 +1342,15 @@ impl ClipApp {
             painter.rect_filled(thumb, CornerRadius::same(2), if lit { p.t3 } else { p.line3 });
         }
         self.rename_field(ui, look, &chips, &info);
+        if let Some(i) = reset_speed {
+            let piece = self.edit.segments[i];
+            self.change(|e| e.set_speed(i, Speed::NORMAL));
+            self.reset_motion = motion().then_some(ResetMotion { index: i, piece, view: v, at: self.now });
+            self.view.clamp(TimeMap::new(&self.edit).duration(), min_span);
+            self.selected = Some(Selected::Segment(i));
+            self.reveal(self.pos);
+            ui.ctx().request_repaint();
+        }
         self.settle_volume(false);
     }
 

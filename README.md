@@ -38,6 +38,7 @@ then trim it, crop it, mute a track, squeeze it under a size<br>
 park the playhead and drag either trim edge to its line to cut there; hold ctrl to bypass snapping<br>
 press **S** at each end of a section, then right-click that piece in the thumbnail strip to remove or restore it<br>
 hold **Shift** and drag either edge of a kept piece in the thumbnail strip to stretch or shorten its playback without trimming the source; the opposite edge stays put as you drag, and the current speed and duration appear beside the drag. Audio pitch follows the speed<br>
+double-click inside a retimed piece to restore it to **1×**; **Ctrl+Z** restores its previous speed. The focused piece stays at normal brightness while other kept pieces dim by 25%. If the whole timeline was visible before a speed drag, it eases to fit the new duration after release<br>
 park the playhead inside a kept piece to target it at either cut shared with another kept piece; otherwise, drag from the kept side you want<br>
 hover over a split for a hint: right-click the line to merge two kept pieces at the same speed; restore any removed piece first<br>
 removed pieces get a moving striped shade that fades in and out as you remove or restore them<br>
