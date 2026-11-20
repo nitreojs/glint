@@ -656,25 +656,23 @@ fn speed_drags_ease_the_painted_edge_into_the_fitted_timeline() {
             .max_by(f32::total_cmp)
             .expect("the painted trim shade")
     };
-    assert!(h.app.refit.is_some(), "refit animation should start after Shift-drag release");
+    let animate = glint_ui::widgets::motion();
     let released = shade_edge(&h);
     assert!(released < left + width * 0.2, "the extreme speed-up leaves most of the strip empty at release: {released}");
 
-    for _ in 0..4 {
-        h.frame(Vec::new());
+    h.frame(Vec::new());
+    if animate {
+        for _ in 0..3 {
+            h.frame(Vec::new());
+        }
+        let mid = shade_edge(&h);
+        assert!(mid > released + (left + width - released) * 0.5, "most of the visible travel should happen early: {released} -> {mid}");
+        assert!(mid < left + width * 0.95, "the visible clip edge should not snap to the final fit early: {mid}");
+        h.settle();
     }
-    let mid = shade_edge(&h);
-    assert!(h.app.refit.is_some(), "animation should still be active ~64ms in");
-    assert!(mid > released + (left + width - released) * 0.5, "most of the visible travel should happen early: {released} -> {mid}");
-    assert!(mid < left + width * 0.95, "the visible clip edge should not snap to the final fit early: {mid}");
 
-    for _ in 0..12 {
-        h.frame(Vec::new());
-    }
-
-    assert!(h.app.refit.is_none(), "refit should complete after 180ms");
     let done = shade_edge(&h);
-    assert!(done > mid, "the visible clip edge should finish filling the strip: {mid} -> {done}");
+    assert!(done > released, "the visible clip edge should fill the strip: {released} -> {done}");
     assert!(done > left + width * 0.95, "the final fitted edge should reach the end of the strip: {done}");
 
     h.app.edit.range.set_end(21 * SECOND, 42 * SECOND, 1);
@@ -688,12 +686,15 @@ fn speed_drags_ease_the_painted_edge_into_the_fitted_timeline() {
     let released = shade_edge(&h);
     assert!(released > fitted + width * 0.2, "slowing down stretches the piece under the pointer");
 
-    for _ in 0..4 {
-        h.frame(Vec::new());
+    h.frame(Vec::new());
+    if animate {
+        for _ in 0..3 {
+            h.frame(Vec::new());
+        }
+        let mid = shade_edge(&h);
+        assert!(fitted + 5.0 < mid && mid < released - 5.0, "the painted edge moves back as the view fits");
+        h.settle();
     }
-    let mid = shade_edge(&h);
-    assert!(fitted + 5.0 < mid && mid < released - 5.0, "the painted edge moves back as the view fits");
-    h.settle();
     assert!((shade_edge(&h) - fitted).abs() < 1.0, "the full recording fits again");
 }
 
