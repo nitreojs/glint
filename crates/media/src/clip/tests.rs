@@ -12,6 +12,56 @@ use super::trim::{self, Progress};
 
 const ACCENT: [u8; 3] = [0xE5, 0x40, 0x2F];
 
+#[test]
+fn a_standalone_soundtrack_decodes_and_seeks_without_a_video_stream() {
+    const RATE: u32 = 44_100;
+    const DATA_BYTES: u32 = RATE * 4;
+    let path = std::env::temp_dir().join(format!("glint-soundtrack-{}.wav", std::process::id()));
+    let mut wav = Vec::with_capacity(44 + DATA_BYTES as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + DATA_BYTES).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&RATE.to_le_bytes());
+    wav.extend_from_slice(&(RATE * 2).to_le_bytes());
+    wav.extend_from_slice(&2_u16.to_le_bytes());
+    wav.extend_from_slice(&16_u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&DATA_BYTES.to_le_bytes());
+    for sample in [8192_i16, -8192] {
+        for _ in 0..RATE {
+            wav.extend_from_slice(&sample.to_le_bytes());
+        }
+    }
+    std::fs::write(&path, wav).unwrap();
+
+    let _com = Com::init();
+    let result = (|| {
+        let mut audio = super::soundtrack::Soundtrack::open(&path)?;
+        let mut stereo = Vec::new();
+        let start = audio.read_stereo(&mut stereo)?;
+        let first = stereo.get(..2).and_then(|samples| <[f32; 2]>::try_from(samples).ok());
+        audio.seek(3 * SECOND / 2)?;
+        let mut sought = None;
+        while let Some(ts) = audio.read_stereo(&mut stereo)? {
+            if ts >= SECOND && sought.is_none() {
+                sought = stereo.get(..2).and_then(|samples| <[f32; 2]>::try_from(samples).ok());
+            }
+        }
+
+        Ok::<_, String>((audio.duration(), audio.rate(), start, first, sought, stereo))
+    })();
+    std::fs::remove_file(path).unwrap();
+
+    let (duration, rate, start, first, sought, end) = result.unwrap();
+    assert_eq!((duration, rate, start), (2 * SECOND, RATE, Some(0)));
+    assert_eq!(first, Some([0.25; 2]));
+    assert_eq!(sought, Some([-0.25; 2]));
+    assert!(end.is_empty());
+}
+
 // ---- headless exports: need ffmpeg and ffprobe on PATH -------------------------------------------
 
 fn tool(name: &str, args: &[&str]) -> String {

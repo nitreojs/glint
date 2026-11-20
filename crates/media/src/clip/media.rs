@@ -171,7 +171,7 @@ fn display_size(native: &IMFMediaType) -> Result<(u32, u32), String> {
 }
 
 /// How long the file plays, in 100 ns units.
-fn length(reader: &IMFSourceReader) -> Result<i64, String> {
+pub(super) fn length(reader: &IMFSourceReader) -> Result<i64, String> {
     unsafe {
         let mut pv =
             reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION).ctx("duration")?;
