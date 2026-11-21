@@ -14,7 +14,7 @@ use glint_core::record::Codec;
 use glint_core::record::keys::Position;
 use glint_ui::widgets::{self, Look, anim, ease, glide, mix, mono, sans, semibold};
 
-use super::{ClipApp, PAD};
+use super::{ClipApp, Note, PAD};
 
 const ROW_GAP: f32 = 14.0;
 const SAVE_H: f32 = 44.0;
@@ -182,13 +182,28 @@ impl ClipApp {
             return;
         }
         let mut child = ui.new_child(UiBuilder::new().max_rect(top).layout(Layout::top_down(Align::Min)));
-        egui::ScrollArea::vertical()
+        let planned = egui::ScrollArea::vertical()
             .id_salt("clip-panel-rows")
             .auto_shrink([false, false])
             .max_height(top.height())
-            .show(&mut child, |ui| self.rows(ui, look));
+            .show(&mut child, |ui| {
+                self.rows(ui, look);
+                let plan = self.plan();
+                let settings = self.saved.export;
+                if settings.format == Format::Video {
+                    let bitrate = match &plan {
+                        Some((Job::Video(VideoJob { video: Video::Encode { bitrate, .. }, .. }), _)) => Some(*bitrate),
+                        _ => None,
+                    };
+                    gap(ui);
+                    self.more_options(ui, look, bitrate);
+                    if self.saved.export != settings {
+                        return self.plan();
+                    }
+                }
 
-        let planned = self.plan();
+                plan
+            }).inner;
         let mut lines = None;
         if let (Some((job, why)), Some(src)) = (&planned, self.source()) {
             let painter = ui.painter();
@@ -474,14 +489,10 @@ impl ClipApp {
             gap(ui);
             self.keys_row(ui, look);
         }
-        if video {
-            gap(ui);
-            self.more_options(ui, look);
-        }
     }
 
     /// The "more options" disclosure: bitrate and codec, sliding open under its header.
-    fn more_options(&mut self, ui: &mut Ui, look: &Look) {
+    fn more_options(&mut self, ui: &mut Ui, look: &Look, bitrate: Option<u32>) {
         let p = look.p;
         let width = ui.available_width();
         let (r, resp) = ui.allocate_exact_size(vec2(width, 22.0), Sense::click());
@@ -513,7 +524,7 @@ impl ClipApp {
         body.set_clip_rect(shown.intersect(ui.clip_rect()));
         body.set_opacity(t);
         body.spacing_mut().item_spacing = vec2(6.0, 6.0);
-        self.more_rows(&mut body, look);
+        self.more_rows(&mut body, look, bitrate);
         let measured = body.min_rect().height();
         ui.data_mut(|d| d.insert_temp(height_id, measured));
         ui.advance_cursor_after_rect(shown);
@@ -522,14 +533,10 @@ impl ClipApp {
         }
     }
 
-    fn more_rows(&mut self, ui: &mut Ui, look: &Look) {
+    fn more_rows(&mut self, ui: &mut Ui, look: &Look, effective: Option<u32>) {
         let p = look.p;
         let width = ui.available_width();
         let source = self.info().and_then(|i| i.codec);
-        let effective = match self.job() {
-            Some(Job::Video(VideoJob { video: Video::Encode { bitrate, .. }, .. })) => Some(bitrate),
-            _ => None,
-        };
         let s = &mut self.saved.export;
         label(ui, look, "bitrate");
         let (text, sizes) = (&mut self.custom_mbps, &mut self.custom_mb);
@@ -639,8 +646,18 @@ impl ClipApp {
         }
     }
 
-    fn save_button(&mut self, ui: &mut Ui, look: &Look, row: Rect, gif: bool) {
+    fn save_button(&mut self, ui: &mut Ui, look: &Look, mut row: Rect, gif: bool) {
         let p = look.p;
+        if !matches!(self.toast.as_ref().map(|t| &t.note), Some(Note::Saved))
+            && let Some(file) = &mut self.last_export
+        {
+            let tile = Rect::from_min_size(row.min, vec2(56.0, row.height()));
+            row.min.x = tile.right() + 8.0;
+            if let Some(action) = file.compact(ui, look, tile) {
+                self.share_export(action);
+            }
+        }
+
         self.save_rect = row;
         let go = Rect::from_min_max(row.min, pos2(row.right() - MORE_W, row.bottom()));
         let more = Rect::from_min_max(pos2(go.right(), row.top()), row.max);
@@ -686,7 +703,7 @@ impl ClipApp {
             let r = Rect::from_min_size(go.min, vec2(go.width() * fill, go.height()));
             painter.rect_filled(r, left, Color32::from_white_alpha(56));
         }
-        painter.text(go.center(), Align2::CENTER_CENTER, &label, semibold(15.0), p.on_acc);
+        painter.with_clip_rect(go.intersect(painter.clip_rect())).text(go.center(), Align2::CENTER_CENTER, &label, semibold(15.0), p.on_acc);
         let c = more.center();
         let chevron = vec![c + vec2(-4.5, -2.0), c + vec2(0.0, 2.5), c + vec2(4.5, -2.0)];
         painter.add(Shape::line(chevron, Stroke::new(1.6, p.on_acc)));

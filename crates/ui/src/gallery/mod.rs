@@ -45,6 +45,7 @@ mod thumbs;
 mod view;
 
 pub use library::{length, list, sources};
+pub use thumbs::drag_preview;
 use library::Library;
 use play::Playback;
 use search::Search;

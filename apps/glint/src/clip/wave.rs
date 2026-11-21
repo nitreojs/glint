@@ -5,15 +5,137 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use eframe::egui;
+use eframe::egui::{self, Color32, Context, Id, Mesh, Painter, Rect, Shape, pos2};
+use glint_core::clip::edit::gain;
 use glint_core::clip::math::SECOND;
 use glint_core::log::log;
 use glint_media::clip::media::{self, ALL, ANY, Com, Got};
 use glint_media::record::Ctx;
+use glint_ui::widgets::{Look, anim_ctx, ease, mix, motion};
+
+use super::overlay::danger;
 
 /// One peak per 10 ms of sound.
 pub(super) const BUCKET: i64 = SECOND / 100;
 const BATCH: usize = 100;
+
+pub(super) const WAVES: [Color32; 6] = [
+    Color32::from_rgb(0x6A, 0xA7, 0xE8),
+    Color32::from_rgb(0x9A, 0xD1, 0x7A),
+    Color32::from_rgb(0xD6, 0x8A, 0xE0),
+    Color32::from_rgb(0xE8, 0xA8, 0x6A),
+    Color32::from_rgb(0x6A, 0xD1, 0xC4),
+    Color32::from_rgb(0xE0, 0xD4, 0x6A),
+];
+
+pub(super) struct Waveform {
+    pub(super) color: Color32,
+    hot: Color32,
+    gain: f32,
+}
+
+impl Waveform {
+    pub(super) fn recorded(
+        ctx: &Context,
+        look: &Look,
+        path: &Path,
+        source: usize,
+        volume: u16,
+        muted: bool,
+    ) -> Self {
+        let id = Id::unique(("recorded-wave", path, source));
+
+        Self::new(ctx, look, id, WAVES[source % WAVES.len()], volume, muted)
+    }
+
+    fn new(
+        ctx: &Context,
+        look: &Look,
+        id: Id,
+        hue: Color32,
+        volume: u16,
+        muted: bool,
+    ) -> Self {
+        let light = ctx.theme() == egui::Theme::Light;
+        let ink = if light { mix(hue, Color32::BLACK, 0.48) } else { hue };
+        let mute = ease(anim_ctx(ctx, id.with("mute"), muted, 0.3));
+        // cached peaks are square roots of the linear sample amplitudes
+        let target = gain(volume).sqrt();
+        let gain = if motion() {
+            ctx.animate_value_with_time(id.with("gain"), target, 0.15)
+        } else {
+            target
+        };
+
+        Self {
+            color: mix(ink, look.p.t3, mute),
+            hot: mix(danger(light), look.p.t3, mute),
+            gain,
+        }
+    }
+
+    pub(super) fn paint(
+        &self,
+        painter: &Painter,
+        rect: Rect,
+        peaks: &[u8],
+        source_at: impl Fn(f32) -> i64,
+    ) {
+        const PITCH: f32 = 2.0;
+        const WIDTH: f32 = 1.5;
+
+        let visible = rect.intersect(painter.clip_rect());
+        if !visible.is_positive() || rect.height() < 3.0 || peaks.is_empty() {
+            return;
+        }
+
+        let first = ((visible.left() - rect.left()) / PITCH).floor() as usize;
+        let last = ((visible.right() - rect.left()) / PITCH).ceil() as usize;
+        let mut at = source_at(rect.left() + first as f32 * PITCH).max(0) as u64;
+        if at / BUCKET as u64 >= peaks.len() as u64 {
+            return;
+        }
+
+        let cy = rect.center().y;
+        let room = rect.height() * 0.8;
+        let ceiling = rect.height() - 2.0;
+        let quiet = self.color.gamma_multiply(0.35);
+        let mut mesh = Mesh {
+            indices: Vec::with_capacity(6 * (last - first)),
+            vertices: Vec::with_capacity(4 * (last - first)),
+            ..Mesh::default()
+        };
+        for column in first..last {
+            let start = (at / BUCKET as u64) as usize;
+            if start >= peaks.len() {
+                break;
+            }
+
+            let x = rect.left() + column as f32 * PITCH;
+            at = source_at((x + PITCH).min(rect.right())).max(0) as u64;
+            let end = at.div_ceil(BUCKET as u64) as usize;
+            let end = end.clamp(start + 1, peaks.len());
+            let peak = peaks[start..end].iter().copied().max().unwrap_or(0);
+            let level = f32::from(peak) / 255.0 * self.gain;
+            let (height, color) = if level == 0.0 {
+                if column % 3 != 0 {
+                    continue;
+                }
+
+                (1.0, quiet)
+            } else {
+                ((level * room).clamp(1.0, ceiling), if level > 1.0 { self.hot } else { self.color })
+            };
+            let right = (x + WIDTH).min(rect.right());
+            let bar = Rect::from_min_max(pos2(x, cy - height / 2.0), pos2(right, cy + height / 2.0));
+            mesh.add_colored_rect(bar, color);
+        }
+
+        if !mesh.is_empty() {
+            painter.with_clip_rect(visible).add(Shape::mesh(mesh));
+        }
+    }
+}
 
 struct Chunk {
     track: usize,

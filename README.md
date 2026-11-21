@@ -45,6 +45,8 @@ removed pieces get a moving striped shade that fades in and out as you remove or
 if nothing has to be re-encoded, it isn't: the cut is lossless, starts on the exact frame, and glint says so<br>
 when combining sound, tracks that end early fall silent while the rest of the clip continues
 
+after saving, drag the thumbnail or filename into a chat, or click it and paste with **Ctrl+V**. After 8 seconds idle, the card becomes a thumbnail beside **Save** with the same drag and copy actions. It stays until the next successful export or you close the clip. Hover for size details; the card’s folder icon still shows the file in Explorer.
+
 in **settings → recording → after trimming**, keep both files (the default), keep only the trimmed copy, or ask each time<br>
 originals go to the recycle bin when the editor closes, only after an edited copy has saved successfully and still exists; unsaved changes or a later failed/cancelled export keep the original
 

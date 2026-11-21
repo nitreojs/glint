@@ -1,5 +1,5 @@
 use eframe::egui::{
-    self, Color32, CornerRadius, CursorIcon, Id, Mesh, Order, Painter, Rect, Role, Sense, Shape, Stroke, StrokeKind, Ui,
+    self, Color32, CornerRadius, CursorIcon, Id, Order, Painter, Rect, Role, Sense, Shape, Stroke, StrokeKind, Ui,
     WidgetInfo, pos2, vec2,
 };
 use glint_core::clip::edit::{Edit, FULL_VOLUME, MAX_VOLUME, Segment, Speed, TimeMap};
@@ -9,7 +9,7 @@ use glint_core::clip::math::{self, SECOND};
 use glint_ui::widgets::{Look, anim, ease, medium, mix, mono, motion, sans};
 
 use super::preview::speaker;
-use super::wave::BUCKET;
+use super::wave::{WAVES, Waveform};
 use super::clicklane::Axis;
 use super::{ClipApp, Play, Selected, scan};
 
@@ -44,14 +44,6 @@ const POP_W: f32 = 240.0;
 const POP_H: f32 = 40.0;
 const SNAP_PX: f32 = 8.0;
 const MARKER: Color32 = Color32::from_rgb(0xF5, 0xC0, 0x4A);
-const WAVES: [Color32; 6] = [
-    Color32::from_rgb(0x6A, 0xA7, 0xE8),
-    Color32::from_rgb(0x9A, 0xD1, 0x7A),
-    Color32::from_rgb(0xD6, 0x8A, 0xE0),
-    Color32::from_rgb(0xE8, 0xA8, 0x6A),
-    Color32::from_rgb(0x6A, 0xD1, 0xC4),
-    Color32::from_rgb(0xE0, 0xD4, 0x6A),
-];
 
 /// The timeline's height with `lanes` sound lanes `lane` tall, and the overlay lanes when present.
 pub(super) fn height(lanes: usize, lane: f32, clicks: bool, keys: bool) -> f32 {
@@ -1078,26 +1070,11 @@ impl ClipApp {
                 }
                 continue;
             };
-            let Some(peaks) = self.peaks.get(source).filter(|v| !v.is_empty()) else { continue };
-            let color = WAVES[source % WAVES.len()].gamma_multiply(0.75 * fade);
-            let hot = super::overlay::danger(light).gamma_multiply(0.85 * fade);
-            // the peaks are square roots of the level, so they scale by the gain's
-            let gain = lanes[k].gain().sqrt();
-            let gain = ui.ctx().animate_value_with_time(Id::unique(("clip-lane-gain", source)), gain, if animate { 0.15 } else { 0.0 });
-            let mut mesh = Mesh::default();
-            let (cy, room, top) = (l.center().y, l.height() * 0.8, l.height() - 2.0);
-            let mut x = x_start;
-            let mut b0 = (t_raw(x).max(0) / BUCKET) as usize;
-            while x < stop && b0 < peaks.len() {
-                let next_x = x + 2.0;
-                let b1 = (t_raw(next_x).max(0) / BUCKET) as usize;
-                let peak = peaks[b0..b1.clamp(b0 + 1, peaks.len())].iter().copied().max().unwrap_or(0);
-                let level = peak as f32 / 255.0 * gain;
-                let h = (level * room).clamp(1.0, top);
-                mesh.add_colored_rect(Rect::from_min_size(pos2(x, cy - h / 2.0), vec2(1.5, h)), if level > 1.0 { hot } else { color });
-                (x, b0) = (next_x, b1);
+            if let Some(peaks) = self.peaks.get(source).filter(|p| !p.is_empty()) {
+                let wave = Waveform::recorded(ui.ctx(), look, &self.path, source, lanes[k].volume, lanes[k].muted);
+                let rect = l.with_min_x(x_start).with_max_x(stop);
+                wave.paint(&clip, rect, peaks, t_of);
             }
-            clip.add(Shape::mesh(mesh));
         }
 
         if let Some(lane) = &click_lane {

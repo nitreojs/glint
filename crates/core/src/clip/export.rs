@@ -720,21 +720,28 @@ pub fn size_label(bytes: u64) -> String {
     }
 }
 
-/// The done message's comparison of a compressed export (`after`) with what that stretch of the source took
-/// (`before`): `412 MB → 190 MB (−54%)`, or plainly that it isn't smaller. None with nothing to compare to.
-pub fn saving_label(before: u64, after: u64) -> Option<String> {
-    if before == 0 {
-        return None;
-    }
-    let sizes = format!("{} → {}", size_label(before), size_label(after));
-    let pct = (before.saturating_sub(after) as f64 * 100.0 / before as f64).round();
-    Some(if after >= before {
+/// The finished file's size and an optional comparison with the source stretch. Only reductions
+/// of at least 5% are called out in the compact label; the detail includes both sizes.
+pub fn saved_size(before: Option<u64>, after: u64) -> (String, Option<String>) {
+    let size = size_label(after);
+    let Some(before) = before.filter(|&b| b > 0) else {
+        return (size, None);
+    };
+
+    let sizes = format!("{} → {size}", size_label(before));
+    let reduction = u128::from(before.saturating_sub(after)) * 100;
+    let base = u128::from(before);
+    let pct = (reduction + base / 2) / base;
+    let detail = if after >= before {
         format!("{sizes}, not smaller: the source was already compact")
-    } else if pct < 1.0 {
+    } else if pct == 0 {
         format!("{sizes}, about the same: the source was already compact")
     } else {
         format!("{sizes} (−{pct}%)")
-    })
+    };
+    let short = if reduction >= 5 * base { format!("{size} (−{pct}%)") } else { size };
+
+    (short, Some(detail))
 }
 
 #[cfg(test)]
@@ -1251,14 +1258,18 @@ mod tests {
         assert_eq!(source.bytes_for(10 * S), 15_500_000);
         assert_eq!((source.bytes_for(40 * S), source.bytes_for(-S)), (31_000_000, 0));
 
-        assert_eq!(saving_label(412_000_000, 190_000_000).unwrap(), "412 MB → 190 MB (−54%)");
-        assert_eq!(saving_label(9_640_000, 420_000).unwrap(), "9.6 MB → 420 KB (−96%)");
-        let same = saving_label(412_000_000, 410_000_000).unwrap();
-        assert_eq!(same, "412 MB → 410 MB, about the same: the source was already compact");
-        let not = "not smaller: the source was already compact";
-        assert_eq!(saving_label(50_000_000, 50_000_000).unwrap(), format!("50 MB → 50 MB, {not}"));
-        assert_eq!(saving_label(50_000_000, 64_000_000).unwrap(), format!("50 MB → 64 MB, {not}"));
-        assert_eq!(saving_label(0, 1_000), None);
+        let (short, detail) = saved_size(Some(412_000_000), 190_000_000);
+        assert_eq!(short, "190 MB (−54%)");
+        assert_eq!(detail.as_deref(), Some("412 MB → 190 MB (−54%)"));
+
+        let (short, detail) = saved_size(Some(1_600_000), 1_599_000);
+        assert_eq!(short, "1.6 MB");
+        assert!(detail.unwrap().starts_with("1.6 MB → 1.6 MB"));
+        assert_eq!(saved_size(Some(1_000_000), 950_001).0, "950 KB");
+        assert_eq!(saved_size(Some(1_000_000), 950_000).0, "950 KB (−5%)");
+        assert_eq!(saved_size(Some(1_000_000), 1_100_000).0, "1.1 MB");
+        assert_eq!(saved_size(None, 420_000), ("420 KB".into(), None));
+        assert_eq!(saved_size(Some(0), 420_000), ("420 KB".into(), None));
     }
 }
 

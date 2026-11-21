@@ -2,7 +2,7 @@
 //! Telegram, Discord. The files go as CF_HDROP in an OLE data object of our own, with a picture
 //! under the pointer, and only ever as a copy: a drop never moves or deletes the user's file.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
 
@@ -22,13 +22,14 @@ use windows::Win32::System::Com::{
 use windows::Win32::System::Memory::GMEM_MOVEABLE;
 use windows::Win32::System::Ole::{
     CF_HDROP, CLIPBOARD_FORMAT, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, DoDragDrop, IDropSource, IDropSource_Impl,
-    OleDuplicateData, OleInitialize, OleUninitialize, ReleaseStgMedium,
+    IDropSourceNotify, IDropSourceNotify_Impl, OleDuplicateData, OleInitialize, OleUninitialize, ReleaseStgMedium,
 };
 use windows::Win32::System::SystemServices::{MK_LBUTTON, MK_RBUTTON, MODIFIERKEYS_FLAGS};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_LBUTTON};
 use windows::Win32::UI::Shell::{CLSID_DragDropHelper, IDragSourceHelper, SHCreateStdEnumFmtEtc, SHDRAGIMAGE};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetCursorPos, GetSystemMetrics, PostMessageW, SM_CXDRAG, SM_CYDRAG, WM_LBUTTONUP, WM_MOUSEMOVE,
+    GetCursorPos, GetSystemMetrics, IDC_NO, IsChild, LoadCursorW, PostMessageW, SM_CXDRAG, SM_CYDRAG, SetCursor,
+    WM_LBUTTONUP, WM_MOUSEMOVE,
 };
 use windows::core::{BOOL, HRESULT, Ref, implement};
 
@@ -74,7 +75,7 @@ pub fn files(owner: Option<HWND>, paths: &[PathBuf], image: Option<&Image>) -> R
     {
         log(&format!("drag: no picture: {e}"));
     }
-    let source: IDropSource = Source.into();
+    let source: IDropSource = Source { owner, over_owner: Cell::new(false) }.into();
     let mut effect = DROPEFFECT_NONE;
     let done = unsafe { DoDragDrop(&data, &source, DROPEFFECT_COPY, &mut effect) };
     if let Some(h) = owner {
@@ -116,11 +117,13 @@ impl Drop for Ole {
 fn settle(owner: HWND) {
     let mut at = POINT::default();
     unsafe {
-        if GetCursorPos(&mut at).is_err() || !ScreenToClient(owner, &mut at).as_bool() {
-            return;
+        let mut lp = LPARAM(0);
+        if GetCursorPos(&mut at).is_ok() && ScreenToClient(owner, &mut at).as_bool() {
+            lp = LPARAM(((at.y as u16 as u32) << 16 | at.x as u16 as u32) as isize);
+            let _ = PostMessageW(Some(owner), WM_MOUSEMOVE, WPARAM(0), lp);
         }
-        let lp = LPARAM(((at.y as u16 as u32) << 16 | at.x as u16 as u32) as isize);
-        let _ = PostMessageW(Some(owner), WM_MOUSEMOVE, WPARAM(0), lp);
+
+        // the cursor position can be unavailable off the input desktop; the button still went up
         let _ = PostMessageW(Some(owner), WM_LBUTTONUP, WPARAM(0), lp);
     }
 }
@@ -307,26 +310,52 @@ impl IDataObject_Impl for Data_Impl {
     }
 }
 
-/// What tells OLE's loop when the drag ends: the left button let go drops, esc or the right
-/// button calls it off.
-#[implement(IDropSource)]
-struct Source;
+/// Releasing over the source cancels, even when that window normally accepts dropped files.
+#[implement(IDropSource, IDropSourceNotify)]
+struct Source {
+    owner: Option<HWND>,
+    over_owner: Cell<bool>,
+}
+
+impl IDropSourceNotify_Impl for Source_Impl {
+    fn DragEnterTarget(&self, target: HWND) -> windows::core::Result<()> {
+        self.over_owner.set(self.owner.is_some_and(|owner| owner == target || unsafe { IsChild(owner, target) }.as_bool()));
+
+        Ok(())
+    }
+
+    fn DragLeaveTarget(&self) -> windows::core::Result<()> {
+        self.over_owner.set(false);
+
+        Ok(())
+    }
+}
 
 impl IDropSource_Impl for Source_Impl {
     fn QueryContinueDrag(&self, escape: BOOL, keys: MODIFIERKEYS_FLAGS) -> HRESULT {
         if escape.as_bool() || keys.0 & MK_RBUTTON.0 != 0 {
             DRAGDROP_S_CANCEL
         } else if keys.0 & MK_LBUTTON.0 == 0 {
-            DRAGDROP_S_DROP
+            if self.over_owner.get() { DRAGDROP_S_CANCEL } else { DRAGDROP_S_DROP }
         } else {
             S_OK
         }
     }
 
     fn GiveFeedback(&self, _effect: DROPEFFECT) -> HRESULT {
+        if self.over_owner.get() && let Ok(cursor) = unsafe { LoadCursorW(None, IDC_NO) } {
+            unsafe { SetCursor(Some(cursor)) };
+
+            return S_OK;
+        }
+
         DRAGDROP_S_USEDEFAULTCURSORS
     }
 }
+
+#[cfg(test)]
+#[path = "drag_source_tests.rs"]
+mod source_tests;
 
 #[cfg(test)]
 mod tests {

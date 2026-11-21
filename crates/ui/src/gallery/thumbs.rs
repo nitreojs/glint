@@ -231,6 +231,38 @@ pub(super) fn cached_within(dir: &Path, key: u64, size: (u32, u32)) -> Option<Pi
     Wic::new().ok()?.memory_fit(image, |w, h| fit_into(w, h, size)).ok()
 }
 
+/// The first frame as an on-screen thumbnail and its native drag image. The calling thread needs COM.
+pub fn drag_preview(path: &Path, size: (u32, u32)) -> Result<(ColorImage, glint_shell::drag::Image), String> {
+    let fit = |w, h| fit_into(w, h, size);
+    let pixels = match Kind::of(path) {
+        Some(Kind::Recording) => recording(path, |_| 0, fit)?.0,
+        Some(Kind::Gif | Kind::Shot) => Wic::new()?.file(path, fit)?.0,
+        None => return Err("no preview for this file type".into()),
+    };
+    let (w, h) = (pixels.w, pixels.h);
+    let image = pixels.image();
+    let hold = ((w / 2) as i32, (h / 2) as i32);
+
+    Ok((image, glint_shell::drag::Image { w, h, bgra: pixels.bgra, hold }))
+}
+
+fn recording(
+    path: &Path,
+    at: impl FnOnce(i64) -> i64,
+    fit: impl FnOnce(u32, u32) -> (u32, u32),
+) -> Result<(Pixels, Meta), String> {
+    let even = |w, h| {
+        let (w, h) = fit(w, h);
+
+        ((w & !1).max(2), (h & !1).max(2))
+    };
+    let s = media::still(path, gpu(), at, even)?;
+    let duration_ms = (s.duration / 10_000).clamp(0, u32::MAX as i64) as u32;
+    let meta = Meta { width: s.native.0, height: s.native.1, duration_ms, alpha: false };
+
+    Ok((Pixels::opaque(s.size.0, s.size.1, s.bgrx), meta))
+}
+
 fn make(wic: &Wic, dir: &Path, job: &Job) -> Result<(Pixels, Meta), String> {
     let fit = |w, h| thumb::size_for(w, h, SHORT, LONG);
     let (pixels, meta) = match job.kind {
@@ -247,14 +279,7 @@ fn make(wic: &Wic, dir: &Path, job: &Job) -> Result<(Pixels, Meta), String> {
         Kind::Recording => {
             // a second in, or a tenth of a short one: past the first frame's fade, before the first seek point
             let at = |len: i64| (len / 10).min(SECOND);
-            let even = |w, h| {
-                let (w, h) = fit(w, h);
-                ((w & !1).max(2), (h & !1).max(2))
-            };
-            let s = media::still(&job.path, gpu(), at, even)?;
-            let duration_ms = (s.duration / 10_000).clamp(0, u32::MAX as i64) as u32;
-            let meta = Meta { width: s.native.0, height: s.native.1, duration_ms, alpha: false };
-            (Pixels::opaque(s.size.0, s.size.1, s.bgrx), meta)
+            recording(&job.path, at, fit)?
         }
     };
     store(dir, job.key, &pixels, meta);

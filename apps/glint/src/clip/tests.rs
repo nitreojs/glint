@@ -1197,6 +1197,69 @@ fn a_file_held_over_an_open_clip_shows_where_it_goes() {
 }
 
 #[test]
+fn the_saved_export_drags_only_from_its_card_and_only_after_moving() {
+    let mut h = Harness::new(1);
+    let output = std::env::temp_dir().join(format!("glint-missing-{}", std::process::id())).join("edited clip.mp4");
+    h.app.finish_export(output.clone(), Then::Nothing, Some(1_000_000), Some(2_000_000));
+    h.settle();
+    let file = h.at("edited clip.mp4");
+    let link = h.ctx.read_response(egui::Id::unique(share::LINK_ID)).unwrap().rect.center();
+    let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE };
+    assert!(h.has("1.0 MB (−50%) · drag to share · click to copy"));
+
+    h.frame(vec![Event::PointerMoved(link), button(link, true)]);
+    h.frame(vec![Event::PointerMoved(file)]);
+    h.frame(vec![button(file, false)]);
+    assert!(matches!(&h.app.toast, Some(Toast { note: Note::Saved, .. })));
+
+    h.frame(vec![Event::PointerMoved(file), button(file, true)]);
+    h.time += 10.0;
+    h.frame(vec![Event::PointerMoved(file + vec2(0.5, 0.0))]);
+    assert!(h.has("edited clip.mp4"), "a hold isn't a drag and keeps the card alive");
+
+    let dx = (glint_shell::drag::threshold().0 + 1) as f32 / h.ctx.pixels_per_point();
+    h.frame(vec![Event::PointerMoved(file + vec2(dx, 0.0))]);
+    let note = h.app.toast.as_ref().map(|t| &t.note);
+    assert!(matches!(note, Some(Note::Failed(err)) if err.contains(&*output.to_string_lossy())), "the drag checks the finished export, not the input");
+    assert!(h.app.task.is_none() && h.app.upload.is_none());
+}
+
+#[test]
+fn the_saved_export_remains_shareable_after_idle_and_is_scoped_to_the_open_clip() {
+    let mut h = Harness::new(1);
+    let missing = std::env::temp_dir().join(format!("glint-last-export-{}", std::process::id()));
+    let first = missing.join("first.mp4");
+    let second = missing.join("second.gif");
+    let tile_id = egui::Id::unique(share::LAST_ID);
+    h.app.finish_export(first.clone(), Then::Nothing, Some(1_599_000), Some(1_600_000));
+    h.settle();
+    assert!(h.has("1.6 MB · drag to share · click to copy"));
+    assert!(h.ctx.read_response(tile_id).is_none());
+
+    h.time += 8.0;
+    h.settle();
+    let tile = h.ctx.read_response(tile_id).unwrap().rect;
+    assert!(tile.right() < h.app.save_rect.left());
+    assert!(!h.has("first.mp4"));
+    h.time += 120.0;
+    h.click(tile.center());
+    assert!(matches!(&h.app.toast, Some(Toast { note: Note::Failed(e), .. }) if e.contains(&*first.to_string_lossy())));
+    assert!(h.app.task.is_none(), "a missing export isn't regenerated");
+
+    h.app.finish_export(second.clone(), Then::Nothing, Some(420_000), None);
+    h.settle();
+    h.app.toast(Note::Info("cancelled, nothing was saved".into()));
+    h.settle();
+    let tile = h.ctx.read_response(tile_id).unwrap().rect;
+    h.click(tile.center());
+    assert!(matches!(&h.app.toast, Some(Toast { note: Note::Failed(e), .. }) if e.contains(&*second.to_string_lossy())));
+
+    h.app.swap_in(&h.ctx, file("another.mp4", 1), None);
+    h.settle();
+    assert!(h.ctx.read_response(tile_id).is_none());
+}
+
+#[test]
 fn the_panel_says_when_the_export_is_lossless_and_why_not() {
     let mut h = Harness::opened(info(1, None, None), Some(index(1)));
     assert!(h.has("lossless") && h.has("· no re-encode"));

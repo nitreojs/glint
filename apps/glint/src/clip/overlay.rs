@@ -4,6 +4,7 @@ use eframe::egui::{
 };
 use glint_ui::widgets::{self, Kind, Look, anim, ease, hint, keycaps, mix, sans, semibold};
 
+use super::share::{self, Action};
 use super::{ClipApp, Note, Then, describe};
 
 const MENU_W: f32 = 220.0;
@@ -173,129 +174,100 @@ impl ClipApp {
     }
 
     pub(super) fn keys_sheet(&mut self, ctx: &egui::Context, look: &Look, body: Rect) {
-        let p = look.p;
-        let t = ease(widgets::anim_ctx(ctx, Id::unique("clip-sheet-open"), self.sheet, 0.2));
-        if t <= 0.0 {
+        let progress = widgets::anim_ctx(ctx, Id::unique("clip-sheet-open"), self.sheet, 0.2);
+        if progress <= 0.0 && !self.sheet {
+            if ctx.read_response(Id::unique("clip-sheet-back")).is_some() {
+                ctx.request_repaint();
+            }
             return;
         }
-        let area = egui::Area::new(Id::unique("clip-sheet")).order(Order::Foreground).fixed_pos(body.min).interactable(self.sheet);
-        let half = KEYS.len().div_ceil(2);
-        let (row_h, col_w) = (28.0, 300.0);
-        let card = Rect::from_center_size(body.center(), vec2(2.0 * col_w + 48.0 + 24.0, half as f32 * row_h + 40.0 + 40.0));
-        let pivot = card.center().to_vec2();
-        let s = 0.97 + 0.03 * t;
-        let mut close = false;
-        let shown = area.show(ctx, |ui| {
-            ui.set_opacity(t);
-            let back = ui.interact(body, Id::unique("clip-sheet-back"), Sense::click());
-            close |= back.clicked();
-            let painter = ui.painter();
-            let r = glint_ui::window::radius(ctx);
-            let corners = egui::CornerRadius { nw: 0, ne: 0, sw: r, se: r };
-            painter.rect_filled(body, corners, Color32::from_rgba_premultiplied(10, 10, 10, 204));
-            painter.rect(card, 10, p.surf, Stroke::new(1.0, p.line2), StrokeKind::Inside);
-            painter.text(card.left_top() + vec2(24.0, 20.0), Align2::LEFT_TOP, "keys", semibold(15.0), p.t1);
-            for (i, (keys, after, what)) in KEYS.iter().enumerate() {
-                let (col, row) = (i / half, i % half);
-                let x = card.left() + 24.0 + col as f32 * (col_w + 24.0);
-                let y = card.top() + 60.0 + row as f32 * row_h;
-                let mut cx = x;
-                for (k, key) in keys.iter().enumerate() {
-                    if k > 0 {
-                        cx += 2.0;
-                    }
-                    cx = keycaps(painter, ui, &p, cx, y, &[(*key).to_string()], false);
-                }
-                if !after.is_empty() {
-                    painter.text(pos2(cx, y), Align2::LEFT_CENTER, *after, sans(13.0), p.t2);
-                }
-                painter.text(pos2(x + 128.0, y), Align2::LEFT_CENTER, *what, sans(13.0), p.t2);
-            }
-        });
-        ctx.set_transform_layer(
-            shown.response.layer_id,
-            TSTransform::from_translation(pivot) * TSTransform::from_scaling(s) * TSTransform::from_translation(-pivot),
-        );
-        if close && self.sheet {
+
+        let opacity = ease(progress);
+        if show_keys_sheet(ctx, look, body, opacity) && self.sheet {
             self.sheet = false;
+            ctx.request_repaint();
         }
     }
 
     pub(super) fn show_toast(&mut self, ctx: &egui::Context, look: &Look, body: Rect) {
         let p = look.p;
-        let Some(toast) = &self.toast else { return };
+        let Some(toast) = &mut self.toast else { return };
         let life = match toast.note {
             Note::Failed(_) | Note::Left(_) => 6.0,
-            Note::Saved(..) | Note::Uploaded { .. } | Note::Copied(Some(_)) => 4.0,
+            Note::Saved => 8.0,
+            Note::Uploaded { .. } => 4.0,
             _ => 2.2,
         };
-        let age = self.now - toast.at;
-        let hovered_id = Id::unique("clip-toast");
-        let held = ctx.read_response(hovered_id).is_some_and(|r| r.hovered());
-        if held && let Some(t) = &mut self.toast {
-            t.at = self.now - age.min(life - 0.5);
+        let held = matches!(toast.note, Note::Saved) && self.last_export.as_ref().is_some_and(|file| file.dragged)
+            || [share::FILE_ID, share::LINK_ID, "clip-toast"].into_iter().any(|key| {
+                ctx.read_response(Id::unique(key)).is_some_and(|r| {
+                    r.hovered() || r.is_pointer_button_down_on() || (look.keyboard && r.has_focus())
+                })
+            });
+        if held || toast.held {
+            toast.at = self.now;
         }
-        let visible = age < life;
+        toast.held = held;
+
+        let visible = self.now - toast.at < life;
         let t = ease(widgets::anim_ctx(ctx, Id::unique("clip-toast-shown"), visible, 0.25));
         if !visible && t <= 0.0 {
             self.toast = None;
+            ctx.request_repaint();
             return;
         }
-        ctx.request_repaint();
-        let Some(toast) = &self.toast else { return };
-        let (text, link, color) = match &toast.note {
-            Note::Saved(path, saving) => {
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let saving = saving.as_ref().map_or(String::new(), |s| format!(" · {s}"));
-                (format!("saved {name}{saving} · "), Some("show in folder"), p.t1)
-            }
-            Note::Uploaded { url, copied } => {
-                (format!("{} {url} · ", if *copied { "uploaded, link copied:" } else { "uploaded:" }), Some("open"), p.t1)
-            }
-            Note::Copied(saving) => {
-                let saving = saving.as_ref().map_or(String::new(), |s| format!(" · {s}"));
-                (format!("copied, paste it anywhere{saving}"), None, p.t1)
-            }
-            Note::Info(s) => (s.clone(), None, p.t2),
-            Note::Failed(s) => (s.clone(), None, p.warn),
-            Note::Left(name) => (format!("{name}: edits kept · "), Some("back"), p.t1),
-        };
-        let note = toast.note.clone();
-        let mut open = false;
-        egui::Area::new(Id::unique("clip-toast-area")).order(Order::Tooltip).fixed_pos(body.min).interactable(true).show(ctx, |ui| {
+        if visible && !held {
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(life - (self.now - toast.at)));
+        }
+        let base = body.center_bottom() + vec2(0.0, -24.0 + 10.0 * (1.0 - t));
+        let area = egui::Area::new(Id::unique("clip-toast-area"))
+            .order(Order::Tooltip)
+            .pivot(Align2::CENTER_BOTTOM)
+            .fixed_pos(base);
+        let action = area.show(ctx, |ui| {
             ui.set_opacity(t);
+            let (text, link, color) = match &mut toast.note {
+                Note::Saved => return self.last_export.as_mut()?.card(ui, look, body.width() - 32.0),
+                Note::Uploaded { url, copied } => {
+                    (format!("{} {url} · ", if *copied { "uploaded, link copied:" } else { "uploaded:" }), Some("open"), p.t1)
+                }
+                Note::Copied => ("copied, paste it anywhere".into(), None, p.t1),
+                Note::Info(s) => (s.clone(), None, p.t2),
+                Note::Failed(s) => (s.clone(), None, p.warn),
+                Note::Left(name) => (format!("{name}: edits kept · "), Some("back"), p.t1),
+            };
             let painter = ui.painter();
             let g = painter.layout(text, sans(13.0), color, body.width() - 120.0);
             let lg = link.map(|l| painter.layout_no_wrap(l.to_string(), sans(13.0), p.t1));
             let w = g.size().x + lg.as_ref().map_or(0.0, |l| l.size().x) + 28.0;
             let h = g.size().y.max(18.0) + 16.0;
-            let r = Rect::from_min_size(pos2(body.center().x - w / 2.0, body.bottom() - 24.0 - h + 10.0 * (1.0 - t)), vec2(w, h));
-            ui.interact(r, hovered_id, Sense::hover());
+            let (r, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+            ui.interact(r, Id::unique("clip-toast"), Sense::hover());
+            let painter = ui.painter();
             painter.rect(r, 8, p.ctl, Stroke::new(1.0, p.line2), StrokeKind::Inside);
             let gx = r.left() + 14.0;
             let gw = g.size().x;
             painter.galley(pos2(gx, r.center().y - g.size().y / 2.0), g, color);
-            if let Some(lg) = lg {
-                let at = pos2(gx + gw, r.center().y - lg.size().y / 2.0);
-                let lr = Rect::from_min_size(at, lg.size());
-                let lresp = ui.interact(lr.expand(3.0), Id::unique("clip-toast-link"), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
-                lresp.widget_info(|| WidgetInfo::labeled(Role::Link, true, link.unwrap_or_default()));
-                let hv = anim(ui, lresp.id.with("hov"), lresp.hovered(), 0.1);
-                ui.painter().hline(lr.x_range(), lr.bottom() + 1.0, Stroke::new(1.0, mix(p.line3, p.t1, hv)));
-                ui.painter().galley(at, lg, p.t1);
-                open |= lresp.clicked();
+            let lg = lg?;
+            let at = pos2(gx + gw, r.center().y - lg.size().y / 2.0);
+            let lr = Rect::from_min_size(at, lg.size());
+            let resp = ui.interact(lr.expand(3.0), Id::unique(share::LINK_ID), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+            resp.widget_info(|| WidgetInfo::labeled(Role::Link, true, link.unwrap_or_default()));
+            let hv = anim(ui, resp.id.with("hov"), resp.hovered(), 0.1);
+            ui.painter().hline(lr.x_range(), lr.bottom() + 1.0, Stroke::new(1.0, mix(p.line3, p.t1, hv)));
+            ui.painter().galley(at, lg, p.t1);
+
+            resp.clicked().then_some(Action::Open)
+        }).inner;
+        let Some(action) = action else { return };
+        match (&toast.note, action) {
+            (Note::Saved, action) => self.share_export(action),
+            (Note::Uploaded { url, .. }, Action::Open) => super::actions::open_url(url),
+            (Note::Left(_), Action::Open) => {
+                self.toast = None;
+                self.back();
             }
-        });
-        if open {
-            match note {
-                Note::Saved(path, _) => super::actions::show_in_folder(&path),
-                Note::Uploaded { url, .. } => super::actions::open_url(&url),
-                Note::Left(_) => {
-                    self.toast = None;
-                    self.back();
-                }
-                _ => {}
-            }
+            _ => {}
         }
     }
 
@@ -376,4 +348,53 @@ impl ClipApp {
             self.delete(ctx);
         }
     }
+}
+
+fn show_keys_sheet(ctx: &egui::Context, look: &Look, body: Rect, opacity: f32) -> bool {
+    let keys = &KEYS;
+    let title = "keys";
+    let half = keys.len().div_ceil(2);
+    let (row_h, col_w) = (28.0, 300.0);
+    let size = vec2(2.0 * col_w + 72.0, half as f32 * row_h + 80.0);
+    let card = Rect::from_center_size(body.center() + vec2(0.0, 5.0 * (1.0 - opacity)), size);
+    let area = egui::Area::new(Id::unique("clip-sheet"))
+        .order(Order::Foreground)
+        .fixed_pos(body.min)
+        .default_size(body.size())
+        .constrain_to(body)
+        .fade_in(false)
+        .role(Role::Dialog)
+        .accessible_name(title);
+
+    area.show(ctx, |ui| {
+        ui.set_min_size(body.size());
+        let back = ui.interact(body, Id::unique("clip-sheet-back"), Sense::CLICK | Sense::DRAG);
+
+        let p = look.p;
+        let radius = glint_ui::window::radius(ctx);
+        let corners = egui::CornerRadius { nw: 0, ne: 0, sw: radius, se: radius };
+        let dim = Color32::from_rgba_premultiplied(10, 10, 10, 204);
+        ui.multiply_opacity(opacity);
+        let painter = ui.painter();
+        painter.rect_filled(body, corners, dim);
+        painter.rect(card, 10, p.surf, Stroke::new(1.0, p.line2), StrokeKind::Inside);
+        painter.text(card.left_top() + vec2(24.0, 20.0), Align2::LEFT_TOP, title, semibold(15.0), p.t1);
+        for (i, (keys, after, what)) in keys.iter().enumerate() {
+            let x = card.left() + 24.0 + (i / half) as f32 * (col_w + 24.0);
+            let y = card.top() + 60.0 + (i % half) as f32 * row_h;
+            let mut cx = x;
+            for (k, key) in keys.iter().enumerate() {
+                if k > 0 {
+                    cx += 2.0;
+                }
+                cx = keycaps(painter, ui, &p, cx, y, &[(*key).to_string()], false);
+            }
+            if !after.is_empty() {
+                painter.text(pos2(cx, y), Align2::LEFT_CENTER, *after, sans(13.0), p.t2);
+            }
+            painter.text(pos2(x + 128.0, y), Align2::LEFT_CENTER, *what, sans(13.0), p.t2);
+        }
+
+        back.clicked()
+    }).inner
 }

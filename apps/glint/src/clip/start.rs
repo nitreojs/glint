@@ -145,7 +145,7 @@ impl ClipApp {
     /// The file held over the window, if any (the first video of those held); a dropped video
     /// opens.
     pub(super) fn files(&mut self, ctx: &egui::Context) -> Option<Held> {
-        if self.confirm_cleanup.is_some() {
+        if self.confirm_delete || self.confirm_cleanup.is_some() || self.closing {
             return None;
         }
         let (held, dropped): (Vec<PathBuf>, Vec<PathBuf>) = ctx.input(|i| {

@@ -194,7 +194,7 @@ impl Worker {
         let near = |ts| ts <= t && t - ts < SECOND;
         if self.ahead.as_ref().is_some_and(|f| near(f.ts)) {
             self.advance(reader)?;
-        } else if !self.head.as_ref().is_some_and(|f| near(f.decoded.ts)) && !(self.fresh && t == 0) {
+        } else if !(self.head.as_ref().is_some_and(|f| near(f.decoded.ts)) || self.fresh && t == 0) {
             media::seek(reader, t)?;
             self.head = None;
             self.ahead = None;

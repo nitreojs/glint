@@ -44,6 +44,7 @@ mod panel;
 mod player;
 mod preview;
 mod scan;
+mod share;
 mod start;
 mod timeline;
 mod wave;
@@ -253,12 +254,10 @@ struct Upload {
     thread: Option<JoinHandle<Result<String, String>>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
 enum Note {
-    /// The file, and when compressing how its size compares with the source's.
-    Saved(PathBuf, Option<String>),
+    Saved,
     Uploaded { url: String, copied: bool },
-    Copied(Option<String>),
+    Copied,
     Info(String),
     Failed(String),
     /// Another file opened over this one's unsaved edits, which "back" brings back.
@@ -268,6 +267,7 @@ enum Note {
 struct Toast {
     note: Note,
     at: f64,
+    held: bool,
 }
 
 /// Space plays on release unless the hold was used to pan.
@@ -332,6 +332,7 @@ struct ClipApp {
     hevc: bool,
     task: Option<Task>,
     upload: Option<Upload>,
+    last_export: Option<share::SavedFile>,
     toast: Option<Toast>,
     flash: f64,
     menu: bool,
@@ -453,6 +454,7 @@ impl ClipApp {
             hevc: false,
             task: None,
             upload: None,
+            last_export: None,
             toast: None,
             flash: f64::NEG_INFINITY,
             gone: false,
@@ -831,7 +833,7 @@ impl ClipApp {
     }
 
     fn toast(&mut self, note: Note) {
-        self.toast = Some(Toast { note, at: self.now });
+        self.toast = Some(Toast { note, at: self.now, held: false });
     }
 
     fn default_out(&self, gif: bool) -> PathBuf {
@@ -846,12 +848,15 @@ impl ClipApp {
         let Some(job) = self.job() else { return };
         let Some(info) = self.info().cloned() else { return };
         let whole = matches!(&job, Job::Video(v) if v.whole(&info));
-        if whole && dest.is_none() && then != Then::Nothing {
-            self.finish(self.path.clone(), then, None);
-            return;
+        if whole && dest.is_none() {
+            match then {
+                Then::Nothing => {}
+                Then::Copy => return self.toast(share::copy_file(self.hwnd, &self.path)),
+                Then::Upload => return self.start_upload(self.path.clone()),
+            }
         }
         let gif = matches!(job, Job::Gif(_));
-        let compressing = matches!(&job, Job::Video(VideoJob { video: Video::Encode { qp: Some(_), .. }, .. }));
+        let compressing = matches!(&job, Job::Video(VideoJob { video: Video::Encode { .. }, .. }));
         let before = self.source().filter(|_| compressing).map(|s| {
             let source_len = self.edit.kept().iter().map(|r| r.len()).sum();
 
@@ -922,18 +927,14 @@ impl ClipApp {
                 {
                     self.remember_trim(&path, edit);
                 }
-                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let size = std::fs::metadata(&path).ok().map(|m| m.len());
                 // the export shows what the clip it's cut from shows, whichever app saved that
                 let histories = Maker::ALL.map(|m| m.history(&appdata()));
                 let from = history::find_in(&histories, &self.path);
                 let (app, exe) = from.map_or((None, None), |e| (e.app, e.exe));
-                let entry = Entry::new(HistoryKind::Recording, Some(&path), size).with_app(app.as_deref(), exe.as_deref());
+                let entry = Entry::new(HistoryKind::Recording, Some(&path), size.unwrap_or_default()).with_app(app.as_deref(), exe.as_deref());
                 history::add(entry.with_duration(glint_ui::gallery::length(&path)));
-                if task.then == Then::Nothing {
-                    self.flash = self.now;
-                }
-                let saving = task.before.and_then(|b| export::saving_label(b, size));
-                self.finish(path, task.then, saving);
+                self.finish_export(path, task.then, size, task.before);
             }
             Err(e) => {
                 log(&format!("clip: exporting {} failed: {e}", self.path.display()));
@@ -942,15 +943,17 @@ impl ClipApp {
         }
     }
 
-    fn finish(&mut self, path: PathBuf, then: Then, saving: Option<String>) {
+    fn finish_export(&mut self, path: PathBuf, then: Then, size: Option<u64>, before: Option<u64>) {
+        let file = share::SavedFile::new(path, size, before);
         match then {
-            Then::Nothing => self.toast(Note::Saved(path, saving)),
-            Then::Upload => self.start_upload(path),
-            Then::Copy => match glint_shell::clipboard::copy_files(self.hwnd, std::slice::from_ref(&path)) {
-                Ok(()) => self.toast(Note::Copied(saving)),
-                Err(e) => self.toast(Note::Failed(format!("couldn't copy the file: {e}"))),
-            },
+            Then::Nothing => {
+                self.flash = self.now;
+                self.toast(Note::Saved);
+            }
+            Then::Copy => self.toast(share::copy_file(self.hwnd, &file.path)),
+            Then::Upload => self.start_upload(file.path.clone()),
         }
+        self.last_export = Some(file);
     }
 
     fn start_upload(&mut self, path: PathBuf) {
@@ -1152,6 +1155,8 @@ impl ClipApp {
         if redo && self.undo.redo(&mut self.edit) || undo && self.undo.undo(&mut self.edit) {
             self.selected = None;
             self.lane_menu = None;
+            self.renaming = None;
+            self.lane_drag = None;
             self.volume_pop = None;
             self.click_menu = None;
             self.click_sel.clear();
