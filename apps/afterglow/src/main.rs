@@ -8,6 +8,7 @@ mod config;
 mod events;
 mod gallery;
 mod glint;
+mod mux;
 mod note;
 mod settings;
 

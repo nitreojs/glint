@@ -45,6 +45,7 @@ use windows::core::w;
 
 /// Wakes a still note when it's time to leave.
 const TIMER: usize = 1;
+const EXPIRY_TIMER: usize = 2;
 /// Posted by the pacer once per composition while a note moves.
 const WM_FRAME: u32 = WM_APP + 1;
 /// Seconds to slide in (easing out), to morph into new text, and to slide back out (easing in).
@@ -212,6 +213,13 @@ pub fn show(monitor: Rect, place: Place, kind: Kind, title: &str, detail: &str) 
             Err(e) => log(&format!("can't show the note: {e}")),
         }
     }
+    // the overlay must expire even if DwmFlush stops driving animation frames
+    NOTES.with(|notes| {
+        if let Some(note) = notes.borrow().last() {
+            let expiry_ms = ((hold + EXIT) * 1000.0).ceil() as u32 + 1;
+            unsafe { SetTimer(Some(note.hwnd), EXPIRY_TIMER, expiry_ms, None) };
+        }
+    });
     tick();
 }
 
@@ -735,9 +743,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             tick();
             LRESULT(0)
         }
-        WM_TIMER if wp.0 == TIMER => {
+        WM_TIMER if matches!(wp.0, TIMER | EXPIRY_TIMER) => {
             unsafe {
-                let _ = KillTimer(Some(hwnd), TIMER);
+                let _ = KillTimer(Some(hwnd), wp.0);
             }
             tick();
             LRESULT(0)

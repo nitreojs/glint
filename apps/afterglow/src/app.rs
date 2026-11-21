@@ -90,6 +90,7 @@ struct Saving {
     app: Option<Source>,
     ms: u32,
     since: Instant,
+    timed_out: bool,
     auto: bool,
 }
 
@@ -393,21 +394,34 @@ impl App {
         }
     }
 
-    /// A save is being written, and not for so long that it's given up on.
     fn save_running(&self) -> bool {
-        self.saving.as_ref().is_some_and(|s| s.since.elapsed() < STUCK)
+        self.saving.as_ref().is_some_and(|save| save.since.elapsed() < STUCK)
+    }
+
+    fn check_save_timeout(&mut self) {
+        let Some(save) = &mut self.saving else { return };
+        if save.timed_out || save.since.elapsed() < STUCK {
+            return;
+        }
+
+        save.timed_out = true;
+        log(&format!("save #{} timed out after {:.0} s", save.id, save.since.elapsed().as_secs_f64()));
+        if !save.auto {
+            self.sample = false;
+            note::show(save.monitor, self.cfg.note_position, Kind::Failed, "save timed out", "you can save another clip");
+        }
     }
 
     /// Writes `cut`; an `auto` save shows no notes and needs no notification (the user games).
     fn write(&mut self, Cut { clip, monitor, name, app }: Cut, auto: bool) {
-        if let Some(s) = &self.saving {
-            if s.since.elapsed() < STUCK {
-                log("save asked for while one is still being written");
+        if self.save_running() {
+            log("save asked for while one is still being written");
+            if !auto {
                 note::show(monitor, self.cfg.note_position, Kind::Warning, "still saving", "the clip before this one");
-                return;
             }
-            log(&format!("save #{} never finished ({:.0} s): saving anyway", s.id, s.since.elapsed().as_secs_f64()));
+            return;
         }
+        self.check_save_timeout();
         // what this one covers is in it: auto-clip neither saves it again nor right after
         self.auto.saved(autoclip::now_ms());
         self.arm_auto();
@@ -435,13 +449,13 @@ impl App {
             note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
         }
         let ms = (secs * 1000.0).round() as u32;
-        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, ms, since: Instant::now(), auto });
+        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, ms, since: Instant::now(), timed_out: false, auto });
         buffer::save(id, clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
     }
 
     fn saved(&mut self, id: u64, result: Result<PathBuf, String>) {
         if self.saving.as_ref().is_none_or(|s| s.id != id) {
-            log(&format!("save #{id} finished after it was given up on: {result:?}"));
+            log(&format!("save #{id} finished after it timed out: {result:?}"));
             return;
         }
         let Some(Saving { long, monitor, capped, app, ms, since, auto, .. }) = self.saving.take() else { return };
@@ -841,7 +855,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return LRESULT(0);
         }
         WM_TIMER if wp.0 == TIP_TIMER => {
-            with_app(App::refresh_tray);
+            with_app(|app| {
+                app.check_save_timeout();
+                app.refresh_tray();
+            });
             return LRESULT(0);
         }
         WM_DESTROY => {

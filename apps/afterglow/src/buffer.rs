@@ -4,17 +4,17 @@ use std::path::{Path, PathBuf};
 
 use glint_core::geom::monitor::Output;
 use glint_core::geom::rect::Rect;
+use glint_core::log::log;
 use glint_core::record::pipeline::{Outcome, Recorder};
 use glint_core::record::replay::{Clip, Limits, ReplaySink};
-use glint_media::record::{Mp4Sink, Params, Source, start_packets};
+use glint_media::record::{Params, Source, start_packets};
 use glint_shell::monitors;
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
-use windows::Win32::Media::MediaFoundation::{MF_VERSION, MFSTARTUP_FULL, MFShutdown, MFStartup};
-use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::Config;
 use crate::events::{self, Watcher};
+use crate::mux;
 
 const SECOND: i64 = 10_000_000;
 
@@ -146,24 +146,15 @@ impl Buffer {
 /// Writes `clip` to `dir`/`name`.mp4 (or `name_2.mp4`… when taken) on its own thread, with the
 /// game events it covers; `done` hears `id` with the path or the error.
 pub fn save(id: u64, clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
-    std::thread::spawn(move || {
-        let result = unsafe {
-            let com = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-            let mf = MFStartup(MF_VERSION, MFSTARTUP_FULL).is_ok();
-            let r = write(clip, &dir.join(name));
-            if mf {
-                let _ = MFShutdown();
-            }
-            if com {
-                CoUninitialize();
-            }
-            r
-        };
-        done.post((id, result));
+    let worker = std::thread::Builder::new().name(format!("save-{id}")).spawn(move || {
+        done.post((id, write(id, clip, &dir.join(name))));
     });
+    if let Err(error) = worker {
+        done.post((id, Err::<PathBuf, _>(format!("couldn't start the save worker: {error}"))));
+    }
 }
 
-fn write(clip: Clip, stem: &Path) -> Result<PathBuf, String> {
+fn write(id: u64, clip: Clip, stem: &Path) -> Result<PathBuf, String> {
     if let Some(dir) = stem.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -173,20 +164,42 @@ fn write(clip: Clip, stem: &Path) -> Result<PathBuf, String> {
         p.push(".mp4");
         PathBuf::from(p)
     };
-    let path = std::iter::once(named("")).chain((2..).map(|n| named(&format!("_{n}")))).find(|p| !p.exists());
-    let path = path.expect("some number is free");
-    // written under another name until it's whole, so a save that dies halfway never looks like a clip
-    let mut part = path.clone().into_os_string();
-    part.push(".part");
-    let part = PathBuf::from(part);
-    let mut sink = Mp4Sink::create(&part)?;
+    let (path, part) = reserve_output(std::iter::once(named("")).chain((2..).map(|n| named(&format!("_{n}")))))?;
+    log(&format!("save #{id}: writing {}", part.display()));
     let span = clip.wall.map(|wall| (wall, clip.duration));
-    clip.write(&mut sink).inspect_err(|_| {
-        let _ = std::fs::remove_file(&part);
-    })?;
+    mux::write(clip, &part).map_err(|error| format!("{}: {error}", part.display()))?;
+    log(&format!("save #{id}: MP4 finalized"));
     if let Some((wall, duration)) = span {
         events::attach(&part, wall, duration);
     }
     std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(path)
 }
+
+fn reserve_output(paths: impl Iterator<Item = PathBuf>) -> Result<(PathBuf, PathBuf), String> {
+    for path in paths {
+        if path.try_exists().map_err(|e| format!("{}: {e}", path.display()))? {
+            continue;
+        }
+
+        let mut name = path.clone().into_os_string();
+        name.push(".part");
+        let part = PathBuf::from(name);
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&part) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", part.display())),
+        }
+        // a previous worker could have renamed its part just before we reserved this one
+        if !path.try_exists().map_err(|e| format!("{}: {e}", path.display()))? {
+            return Ok((path, part));
+        }
+        std::fs::remove_file(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    }
+
+    Err("no available clip name".into())
+}
+
+#[cfg(test)]
+#[path = "buffer_tests.rs"]
+mod tests;

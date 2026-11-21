@@ -80,7 +80,7 @@ pub(super) struct Search {
     fresh: Vec<Facet>,
     leaving: Vec<Leaving>,
     /// Where each chip was drawn last, by facet.
-    chips: [Option<Rect>; 5],
+    chips: [Option<Rect>; 6],
     field: Rect,
     offers_at: Rect,
     button: Rect,
@@ -100,7 +100,7 @@ impl Default for Search {
             calendar: Calendar::default(),
             fresh: Vec::new(),
             leaving: Vec::new(),
-            chips: [None; 5],
+            chips: [None; 6],
             field: Rect::NOTHING,
             offers_at: Rect::NOTHING,
             button: Rect::NOTHING,
@@ -135,6 +135,7 @@ fn glyph_of(token: &Token) -> Glyph<'_> {
         Token::Length(_) => Glyph::Length,
         Token::App(name) => Glyph::App(name),
         Token::Maker(m) => Glyph::Maker(*m),
+        Token::Trimmed(_) => Glyph::Kind(Filter::Recordings),
     }
 }
 
@@ -319,7 +320,7 @@ impl Gallery {
         let mut x = start - (start + row - typing).max(0.0);
         let mut removed = None;
         let mut opened = false;
-        self.search.chips = [None; 5];
+        self.search.chips = [None; 6];
         for (t, cw) in chips.iter().zip(&widths) {
             let facet = t.facet();
             let id = Id::unique(("gallery-chip", facet as u8));
@@ -628,6 +629,16 @@ impl Gallery {
                 pills.push(Pill::new(Act::Clear(Facet::Length), l.label(), None, true, None));
             }
             y = self.pills(ui, look, "length", &pills, x0, y, inner_w, &mut action);
+            if self.index.kinds.contains(&Kind::Recording) {
+                y = section(&painter, look, "video edits", x0, y + 6.0);
+                let pills = [false, true].map(|trimmed| {
+                    let token = Token::Trimmed(trimmed);
+                    let label = token.label(self.today);
+                    let on = self.search.filters.has(&token);
+                    Pill::new(Act::Set(token), label, Some(self.counts.trimmed[usize::from(trimmed)]), on, None)
+                });
+                y = self.pills(ui, look, "video edits", &pills, x0, y, inner_w, &mut action);
+            }
             // app: as many rows as the window leaves room for under it, and it scrolls
             if !self.index.apps.is_empty() {
                 y = section(&painter, look, "app", x0, y + 6.0);

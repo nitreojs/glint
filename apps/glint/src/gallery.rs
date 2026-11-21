@@ -43,9 +43,11 @@ impl Host for Glint {
         if item.kind == Kind::Recording { "trim…" } else { "open" }
     }
 
-    fn open(&mut self, item: &Item) -> Result<(), String> {
+    fn open(&mut self, item: &Item, background: bool) -> Result<(), String> {
         if item.kind == Kind::Recording {
-            return crate::clip::spawn(&item.path).map_err(|e| format!("can't open the trimmer: {e}"));
+            let exe = std::env::current_exe();
+            return exe.and_then(|exe| gallery::open_editor(&exe, &item.path, background))
+                .map_err(|e| format!("can't open the trimmer: {e}"));
         }
         gallery::open_file(&item.path);
         Ok(())

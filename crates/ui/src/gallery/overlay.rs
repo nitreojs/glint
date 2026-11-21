@@ -122,7 +122,7 @@ impl Gallery {
         let url = self.item(id).and_then(|i| i.url.clone());
         let path = self.item(id).map(|i| i.path.clone());
         match entry {
-            Entry::Open => self.open_item(id),
+            Entry::Open => self.open_item(id, false),
             Entry::Copy => self.copy(id, false),
             Entry::CopyFile => self.copy(id, true),
             Entry::CopyLink => {

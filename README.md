@@ -58,6 +58,8 @@ originals go to the recycle bin when the editor closes, only after an edited cop
 
 every shot and clip in one place<br>
 hover to play, search by app or game or day, drag straight into a chat
+<br>under **filter → video edits**, choose **untrimmed** for original videos or **trimmed** for edited exports<br>
+**Shift+click** videos to open separate Glint editors in the background without leaving the gallery
 
 <img src="docs/readme/4-gallery.avif" alt="the gallery" width="880">
 
@@ -67,6 +69,8 @@ hover to play, search by app or game or day, drag straight into a chat
 
 **afterglow** is glint's little sibling for games: it keeps the last minute of your screen and sound, and `alt+f10` saves it<br>
 clips open in glint's editor, and in deadlock it even knows when you got a kill, and can clip it by itself (beta)
+<br>
+replay saves write MP4 directly without waiting for Windows Media Foundation to finalize the file. If a save stalls, afterglow reports a timeout and allows another save after 90 seconds; any `.mp4.part` left behind is kept separate from finished clips
 
 ### get it
 

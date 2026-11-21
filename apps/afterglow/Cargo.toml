@@ -1,15 +1,17 @@
 [package]
 name = "afterglow"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 repository.workspace = true
 
 [dependencies]
+containr = { version = "0.1.1", features = ["mp4"] }
 eframe.workspace = true
 glint-core.workspace = true
 glint-media.workspace = true
 glint-shell.workspace = true
 glint-ui.workspace = true
+memchr = "2"
 serde.workspace = true
 toml.workspace = true
 windows.workspace = true

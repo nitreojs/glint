@@ -50,9 +50,12 @@ impl Host for Afterglow {
         if self.trims(item) { "trim…" } else { "open" }
     }
 
-    fn open(&mut self, item: &Item) -> Result<(), String> {
+    fn open(&mut self, item: &Item, background: bool) -> Result<(), String> {
         match &self.glint {
-            Some(exe) if item.kind == Kind::Recording => glint::trim(exe, &item.path),
+            Some(exe) if item.kind == Kind::Recording => {
+                gallery::open_editor(exe, &item.path, background).map_err(|e| format!("can't open glint: {e}"))
+            }
+            None if background => Err("Glint is required to open a video in its editor".into()),
             _ => {
                 gallery::open_file(&item.path);
                 Ok(())

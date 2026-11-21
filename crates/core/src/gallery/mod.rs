@@ -69,6 +69,7 @@ pub struct Item {
     /// How long it plays, once known; never for screenshots.
     pub duration_ms: Option<u32>,
     pub maker: Maker,
+    pub trimmed: bool,
     /// The name, its folder below the output folder and the app, lowercased: what search looks in.
     haystack: String,
 }
@@ -95,6 +96,7 @@ struct Known {
     app: Option<String>,
     exe: Option<String>,
     duration_ms: Option<u32>,
+    trimmed: Option<bool>,
 }
 
 impl Item {
@@ -110,6 +112,7 @@ impl Item {
             (!["other", "screen"].contains(&named.as_str())).then_some(named)
         });
         let haystack = [name.as_str(), folder.as_str(), app.as_deref().unwrap_or("")].join("\n").to_lowercase();
+        let trimmed = kind == Kind::Recording && known.trimmed.unwrap_or_else(|| trim_name(&file.path));
         let time = known.time.unwrap_or(file.modified / 1_000_000_000);
         Item {
             id: path_id(&file.path),
@@ -123,6 +126,7 @@ impl Item {
             app,
             duration_ms: known.duration_ms.filter(|_| kind.moves()),
             maker: source.maker,
+            trimmed,
             haystack,
         }
     }
@@ -135,6 +139,16 @@ impl Item {
     pub fn holds(&self, words: &[String]) -> bool {
         words.iter().all(|w| self.haystack.contains(w.as_str()))
     }
+}
+
+fn trim_name(path: &Path) -> bool {
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else { return false };
+    let trimmed = |stem: &str| {
+        stem.get(stem.len().saturating_sub(5)..).is_some_and(|end| end.eq_ignore_ascii_case("_trim"))
+    };
+    trimmed(stem) || stem.rsplit_once('_').is_some_and(|(base, n)| {
+        trimmed(base) && !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())
+    })
 }
 
 /// One app's captures as read: its history (oldest first, as [`crate::history::all_in`] gives
@@ -175,6 +189,7 @@ pub fn collect(shelves: Vec<Shelf>, stat: impl Fn(&Path) -> Option<(u64, u64)>) 
                         (first.app, first.exe) = (other.app, other.exe);
                     }
                     first.duration_ms = first.duration_ms.or(other.duration_ms);
+                    first.trimmed = first.trimmed.or(other.trimmed);
                 }
                 None => {
                     at.insert(path_id(path), entries.len());
@@ -189,7 +204,7 @@ pub fn collect(shelves: Vec<Shelf>, stat: impl Fn(&Path) -> Option<(u64, u64)>) 
         let Some(path) = e.path else { continue };
         let Some(kind) = Kind::of(&path) else { continue };
         let Some((size, modified)) = stat(&path) else { continue };
-        let known = Known { time: Some(e.time), url: e.url, app: e.app, exe: e.exe, duration_ms: e.duration_ms };
+        let known = Known { time: Some(e.time), url: e.url, app: e.app, exe: e.exe, duration_ms: e.duration_ms, trimmed: e.trimmed };
         items.push(Item::new(OnDisk { path, size, modified }, kind, known, source));
     }
     let mut found: Vec<(OnDisk, &Source)> = Vec::new();

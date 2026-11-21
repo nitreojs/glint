@@ -54,6 +54,7 @@ use thumbs::{Done, Job, Pool};
 use view::Flip;
 
 pub const GALLERY_ARG: &str = "--gallery";
+pub const BACKGROUND_EDITOR: &str = "GLINT_BACKGROUND_EDITOR";
 /// What starts an app's settings window.
 const SETTINGS_ARG: &str = "--settings";
 const WINDOW: [f32; 2] = [1120.0, 760.0];
@@ -120,7 +121,7 @@ pub trait Host {
         "open"
     }
 
-    fn open(&mut self, item: &Item) -> Result<(), String>;
+    fn open(&mut self, item: &Item, background: bool) -> Result<(), String>;
 
     /// The app's own lines in `item`'s menu; `busy` while work on it runs.
     fn extras(&self, _item: &Item, _busy: bool) -> Vec<Extra> {
@@ -208,6 +209,17 @@ fn spawn(arg: &str, file: Option<&Path>) -> std::io::Result<()> {
         cmd.arg(p);
     }
     cmd.spawn().map(|_| ())
+}
+
+/// Launches one Glint editor per video; a background launch leaves the gallery focused.
+pub fn open_editor(exe: &Path, video: &Path, background: bool) -> std::io::Result<()> {
+    let mut command = std::process::Command::new(exe);
+    command.arg("--clip").arg(video);
+    if background {
+        command.env(BACKGROUND_EDITOR, "1");
+    }
+
+    command.spawn().map(|_| ())
 }
 
 /// Brings `app`'s gallery forward, or starts it (on `select`, when given).
@@ -724,9 +736,9 @@ impl Gallery {
 
     // ---- actions --------------------------------------------------------------------------------
 
-    fn open_item(&mut self, id: u64) {
+    fn open_item(&mut self, id: u64, background: bool) {
         let Some(item) = self.item(id).cloned() else { return };
-        if let Err(e) = self.host.open(&item) {
+        if let Err(e) = self.host.open(&item, background && item.kind == Kind::Recording) {
             self.say(&e, None, true);
         }
     }
@@ -1079,7 +1091,7 @@ impl Gallery {
         }
         let Some(id) = self.focus.filter(|id| self.index(*id).is_some()) else { return };
         if enter {
-            self.open_item(id);
+            self.open_item(id, false);
         }
         if space {
             if self.preview.as_ref().is_some_and(|p| p.id == id) {

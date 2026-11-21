@@ -33,6 +33,9 @@ pub struct Entry {
     /// How long it plays (recordings and gifs), in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u32>,
+    /// Whether this video is an edited export; absent in older history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trimmed: Option<bool>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,7 +113,7 @@ fn relocate_in(file: &Path, moved: &[(PathBuf, PathBuf)]) -> Result<(), String> 
 impl Entry {
     /// A capture of `kind` made now, saved at `path` (none for a link to something unsaved).
     pub fn new(kind: Kind, path: Option<&Path>, size: u64) -> Entry {
-        Entry { kind, path: path.map(Path::to_path_buf), url: None, size, time: now(), app: None, exe: None, duration_ms: None }
+        Entry { kind, path: path.map(Path::to_path_buf), url: None, size, time: now(), app: None, exe: None, duration_ms: None, trimmed: None }
     }
 
     pub fn with_url(mut self, url: &str) -> Entry {
@@ -219,6 +222,9 @@ fn read(file: &Path) -> Vec<Entry> {
                 }
                 if e.duration_ms.is_some() {
                     old.duration_ms = e.duration_ms;
+                }
+                if e.trimmed.is_some() {
+                    old.trimmed = e.trimmed;
                 }
             }
             None => entries.push(e),

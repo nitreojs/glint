@@ -1,7 +1,7 @@
 //! Finding glint, whose trimmer opens afterglow's clips when it's there: the exe its "open in
 //! glint editor" Explorer entry starts, else a glint that's running.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use glint_core::wide::from_wstr;
 use windows::Win32::Foundation::{CloseHandle, ERROR_SUCCESS};
@@ -17,22 +17,10 @@ use windows::core::{HSTRING, PCWSTR, PWSTR};
 /// The command of glint's Explorer entry on videos.
 const VERB: &str = r"Software\Classes\SystemFileAssociations\.mp4\shell\glint.edit\command";
 const EXE: &str = "glint.exe";
-/// What makes glint open a video in its trimmer.
-pub const CLIP_ARG: &str = "--clip";
 
 /// glint's exe, if it's installed or running.
 pub fn find() -> Option<PathBuf> {
     command(VERB).and_then(|c| exe_of(&c)).filter(|p| p.is_file()).or_else(|| running(EXE))
-}
-
-/// Opens `video` in glint's trimmer.
-pub fn trim(glint: &Path, video: &Path) -> Result<(), String> {
-    std::process::Command::new(glint)
-        .arg(CLIP_ARG)
-        .arg(video)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("can't open glint: {e}"))
 }
 
 /// The default value of `key` under HKEY_CURRENT_USER, a string.

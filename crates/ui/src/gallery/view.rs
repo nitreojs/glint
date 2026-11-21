@@ -224,6 +224,7 @@ impl Gallery {
             self.dirty = false;
         }
         let scroll_to = self.scroll_to.take().and_then(|id| self.index(id));
+        let shift = ctx.input(|i| i.modifiers.shift);
         let mut hit = None;
         let mut pointer = None;
         let mut clicked = None;
@@ -276,7 +277,7 @@ impl Gallery {
                 if over.is_some() {
                     resp.clone().on_hover_cursor(CursorIcon::PointingHand);
                 }
-                if resp.clicked() {
+                if resp.clicked_by(egui::PointerButton::Primary) {
                     clicked = over;
                 }
                 if resp.secondary_clicked() {
@@ -286,19 +287,25 @@ impl Gallery {
         if self.flip.busy() {
             ctx.request_repaint();
         }
-        // the preview sits over the grid: it takes the pointer where it is
-        let in_preview = self.preview.as_ref().filter(|pv| pointer.is_some_and(|p| pv.rect.contains(p))).map(|pv| pv.id);
+        // Shift targets the grid so a hover preview can't intercept batch opens.
+        let in_preview = self.preview.as_ref()
+            .filter(|pv| !shift && pointer.is_some_and(|p| pv.rect.contains(p)))
+            .map(|pv| pv.id);
         let over = in_preview.or(hit);
         // a press that went on into a drag isn't a click
         let dragging = self.track_press(&ctx, over);
-        if clicked.is_some() && !dragging {
-            let id = in_preview.or(clicked);
-            if let Some(id) = id {
-                self.focus = Some(id);
-                if let Some(f) = ctx.memory(|m| m.focused()) {
-                    ctx.memory_mut(|m| m.surrender_focus(f));
-                }
-                self.open_item(id);
+        if let Some(id) = clicked
+            && !dragging
+        {
+            let id = in_preview.unwrap_or(id);
+            self.focus = Some(id);
+            if let Some(f) = ctx.memory(|m| m.focused()) {
+                ctx.memory_mut(|m| m.surrender_focus(f));
+            }
+            self.open_item(id, shift);
+            if shift {
+                self.close_preview();
+                self.hover = None;
             }
         }
         if let Some((id, at)) = menu_at {
@@ -314,7 +321,7 @@ impl Gallery {
                 self.follow = None;
                 self.open_preview(&ctx, id, true);
             }
-        } else {
+        } else if !shift {
             self.hover(&ctx, pointer, over);
         }
         let visible = rows_in_view.len();

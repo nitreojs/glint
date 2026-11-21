@@ -110,6 +110,7 @@ pub enum Token {
     /// An app's name, as the list shows it.
     App(String),
     Maker(Maker),
+    Trimmed(bool),
 }
 
 /// What a [`Token`] narrows.
@@ -120,6 +121,7 @@ pub enum Facet {
     Length,
     App,
     Maker,
+    Trimmed,
 }
 
 impl Token {
@@ -130,6 +132,7 @@ impl Token {
             Token::Length(_) => Facet::Length,
             Token::App(_) => Facet::App,
             Token::Maker(_) => Facet::Maker,
+            Token::Trimmed(_) => Facet::Trimmed,
         }
     }
 
@@ -140,6 +143,8 @@ impl Token {
             Token::Length(l) => l.label(),
             Token::App(a) => a.clone(),
             Token::Maker(m) => m.name().into(),
+            Token::Trimmed(true) => "trimmed".into(),
+            Token::Trimmed(false) => "untrimmed".into(),
         }
     }
 }
@@ -162,6 +167,7 @@ pub struct Filters {
     pub length: Option<Length>,
     pub app: Option<String>,
     pub maker: Option<Maker>,
+    pub trimmed: Option<bool>,
 }
 
 impl Filters {
@@ -172,6 +178,7 @@ impl Filters {
             Token::Length(l) => self.length = Some(l),
             Token::App(a) => self.app = Some(a),
             Token::Maker(m) => self.maker = Some(m),
+            Token::Trimmed(trimmed) => self.trimmed = Some(trimmed),
         }
     }
 
@@ -182,6 +189,7 @@ impl Filters {
             Facet::Length => self.length = None,
             Facet::App => self.app = None,
             Facet::Maker => self.maker = None,
+            Facet::Trimmed => self.trimmed = None,
         }
     }
 
@@ -193,6 +201,7 @@ impl Filters {
             Token::Length(l) => self.length == Some(*l),
             Token::App(a) => self.app.as_deref().is_some_and(|x| x.eq_ignore_ascii_case(a)),
             Token::Maker(m) => self.maker == Some(*m),
+            Token::Trimmed(trimmed) => self.trimmed == Some(*trimmed),
         }
     }
 
@@ -203,6 +212,7 @@ impl Filters {
         out.extend(self.length.map(Token::Length));
         out.extend(self.app.clone().map(Token::App));
         out.extend(self.maker.map(Token::Maker));
+        out.extend(self.trimmed.map(Token::Trimmed));
         out
     }
 
@@ -238,6 +248,7 @@ pub struct Fact {
     /// Its app in [`Index::apps`].
     pub app: Option<u32>,
     pub maker: Maker,
+    trimmed: bool,
 }
 
 /// The facts of a list, made once whenever the list changes, so narrowing it is a tight loop.
@@ -291,6 +302,7 @@ impl Index {
                 ms: it.duration_ms,
                 app: app.map(|a| rank[a]),
                 maker: it.maker,
+                trimmed: it.trimmed,
             })
             .collect();
         let kinds = [Kind::Shot, Kind::Recording, Kind::Gif].into_iter().filter(|k| items.iter().any(|i| i.kind == *k)).collect();
@@ -312,6 +324,7 @@ pub struct Narrow {
     /// `Some(None)`: an app none of the items shows.
     app: Option<Option<u32>>,
     maker: Option<Maker>,
+    trimmed: Option<bool>,
     today: i64,
     week: (i64, i64),
     month: (i64, i64),
@@ -325,6 +338,7 @@ impl Narrow {
             length: f.length,
             app: f.app.as_deref().map(|a| index.app(a)),
             maker: f.maker,
+            trimmed: f.trimmed,
             today: today.number(),
             week: When::Week.span(today),
             month: When::Month.span(today),
@@ -340,12 +354,13 @@ impl Narrow {
             self.length.is_none_or(|l| f.ms.is_some_and(|ms| l.admits(ms))),
             self.app.is_none_or(|a| a.is_some() && a == f.app),
             self.maker.is_none_or(|m| m == f.maker),
+            self.trimmed.is_none_or(|trimmed| f.kind == Kind::Recording && f.trimmed == trimmed),
         ];
         bits.iter().enumerate().fold(0, |acc, (i, b)| acc | (u8::from(*b) << i))
     }
 }
 
-const ALL_FACETS: u8 = 0b1_1111;
+const ALL_FACETS: u8 = 0b11_1111;
 
 /// How many items each option would show, the other facets as they are.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -360,6 +375,8 @@ pub struct Counts {
     pub apps: Vec<usize>,
     /// By [`Maker::ALL`].
     pub makers: [usize; 2],
+    /// Untrimmed and trimmed recordings.
+    pub trimmed: [usize; 2],
     /// By local day, the when facet left out: what the calendar marks.
     pub days: std::collections::HashMap<i64, usize>,
 }
@@ -373,6 +390,7 @@ pub fn apply(index: &Index, narrow: &Narrow, visible: impl Fn(usize) -> bool, sh
     counts.when = [0; 4];
     counts.length = [0; 3];
     counts.makers = [0; 2];
+    counts.trimmed = [0; 2];
     counts.apps.clear();
     counts.apps.resize(index.apps.len(), 0);
     counts.days.clear();
@@ -416,6 +434,9 @@ pub fn apply(index: &Index, narrow: &Narrow, visible: impl Fn(usize) -> bool, sh
         }
         if p & but(Facet::Maker) == but(Facet::Maker) {
             counts.makers[f.maker as usize] += 1;
+        }
+        if p & but(Facet::Trimmed) == but(Facet::Trimmed) && f.kind == Kind::Recording {
+            counts.trimmed[usize::from(f.trimmed)] += 1;
         }
     }
 }
@@ -672,6 +693,10 @@ fn lengths_from(typed: &str) -> Vec<Length> {
         .map(|ms| if op == '>' { Length { min_ms: ms, max_ms: None } } else { Length { min_ms: 0, max_ms: Some(ms) } })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "trim_tests.rs"]
+mod trim_tests;
 
 #[cfg(test)]
 mod tests {

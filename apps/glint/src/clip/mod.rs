@@ -72,7 +72,7 @@ const SAVED_FLASH: f64 = 1.4;
 
 pub(crate) fn spawn(path: &Path) -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    std::process::Command::new(exe).arg(CLIP_ARG).arg(path).spawn().map(|_| ())
+    glint_ui::gallery::open_editor(&exe, path, false)
 }
 
 /// A file probed for the editor.
@@ -115,6 +115,7 @@ pub fn run(path: Option<PathBuf>) {
     let accent = cfg.accent_rgb();
     let saved = Saved::load();
     let name = file.as_ref().and_then(|f| f.path.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let background = std::env::var_os(glint_ui::gallery::BACKGROUND_EDITOR).is_some_and(|v| v == "1");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(title(&name))
@@ -123,7 +124,7 @@ pub fn run(path: Option<PathBuf>) {
             .with_resizable(true)
             .with_decorations(false)
             .with_transparent(glint_ui::window::transparent())
-            .with_active(!glint_ui::window::quiet())
+            .with_active(!background && !glint_ui::window::quiet())
             .with_drag_and_drop(true)
             .with_icon(egui::IconData { rgba: icon_rgba(64, accent), width: 64, height: 64 }),
         centered: saved.rect.is_none(),
@@ -931,8 +932,11 @@ impl ClipApp {
                 // the export shows what the clip it's cut from shows, whichever app saved that
                 let histories = Maker::ALL.map(|m| m.history(&appdata()));
                 let from = history::find_in(&histories, &self.path);
+                let from_trimmed = from.as_ref().and_then(|entry| entry.trimmed);
                 let (app, exe) = from.map_or((None, None), |e| (e.app, e.exe));
-                let entry = Entry::new(HistoryKind::Recording, Some(&path), size.unwrap_or_default()).with_app(app.as_deref(), exe.as_deref());
+                let mut entry = Entry::new(HistoryKind::Recording, Some(&path), size.unwrap_or_default())
+                    .with_app(app.as_deref(), exe.as_deref());
+                entry.trimmed = if task.copy { from_trimmed } else { Some(true) };
                 history::add(entry.with_duration(glint_ui::gallery::length(&path)));
                 self.finish_export(path, task.then, size, task.before);
             }
