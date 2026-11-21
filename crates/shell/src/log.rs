@@ -18,7 +18,8 @@ pub fn install(app: &'static str) {
 fn write(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path()) {
-        let _ = writeln!(f, "[{}] {}", timestamp(), msg);
+        let line = format!("[{}] {msg}\n", timestamp());
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -27,6 +28,10 @@ fn write(msg: &str) {
 pub fn start_fresh() {
     let path = path();
     let _ = std::fs::rename(&path, path.with_extension("prev.log"));
+}
+
+pub fn diagnostic(event: glint_core::diagnostics::Event, message: &str) {
+    write(&event.line(message));
 }
 
 /// The log file of the app that called [`install`].

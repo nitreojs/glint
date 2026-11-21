@@ -15,6 +15,7 @@ use glint_core::geom::rect::Rect;
 use glint_core::events::GameEvent;
 use glint_core::record::replay::Clip;
 use glint_core::config::UpdateMode;
+use glint_core::diagnostics::Event as Diagnostic;
 use glint_core::icon::{add_badge, icon_pixels};
 use glint_core::history::Kind as HistoryKind;
 use glint_core::log::log;
@@ -32,6 +33,7 @@ use glint_shell::tray::{TrayIcon, destroy, icon_size, make_icon};
 use glint_shell::start_menu::{self, Shortcut};
 use glint_shell::update::{self, Build, Checked, Click, Host, OwnWindow, Updates};
 use glint_shell::{autostart, explorer, hotkey, window};
+use glint_shell::log::diagnostic;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::RemoteDesktop::{NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification};
 use windows::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
@@ -86,7 +88,8 @@ struct Saving {
     id: u64,
     long: String,
     monitor: Rect,
-    capped: bool,
+    requested_s: Option<u32>,
+    folder: PathBuf,
     app: Option<Source>,
     ms: u32,
     since: Instant,
@@ -198,7 +201,7 @@ impl App {
                 }
             }
             Balloon::Update(Click::Install) => self.install_update(),
-            Balloon::Update(Click::Log) => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
+            Balloon::Update(Click::Log) => glint_ui::diagnostics::open(glint_core::gallery::Maker::Afterglow),
             Balloon::Link(url) => open(url, None),
         }
     }
@@ -405,7 +408,10 @@ impl App {
         }
 
         save.timed_out = true;
-        log(&format!("save #{} timed out after {:.0} s", save.id, save.since.elapsed().as_secs_f64()));
+        diagnostic(
+            Diagnostic::ReplayTimedOut { id: save.id, seconds: STUCK.as_secs(), folder: save.folder.clone() },
+            &format!("save #{} timed out after {:.0} s", save.id, save.since.elapsed().as_secs_f64()),
+        );
         if !save.auto {
             self.sample = false;
             note::show(save.monitor, self.cfg.note_position, Kind::Failed, "save timed out", "you can save another clip");
@@ -449,33 +455,49 @@ impl App {
             note::show(monitor, self.cfg.note_position, Kind::Saving, &format!("saving the last {long}"), APP);
         }
         let ms = (secs * 1000.0).round() as u32;
-        self.saving = Some(Saving { id, long, monitor, capped: clip.capped, app, ms, since: Instant::now(), timed_out: false, auto });
-        buffer::save(id, clip, self.cfg.output_dir(), name, Notify::new(self.hwnd, WM_SAVED));
+        let dir = self.cfg.output_dir();
+        let folder = dir.join(&name).parent().map_or_else(|| dir.clone(), std::path::Path::to_path_buf);
+        self.saving = Some(Saving {
+            id, long, monitor, requested_s: clip.capped.then_some(self.cfg.length), folder, app, ms,
+            since: Instant::now(), timed_out: false, auto,
+        });
+        buffer::save(id, clip, dir, name, Notify::new(self.hwnd, WM_SAVED));
     }
 
     fn saved(&mut self, id: u64, result: Result<PathBuf, String>) {
         if self.saving.as_ref().is_none_or(|s| s.id != id) {
-            log(&format!("save #{id} finished after it timed out: {result:?}"));
+            match result {
+                Ok(path) => log(&format!("save #{id} finished after it timed out: {}", path.display())),
+                Err(error) => log(&format!("save #{id} failed after it timed out: {error}")),
+            }
             return;
         }
-        let Some(Saving { long, monitor, capped, app, ms, since, auto, .. }) = self.saving.take() else { return };
+        let Some(Saving { long, monitor, requested_s, folder, app, ms, since, auto, .. }) = self.saving.take() else { return };
         match result {
             Ok(path) => {
-                log(&format!("save #{id} done in {:.1} s: {}", since.elapsed().as_secs_f64(), path.display()));
+                let elapsed = since.elapsed();
+                let elapsed_ms = elapsed.as_millis() as u64;
+                let event = match requested_s {
+                    Some(requested_s) => Diagnostic::ReplayShortened { id, duration_ms: ms, requested_s, elapsed_ms, path: path.clone() },
+                    None => Diagnostic::ReplaySaved { id, duration_ms: ms, elapsed_ms, path: path.clone() },
+                };
+                diagnostic(event, &format!("save #{id} done in {:.1} s: {}", elapsed.as_secs_f64(), path.display()));
                 gallery::remember(&path, app.as_ref(), ms);
                 if auto {
                     self.auto_saves += 1;
                     self.refresh_tray();
                 } else {
                     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                    let kind = if capped { Kind::Warning } else { Kind::Saved };
+                    let kind = if requested_s.is_some() { Kind::Warning } else { Kind::Saved };
                     note::show(monitor, self.cfg.note_position, kind, &format!("saved the last {long}"), &name);
                 }
                 self.last_saved = Some(path);
             }
-            Err(e) if auto => log(&format!("auto-clip: save #{id} failed: {e}")),
             Err(e) => {
-                log(&format!("save #{id} failed: {e}"));
+                diagnostic(Diagnostic::ReplayFailed { id, folder }, &format!("save #{id} failed: {e}"));
+                if auto {
+                    return;
+                }
                 note::show(monitor, self.cfg.note_position, Kind::Failed, "couldn't save", "see the notification for why");
                 self.notify("afterglow: couldn't save", &e, true);
             }
@@ -588,7 +610,7 @@ impl App {
             Item::command(ID_LAST, "show last clip").glyph(Glyph::Video).enabled(self.last_saved.is_some()),
             Item::command(ID_FOLDER, "open folder").glyph(Glyph::Folder),
             Item::command(ID_SETTINGS, "settings").glyph(Glyph::Settings),
-            Item::command(ID_LOG, "log").glyph(Glyph::Log),
+            Item::command(ID_LOG, "diagnostics").glyph(Glyph::Log),
             Item::separator(),
         ];
         if let Some(v) = self.update.ready_version() {
@@ -665,6 +687,10 @@ impl Host for App {
         vec![
             OwnWindow { title: crate::settings::TITLE.into(), arg: SETTINGS_ARG },
             OwnWindow { title: glint_ui::gallery::title(crate::config::APP), arg: glint_ui::gallery::GALLERY_ARG },
+            OwnWindow {
+                title: glint_ui::diagnostics::title(glint_core::gallery::Maker::Afterglow),
+                arg: glint_ui::diagnostics::ARG,
+            },
         ]
     }
 }
@@ -694,7 +720,7 @@ fn menu(hwnd: HWND) {
                 explorer::reveal(&p);
             }
         }
-        ID_LOG => open("notepad.exe", Some(&format!("\"{}\"", glint_shell::log::path().display()))),
+        ID_LOG => glint_ui::diagnostics::open(glint_core::gallery::Maker::Afterglow),
         ID_UPDATE => {
             with_app(|a| a.install_update());
         }
@@ -765,6 +791,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_POWERBROADCAST if wp.0 == PBT_APMSUSPEND as usize || wp.0 == PBT_APMRESUMEAUTOMATIC as usize => {
             with_app(|a| a.set_away(wp.0 == PBT_APMSUSPEND as usize));
             return LRESULT(1);
+        }
+        glint_shell::afterglow::WM_OPEN_SETTINGS => {
+            open_settings();
+            return LRESULT(0);
         }
         WM_RELOAD => {
             with_app(App::reload);

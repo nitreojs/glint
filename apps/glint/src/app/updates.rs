@@ -55,6 +55,10 @@ impl Host for App {
         vec![
             OwnWindow { title: super::ipc::SETTINGS_TITLE.into(), arg: super::ipc::SETTINGS_ARG },
             OwnWindow { title: glint_ui::gallery::title(crate::gallery::APP), arg: glint_ui::gallery::GALLERY_ARG },
+            OwnWindow {
+                title: glint_ui::diagnostics::title(glint_core::gallery::Maker::Glint),
+                arg: glint_ui::diagnostics::ARG,
+            },
         ]
     }
 }

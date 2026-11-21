@@ -23,6 +23,10 @@ fn main() {
         return;
     }
     let args: Vec<_> = std::env::args_os().collect();
+    if args.iter().any(|arg| arg == glint_ui::diagnostics::ARG) {
+        glint_ui::diagnostics::run(glint_core::gallery::Maker::Afterglow);
+        return;
+    }
     if let Some(i) = args.iter().position(|a| a == glint_ui::gallery::GALLERY_ARG) {
         gallery::run(args.get(i + 1).map(Into::into));
         return;

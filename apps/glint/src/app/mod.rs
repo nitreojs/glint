@@ -13,7 +13,6 @@ use glint_core::wide::wide;
 use glint_media::record::{self, ClickHighlights, KeyOverlay, Params, Source};
 use glint_shell::identity::{front_window, identify};
 use glint_shell::instance::{self, Again};
-use glint_shell::log::path as log_path;
 use glint_shell::start_menu::{self, Shortcut};
 use glint_shell::update::{self, Checked, Host, Updates};
 use glint_shell::{autostart, file_menu, monitors, window};
@@ -609,7 +608,7 @@ impl App {
         match &self.click {
             ClickTarget::Capture(p) => crate::gallery::open(Some(p)),
             ClickTarget::Link(url) => shell(url, ""),
-            ClickTarget::Log => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
+            ClickTarget::Log => glint_ui::diagnostics::open(glint_core::gallery::Maker::Glint),
             ClickTarget::Update | ClickTarget::None => {}
         }
     }

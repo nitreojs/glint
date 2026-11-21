@@ -10,6 +10,8 @@ use windows::core::HSTRING;
 pub const MAIN_CLASS: &str = "afterglow_main";
 /// WPARAM 1: let capture see the note (answers 1 when one is up); 0: keep it out again.
 pub const WM_NOTE_CAPTURABLE: u32 = WM_APP + 23;
+/// Open the Afterglow settings from the shared diagnostics window.
+pub const WM_OPEN_SETTINGS: u32 = WM_APP + 31;
 
 /// Runs `grab` with afterglow's note, if one is up, visible to screen capture.
 pub fn with_note_visible<T>(grab: impl FnOnce() -> T) -> T {

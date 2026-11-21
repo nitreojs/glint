@@ -4,7 +4,6 @@
 use glint_core::format::human_size;
 use glint_core::history::{self, Entry, Kind as HistoryKind};
 use glint_shell::clipboard;
-use glint_shell::log::path as log_path;
 use glint_shell::menu::{self, Glyph, Header, Item, Menu};
 use glint_shell::time::local_time;
 use glint_shell::update::Host;
@@ -160,7 +159,7 @@ pub(super) fn show_menu(hwnd: HWND, keyboard: bool) {
         Item::submenu("recent", recent_items).glyph(Glyph::Recent),
         Item::command(ID_FOLDER, "open folder").glyph(Glyph::Folder),
         Item::command(ID_SETTINGS, "settings").glyph(Glyph::Settings),
-        Item::command(ID_LOG, "log").glyph(Glyph::Log),
+        Item::command(ID_LOG, "diagnostics").glyph(Glyph::Log),
         Item::separator(),
     ]);
     if let Some(v) = with_app(|a| a.update.ready_version()).flatten() {
@@ -198,7 +197,7 @@ pub(super) fn show_menu(hwnd: HWND, keyboard: bool) {
         }
         ID_SETTINGS => open_settings(),
         ID_GALLERY => crate::gallery::open(None),
-        ID_LOG => shell("notepad.exe", &format!("\"{}\"", log_path().display())),
+        ID_LOG => glint_ui::diagnostics::open(glint_core::gallery::Maker::Glint),
         ID_CLEAR_HISTORY => history::clear(),
         c if (ID_RECENT..ID_RECENT + RECENT * ACTIONS).contains(&c) => {
             let i = (c - ID_RECENT) / ACTIONS;

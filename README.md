@@ -72,6 +72,11 @@ clips open in glint's editor, and in deadlock it even knows when you got a kill,
 <br>
 replay saves write MP4 directly without waiting for Windows Media Foundation to finalize the file. If a save stalls, afterglow reports a timeout and allows another save after 90 seconds; any `.mp4.part` left behind is kept separate from finished clips
 
+In either tray menu, **diagnostics** shows the current and previous run. Search for a clip name,
+filter by event type or level, or pick an error and show the surrounding events. Replay saves
+explain whether the clip was saved, shortened by the memory cap, or not reported in time.
+**Open raw log** still opens the complete file in Notepad.
+
 ### get it
 
 grab the exe from [releases](https://github.com/nitreojs/glint/releases/latest) and run it, it lands in the tray and updates itself from then on
