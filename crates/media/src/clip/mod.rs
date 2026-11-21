@@ -4,7 +4,6 @@ pub(crate) mod gif;
 pub mod media;
 pub(crate) mod process;
 mod smart;
-pub mod soundtrack;
 pub mod trim;
 
 #[cfg(test)]
