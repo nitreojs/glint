@@ -119,6 +119,9 @@ impl<T> Video<T> {
                 paint(self.burn.as_ref(), &self.clicks, &mut self.shapes, at);
                 frames.compose(&next, self.cursor, &self.shapes, self.keyframe(at))?;
                 if let Some((prev, ps)) = self.pending.take() {
+                    if let Some(thumb) = frames.preview_frame(&prev, self.slot_time(ps)) {
+                        output.preview_thumb(thumb);
+                    }
                     output.video(prev, self.slot_time(ps), self.slot_time(slot) - self.slot_time(ps))?;
                     self.frames += 1;
                 }
@@ -274,6 +277,9 @@ where
     if let Some((prev, ps)) = v.pending.take() {
         let end = lock(ctl.pauses).active_clamped(end.unwrap_or_else(ctl.now));
         let end_slot = v.slot(end).max(ps + 1);
+        if let Some(thumb) = frames.preview_frame(&prev, v.slot_time(ps)) {
+            output.preview_thumb(thumb);
+        }
         output.video(prev, v.slot_time(ps), v.slot_time(end_slot) - v.slot_time(ps))?;
         v.frames += 1;
         video_end = v.slot_time(end_slot);
@@ -284,6 +290,9 @@ where
     }
     if v.frames == 0 {
         return Err("no frames were captured".into());
+    }
+    if let Some(thumb) = frames.finish_preview() {
+        output.preview_thumb(thumb);
     }
     output.finish()?;
     let clicks = matches!(ctl.clicks, Clicks::Keep).then(|| {

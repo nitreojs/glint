@@ -10,7 +10,7 @@
 //! * Mouse thread (with click highlights on): the [`Mouse`] hook's presses, placed on the video
 //!   timeline by the encoder thread, drawn into frames or saved in the file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -22,6 +22,7 @@ use super::clicks::{self, Payload, Press, Shape, Style};
 use super::keys::{self, KeyFrame, Stroke};
 use super::pointer::PointerShape;
 use super::timeline::Pauses;
+use crate::clip::timeline_cache::Thumb;
 use crate::config::audio::AudioSource;
 use crate::log::log;
 
@@ -77,6 +78,12 @@ pub trait Frames {
         clicks: &[Shape],
         keys: Option<KeyFrame>,
     ) -> Result<(), String>;
+    fn preview_frame(&mut self, _frame: &Self::Frame, _at: i64) -> Option<Thumb> {
+        None
+    }
+    fn finish_preview(&mut self) -> Option<Thumb> {
+        None
+    }
 }
 
 /// Mouse buttons on a global hook: presses inside the region and every release, positions in
@@ -117,6 +124,8 @@ pub trait Output {
     fn video(&mut self, frame: Self::Frame, time: i64, duration: i64) -> Result<(), String>;
     fn audio(&mut self, track: usize, at: i64, pcm: &[i16]) -> Result<(), String>;
     fn finish(&mut self) -> Result<(), String>;
+    fn preview_thumb(&mut self, _thumb: Thumb) {}
+    fn save_preview(&mut self, _path: &Path, _duration: i64) {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -182,6 +191,8 @@ pub trait PacketSink {
     fn add_stream(&mut self, stream: Stream) -> Result<usize, String>;
     fn write(&mut self, stream: usize, packet: Packet) -> Result<(), String>;
     fn finalize(&mut self) -> Result<(), String>;
+    fn preview_thumb(&mut self, _thumb: Thumb) {}
+    fn preview_audio(&mut self, _stream: usize, _at: i64, _pcm: &[i16]) {}
 }
 
 pub trait AudioInput: Send + Sized {
@@ -471,6 +482,9 @@ fn run_session<B: Backend>(
             Ok(()) => log(&format!("saved {n} keystroke(s) for the trimmer")),
             Err(e) => log(&format!("couldn't save the keystrokes: {e}")),
         }
+    }
+    if !abort.load(Ordering::Relaxed) {
+        output.save_preview(&path, (duration_s * 1e7).round() as i64);
     }
     let (cap_dropped, coalesced, stopped_early) = match cap_res {
         Ok(s) => (s.dropped, s.coalesced, None),

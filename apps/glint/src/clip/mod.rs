@@ -306,6 +306,7 @@ struct ClipApp {
     cuts: Vec<i64>,
     thumbs: Vec<(i64, TextureHandle)>,
     overview: Vec<(i64, TextureHandle)>,
+    recorded_overview: bool,
     tex: Option<TextureHandle>,
     image: Option<Arc<ColorImage>>,
     nearest: bool,
@@ -429,6 +430,7 @@ impl ClipApp {
             cuts: Vec::new(),
             thumbs: Vec::new(),
             overview: Vec::new(),
+            recorded_overview: false,
             tex: None,
             image: None,
             nearest: false,
@@ -717,6 +719,7 @@ impl ClipApp {
             self.cuts.clear();
             self.thumbs.clear();
             self.overview.clear();
+            self.recorded_overview = false;
             let keys = self.index.as_ref().map_or(&[][..], |i| i.video.keys.as_slice());
             self.scan = Some(Scan::start(self.path.clone(), size, duration, keys, ctx.clone()));
         }
@@ -728,13 +731,14 @@ impl ClipApp {
         }
         let Some(scan) = &self.scan else { return };
         while let Some(found) = scan.poll() {
+            self.recorded_overview |= matches!(&found, Found::Recorded(..));
             match found {
                 Found::Cut(t) => self.cuts.push(t),
                 Found::Thumb(t, image) => {
                     let tex = ctx.load_texture(format!("clip-thumb-{t}"), image, TextureOptions::LINEAR);
                     self.thumbs.push((t, tex));
                 }
-                Found::Overview(t, image) => {
+                Found::Overview(t, image) | Found::Recorded(t, image) => {
                     if let Err(at) = self.overview.binary_search_by_key(&t, |(ts, _)| *ts) {
                         let tex = ctx.load_texture(format!("clip-overview-{t}"), image, TextureOptions::LINEAR);
                         self.overview.insert(at, (t, tex));

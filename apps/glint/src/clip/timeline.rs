@@ -1023,7 +1023,7 @@ impl ClipApp {
                 let tex = self.thumbs.get(i)
                     .filter(|(ts, _)| t.abs_diff(*ts) <= (2 * every) as u64)
                     .or_else(|| {
-                        let step = overview_interval?;
+                        let step = if self.recorded_overview { i64::MAX } else { overview_interval? };
                         let next = self.overview.partition_point(|(ts, _)| *ts < t);
                         [next.checked_sub(1).and_then(|i| self.overview.get(i)), self.overview.get(next)]
                             .into_iter()

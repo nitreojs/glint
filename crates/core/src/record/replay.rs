@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::pipeline::{Packet, PacketSink, Stream};
+use super::preview::{CapturePreview, Preview};
+use crate::clip::timeline_cache::Thumb;
 
 /// What the buffer keeps: `keep` (100 ns units) of the newest video, from a keyframe, and never
 /// more than `max_bytes` of packets (then it keeps less time).
@@ -22,6 +24,8 @@ pub struct Replay {
     streams: Vec<Stream>,
     /// The video stream's index, once added.
     video: Option<usize>,
+    audio: Vec<Option<usize>>,
+    preview: CapturePreview,
     /// Shared with the clips cut from it, so cutting under the lock copies no packet data.
     packets: VecDeque<(usize, Arc<Packet>)>,
     /// Presentation times of the video keyframes in `packets`, oldest first.
@@ -90,6 +94,7 @@ pub struct Clip {
     pub capped: bool,
     /// The unix time (ms) of its first frame, from the buffer's [`Clock`]; `None` when unknown.
     pub wall: Option<i64>,
+    pub preview: Preview,
 }
 
 impl Replay {
@@ -98,6 +103,8 @@ impl Replay {
             limits,
             streams: Vec::new(),
             video: None,
+            audio: Vec::new(),
+            preview: CapturePreview::default(),
             packets: VecDeque::new(),
             keys: VecDeque::new(),
             bytes: 0,
@@ -134,6 +141,13 @@ impl Replay {
         if matches!(stream, Stream::Video { .. }) && self.video.is_none() {
             self.video = Some(self.streams.len());
         }
+        let audio = matches!(stream, Stream::Audio { .. }).then(|| {
+            let track = self.audio.iter().flatten().count();
+            self.preview.add_track();
+
+            track
+        });
+        self.audio.push(audio);
         self.streams.push(stream);
         self.streams.len() - 1
     }
@@ -164,6 +178,7 @@ impl Replay {
             self.capped = !old;
             self.keys.pop_front();
             self.drop_before(next);
+            self.preview.trim(next);
         }
     }
 
@@ -186,7 +201,16 @@ impl Replay {
         packets.sort_by_key(|(_, p)| p.pts);
         let capped = self.capped && end - start < len;
         let wall = self.clock.zero().map(|z| (z + start) / 10_000);
-        Some(Clip { streams: self.streams.clone(), packets, start, duration: end - start, capped, wall })
+        let mut first = vec![None; self.streams.len()];
+        for (stream, packet) in &packets {
+            if self.audio[*stream].is_some() {
+                first[*stream].get_or_insert(packet.pts);
+            }
+        }
+        let audio: Vec<_> = self.audio.iter().zip(first).filter_map(|(&track, at)| track.zip(at)).collect();
+        let preview = self.preview.snapshot(start, end, &audio);
+
+        Some(Clip { streams: self.streams.clone(), packets, start, duration: end - start, capped, wall, preview })
     }
 }
 
@@ -231,6 +255,20 @@ impl PacketSink for ReplaySink {
     fn finalize(&mut self) -> Result<(), String> {
         self.lock().finished = true;
         Ok(())
+    }
+
+    fn preview_thumb(&mut self, thumb: Thumb) {
+        let mut replay = self.lock();
+        if replay.keys.front().is_none_or(|&start| thumb.at >= start) {
+            replay.preview.thumbnail(thumb);
+        }
+    }
+
+    fn preview_audio(&mut self, stream: usize, at: i64, pcm: &[i16]) {
+        let mut replay = self.lock();
+        if let Some(track) = replay.audio[stream] {
+            replay.preview.audio(track, at, pcm);
+        }
     }
 }
 

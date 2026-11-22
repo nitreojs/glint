@@ -32,6 +32,9 @@ use super::win::{INFINITE, RING, adapter, create_device, hns, qpc, texture_desc}
 use crate::clip::media::{probe, still};
 use crate::rect::WinRect;
 
+#[path = "preview_tests.rs"]
+mod preview_tests;
+
 #[derive(Default)]
 struct Seen {
     streams: Vec<Stream>,

@@ -1,3 +1,5 @@
+use crate::clip::timeline_cache::Thumb;
+
 use super::{AudioEncoder, Output, Packet, PacketSink, VideoConfig, VideoEncoder};
 
 pub struct Encoded<V, A, S> {
@@ -44,6 +46,7 @@ impl<V: VideoEncoder, A: AudioEncoder, S: PacketSink> Output for Encoded<V, A, S
 
     fn audio(&mut self, track: usize, at: i64, pcm: &[i16]) -> Result<(), String> {
         let (enc, stream) = &mut self.audio[track];
+        self.sink.preview_audio(*stream, at, pcm);
         enc.encode(at, pcm, &mut self.packets)?;
         flush(&mut self.packets, &mut self.sink, *stream)
     }
@@ -56,5 +59,9 @@ impl<V: VideoEncoder, A: AudioEncoder, S: PacketSink> Output for Encoded<V, A, S
             flush(&mut self.packets, &mut self.sink, *stream)?;
         }
         self.sink.finalize()
+    }
+
+    fn preview_thumb(&mut self, thumb: Thumb) {
+        self.sink.preview_thumb(thumb);
     }
 }

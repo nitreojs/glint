@@ -6,6 +6,7 @@ pub mod mp4;
 pub mod negotiate;
 pub mod pipeline;
 pub mod pointer;
+pub mod preview;
 pub mod replay;
 pub mod timeline;
 pub mod tracks;

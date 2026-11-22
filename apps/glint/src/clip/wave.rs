@@ -1,14 +1,15 @@
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Context, Id, Mesh, Painter, Rect, Shape, pos2};
 use glint_core::clip::edit::gain;
 use glint_core::clip::math::SECOND;
+use glint_core::clip::timeline_cache::Cache;
 use glint_core::log::log;
 use glint_core::record::mp4;
 use glint_media::clip::media::{self, ALL, ANY, Com, Got};
@@ -18,8 +19,7 @@ use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 
 use super::overlay::danger;
 
-/// One peak per 10 ms of sound.
-pub(super) const BUCKET: i64 = SECOND / 100;
+pub(super) use glint_core::clip::timeline_cache::BUCKET;
 const BATCH: usize = 25;
 const UNLOADED: u8 = 0;
 const SILENCE: u8 = 1;
@@ -192,22 +192,47 @@ impl Waves {
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         let thread = thread::spawn(move || {
+            let cache = compact.then(|| Cache::for_file(&path)).flatten();
+            if let Some(peaks) = cache.as_ref().and_then(|cache| cache.waves(streams.len())) {
+                for (track, peaks) in peaks.into_iter().enumerate() {
+                    let _ = tx.send(Chunk { track, at: 0, peaks });
+                }
+                ctx.request_repaint();
+                return;
+            }
+
+            let saved = cache.as_ref().map(|_| Mutex::new(vec![Vec::new(); streams.len()]));
+            let emit = |chunk: Chunk| {
+                if let Some(saved) = &saved {
+                    merge(&mut saved.lock().unwrap()[chunk.track], &chunk);
+                }
+                let _ = tx.send(chunk);
+            };
             let _com = Com::init();
+            let mut complete = false;
             if compact {
                 let view = mp4::audio_view(&path, || stop.load(Ordering::Relaxed))
                     .and_then(|bytes| media::audio_view_reader(&bytes));
                 if let Ok((reader, order)) = view
                     && order.len() == streams.len()
-                    && run(&reader, &order, 0..duration, &tx, &stop, &ctx).is_ok()
+                    && run(&reader, &order, 0..duration, &emit, &stop, &ctx).is_ok()
                 {
-                    ctx.request_repaint();
-                    return;
+                    complete = true;
                 }
             }
 
-            if !stop.load(Ordering::Relaxed) {
-                run_sections(&path, &streams, duration, sections, &tx, &stop, &ctx);
+            if !complete && !stop.load(Ordering::Relaxed) {
+                if let Some(saved) = &saved {
+                    saved.lock().unwrap().iter_mut().for_each(Vec::clear);
+                }
+                complete = run_sections(&path, &streams, duration, sections, &emit, &stop, &ctx);
             }
+            if complete && !stop.load(Ordering::Relaxed)
+                && let (Some(cache), Some(saved)) = (cache, saved)
+            {
+                let _ = cache.save_waves(&saved.into_inner().unwrap());
+            }
+            ctx.request_repaint();
         });
 
         Waves { rx, cancel, thread: Some(thread) }
@@ -217,11 +242,7 @@ impl Waves {
     pub(super) fn poll(&self, peaks: &mut [Vec<u8>]) {
         while let Ok(c) = self.rx.try_recv() {
             let Some(v) = peaks.get_mut(c.track) else { continue };
-            let end = c.at + c.peaks.len();
-            if v.len() < end {
-                v.resize(end, UNLOADED);
-            }
-            v[c.at..end].copy_from_slice(&c.peaks);
+            merge(v, &c);
         }
     }
 }
@@ -233,6 +254,14 @@ impl Drop for Waves {
             let _ = t.join();
         }
     }
+}
+
+fn merge(peaks: &mut Vec<u8>, chunk: &Chunk) {
+    let end = chunk.at + chunk.peaks.len();
+    if peaks.len() < end {
+        peaks.resize(end, UNLOADED);
+    }
+    peaks[chunk.at..end].copy_from_slice(&chunk.peaks);
 }
 
 /// Peaks per bucket, square-rooted so quiet sound still shows.
@@ -311,11 +340,12 @@ fn run_sections(
     streams: &[u32],
     duration: i64,
     sections: i64,
-    tx: &Sender<Chunk>,
+    emit: &(impl Fn(Chunk) + Sync),
     stop: &AtomicBool,
     ctx: &egui::Context,
-) {
+) -> bool {
     let buckets = duration.div_euclid(BUCKET);
+    let failed = AtomicBool::new(false);
     thread::scope(|scope| {
         for section in 0..sections {
             let start = buckets * section / sections * BUCKET;
@@ -324,28 +354,31 @@ fn run_sections(
             } else {
                 buckets * (section + 1) / sections * BUCKET
             };
+            let failed = &failed;
 
             scope.spawn(move || {
                 let _com = Com::init();
                 let result = media::open(path, None)
-                    .and_then(|reader| run(&reader, streams, start..end, tx, stop, ctx));
-                if let Err(e) = result
-                    && !stop.load(Ordering::Relaxed)
-                    && path.exists()
-                {
-                    log(&format!("clip: drawing the waveforms stopped: {e}"));
+                    .and_then(|reader| run(&reader, streams, start..end, emit, stop, ctx));
+                if let Err(e) = result {
+                    failed.store(true, Ordering::Relaxed);
+                    if !stop.load(Ordering::Relaxed) && path.exists() {
+                        log(&format!("clip: drawing the waveforms stopped: {e}"));
+                    }
                 }
                 ctx.request_repaint();
             });
         }
     });
+
+    !failed.load(Ordering::Relaxed)
 }
 
 fn run(
     reader: &IMFSourceReader,
     streams: &[u32],
     range: Range<i64>,
-    tx: &Sender<Chunk>,
+    emit: &impl Fn(Chunk),
     stop: &AtomicBool,
     ctx: &egui::Context,
 ) -> Result<(), String> {
@@ -377,7 +410,7 @@ fn run(
     let mut shown = Instant::now();
     let send = |k: usize, t: &mut Track, all: bool| {
         if let Some((at, peaks)) = t.peaks.take(all) {
-            let _ = tx.send(Chunk { track: k, at, peaks });
+            emit(Chunk { track: k, at, peaks });
         }
     };
     while tracks.iter().flatten().any(|t| !t.ended) && !stop.load(Ordering::Relaxed) {
@@ -407,6 +440,10 @@ fn run(
             ctx.request_repaint();
         }
     }
+    if tracks.iter().any(Option::is_none) {
+        return Err("one or more waveform tracks couldn't be opened".into());
+    }
+
     Ok(())
 }
 

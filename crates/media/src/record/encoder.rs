@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use glint_core::clip::timeline_cache::Thumb;
 use glint_core::geom::rect::Rect;
 use glint_core::log::log;
 use glint_core::record::Codec;
@@ -11,6 +12,7 @@ use glint_core::record::mp4::{name_tracks, tag_colours};
 use glint_core::record::negotiate::{Engine, Force, Input, Matrix, Refusal, Route, describe, log_tried, matrix, negotiate_rate, notice};
 use glint_core::record::pipeline::{Frames, Output, VideoConfig};
 use glint_core::record::pointer::PointerShape;
+use glint_core::record::preview::CapturePreview;
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Dxgi::*;
@@ -22,6 +24,7 @@ use windows::core::{GUID, HSTRING, Interface};
 use super::convert::Converter;
 use super::cursor::CursorRenderer;
 use super::gpu::{Gpu, friendly_name, hardware_encoders, plain, software_encoders, string};
+use super::preview::Sampler;
 use crate::clicks;
 use crate::keys;
 use super::win::{INFINITE, texture_desc};
@@ -47,6 +50,7 @@ pub(super) struct Composer {
     alloc: IMFVideoSampleAllocatorEx,
     /// With NV12 samples: how frames get converted.
     nv12: Option<Nv12>,
+    preview: Option<Sampler>,
     _mgr: IMFDXGIDeviceManager,
 }
 
@@ -64,6 +68,7 @@ pub(super) struct SinkWriter {
     audio: Vec<u32>,
     track_names: Vec<String>,
     path: PathBuf,
+    preview: CapturePreview,
 }
 
 impl Composer {
@@ -164,7 +169,11 @@ impl Composer {
             }
             pooled?;
 
-            Ok(Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, clicks, keys, alloc, nv12, _mgr: mgr })
+            let preview = Sampler::new(&device, &ctx, (r.w as u32, r.h as u32), input, matrix)
+                .inspect_err(|err| log(&format!("recording thumbnails unavailable: {err}")))
+                .ok();
+
+            Ok(Composer { region: r, device, ctx, mt, ring, clean: clean.unwrap(), cursor, clicks, keys, alloc, nv12, preview, _mgr: mgr })
         }
     }
 }
@@ -381,7 +390,12 @@ impl SinkWriter {
             }
             writer.BeginWriting().map_err(|e| Refusal::Format(format!("{name} {}", plain(&e, "BeginWriting"))))?;
             let path = path.to_path_buf();
-            Ok((SinkWriter { writer, matrix, stream, audio, track_names: track_names.to_vec(), path }, name))
+            let mut preview = CapturePreview::default();
+            for _ in &audio {
+                preview.add_track();
+            }
+
+            Ok((SinkWriter { writer, matrix, stream, audio, track_names: track_names.to_vec(), path, preview }, name))
         }
     }
 }
@@ -421,6 +435,7 @@ impl Output for SinkWriter {
     }
 
     fn audio(&mut self, track: usize, at: i64, pcm: &[i16]) -> Result<(), String> {
+        self.preview.audio(track, at, pcm);
         unsafe { write_pcm(&self.writer, self.audio[track], at, pcm) }
     }
 
@@ -435,6 +450,15 @@ impl Output for SinkWriter {
             log(&format!("couldn't name the audio tracks: {e}"));
         }
         Ok(())
+    }
+
+    fn preview_thumb(&mut self, thumb: Thumb) {
+        self.preview.thumbnail(thumb);
+    }
+
+    fn save_preview(&mut self, path: &Path, duration: i64) {
+        let audio: Vec<_> = (0..self.audio.len()).map(|track| (track, 0)).collect();
+        self.preview.snapshot(0, duration, &audio).save(path);
     }
 }
 
@@ -550,6 +574,31 @@ impl Frames for Composer {
             self.mt.Leave();
             drawn
         }
+    }
+
+    fn preview_frame(&mut self, frame: &IMFSample, at: i64) -> Option<Thumb> {
+        let preview = self.preview.as_mut().filter(|p| p.due(at))?;
+        unsafe { self.mt.Enter() };
+        let result = preview.frame(&self.ctx, frame, at);
+        unsafe { self.mt.Leave() };
+        match result {
+            Ok(thumb) => thumb,
+            Err(e) => {
+                log(&format!("recording thumbnail sampling stopped: {e}"));
+                self.preview = None;
+
+                None
+            }
+        }
+    }
+
+    fn finish_preview(&mut self) -> Option<Thumb> {
+        let mut preview = self.preview.take()?;
+        unsafe { self.mt.Enter() };
+        let result = preview.read(&self.ctx, true);
+        unsafe { self.mt.Leave() };
+
+        result.inspect_err(|err| log(&format!("couldn't read last recording thumbnail: {err}"))).ok().flatten()
     }
 }
 

@@ -33,6 +33,8 @@ mod encoder;
 mod gpu;
 #[cfg(windows)]
 mod packets;
+#[cfg(windows)]
+mod preview;
 #[cfg(all(test, windows))]
 mod tests;
 #[cfg(windows)]

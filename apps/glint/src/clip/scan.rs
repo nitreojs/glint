@@ -6,12 +6,11 @@ use std::thread::JoinHandle;
 
 use eframe::egui::{self, Color32, ColorImage};
 use glint_core::clip::math::SECOND;
+use glint_core::clip::timeline_cache::{Cache, Filmstrip, MAX_THUMBS, THUMB_HEIGHT, Thumb};
 use glint_core::log::log;
 use glint_media::clip::media::{self, Com};
 use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 
-const THUMB_H: u32 = 64;
-const THUMBS: i64 = 240;
 const OVERVIEW_SLOTS: u32 = 16;
 const OVERVIEW_MIN: i64 = 12 * SECOND;
 const CUT_STRIDE: usize = 4;
@@ -23,6 +22,7 @@ pub(super) enum Found {
     Cut(i64),
     Thumb(i64, ColorImage),
     Overview(i64, ColorImage),
+    Recorded(i64, ColorImage),
 }
 
 pub(super) struct Scan {
@@ -32,7 +32,7 @@ pub(super) struct Scan {
 }
 
 pub(super) fn interval(duration: i64) -> i64 {
-    (duration / THUMBS).max(SECOND / 4)
+    (duration.max(0) as u64).div_ceil(MAX_THUMBS as u64).max((SECOND / 4) as u64) as i64
 }
 
 pub(super) fn overview_interval(duration: i64) -> Option<i64> {
@@ -105,6 +105,10 @@ fn overview(
     Ok(())
 }
 
+fn image(thumb: &Thumb) -> ColorImage {
+    ColorImage::from_rgb([thumb.size.0 as usize, thumb.size.1 as usize], &thumb.rgb)
+}
+
 impl Scan {
     pub(super) fn start(
         path: PathBuf,
@@ -116,14 +120,38 @@ impl Scan {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
-        let w = ((THUMB_H as f32 * size.0 as f32 / size.1.max(1) as f32).round() as u32).clamp(8, 512) & !1;
-        let thumb = (w, THUMB_H);
+        let w = ((THUMB_HEIGHT as f32 * size.0 as f32 / size.1.max(1) as f32).round() as u32).clamp(8, 512) & !1;
+        let thumb = (w, THUMB_HEIGHT);
         let times = overview_interval(duration).map(|step| overview_times(step, keys));
         let thread = std::thread::spawn(move || {
+            let cache = (duration > 0).then(|| Cache::for_file(&path)).flatten();
+            let mut seeded = false;
+            if let Some(Filmstrip { thumbs, cuts }) = cache.as_ref().and_then(Cache::filmstrip)
+                && !thumbs.is_empty()
+            {
+                let detailed = cuts.is_some();
+                for thumb in thumbs {
+                    let image = image(&thumb);
+                    let found = if detailed { Found::Thumb(thumb.at, image) } else { Found::Recorded(thumb.at, image) };
+                    let _ = tx.send(found);
+                }
+                if let Some(cuts) = cuts {
+                    for at in cuts {
+                        let _ = tx.send(Found::Cut(at));
+                    }
+                }
+                ctx.request_repaint();
+                if detailed {
+                    return;
+                }
+
+                seeded = true;
+            }
+
             let _com = Com::init();
             let res = (|| -> Result<(), String> {
                 let mut reader = media::rgb_reader(&path, thumb)?;
-                if let Some(times) = times {
+                if let Some(times) = times.filter(|_| !seeded) {
                     if let Err(e) = overview(&reader, thumb, times, &stop, |t, image| {
                         if tx.send(Found::Overview(t, image)).is_ok() {
                             ctx.request_repaint();
@@ -141,12 +169,13 @@ impl Scan {
                 }
                 let every = interval(duration);
                 let (mut next_thumb, mut cuts) = (0, Cuts::default());
+                let mut strip = Filmstrip { thumbs: Vec::new(), cuts: Some(Vec::new()) };
                 let mut luma = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
                     let Some(f) = media::next_video(&reader)? else { break };
                     let (tw, th) = (thumb.0 as usize, thumb.1 as usize);
                     let take = f.ts >= next_thumb;
-                    let mut px = Vec::with_capacity(if take { tw * th } else { 0 });
+                    let mut rgb = Vec::with_capacity(if take { tw * th * 3 } else { 0 });
                     media::with_pixels(&f.sample, thumb.0, |rows| {
                         luma.clear();
                         for y in (0..th).step_by(CUT_STRIDE) {
@@ -156,22 +185,33 @@ impl Scan {
                         }
                         if take {
                             for y in 0..th {
-                                px.extend(rows.row(y).chunks_exact(4).map(|c| Color32::from_rgb(c[2], c[1], c[0])));
+                                for c in rows.row(y).chunks_exact(4) {
+                                    rgb.extend_from_slice(&[c[2], c[1], c[0]]);
+                                }
                             }
                         }
                     })?;
                     let mut sent = false;
                     if let Some(t) = cuts.push(f.ts, &luma) {
+                        strip.cuts.as_mut().unwrap().push(t);
                         sent |= tx.send(Found::Cut(t)).is_ok();
                     }
                     if take {
                         next_thumb = f.ts - f.ts % every + every;
-                        sent |= tx.send(Found::Thumb(f.ts, ColorImage::new([tw, th], px))).is_ok();
+                        let thumb = Thumb { at: f.ts, size: thumb, rgb: Arc::new(rgb) };
+                        sent |= tx.send(Found::Thumb(f.ts, image(&thumb))).is_ok();
+                        strip.thumbs.push(thumb);
                     }
                     if sent {
                         ctx.request_repaint();
                     }
                 }
+                if !stop.load(Ordering::Relaxed) && !strip.thumbs.is_empty()
+                    && let Some(cache) = cache
+                {
+                    let _ = cache.save_filmstrip(&strip);
+                }
+
                 Ok(())
             })();
             if let Err(e) = res

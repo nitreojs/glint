@@ -35,7 +35,7 @@ paste pictures in with `ctrl+v`, pin the result above every window
 it records straight off the gpu with your mic and system sound, and can show your clicks and keys
 
 then trim it, crop it, mute a track, squeeze it under a size<br>
-long recordings show a quick thumbnail overview first, then fill in the detailed filmstrip. MP4 waveforms can load from audio data alone, without reading through the video. Recently viewed frames are reused when you scrub back to them<br>
+Glint and Afterglow collect audio waveforms and a thumbnail overview while recording, so the editor can show them on first open. For other videos, the editor builds the previews once and reuses them on later opens. The cache stays on this PC and doesn't change the video file<br>
 park the playhead and drag either trim edge to its line to cut there; hold ctrl to bypass snapping<br>
 press **S** at each end of a section, then right-click that piece in the thumbnail strip to remove or restore it<br>
 hold **Shift** and drag either edge of a kept piece in the thumbnail strip to stretch or shorten its playback without trimming the source; the opposite edge stays put as you drag, and the current speed and duration appear beside the drag. Audio pitch follows the speed<br>

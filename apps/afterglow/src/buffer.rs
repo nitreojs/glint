@@ -154,7 +154,7 @@ pub fn save(id: u64, clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
     }
 }
 
-fn write(id: u64, clip: Clip, stem: &Path) -> Result<PathBuf, String> {
+fn write(id: u64, mut clip: Clip, stem: &Path) -> Result<PathBuf, String> {
     if let Some(dir) = stem.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
@@ -167,12 +167,14 @@ fn write(id: u64, clip: Clip, stem: &Path) -> Result<PathBuf, String> {
     let (path, part) = reserve_output(std::iter::once(named("")).chain((2..).map(|n| named(&format!("_{n}")))))?;
     log(&format!("save #{id}: writing {}", part.display()));
     let span = clip.wall.map(|wall| (wall, clip.duration));
+    let preview = std::mem::take(&mut clip.preview);
     mux::write(clip, &part).map_err(|error| format!("{}: {error}", part.display()))?;
     log(&format!("save #{id}: MP4 finalized"));
     if let Some((wall, duration)) = span {
         events::attach(&part, wall, duration);
     }
     std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
+    preview.save(&path);
     Ok(path)
 }
 

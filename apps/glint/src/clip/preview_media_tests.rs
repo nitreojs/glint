@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use glint_core::clip::{index, math::SECOND};
+use glint_core::clip::timeline_cache::Cache;
 use glint_core::record::mp4;
 use glint_media::clip::media::{self, Com};
 
@@ -85,7 +86,7 @@ fn editor_media_preview_covers_long_clips_and_reuses_exact_frames() {
             (t >= 35 * SECOND).then(|| start.elapsed())
         }
         Found::Thumb(..) => panic!("detailed scan started before the last quarter had a thumbnail"),
-        Found::Cut(_) => None,
+        Found::Cut(_) | Found::Recorded(..) => None,
     });
     assert!(sparse <= 16);
     drop(scan);
@@ -124,6 +125,10 @@ fn editor_media_preview_covers_long_clips_and_reuses_exact_frames() {
                 && peaks.iter().filter(|p| p.get(100..bucket(39)).is_some_and(|r| r.iter().all(|&v| v > 50))).count() == 3)
                 .then(|| start.elapsed())
         });
+        if sections.is_none() {
+            let cache = Cache::for_file(&fixture.0).unwrap();
+            wait_for(|| cache.waves(streams.len()));
+        }
         assert_eq!(peaks.iter().filter(|p| p.len() < bucket(13)).count(), 1);
 
         let means: Vec<_> = peaks.iter().map(|p| p[100..900].iter().copied().map(u32::from).sum::<u32>() / 800).collect();
@@ -136,6 +141,23 @@ fn editor_media_preview_covers_long_clips_and_reuses_exact_frames() {
     assert_eq!(compact_peaks, reference_peaks);
     eprintln!("late waveform: {wave_sequential:?} original, {wave_compact:?} compact");
     eprintln!("continuous waveform: {all_sequential:?} original, {all_compact:?} compact");
+
+    let cache = Cache::for_file(&fixture.0).unwrap();
+    let scan = Scan::start(fixture.0.clone(), info.size, info.duration, &index.video.keys, ctx.clone());
+    let detailed = wait_for(|| cache.filmstrip().filter(|strip| strip.cuts.is_some()));
+    assert!(detailed.thumbs.last().unwrap().at >= 39 * SECOND);
+    drop(scan);
+    let start = Instant::now();
+    let warm_scan = Scan::start(fixture.0.clone(), info.size, info.duration, &index.video.keys, ctx.clone());
+    assert!(matches!(wait_for(|| warm_scan.poll()), Found::Thumb(0, _)));
+    let stored = cache.waves(streams.len()).unwrap();
+    let waves = Waves::start(fixture.0.clone(), streams, info.duration, ctx);
+    let mut loaded = vec![Vec::new(); stored.len()];
+    wait_for(|| {
+        waves.poll(&mut loaded);
+        (loaded == stored).then_some(())
+    });
+    eprintln!("cached filmstrip first frame and all four waveforms: {:?}", start.elapsed());
 
     eprintln!("late filmstrip: {sequential:?} sequential, {overview:?} overview; exact seek: {cold:?} cold, {warm:?} cached");
 }
