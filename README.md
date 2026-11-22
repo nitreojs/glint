@@ -1,94 +1,89 @@
+# Glint
+
+Glint is a Windows tray app for screenshots, screen recording, and quick video edits.
+
+**[Download Glint for Windows](https://github.com/nitreojs/glint/releases/latest)** · [Afterglow replay recorder](#afterglow)
+
+Run the downloaded `.exe` to start Glint in the system tray. It checks for updates automatically.
+
 <p align="center"><picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/hero-light.png"><img src="docs/readme/hero.png" alt="glint" width="880"></picture></p>
 
-<p align="center">
-screenshots and screen recording for windows, living in your tray<br>
-<a href="https://github.com/nitreojs/glint/releases/latest"><b>download</b></a>
-</p>
+## Capture and annotate
 
-<br>
+Press **Ctrl+Print Screen** and drag to capture a region. Mark it up with arrows, boxes, numbered steps, or text. Blur or pixelate anything you don't want to share.
 
-<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-screenshots-light.png"><img src="docs/readme/head-screenshots.png" alt="draw on it, type on it, blur the rest" width="880"></picture>
+- **Reframe without redrawing.** Annotate anywhere on the frozen screen and resize the selection. Only the selected area is copied or saved. Enable the magnifier for precise resizing.
+- **Make the toolbar yours.** Hide tools, reorder them, group them, or assign your own shortcuts.
+- **Pin a reference.** Grab part of the screen or paste a picture with **Ctrl+V**, then pin it above other windows. Drag a corner to resize it; hold **Shift** to keep its proportions.
 
-`ctrl+printscreen`, drag over the thing, done<br>
-or don't stop there: pens, arrows, boxes, numbered steps, text in any font you have, blur and pixelate for the stuff nobody should see<br>
-the toolbar is yours: hide what you never use, put the rest in your order and groups, give them your keys<br>
-draw anywhere on the frozen screen, even outside the selection; resize the selection to reframe it, with the magnifier beside the moving edge when enabled<br>
-only the selected area is copied or saved
-
-<img src="docs/readme/1-screenshot.avif" alt="taking a screenshot and marking it up" width="880">
-
-<br>
-
-<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-grab-light.png"><img src="docs/readme/head-grab.png" alt="grab a piece, make it bigger" width="880"></picture>
-
-grab any piece of the screen and drop it right on top, as big as you want<br>
-drag its corners to resize freely; hold `shift` to keep its proportions<br>
-paste pictures in with `ctrl+v`, pin the result above every window
-
-<p align="center"><img src="docs/readme/2-grab.avif" alt="grabbing a piece of the screen and blowing it up" width="440"></p>
-
-<br>
-
-<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-recording-light.png"><img src="docs/readme/head-recording.png" alt="record it, then cut the boring part" width="880"></picture>
-
-`ctrl+alt+printscreen`, pick a region or a window, go<br>
-it records straight off the gpu with your mic and system sound, and can show your clicks and keys
-
-then trim it, crop it, mute a track, squeeze it under a size<br>
-Glint and Afterglow collect audio waveforms and a thumbnail overview while recording. For other videos, the editor draws waveforms as the audio loads, then caches them with the filmstrip for later opens. The cache stays on this PC and doesn't change the video file<br>
-park the playhead and drag either trim edge to its line to cut there; hold ctrl to bypass snapping<br>
-press **←** or **→** to step backward or forward one video frame<br>
-press **S** at each end of a section, then right-click that piece in the thumbnail strip to remove or restore it<br>
-hold **Shift** and drag either edge of a kept piece in the thumbnail strip to stretch or shorten its playback without trimming the source; the opposite edge stays put as you drag, and the current speed and duration appear beside the drag. Audio pitch follows the speed<br>
-double-click inside a retimed piece to restore it to **1×**; **Ctrl+Z** restores its previous speed. The focused piece stays at normal brightness while other kept pieces dim by 25%. If the whole timeline was visible before a speed drag, it eases to fit the new duration after release<br>
-park the playhead inside a kept piece to target it at either cut shared with another kept piece; otherwise, drag from the kept side you want<br>
-hover over a split for a hint: right-click the line to merge two kept pieces at the same speed; restore any removed piece first<br>
-removed pieces get a moving striped shade that fades in and out as you remove or restore them<br>
-if nothing has to be re-encoded, it isn't: the cut is lossless, starts on the exact frame, and glint says so<br>
-when combining sound, tracks that end early fall silent while the rest of the clip continues
-
-after saving, drag the thumbnail or filename into a chat, or click it and paste with **Ctrl+V**. After 8 seconds idle, the card becomes a thumbnail beside **Save** with the same drag and copy actions. It stays until the next successful export or you close the clip. Hover for size details; the card’s folder icon still shows the file in Explorer.
-
-in **settings → recording → after trimming**, keep both files (the default), keep only the trimmed copy, or ask each time<br>
-originals go to the recycle bin when the editor closes, only after an edited copy has saved successfully and still exists; unsaved changes or a later failed/cancelled export keep the original
-
-<img src="docs/readme/3-record.avif" alt="recording a region and trimming it" width="880">
-
-<br>
-
-<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-gallery-light.png"><img src="docs/readme/head-gallery.png" alt="everything, findable" width="880"></picture>
-
-every shot and clip in one place<br>
-hover to play, search by app or game or day, drag straight into a chat
-<br>under **filter → video edits**, choose **untrimmed** for original videos or **trimmed** for edited exports<br>
-**Shift+click** videos to open separate Glint editors in the background without leaving the gallery
-
-<img src="docs/readme/4-gallery.avif" alt="the gallery" width="880">
-
-<br>
-
-<picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-afterglow-light.png"><img src="docs/readme/head-afterglow.png" alt="it was recording the whole time" width="880"></picture>
-
-**afterglow** is glint's little sibling for games: it keeps the last minute of your screen and sound, and `alt+f10` saves it<br>
-clips open in glint's editor, and in deadlock it even knows when you got a kill, and can clip it by itself (beta)
-<br>
-replay saves write MP4 directly without waiting for Windows Media Foundation to finalize the file. If a save stalls, afterglow reports a timeout and allows another save after 90 seconds; any `.mp4.part` left behind is kept separate from finished clips
-
-In either tray menu, **diagnostics** shows the current and previous run. Search for a clip name,
-filter by event type or level, or pick an error and show the surrounding events. Replay saves
-explain whether the clip was saved, shortened by the memory cap, or not reported in time.
-**Open raw log** still opens the complete file in Notepad.
-
-### get it
-
-grab the exe from [releases](https://github.com/nitreojs/glint/releases/latest) and run it, it lands in the tray and updates itself from then on
+<img src="docs/readme/1-screenshot.avif" alt="Capturing and annotating a screenshot in Glint" width="880">
 
 <details>
-<summary>building it yourself</summary>
+<summary>See how pinned captures work</summary>
 
-```
+<img src="docs/readme/2-grab.avif" alt="Pinning and enlarging a region of the screen" width="440">
+
+</details>
+
+## Record and edit video
+
+Press **Ctrl+Alt+Print Screen** and pick a region or window. Glint records on the GPU with mic and system audio, and can show clicks and keystrokes.
+
+In the editor, trim or crop the video, mute individual tracks, or export to a target file size. Use **← / →** to move one frame at a time.
+
+<img src="docs/readme/3-record.avif" alt="Recording a region and trimming the clip in Glint" width="880">
+
+<details>
+<summary>Timeline shortcuts and editing tips</summary>
+
+- **Trim:** Drag either trim edge toward the playhead to snap to it. Hold **Ctrl** to bypass snapping.
+- **Split and remove:** Press **S** at both ends of a section, then right-click the piece in the thumbnail strip to remove or restore it.
+- **Change speed:** **Shift+drag** an edge of a kept piece to stretch or shorten playback without trimming the source. The other edge stays put, and the current speed and duration appear as you drag. Audio pitch follows the speed.
+- **Target a shared edge:** Park the playhead in the piece you want, or drag from its side of the split.
+- **Reset or merge:** Double-click a retimed piece to reset it to **1×**; **Ctrl+Z** restores its previous speed. Right-click a split to merge two kept pieces at the same speed.
+- **Preview faster:** Glint and Afterglow collect waveform peaks and a thumbnail overview while recording. For other videos, the editor draws waveforms as it loads audio, then caches them with the filmstrip for later opens. The cache stays on your PC and doesn't change the video.
+
+</details>
+
+<details>
+<summary>Exporting, sharing, and keeping originals</summary>
+
+- **Lossless cuts:** Glint shows when it can export without re-encoding. When combining sound, tracks that end early fall silent while the clip continues.
+- **Share a saved clip:** Drag its thumbnail or filename into a chat, or click it and paste with **Ctrl+V**. The card shrinks to a thumbnail beside **Save** after eight seconds, but keeps its drag and copy actions. Hover for file size or use the folder icon to show it in Explorer.
+- **Keep or recycle the original:** In **Settings → Recording → After trimming**, choose **Keep both** (the default), **Keep trimmed only**, or **Ask each time**. Glint only recycles the original on editor close if a successful edited export still exists. Unsaved edits and later failed or cancelled exports keep the original.
+
+</details>
+
+## Find and share captures
+
+The gallery brings your screenshots and clips into one place. Search by app, game, or day, hover over a clip to play it, or drag a capture straight into a chat.
+
+- Under **Filter → Video edits**, choose **Untrimmed** for originals or **Trimmed** for exports.
+- **Shift+click** a video to open it in a separate Glint editor without leaving the gallery.
+
+<img src="docs/readme/4-gallery.avif" alt="Browsing screenshots and videos in Glint's gallery" width="880">
+
+## Afterglow
+
+Afterglow is a separate Windows tray app that keeps the last minute of your screen and audio. Press **Alt+F10** to save a replay, then open it in Glint to edit it. In **Deadlock**, automatic clips for kills are available in beta.
+
+**[Find the latest Afterglow download](https://github.com/nitreojs/glint/releases?q=afterglow)**
+
+<details>
+<summary>Diagnostics and stalled replay saves</summary>
+
+In either tray menu, open **Diagnostics** to see the current and previous run. Search for a clip name, filter by event type or level, or select an error to see the surrounding events. **Open raw log** opens the full file in Notepad.
+
+Afterglow writes MP4s directly. Diagnostics reports whether a replay saved, was shortened by the memory cap, or timed out. If a save stalls, you can try another after 90 seconds. Any `.mp4.part` left behind stays separate from finished clips.
+
+</details>
+
+## Build from source
+
+On Windows with Rust installed, run:
+
+```sh
 cargo build --release -p glint
 ```
 
-needs rust and windows, the exe ends up in `target/release/glint.exe`
-</details>
+The executable is at `target/release/glint.exe`. To build Afterglow, use `-p afterglow` instead.
