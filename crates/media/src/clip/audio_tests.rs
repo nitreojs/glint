@@ -54,3 +54,53 @@ fn fractional_audio_stays_in_phase_across_decoder_and_output_chunks() {
         }
     }
 }
+
+#[test]
+#[ignore = "needs ffmpeg on PATH and Windows Media Foundation"]
+fn preview_audio_seeks_and_keeps_playing_when_one_track_ends() {
+    use super::{Com, Gains, Source, media, pcm};
+
+    let path = std::env::temp_dir().join(format!("glint-preview-audio-{}.mp4", std::process::id()));
+    let output = std::process::Command::new("ffmpeg")
+        .args([
+            "-y", "-v", "error", "-f", "lavfi", "-i", "color=size=64x64:rate=12:duration=2",
+            "-f", "lavfi", "-i", "sine=frequency=400:sample_rate=48000:duration=1",
+            "-f", "lavfi", "-i", "sine=frequency=800:sample_rate=48000:duration=2",
+            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "libx264", "-threads:v", "1",
+            "-c:a", "aac",
+        ])
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+
+    let _com = Com::init();
+    let info = media::probe(&path).unwrap();
+    let streams: Vec<_> = info.tracks.iter().map(|track| track.stream).collect();
+    let gains = Gains::new(streams.len(), 1.0);
+    let mut source = Source::open(&path, &streams).unwrap();
+    let mut out = vec![0.0; source.rate as usize / 5 * 2];
+    let mut mix = |at| {
+        source.seek(at, &gains).unwrap();
+        source.mix(pcm::frames(at, source.rate) + (out.len() / 2) as i64, &gains, &mut out).unwrap();
+
+        [400.0, 800.0].map(|hz| {
+            let (sin, cos) = out.iter().step_by(2).enumerate().fold((0.0, 0.0), |(sin, cos), (i, &s)| {
+                let phase = std::f64::consts::TAU * hz * i as f64 / f64::from(source.rate);
+
+                (sin + f64::from(s) * phase.sin(), cos + f64::from(s) * phase.cos())
+            });
+
+            sin.hypot(cos) / (out.len() / 2) as f64
+        })
+    };
+    let start = mix(0);
+    let late = mix(SECOND * 3 / 2);
+    let back = mix(SECOND / 2);
+    drop(source);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(start[0] > 0.04 && start[1] > 0.04, "{start:?}");
+    assert!(late[0] < 0.002 && late[1] > 0.04, "{late:?}");
+    assert!(back[0] > 0.04 && back[1] > 0.04, "{back:?}");
+}

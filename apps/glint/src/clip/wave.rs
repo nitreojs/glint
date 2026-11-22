@@ -278,7 +278,8 @@ fn run(path: &Path, streams: &[u32], tx: &Sender<Chunk>, stop: &AtomicBool, ctx:
     while tracks.iter().flatten().any(|t| !t.ended) && !stop.load(Ordering::Relaxed) {
         match media::read(&reader, ANY)? {
             Got::Sample { stream, ts, sample } => {
-                let Some((k, t)) = tracks.iter_mut().enumerate().find_map(|(k, t)| Some((k, t.as_mut()?)).filter(|(_, t)| t.stream == stream))
+                let Some((k, t)) = tracks.iter_mut().enumerate().filter_map(|(k, t)| Some((k, t.as_mut()?)))
+                    .find(|(_, t)| t.stream == stream)
                 else {
                     continue;
                 };
@@ -287,9 +288,12 @@ fn run(path: &Path, streams: &[u32], tx: &Sender<Chunk>, stop: &AtomicBool, ctx:
                 send(k, t, false);
             }
             Got::End(stream) => {
-                if let Some((k, t)) = tracks.iter_mut().enumerate().find_map(|(k, t)| Some((k, t.as_mut()?)).filter(|(_, t)| t.stream == stream)) {
+                if let Some((k, t)) = tracks.iter_mut().enumerate().filter_map(|(k, t)| Some((k, t.as_mut()?)))
+                    .find(|(_, t)| t.stream == stream)
+                {
                     t.ended = true;
                     send(k, t, true);
+                    unsafe { reader.SetStreamSelection(stream, false).ctx("SetStreamSelection")? };
                 }
             }
         }

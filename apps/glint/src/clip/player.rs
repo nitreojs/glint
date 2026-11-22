@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -11,6 +12,8 @@ use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 
 pub(super) const NO_CLOCK: i64 = i64::MIN;
 pub(super) const AHEAD: usize = 4;
+const CACHE_BYTES: usize = 48 * 1024 * 1024;
+const CACHE_FRAMES: usize = 32;
 
 pub(super) struct Shown {
     pub epoch: u64,
@@ -46,6 +49,9 @@ impl Player {
             let mut w = Worker {
                 size, out, queued: q, clock: c, ctx, epoch: 0,
                 head: None, ahead: None, sent: false, fresh: true, eof: false,
+                cache: VecDeque::new(),
+                cache_limit: (CACHE_BYTES / (size.0 as usize * size.1 as usize * size_of::<Color32>()))
+                    .min(CACHE_FRAMES),
             };
             if let Err(e) = w.run(&path, &cmds) {
                 let _ = w.out.send(Err(e));
@@ -120,6 +126,19 @@ struct Frame {
     image: Option<Arc<ColorImage>>,
 }
 
+#[derive(Clone)]
+struct Cached {
+    ts: i64,
+    dur: i64,
+    image: Arc<ColorImage>,
+}
+
+impl Cached {
+    fn covers(&self, t: i64) -> bool {
+        t == self.ts || (t > self.ts && t < self.ts.saturating_add(self.dur))
+    }
+}
+
 struct Worker {
     size: (u32, u32),
     out: Sender<Result<Shown, String>>,
@@ -132,6 +151,8 @@ struct Worker {
     sent: bool,
     fresh: bool,
     eof: bool,
+    cache: VecDeque<Cached>,
+    cache_limit: usize,
 }
 
 impl Worker {
@@ -139,8 +160,8 @@ impl Worker {
         let reader = media::rgb_reader(path, self.size)?;
         let mut playing = false;
         let mut seek = None;
+        let mut reposition = false;
         loop {
-            let mut reposition = false;
             loop {
                 match cmds.try_recv() {
                     Ok(Cmd::Seek { t, epoch, play, .. }) => {
@@ -158,12 +179,21 @@ impl Worker {
                     Err(TryRecvError::Disconnected) => return Ok(()),
                 }
             }
-            if reposition && let Some(t) = seek {
-                self.seek(&reader, t)?;
-            }
             if (!playing && seek.is_none()) || self.queued.load(Ordering::Relaxed) >= AHEAD {
                 thread::park();
                 continue;
+            }
+            if reposition && let Some(t) = seek {
+                reposition = false;
+                if !playing && let Some(i) = self.cache.iter().rposition(|f| f.covers(t)) {
+                    let frame = self.cache.remove(i).unwrap();
+                    self.send(frame.clone());
+                    self.cache.push_back(frame);
+                    seek = None;
+                    continue;
+                }
+
+                self.seek(&reader, t)?;
             }
             if self.head.is_none() || (seek.is_none() && self.sent) {
                 if !self.advance(&reader)? {
@@ -244,11 +274,30 @@ impl Worker {
             })?;
             head.image = Some(Arc::new(ColorImage::new([w, h], pixels)));
         }
-        let image = head.image.as_ref().unwrap().clone();
-        self.queued.fetch_add(1, Ordering::Relaxed);
-        let _ = self.out.send(Ok(Shown { epoch: self.epoch, ts: f.ts, dur: f.dur, image }));
-        self.ctx.request_repaint();
+        let frame = Cached { ts: f.ts, dur: f.dur, image: head.image.as_ref().unwrap().clone() };
+        if self.cache_limit > 0 {
+            if let Some(i) = self.cache.iter().position(|f| f.ts == frame.ts) {
+                self.cache.remove(i);
+            } else if self.cache.len() == self.cache_limit {
+                self.cache.pop_front();
+            }
+
+            self.cache.push_back(frame.clone());
+        }
+
+        self.send(frame);
 
         Ok(())
+    }
+
+    fn send(&self, frame: Cached) {
+        self.queued.fetch_add(1, Ordering::Relaxed);
+        let _ = self.out.send(Ok(Shown {
+            epoch: self.epoch,
+            ts: frame.ts,
+            dur: frame.dur,
+            image: frame.image,
+        }));
+        self.ctx.request_repaint();
     }
 }

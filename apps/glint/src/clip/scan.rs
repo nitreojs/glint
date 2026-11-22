@@ -8,9 +8,12 @@ use eframe::egui::{self, Color32, ColorImage};
 use glint_core::clip::math::SECOND;
 use glint_core::log::log;
 use glint_media::clip::media::{self, Com};
+use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 
 const THUMB_H: u32 = 64;
 const THUMBS: i64 = 240;
+const OVERVIEW_SLOTS: u32 = 16;
+const OVERVIEW_MIN: i64 = 30 * SECOND;
 const CUT_DIFF: f32 = 30.0;
 const CUT_RATIO: f32 = 4.0;
 const CUT_GAP: i64 = SECOND / 2;
@@ -18,6 +21,7 @@ const CUT_GAP: i64 = SECOND / 2;
 pub(super) enum Found {
     Cut(i64),
     Thumb(i64, ColorImage),
+    Overview(i64, ColorImage),
 }
 
 pub(super) struct Scan {
@@ -30,17 +34,101 @@ pub(super) fn interval(duration: i64) -> i64 {
     (duration / THUMBS).max(SECOND / 4)
 }
 
+pub(super) fn overview_interval(duration: i64) -> Option<i64> {
+    (duration >= OVERVIEW_MIN).then(|| duration / i64::from(OVERVIEW_SLOTS))
+}
+
+fn overview_times(step: i64, keys: &[i64]) -> [i64; OVERVIEW_SLOTS as usize] {
+    std::array::from_fn(|i| {
+        // Fill the largest empty stretches first.
+        let slot = (i as u32).reverse_bits() >> (u32::BITS - OVERVIEW_SLOTS.trailing_zeros());
+        let t = i64::from(slot) * step;
+        let next = keys.partition_point(|&key| key < t);
+
+        keys.get(next).copied().filter(|&key| key - t <= step / 4).unwrap_or(t)
+    })
+}
+
+fn overview(
+    reader: &IMFSourceReader,
+    thumb: (u32, u32),
+    times: [i64; OVERVIEW_SLOTS as usize],
+    stop: &AtomicBool,
+    mut found: impl FnMut(i64, ColorImage),
+) -> Result<(), String> {
+    let (w, h) = (thumb.0 as usize, thumb.1 as usize);
+    for t in times {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if t != 0 {
+            media::seek(reader, t)?;
+        }
+
+        let mut best = None;
+        while !stop.load(Ordering::Relaxed) {
+            let Some(frame) = media::next_video(reader)? else { break };
+            if frame.ts > t && best.is_some() {
+                break;
+            }
+
+            let covers = frame.ts >= t || frame.ts.saturating_add(frame.dur) > t;
+            best = Some(frame);
+            if covers {
+                break;
+            }
+        }
+
+        if let Some(frame) = best {
+            let pixels = media::with_pixels(&frame.sample, thumb.0, |rows| {
+                let mut pixels = Vec::with_capacity(w * h);
+                for y in 0..h {
+                    pixels.extend(rows.row(y).chunks_exact(4).map(|c| Color32::from_rgb(c[2], c[1], c[0])));
+                }
+
+                pixels
+            })?;
+            found(frame.ts, ColorImage::new([w, h], pixels));
+        }
+    }
+
+    Ok(())
+}
+
 impl Scan {
-    pub(super) fn start(path: PathBuf, size: (u32, u32), duration: i64, ctx: egui::Context) -> Self {
+    pub(super) fn start(
+        path: PathBuf,
+        size: (u32, u32),
+        duration: i64,
+        keys: &[i64],
+        ctx: egui::Context,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
         let w = ((THUMB_H as f32 * size.0 as f32 / size.1.max(1) as f32).round() as u32).clamp(8, 512) & !1;
         let thumb = (w, THUMB_H);
+        let times = overview_interval(duration).map(|step| overview_times(step, keys));
         let thread = std::thread::spawn(move || {
             let _com = Com::init();
             let res = (|| -> Result<(), String> {
-                let reader = media::rgb_reader(&path, thumb)?;
+                let mut reader = media::rgb_reader(&path, thumb)?;
+                if let Some(times) = times {
+                    if let Err(e) = overview(&reader, thumb, times, &stop, |t, image| {
+                        if tx.send(Found::Overview(t, image)).is_ok() {
+                            ctx.request_repaint();
+                        }
+                    }) {
+                        log(&format!("clip: fast filmstrip overview stopped: {e}"));
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    if media::seek(&reader, 0).is_err() {
+                        drop(reader);
+                        reader = media::rgb_reader(&path, thumb)?;
+                    }
+                }
                 let every = interval(duration);
                 let (mut next_thumb, mut cuts) = (0, Cuts::default());
                 let mut luma = Vec::new();

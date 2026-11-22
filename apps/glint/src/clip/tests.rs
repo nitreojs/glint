@@ -826,16 +826,17 @@ fn tracks_get_added_moved_deleted_renamed_and_undone_from_the_lanes() {
 }
 
 #[test]
-fn the_preview_smooths_below_200_percent_and_decodes_room_to_shrink() {
+fn the_preview_decodes_at_fit_size_and_keeps_room_to_shrink_when_zoomed() {
     use super::preview::crisp;
     assert!(crisp(1.0, true) && crisp(1.0, false), "100 % stays 1:1");
     assert!(!crisp(0.5, true) && !crisp(0.5, false) && !crisp(1.5, false) && !crisp(1.999 - 0.01, false));
     assert!(!crisp(2.6, true), "fitting a small video up stays smooth");
     assert!(crisp(2.0, false) && crisp(8.0, false), "zooming in to 200 % and past shows pixels");
     let info = Info { duration: SECOND, size: (1920, 1080), fps: 60.0, codec: None, tracks: Vec::new(), clicks: None, keys: None, snap: None };
-    assert_eq!(decode_size(&info, vec2(480.0, 270.0)), (960, 540));
-    assert_eq!(decode_size(&info, vec2(1200.0, 675.0)), (1920, 1080));
-    assert_eq!(decode_size(&info, vec2(3840.0, 2160.0)), (1920, 1080));
+    assert_eq!(decode_size(&info, vec2(480.0, 270.0), true), (480, 270));
+    assert_eq!(decode_size(&info, vec2(480.0, 270.0), false), (960, 540));
+    assert_eq!(decode_size(&info, vec2(1200.0, 675.0), false), (1920, 1080));
+    assert_eq!(decode_size(&info, vec2(3840.0, 2160.0), true), (1920, 1080));
 }
 
 fn clicks_harness() -> Harness {

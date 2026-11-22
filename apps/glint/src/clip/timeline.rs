@@ -1005,12 +1005,13 @@ impl ClipApp {
         let lane_clip = |r: Rect| painter.with_clip_rect(r.intersect(painter.clip_rect()));
 
         painter.rect_filled(rows.video, 6, p.ctl);
-        if let Some((_, first)) = self.thumbs.first() {
+        if let Some((_, first)) = self.thumbs.first().or_else(|| self.overview.first()) {
             let clip = lane_clip(rows.video.shrink(1.0));
             let [tw, th] = first.size();
             let h = rows.video.height() - 2.0;
             let w = (h * tw as f32 / th.max(1) as f32).max(8.0);
             let every = scan::interval(source_dur);
+            let overview_interval = scan::overview_interval(source_dur);
             let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
             let tint = Color32::WHITE.gamma_multiply(if light { 0.95 } else { 0.85 });
             let (x_start, x_end) = (x_of(0), x_of(source_dur));
@@ -1019,8 +1020,18 @@ impl ClipApp {
             while x < inner.right().min(x_end) {
                 let t = t_of(x + w / 2.0);
                 let i = self.thumbs.partition_point(|(ts, _)| *ts <= t).saturating_sub(1);
-                let (ts, tex) = &self.thumbs[i];
-                if t - ts <= 2 * every {
+                let tex = self.thumbs.get(i)
+                    .filter(|(ts, _)| t.abs_diff(*ts) <= (2 * every) as u64)
+                    .or_else(|| {
+                        let step = overview_interval?;
+                        let next = self.overview.partition_point(|(ts, _)| *ts < t);
+                        [next.checked_sub(1).and_then(|i| self.overview.get(i)), self.overview.get(next)]
+                            .into_iter()
+                            .flatten()
+                            .min_by_key(|(ts, _)| t.abs_diff(*ts))
+                            .filter(|(ts, _)| t.abs_diff(*ts) <= step as u64)
+                    });
+                if let Some((_, tex)) = tex {
                     let r = Rect::from_min_size(pos2(x, rows.video.top() + 1.0), vec2(w, h));
                     clip.image(tex.id(), r, uv, tint);
                     clip.vline(r.right(), r.y_range(), Stroke::new(1.0, Color32::from_black_alpha(90)));

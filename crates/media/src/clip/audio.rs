@@ -13,7 +13,7 @@ use windows::Win32::Media::Audio::*;
 use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 
-use super::media::{self, ALL, ANY, Com, Got};
+use super::media::{self, ALL, Com, Got};
 use crate::record::Ctx;
 
 const BUFFER: i64 = SECOND / 12;
@@ -198,6 +198,7 @@ struct Source {
     tracks: Vec<Option<Track>>,
     scratch: Vec<f32>,
     stereo: Vec<f32>,
+    fresh: bool,
 }
 
 impl Source {
@@ -224,12 +225,16 @@ impl Source {
         if tracks.iter().all(Option::is_none) {
             return Err("no playable audio track".into());
         }
-        Ok(Source { reader, rate, tracks, scratch: Vec::new(), stereo: Vec::new() })
+        Ok(Source { reader, rate, tracks, scratch: Vec::new(), stereo: Vec::new(), fresh: true })
     }
 
     /// Starts over at `t`, at the gains as they're set now: nothing is playing to slide from.
     fn seek(&mut self, t: i64, gains: &Gains) -> Result<(), String> {
-        media::seek(&self.reader, t)?;
+        if !self.fresh || t != 0 {
+            media::seek(&self.reader, t)?;
+        }
+        self.fresh = false;
+
         let at = pcm::frames(t, self.rate);
         for (i, tr) in self.tracks.iter_mut().enumerate() {
             if let Some(tr) = tr {
@@ -242,21 +247,25 @@ impl Source {
     }
 
     fn mix(&mut self, upto: i64, gains: &Gains, out: &mut [f32]) -> Result<(), String> {
-        while self.tracks.iter().flatten().any(|t| !t.ended && t.lane.end() < upto) {
-            match media::read(&self.reader, ANY)? {
-                Got::Sample { stream, ts, sample } => {
-                    let Some(tr) = self.tracks.iter_mut().flatten().find(|t| t.stream == stream) else { continue };
-                    media::floats(&sample, &mut self.scratch)?;
-                    pcm::to_stereo(&self.scratch, tr.channels, &mut self.stereo);
-                    tr.lane.push(pcm::frames(ts, self.rate), &self.stereo);
-                }
-                Got::End(stream) => {
-                    if let Some(tr) = self.tracks.iter_mut().flatten().find(|t| t.stream == stream) {
-                        tr.ended = true;
+        for tr in self.tracks.iter_mut().flatten() {
+            while !tr.ended && tr.lane.end() < upto {
+                match media::read(&self.reader, tr.stream)? {
+                    Got::Sample { ts, sample, .. } => {
+                        media::floats(&sample, &mut self.scratch)?;
+                        let stereo = if tr.channels == 2 {
+                            &self.scratch
+                        } else {
+                            pcm::to_stereo(&self.scratch, tr.channels, &mut self.stereo);
+
+                            &self.stereo
+                        };
+                        tr.lane.push(pcm::frames(ts, self.rate), stereo);
                     }
+                    Got::End(_) => tr.ended = true,
                 }
             }
         }
+
         out.fill(0.0);
         let step = pcm::ramp_step(self.rate);
         for (i, tr) in self.tracks.iter_mut().enumerate() {

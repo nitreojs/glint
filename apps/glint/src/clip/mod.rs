@@ -305,6 +305,7 @@ struct ClipApp {
     peaks: Vec<Vec<u8>>,
     cuts: Vec<i64>,
     thumbs: Vec<(i64, TextureHandle)>,
+    overview: Vec<(i64, TextureHandle)>,
     tex: Option<TextureHandle>,
     image: Option<Arc<ColorImage>>,
     nearest: bool,
@@ -379,8 +380,8 @@ fn fit(src: (u32, u32), area: egui::Vec2) -> egui::Vec2 {
     vec2(w * s, h * s)
 }
 
-fn decode_size(info: &Info, px: egui::Vec2) -> (u32, u32) {
-    let scaled = fit(info.size, px * 2.0);
+fn decode_size(info: &Info, px: egui::Vec2, fitted: bool) -> (u32, u32) {
+    let scaled = fit(info.size, if fitted { px } else { px * 2.0 });
     if scaled.x >= info.size.0 as f32 {
         info.size
     } else {
@@ -427,6 +428,7 @@ impl ClipApp {
             peaks: vec![Vec::new(); tracks],
             cuts: Vec::new(),
             thumbs: Vec::new(),
+            overview: Vec::new(),
             tex: None,
             image: None,
             nearest: false,
@@ -547,6 +549,7 @@ impl ClipApp {
     fn seek_with(&mut self, t: i64, mut playback: Option<Playback>) {
         let t = playback.as_ref().map_or(t, |p| p.pieces[0].range.start);
         let playing = playback.is_some();
+        let was_playing = self.play != Play::Paused;
         self.seek_video(t, playing, NO_CLOCK);
         if let Some(playback) = &mut playback {
             self.pos = t;
@@ -556,7 +559,7 @@ impl ClipApp {
         if let Some(a) = &self.audio {
             if let Some(playback) = &playback {
                 a.prepare(playback.pieces.clone(), playback.audio_epoch);
-            } else {
+            } else if was_playing {
                 a.stop();
             }
         }
@@ -682,15 +685,14 @@ impl ClipApp {
             return;
         }
         let Some(info) = self.info().cloned() else { return };
-        let want = decode_size(&info, shown_px);
+        let want = decode_size(&info, shown_px, self.viewer.fitted);
         let resized = (want.0 as f32 - self.player_size.0 as f32).abs() > self.player_size.0 as f32 * 0.1;
         let settled = settled && !ctx.input(|i| i.pointer.any_down());
         let first = self.player.is_none();
         if self.audio.is_none() && !info.tracks.is_empty() {
-            let streams: Vec<u32> = info.tracks.iter().map(|t| t.stream).collect();
-            self.audio = Some(Audio::start(self.path.clone(), streams.clone(), self.saved.volume));
+            let streams = info.tracks.iter().map(|t| t.stream).collect();
+            self.audio = Some(Audio::start(self.path.clone(), streams, self.saved.volume));
             self.sync_gains();
-            self.waves = Some(Waves::start(self.path.clone(), streams, ctx.clone()));
         }
         if first || (resized && settled) {
             self.player = None;
@@ -702,10 +704,20 @@ impl ClipApp {
                 _ => self.seek(self.pos, self.play != Play::Paused),
             }
         }
+        if self.tex.is_none() && self.player_error.is_none() {
+            return;
+        }
+
+        if self.waves.is_none() && !info.tracks.is_empty() {
+            let streams = info.tracks.iter().map(|t| t.stream).collect();
+            self.waves = Some(Waves::start(self.path.clone(), streams, ctx.clone()));
+        }
         if self.scan.is_none() {
             self.cuts.clear();
             self.thumbs.clear();
-            self.scan = Some(Scan::start(self.path.clone(), info.size, info.duration, ctx.clone()));
+            self.overview.clear();
+            let keys = self.index.as_ref().map_or(&[][..], |i| i.video.keys.as_slice());
+            self.scan = Some(Scan::start(self.path.clone(), info.size, info.duration, keys, ctx.clone()));
         }
     }
 
@@ -720,6 +732,12 @@ impl ClipApp {
                 Found::Thumb(t, image) => {
                     let tex = ctx.load_texture(format!("clip-thumb-{t}"), image, TextureOptions::LINEAR);
                     self.thumbs.push((t, tex));
+                }
+                Found::Overview(t, image) => {
+                    if let Err(at) = self.overview.binary_search_by_key(&t, |(ts, _)| *ts) {
+                        let tex = ctx.load_texture(format!("clip-overview-{t}"), image, TextureOptions::LINEAR);
+                        self.overview.insert(at, (t, tex));
+                    }
                 }
             }
         }
@@ -1365,6 +1383,8 @@ impl eframe::App for ClipApp {
 
 #[cfg(test)]
 mod playback_tests;
+#[cfg(test)]
+mod preview_media_tests;
 
 #[cfg(test)]
 mod tests;
