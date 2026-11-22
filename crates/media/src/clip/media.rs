@@ -10,6 +10,7 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Variant::VT_I8;
+use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::core::{GUID, HSTRING, Interface};
 
 use crate::record::Ctx;
@@ -95,6 +96,26 @@ pub fn open(path: &Path, gpu: Option<&Gpu>) -> Result<IMFSourceReader, String> {
             attrs.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &g.mgr).ctx("attr")?;
         }
         MFCreateSourceReaderFromURL(&HSTRING::from(path.as_os_str()), &attrs).ctx("can't open the video")
+    }
+}
+
+/// Opens an in-memory, audio-only MP4 and lists its streams in MP4 track order.
+pub fn audio_view_reader(data: &[u8]) -> Result<(IMFSourceReader, Vec<u32>), String> {
+    unsafe {
+        let stream = SHCreateMemStream(Some(data)).ok_or("can't allocate audio preview stream")?;
+        let bytes = MFCreateMFByteStreamOnStreamEx(&stream).ctx("MFCreateMFByteStreamOnStreamEx")?;
+        let attrs = bytes.cast::<IMFAttributes>().ctx("audio stream attributes")?;
+        attrs.SetString(&MF_BYTESTREAM_CONTENT_TYPE, &HSTRING::from("audio/mp4")).ctx("audio content type")?;
+        let reader = MFCreateSourceReaderFromByteStream(&bytes, None).ctx("can't read compact audio")?;
+        let mut order = Vec::new();
+        for (stream, kind, _) in streams(&reader).into_iter().rev() {
+            if kind != MFMediaType_Audio {
+                return Err("compact audio contains a non-audio stream".into());
+            }
+            order.push(stream);
+        }
+
+        Ok((reader, order))
     }
 }
 

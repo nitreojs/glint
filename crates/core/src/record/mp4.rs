@@ -4,6 +4,10 @@ use std::path::Path;
 
 use super::negotiate::Matrix;
 
+mod audio_view;
+
+pub use audio_view::audio_view;
+
 struct Atom {
     kind: [u8; 4],
     start: usize,

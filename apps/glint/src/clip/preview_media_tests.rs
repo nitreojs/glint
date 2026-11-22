@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use glint_core::clip::{index, math::SECOND};
+use glint_core::record::mp4;
 use glint_media::clip::media::{self, Com};
 
 use super::player::{Cmd, NO_CLOCK, Player};
@@ -43,6 +44,8 @@ fn editor_media_preview_covers_long_clips_and_reuses_exact_frames() {
             "-f", "lavfi", "-i", "sine=frequency=660:sample_rate=48000:duration=40",
             "-f", "lavfi", "-i", "sine=frequency=220:sample_rate=48000:duration=40",
             "-map", "0:v", "-map", "1:a", "-map", "2:a", "-map", "3:a", "-map", "4:a",
+            "-filter:a:0", "volume=0.6", "-filter:a:1", "volume=1.5",
+            "-filter:a:2", "volume=2.5", "-filter:a:3", "volume=4",
             "-c:v", "libx264", "-preset", "ultrafast", "-g", "120", "-sc_threshold", "0", "-threads:v", "4", "-c:a", "aac",
         ])
         .arg(&fixture.0)
@@ -97,10 +100,16 @@ fn editor_media_preview_covers_long_clips_and_reuses_exact_frames() {
 
     let streams: Vec<_> = info.tracks.iter().map(|track| track.stream).collect();
     assert_eq!(streams.len(), 4);
+    let compact = mp4::audio_view(&fixture.0, || false).unwrap();
+    let (_, order) = media::audio_view_reader(&compact).unwrap();
+    assert_eq!(order.len(), streams.len());
     let bucket = |seconds| (seconds * SECOND / BUCKET) as usize;
     let measure_waves = |sections| {
         let start = Instant::now();
-        let waves = Waves::start_sections(fixture.0.clone(), streams.clone(), info.duration, sections, ctx.clone());
+        let waves = match sections {
+            Some(count) => Waves::start_sections(fixture.0.clone(), streams.clone(), info.duration, count, ctx.clone()),
+            None => Waves::start(fixture.0.clone(), streams.clone(), info.duration, ctx.clone()),
+        };
         let mut peaks = vec![Vec::new(); streams.len()];
         let late = wait_for(|| {
             waves.poll(&mut peaks);
@@ -117,12 +126,16 @@ fn editor_media_preview_covers_long_clips_and_reuses_exact_frames() {
         });
         assert_eq!(peaks.iter().filter(|p| p.len() < bucket(13)).count(), 1);
 
-        (late, completed)
+        let means: Vec<_> = peaks.iter().map(|p| p[100..900].iter().copied().map(u32::from).sum::<u32>() / 800).collect();
+
+        (late, completed, means)
     };
-    let (wave_sequential, all_sequential) = measure_waves(1);
-    let (wave_parallel, all_parallel) = measure_waves(4);
-    eprintln!("late waveform across three active tracks: {wave_sequential:?} sequential, {wave_parallel:?} parallel");
-    eprintln!("continuous waveform across sections: {all_sequential:?} sequential, {all_parallel:?} parallel");
+    let (wave_sequential, all_sequential, reference_peaks) = measure_waves(Some(1));
+    let (wave_compact, all_compact, compact_peaks) = measure_waves(None);
+    assert!(reference_peaks.windows(2).all(|w| w[0] + 10 < w[1]), "{reference_peaks:?}");
+    assert_eq!(compact_peaks, reference_peaks);
+    eprintln!("late waveform: {wave_sequential:?} original, {wave_compact:?} compact");
+    eprintln!("continuous waveform: {all_sequential:?} original, {all_compact:?} compact");
 
     eprintln!("late filmstrip: {sequential:?} sequential, {overview:?} overview; exact seek: {cold:?} cold, {warm:?} cached");
 }

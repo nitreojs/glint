@@ -3,16 +3,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread::JoinHandle;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Color32, Context, Id, Mesh, Painter, Rect, Shape, pos2};
 use glint_core::clip::edit::gain;
 use glint_core::clip::math::SECOND;
 use glint_core::log::log;
+use glint_core::record::mp4;
 use glint_media::clip::media::{self, ALL, ANY, Com, Got};
 use glint_media::record::Ctx;
 use glint_ui::widgets::{Look, anim_ctx, ease, mix, motion};
+use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 
 use super::overlay::danger;
 
@@ -156,17 +158,18 @@ struct Chunk {
 pub(super) struct Waves {
     rx: Receiver<Chunk>,
     cancel: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    thread: Option<JoinHandle<()>>,
 }
 
 impl Waves {
     pub(super) fn start(path: PathBuf, streams: Vec<u32>, duration: i64, ctx: egui::Context) -> Self {
-        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let parallelism = thread::available_parallelism().map_or(1, |n| n.get());
         let sections = (duration / MIN_SECTION).clamp(1, parallelism.saturating_sub(1).clamp(1, 4) as i64);
 
-        Self::start_sections(path, streams, duration, sections, ctx)
+        Self::launch(path, streams, duration, sections, true, ctx)
     }
 
+    #[cfg(test)]
     pub(super) fn start_sections(
         path: PathBuf,
         streams: Vec<u32>,
@@ -174,36 +177,40 @@ impl Waves {
         sections: i64,
         ctx: egui::Context,
     ) -> Self {
+        Self::launch(path, streams, duration, sections, false, ctx)
+    }
+
+    fn launch(
+        path: PathBuf,
+        streams: Vec<u32>,
+        duration: i64,
+        sections: i64,
+        compact: bool,
+        ctx: egui::Context,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let media = Arc::new((path, streams));
-        let buckets = duration.div_euclid(BUCKET);
-        let threads = (0..sections).map(|section| {
-            let start = buckets * section / sections * BUCKET;
-            let end = if section + 1 == sections {
-                duration
-            } else {
-                buckets * (section + 1) / sections * BUCKET
-            };
-            let tx = tx.clone();
-            let media = media.clone();
-            let stop = cancel.clone();
-            let ctx = ctx.clone();
-
-            std::thread::spawn(move || {
-                let (path, streams) = &*media;
-                let _com = Com::init();
-                if let Err(e) = run(path, streams, start..end, &tx, &stop, &ctx)
-                    && !stop.load(Ordering::Relaxed)
-                    && path.exists()
+        let stop = cancel.clone();
+        let thread = thread::spawn(move || {
+            let _com = Com::init();
+            if compact {
+                let view = mp4::audio_view(&path, || stop.load(Ordering::Relaxed))
+                    .and_then(|bytes| media::audio_view_reader(&bytes));
+                if let Ok((reader, order)) = view
+                    && order.len() == streams.len()
+                    && run(&reader, &order, 0..duration, &tx, &stop, &ctx).is_ok()
                 {
-                    log(&format!("clip: drawing the waveforms stopped: {e}"));
+                    ctx.request_repaint();
+                    return;
                 }
-                ctx.request_repaint();
-            })
-        }).collect();
+            }
 
-        Waves { rx, cancel, threads }
+            if !stop.load(Ordering::Relaxed) {
+                run_sections(&path, &streams, duration, sections, &tx, &stop, &ctx);
+            }
+        });
+
+        Waves { rx, cancel, thread: Some(thread) }
     }
 
     /// Moves what's arrived into `peaks`, one list per track.
@@ -222,7 +229,7 @@ impl Waves {
 impl Drop for Waves {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        for t in self.threads.drain(..) {
+        if let Some(t) = self.thread.take() {
             let _ = t.join();
         }
     }
@@ -299,15 +306,49 @@ struct Track {
     ended: bool,
 }
 
-fn run(
+fn run_sections(
     path: &Path,
+    streams: &[u32],
+    duration: i64,
+    sections: i64,
+    tx: &Sender<Chunk>,
+    stop: &AtomicBool,
+    ctx: &egui::Context,
+) {
+    let buckets = duration.div_euclid(BUCKET);
+    thread::scope(|scope| {
+        for section in 0..sections {
+            let start = buckets * section / sections * BUCKET;
+            let end = if section + 1 == sections {
+                duration
+            } else {
+                buckets * (section + 1) / sections * BUCKET
+            };
+
+            scope.spawn(move || {
+                let _com = Com::init();
+                let result = media::open(path, None)
+                    .and_then(|reader| run(&reader, streams, start..end, tx, stop, ctx));
+                if let Err(e) = result
+                    && !stop.load(Ordering::Relaxed)
+                    && path.exists()
+                {
+                    log(&format!("clip: drawing the waveforms stopped: {e}"));
+                }
+                ctx.request_repaint();
+            });
+        }
+    });
+}
+
+fn run(
+    reader: &IMFSourceReader,
     streams: &[u32],
     range: Range<i64>,
     tx: &Sender<Chunk>,
     stop: &AtomicBool,
     ctx: &egui::Context,
 ) -> Result<(), String> {
-    let reader = media::open(path, None)?;
     unsafe { reader.SetStreamSelection(ALL, false).ctx("SetStreamSelection")? };
     let mut tracks: Vec<Option<Track>> = streams
         .iter()

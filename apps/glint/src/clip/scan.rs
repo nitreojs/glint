@@ -53,6 +53,8 @@ fn overview_times(step: i64, keys: &[i64]) -> [i64; OVERVIEW_SLOTS as usize] {
             .copied()
             .min_by_key(|&key| key.abs_diff(t))
             .filter(|&key| key.abs_diff(t) <= (step / 2) as u64)
+            // Seek just past the keyframe so Media Foundation's timestamp rounding can't land on the previous GOP.
+            .map(|key| if key > 0 { key + SECOND / 1_000 } else { key })
             .unwrap_or(t)
     })
 }
