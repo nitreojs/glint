@@ -1,13 +1,14 @@
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use glint_core::clip::{index, math::SECOND};
 use glint_core::clip::timeline_cache::Cache;
-use glint_core::record::mp4;
+use glint_core::record::mp4::AudioView;
 use glint_media::clip::media::{self, Com};
 
 use super::player::{Cmd, NO_CLOCK, Player};
@@ -101,9 +102,15 @@ fn editor_media_preview_covers_long_clips_and_reuses_exact_frames() {
 
     let streams: Vec<_> = info.tracks.iter().map(|track| track.stream).collect();
     assert_eq!(streams.len(), 4);
-    let compact = mp4::audio_view(&fixture.0, || false).unwrap();
-    let (_, order) = media::audio_view_reader(&compact).unwrap();
+    let view = AudioView::open(&fixture.0).unwrap();
+    let (reader, order) = media::audio_view_reader(view, Arc::new(AtomicBool::new(false))).unwrap();
     assert_eq!(order.len(), streams.len());
+    for stream in order {
+        unsafe { reader.SetStreamSelection(stream, true) }.unwrap();
+        media::float_native(&reader, stream).unwrap();
+        assert!(matches!(media::read(&reader, stream).unwrap(), media::Got::Sample { .. }));
+    }
+    drop(reader);
     let bucket = |seconds| (seconds * SECOND / BUCKET) as usize;
     let measure_waves = |sections| {
         let start = Instant::now();

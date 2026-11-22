@@ -11,7 +11,7 @@ use glint_core::clip::edit::gain;
 use glint_core::clip::math::SECOND;
 use glint_core::clip::timeline_cache::Cache;
 use glint_core::log::log;
-use glint_core::record::mp4;
+use glint_core::record::mp4::AudioView;
 use glint_media::clip::media::{self, ALL, ANY, Com, Got};
 use glint_media::record::Ctx;
 use glint_ui::widgets::{Look, anim_ctx, ease, mix, motion};
@@ -211,8 +211,8 @@ impl Waves {
             let _com = Com::init();
             let mut complete = false;
             if compact {
-                let view = mp4::audio_view(&path, || stop.load(Ordering::Relaxed))
-                    .and_then(|bytes| media::audio_view_reader(&bytes));
+                let view = AudioView::open(&path)
+                    .and_then(|view| media::audio_view_reader(view, stop.clone()));
                 if let Ok((reader, order)) = view
                     && order.len() == streams.len()
                     && run(&reader, &order, 0..duration, &emit, &stop, &ctx).is_ok()

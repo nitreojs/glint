@@ -6,7 +6,7 @@ use super::negotiate::Matrix;
 
 mod audio_view;
 
-pub use audio_view::audio_view;
+pub use audio_view::AudioView;
 
 struct Atom {
     kind: [u8; 4],

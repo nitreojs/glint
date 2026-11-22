@@ -1,7 +1,10 @@
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use glint_core::clip::info::{Info, Track};
 use glint_core::log::log;
+use glint_core::record::mp4::AudioView;
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
@@ -10,9 +13,9 @@ use windows::Win32::Media::MediaFoundation::*;
 use windows::Win32::System::Com::StructuredStorage::{PROPVARIANT, PropVariantClear};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::System::Variant::VT_I8;
-use windows::Win32::UI::Shell::SHCreateMemStream;
 use windows::core::{GUID, HSTRING, Interface};
 
+use super::audio_stream;
 use crate::record::Ctx;
 
 pub(super) const VIDEO: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
@@ -99,10 +102,10 @@ pub fn open(path: &Path, gpu: Option<&Gpu>) -> Result<IMFSourceReader, String> {
     }
 }
 
-/// Opens an in-memory, audio-only MP4 and lists its streams in MP4 track order.
-pub fn audio_view_reader(data: &[u8]) -> Result<(IMFSourceReader, Vec<u32>), String> {
+/// Opens a seekable, audio-only MP4 and lists its streams in MP4 track order.
+pub fn audio_view_reader(view: AudioView, stop: Arc<AtomicBool>) -> Result<(IMFSourceReader, Vec<u32>), String> {
+    let stream = audio_stream::open(view, stop);
     unsafe {
-        let stream = SHCreateMemStream(Some(data)).ok_or("can't allocate audio preview stream")?;
         let bytes = MFCreateMFByteStreamOnStreamEx(&stream).ctx("MFCreateMFByteStreamOnStreamEx")?;
         let attrs = bytes.cast::<IMFAttributes>().ctx("audio stream attributes")?;
         attrs.SetString(&MF_BYTESTREAM_CONTENT_TYPE, &HSTRING::from("audio/mp4")).ctx("audio content type")?;
