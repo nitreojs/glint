@@ -617,14 +617,24 @@ impl ClipApp {
         self.seek_with(start, Playback::new(Playback::from_source(pieces, start)));
     }
 
-    fn step(&mut self, forward: bool) {
+    fn step(&mut self, steps: isize) {
         let Some((ts, dur)) = self.shown else { return };
-        let t = if forward { ts + if dur > 0 { dur } else { self.frame_len() } } else { ts - 1 };
+        let (t, seek) = if let Some(index) = &self.index {
+            let at = if self.play == Play::Paused { self.pos } else { ts };
+            let Some(t) = index.video.step(at.saturating_add(1), steps) else { return };
+
+            (t, t.saturating_add(1).min(self.duration() - 1))
+        } else {
+            let t = if steps > 0 { ts + if dur > 0 { dur } else { self.frame_len() } } else { ts - 1 };
+
+            (t, t)
+        };
         if t < 0 || t >= self.duration() {
             return;
         }
+
         self.pos = t;
-        self.seek(t, false);
+        self.seek(seek, false);
         self.reveal(t);
     }
 
@@ -1092,11 +1102,15 @@ impl ClipApp {
         }
         let cmd = Modifiers::COMMAND;
         let none = Modifiers::NONE;
-        let (left, right, marker, set_in, set_out, prev, next, split, delete, redo, undo) = ctx.input_mut(|i| {
-            let arrows = !navigating;
+        let (steps, marker, set_in, set_out, prev, next, split, delete, redo, undo) = ctx.input_mut(|i| {
+            let steps = if navigating {
+                0
+            } else {
+                i.count_and_consume_key(none, Key::ArrowRight) as isize
+                    - i.count_and_consume_key(none, Key::ArrowLeft) as isize
+            };
             (
-                arrows && i.consume_key(none, Key::ArrowLeft),
-                arrows && i.consume_key(none, Key::ArrowRight),
+                steps,
                 i.consume_key(none, Key::M),
                 i.consume_key(none, Key::I),
                 i.consume_key(none, Key::O),
@@ -1126,8 +1140,8 @@ impl ClipApp {
             self.menu = false;
         }
         let (frame, duration, pos) = (self.frame_len(), self.duration(), math::snap(self.pos, self.fps()));
-        if left || right {
-            self.step(right);
+        if steps != 0 {
+            self.step(steps);
         }
         if marker {
             self.change(|e| e.add_marker(pos, frame / 2));

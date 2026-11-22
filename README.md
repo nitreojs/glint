@@ -37,6 +37,7 @@ it records straight off the gpu with your mic and system sound, and can show you
 then trim it, crop it, mute a track, squeeze it under a size<br>
 Glint and Afterglow collect audio waveforms and a thumbnail overview while recording. For other videos, the editor draws waveforms as the audio loads, then caches them with the filmstrip for later opens. The cache stays on this PC and doesn't change the video file<br>
 park the playhead and drag either trim edge to its line to cut there; hold ctrl to bypass snapping<br>
+press **←** or **→** to step backward or forward one video frame<br>
 press **S** at each end of a section, then right-click that piece in the thumbnail strip to remove or restore it<br>
 hold **Shift** and drag either edge of a kept piece in the thumbnail strip to stretch or shorten its playback without trimming the source; the opposite edge stays put as you drag, and the current speed and duration appear beside the drag. Audio pitch follows the speed<br>
 double-click inside a retimed piece to restore it to **1×**; **Ctrl+Z** restores its previous speed. The focused piece stays at normal brightness while other kept pieces dim by 25%. If the whole timeline was visible before a speed drag, it eases to fit the new duration after release<br>

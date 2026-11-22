@@ -36,6 +36,16 @@ impl Samples {
         self.times[..self.times.partition_point(|&s| s <= t)].last().copied()
     }
 
+    /// Moves by presentation-order samples, clamping to the ends of the track.
+    pub fn step(&self, t: i64, steps: isize) -> Option<i64> {
+        let first = self.times.partition_point(|&at| at < 0);
+        let last = self.times.len().checked_sub(1).filter(|&last| last >= first)?;
+        let current = self.times.partition_point(|&at| at <= t).saturating_sub(1).max(first);
+        let next = current.saturating_add_signed(steps).clamp(first, last);
+
+        (next != current).then(|| self.times[next])
+    }
+
     fn at(&self, t: i64) -> u64 {
         let i = self.times.partition_point(|&s| s < t);
         self.before.get(i).copied().unwrap_or(self.total)

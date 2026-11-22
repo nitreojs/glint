@@ -826,6 +826,30 @@ fn tracks_get_added_moved_deleted_renamed_and_undone_from_the_lanes() {
 }
 
 #[test]
+fn arrow_keys_step_each_frame_without_waiting_for_the_decoder() {
+    let times = [0, 166_667, 500_000, 1_333_333];
+    let video = Samples::new(times.into_iter().map(|at| (at, 40_000, at == 0)).collect());
+    let mut h = Harness::opened(info(0, None, None), Some(Index { video, audio: Vec::new() }));
+    h.app.shown = Some((0, 166_667));
+    h.key(Key::ArrowLeft, true);
+    assert_eq!(h.app.pos, 0);
+
+    h.key(Key::ArrowRight, true);
+    assert_eq!(h.app.pos, times[1]);
+    h.frame(vec![Event::Key {
+        key: Key::ArrowRight, physical_key: None, pressed: true, repeat: true, modifiers: Modifiers::NONE,
+    }; 2]);
+    assert_eq!(h.app.pos, times[3]);
+    h.key(Key::ArrowRight, true);
+    assert_eq!(h.app.pos, times[3]);
+    h.key(Key::ArrowLeft, true);
+    assert_eq!(h.app.pos, times[2]);
+    h.key(Key::ArrowLeft, true);
+    h.key(Key::ArrowLeft, true);
+    assert_eq!(h.app.pos, 0);
+}
+
+#[test]
 fn the_preview_decodes_at_fit_size_and_keeps_room_to_shrink_when_zoomed() {
     use super::preview::crisp;
     assert!(crisp(1.0, true) && crisp(1.0, false), "100 % stays 1:1");
