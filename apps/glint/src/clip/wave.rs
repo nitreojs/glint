@@ -1,3 +1,4 @@
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,7 +18,11 @@ use super::overlay::danger;
 
 /// One peak per 10 ms of sound.
 pub(super) const BUCKET: i64 = SECOND / 100;
-const BATCH: usize = 100;
+const BATCH: usize = 25;
+const UNLOADED: u8 = 0;
+const SILENCE: u8 = 1;
+const MIN_SECTION: i64 = 10 * SECOND;
+const SEEK_PREROLL: i64 = SECOND / 4;
 
 pub(super) const WAVES: [Color32; 6] = [
     Color32::from_rgb(0x6A, 0xA7, 0xE8),
@@ -115,8 +120,12 @@ impl Waveform {
             at = source_at((x + PITCH).min(rect.right())).max(0) as u64;
             let end = at.div_ceil(BUCKET as u64) as usize;
             let end = end.clamp(start + 1, peaks.len());
-            let peak = peaks[start..end].iter().copied().max().unwrap_or(0);
-            let level = f32::from(peak) / 255.0 * self.gain;
+            let peak = peaks[start..end].iter().copied().max().unwrap_or(UNLOADED);
+            if peak == UNLOADED {
+                continue;
+            }
+
+            let level = f32::from(peak - SILENCE) / 254.0 * self.gain;
             let (height, color) = if level == 0.0 {
                 if column % 3 != 0 {
                     continue;
@@ -147,25 +156,54 @@ struct Chunk {
 pub(super) struct Waves {
     rx: Receiver<Chunk>,
     cancel: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl Waves {
-    pub(super) fn start(path: PathBuf, streams: Vec<u32>, ctx: egui::Context) -> Self {
+    pub(super) fn start(path: PathBuf, streams: Vec<u32>, duration: i64, ctx: egui::Context) -> Self {
+        let parallelism = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let sections = (duration / MIN_SECTION).clamp(1, parallelism.saturating_sub(1).clamp(1, 4) as i64);
+
+        Self::start_sections(path, streams, duration, sections, ctx)
+    }
+
+    pub(super) fn start_sections(
+        path: PathBuf,
+        streams: Vec<u32>,
+        duration: i64,
+        sections: i64,
+        ctx: egui::Context,
+    ) -> Self {
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let stop = cancel.clone();
-        let thread = std::thread::spawn(move || {
-            let _com = Com::init();
-            if let Err(e) = run(&path, &streams, &tx, &stop, &ctx)
-                && !stop.load(Ordering::Relaxed)
-                && path.exists()
-            {
-                log(&format!("clip: drawing the waveforms stopped: {e}"));
-            }
-            ctx.request_repaint();
-        });
-        Waves { rx, cancel, thread: Some(thread) }
+        let media = Arc::new((path, streams));
+        let buckets = duration.div_euclid(BUCKET);
+        let threads = (0..sections).map(|section| {
+            let start = buckets * section / sections * BUCKET;
+            let end = if section + 1 == sections {
+                duration
+            } else {
+                buckets * (section + 1) / sections * BUCKET
+            };
+            let tx = tx.clone();
+            let media = media.clone();
+            let stop = cancel.clone();
+            let ctx = ctx.clone();
+
+            std::thread::spawn(move || {
+                let (path, streams) = &*media;
+                let _com = Com::init();
+                if let Err(e) = run(path, streams, start..end, &tx, &stop, &ctx)
+                    && !stop.load(Ordering::Relaxed)
+                    && path.exists()
+                {
+                    log(&format!("clip: drawing the waveforms stopped: {e}"));
+                }
+                ctx.request_repaint();
+            })
+        }).collect();
+
+        Waves { rx, cancel, threads }
     }
 
     /// Moves what's arrived into `peaks`, one list per track.
@@ -174,7 +212,7 @@ impl Waves {
             let Some(v) = peaks.get_mut(c.track) else { continue };
             let end = c.at + c.peaks.len();
             if v.len() < end {
-                v.resize(end, 0);
+                v.resize(end, UNLOADED);
             }
             v[c.at..end].copy_from_slice(&c.peaks);
         }
@@ -184,7 +222,7 @@ impl Waves {
 impl Drop for Waves {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
+        for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
@@ -200,14 +238,20 @@ pub(super) struct Peaks {
 }
 
 fn level(peak: f32) -> u8 {
-    (peak.clamp(0.0, 1.0).sqrt() * 255.0).round() as u8
+    (peak.clamp(0.0, 1.0).sqrt() * 254.0).round() as u8 + SILENCE
 }
 
 impl Peaks {
-    pub(super) fn push(&mut self, ts: i64, rate: u32, channels: usize, data: &[f32]) {
-        for (i, frame) in data.chunks_exact(channels.max(1)).enumerate() {
-            let t = ts + (i as i64 * SECOND) / rate as i64;
-            let b = (t.max(0) / BUCKET) as usize;
+    fn push(&mut self, ts: i64, rate: u32, channels: usize, data: &[f32], range: &Range<i64>) -> bool {
+        let frames = (data.len() / channels) as i64;
+        let rate = i64::from(rate);
+        let frame_at = |at: i64| ((at - ts).max(0) * rate + SECOND - 1) / SECOND;
+        let end = frame_at(range.end);
+        let limit = end.min(frames);
+        let mut i = frame_at(range.start);
+        while i < limit {
+            let t = ts + i * SECOND / rate;
+            let b = (t / BUCKET) as usize;
             match self.bucket {
                 None => {
                     self.bucket = Some(b);
@@ -215,14 +259,20 @@ impl Peaks {
                 }
                 Some(cur) if b > cur => {
                     self.pending.push(level(self.peak));
-                    self.pending.extend(std::iter::repeat_n(0, b - cur - 1));
+                    self.pending.extend(std::iter::repeat_n(SILENCE, b - cur - 1));
                     self.bucket = Some(b);
                     self.peak = 0.0;
                 }
                 _ => {}
             }
-            self.peak = frame.iter().fold(self.peak, |m, s| m.max(s.abs()));
+
+            let next = frame_at((b as i64 + 1) * BUCKET).min(limit);
+            let samples = &data[i as usize * channels..next as usize * channels];
+            self.peak = samples.iter().fold(self.peak, |m, s| m.max(s.abs()));
+            i = next;
         }
+
+        end <= frames
     }
 
     /// The finished peaks so far, from bucket `.0`; `all` closes the open bucket too.
@@ -249,7 +299,14 @@ struct Track {
     ended: bool,
 }
 
-fn run(path: &Path, streams: &[u32], tx: &Sender<Chunk>, stop: &AtomicBool, ctx: &egui::Context) -> Result<(), String> {
+fn run(
+    path: &Path,
+    streams: &[u32],
+    range: Range<i64>,
+    tx: &Sender<Chunk>,
+    stop: &AtomicBool,
+    ctx: &egui::Context,
+) -> Result<(), String> {
     let reader = media::open(path, None)?;
     unsafe { reader.SetStreamSelection(ALL, false).ctx("SetStreamSelection")? };
     let mut tracks: Vec<Option<Track>> = streams
@@ -268,6 +325,13 @@ fn run(path: &Path, streams: &[u32], tx: &Sender<Chunk>, stop: &AtomicBool, ctx:
             }
         })
         .collect();
+    if range.start > 0 {
+        let at = (range.start - SEEK_PREROLL).max(0);
+        if let Err(e) = media::seek(&reader, at) {
+            log(&format!("clip: waveform seek failed, reading from the start: {e}"));
+        }
+    }
+
     let mut scratch = Vec::new();
     let mut shown = Instant::now();
     let send = |k: usize, t: &mut Track, all: bool| {
@@ -276,26 +340,26 @@ fn run(path: &Path, streams: &[u32], tx: &Sender<Chunk>, stop: &AtomicBool, ctx:
         }
     };
     while tracks.iter().flatten().any(|t| !t.ended) && !stop.load(Ordering::Relaxed) {
-        match media::read(&reader, ANY)? {
-            Got::Sample { stream, ts, sample } => {
-                let Some((k, t)) = tracks.iter_mut().enumerate().filter_map(|(k, t)| Some((k, t.as_mut()?)))
-                    .find(|(_, t)| t.stream == stream)
-                else {
-                    continue;
-                };
+        let got = media::read(&reader, ANY)?;
+        let stream = match &got {
+            Got::Sample { stream, .. } | Got::End(stream) => *stream,
+        };
+        let Some((k, track)) = tracks.iter_mut().enumerate().filter_map(|(k, t)| Some((k, t.as_mut()?)))
+            .find(|(_, t)| t.stream == stream && !t.ended)
+        else {
+            continue;
+        };
+        let done = match got {
+            Got::Sample { ts, sample, .. } if ts < range.end => {
                 media::floats(&sample, &mut scratch)?;
-                t.peaks.push(ts, t.rate, t.channels, &scratch);
-                send(k, t, false);
+                track.peaks.push(ts, track.rate, track.channels, &scratch, &range)
             }
-            Got::End(stream) => {
-                if let Some((k, t)) = tracks.iter_mut().enumerate().filter_map(|(k, t)| Some((k, t.as_mut()?)))
-                    .find(|(_, t)| t.stream == stream)
-                {
-                    t.ended = true;
-                    send(k, t, true);
-                    unsafe { reader.SetStreamSelection(stream, false).ctx("SetStreamSelection")? };
-                }
-            }
+            _ => true,
+        };
+        send(k, track, done);
+        if done {
+            track.ended = true;
+            unsafe { reader.SetStreamSelection(stream, false).ctx("SetStreamSelection")? };
         }
         if shown.elapsed() > Duration::from_millis(60) {
             shown = Instant::now();
@@ -313,13 +377,14 @@ mod tests {
     fn peaks_fill_buckets_in_order_with_silence_for_gaps() {
         let mut p = Peaks::default();
         let rate = 1000;
+        let range = 0..7 * BUCKET;
         let loud: Vec<f32> = (0..20).flat_map(|i| [if i == 3 { -1.0 } else { 0.0 }, 0.25]).collect();
-        p.push(0, rate, 2, &loud);
+        p.push(0, rate, 2, &loud, &range);
         assert_eq!(p.take(false), None);
-        p.push(5 * BUCKET, rate, 2, &[0.04, 0.0]);
-        assert_eq!(p.take(true), Some((0, vec![255, 128, 0, 0, 0, 51])));
+        p.push(5 * BUCKET, rate, 2, &[0.04, 0.0], &range);
+        assert_eq!(p.take(true), Some((0, vec![255, 128, 1, 1, 1, 52])));
         assert_eq!(p.take(true), None);
-        p.push(6 * BUCKET, rate, 1, &[0.0; 10]);
-        assert_eq!(p.take(true), Some((6, vec![0])));
+        p.push(6 * BUCKET, rate, 1, &[0.0; 10], &range);
+        assert_eq!(p.take(true), Some((6, vec![1])));
     }
 }

@@ -684,8 +684,9 @@ impl ClipApp {
         if self.gone {
             return;
         }
-        let Some(info) = self.info().cloned() else { return };
-        let want = decode_size(&info, shown_px, self.viewer.fitted);
+        let Some(info) = self.info() else { return };
+        let want = decode_size(info, shown_px, self.viewer.fitted);
+        let (size, duration) = (info.size, info.duration);
         let resized = (want.0 as f32 - self.player_size.0 as f32).abs() > self.player_size.0 as f32 * 0.1;
         let settled = settled && !ctx.input(|i| i.pointer.any_down());
         let first = self.player.is_none();
@@ -708,16 +709,16 @@ impl ClipApp {
             return;
         }
 
-        if self.waves.is_none() && !info.tracks.is_empty() {
+        if self.waves.is_none() && let Ok(info) = &self.info && !info.tracks.is_empty() {
             let streams = info.tracks.iter().map(|t| t.stream).collect();
-            self.waves = Some(Waves::start(self.path.clone(), streams, ctx.clone()));
+            self.waves = Some(Waves::start(self.path.clone(), streams, duration, ctx.clone()));
         }
         if self.scan.is_none() {
             self.cuts.clear();
             self.thumbs.clear();
             self.overview.clear();
             let keys = self.index.as_ref().map_or(&[][..], |i| i.video.keys.as_slice());
-            self.scan = Some(Scan::start(self.path.clone(), info.size, info.duration, keys, ctx.clone()));
+            self.scan = Some(Scan::start(self.path.clone(), size, duration, keys, ctx.clone()));
         }
     }
 

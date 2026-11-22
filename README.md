@@ -35,7 +35,7 @@ paste pictures in with `ctrl+v`, pin the result above every window
 it records straight off the gpu with your mic and system sound, and can show your clicks and keys
 
 then trim it, crop it, mute a track, squeeze it under a size<br>
-long recordings show a quick thumbnail overview first, then fill in the detailed filmstrip. Recently viewed frames are reused when you scrub back to them<br>
+long recordings show a quick thumbnail overview first, then fill in the detailed filmstrip. Audio waveforms fill in across several parts of the timeline at once on multicore machines. Recently viewed frames are reused when you scrub back to them<br>
 park the playhead and drag either trim edge to its line to cut there; hold ctrl to bypass snapping<br>
 press **S** at each end of a section, then right-click that piece in the thumbnail strip to remove or restore it<br>
 hold **Shift** and drag either edge of a kept piece in the thumbnail strip to stretch or shorten its playback without trimming the source; the opposite edge stays put as you drag, and the current speed and duration appear beside the drag. Audio pitch follows the speed<br>

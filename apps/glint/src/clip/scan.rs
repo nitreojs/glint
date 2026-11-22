@@ -13,7 +13,8 @@ use windows::Win32::Media::MediaFoundation::IMFSourceReader;
 const THUMB_H: u32 = 64;
 const THUMBS: i64 = 240;
 const OVERVIEW_SLOTS: u32 = 16;
-const OVERVIEW_MIN: i64 = 30 * SECOND;
+const OVERVIEW_MIN: i64 = 12 * SECOND;
+const CUT_STRIDE: usize = 4;
 const CUT_DIFF: f32 = 30.0;
 const CUT_RATIO: f32 = 4.0;
 const CUT_GAP: i64 = SECOND / 2;
@@ -45,7 +46,14 @@ fn overview_times(step: i64, keys: &[i64]) -> [i64; OVERVIEW_SLOTS as usize] {
         let t = i64::from(slot) * step;
         let next = keys.partition_point(|&key| key < t);
 
-        keys.get(next).copied().filter(|&key| key - t <= step / 4).unwrap_or(t)
+        let before = next.checked_sub(1).and_then(|i| keys.get(i));
+
+        before.into_iter()
+            .chain(keys.get(next))
+            .copied()
+            .min_by_key(|&key| key.abs_diff(t))
+            .filter(|&key| key.abs_diff(t) <= (step / 2) as u64)
+            .unwrap_or(t)
     })
 }
 
@@ -139,12 +147,14 @@ impl Scan {
                     let mut px = Vec::with_capacity(if take { tw * th } else { 0 });
                     media::with_pixels(&f.sample, thumb.0, |rows| {
                         luma.clear();
-                        for y in 0..th {
-                            for c in rows.row(y).chunks_exact(4) {
+                        for y in (0..th).step_by(CUT_STRIDE) {
+                            for c in rows.row(y).chunks_exact(4).step_by(CUT_STRIDE) {
                                 luma.push(((c[2] as u32 * 77 + c[1] as u32 * 150 + c[0] as u32 * 29) >> 8) as u8);
-                                if take {
-                                    px.push(Color32::from_rgb(c[2], c[1], c[0]));
-                                }
+                            }
+                        }
+                        if take {
+                            for y in 0..th {
+                                px.extend(rows.row(y).chunks_exact(4).map(|c| Color32::from_rgb(c[2], c[1], c[0])));
                             }
                         }
                     })?;
