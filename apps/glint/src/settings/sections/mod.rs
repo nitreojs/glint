@@ -94,7 +94,6 @@ impl Section {
                 let (x, y) = (&a.audio_sources, &b.audio_sources);
                 let named = |n| track_name(&a.audio_track_names, n) != track_name(&b.audio_track_names, n);
                 x.iter().zip(y).filter(|(s, t)| s != t).count() + x.len().abs_diff(y.len()) + (1..=MAX_TRACKS).filter(|&n| named(n)).count()
-                    + n(a.editor_track_volumes == b.editor_track_volumes)
             }
             Section::Screenshots => {
                 n(a.screenshot_format == b.screenshot_format)
@@ -160,7 +159,6 @@ impl Section {
             Section::Audio => {
                 cfg.audio_sources = d.audio_sources;
                 cfg.audio_track_names = d.audio_track_names;
-                cfg.editor_track_volumes = d.editor_track_volumes;
             }
             Section::Screenshots => {
                 cfg.screenshot_format = d.screenshot_format;

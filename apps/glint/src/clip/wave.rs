@@ -130,7 +130,8 @@ impl Waveform {
 
             let center = (start as i64 * BUCKET + at as i64) / 2;
             let i = ranges.partition_point(|range| range.range.end <= center);
-            let local = ranges.get(i).filter(|range| range.range.start <= center).map_or(1.0, |range| gain(range.volume).sqrt());
+            let local = ranges.get(i).filter(|range| range.range.start <= center)
+                .map_or(1.0, |range| if range.muted { 0.0 } else { gain(range.volume).sqrt() });
             let level = f32::from(peak - SILENCE) / 254.0 * self.gain * local;
             let (height, color) = if level == 0.0 {
                 if column % 3 != 0 {

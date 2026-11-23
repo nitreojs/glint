@@ -231,6 +231,7 @@ enum Then {
 enum Selected {
     Segment(usize),
     Marker(usize),
+    Audio { source: usize, at: i64 },
 }
 
 /// An export in flight.
@@ -349,7 +350,8 @@ struct ClipApp {
     lane_drag: Option<usize>,
     /// The lane whose volume slider is open, under the volume pill at that rect.
     volume_pop: Option<(usize, Rect)>,
-    audio_range: Option<timeline::AudioRange>,
+    grouped: bool,
+    track_context: Option<timeline::TrackContext>,
     nudge: Option<Nudge>,
     playhead: Glide,
     trim: [Glide; 2],
@@ -476,7 +478,8 @@ impl ClipApp {
             renaming: None,
             lane_drag: None,
             volume_pop: None,
-            audio_range: None,
+            grouped: true,
+            track_context: None,
             nudge: None,
             playhead: Glide::new(0),
             trim: [Glide::new(0), Glide::new(duration)],
@@ -1177,9 +1180,16 @@ impl ClipApp {
         if let Some(t) = target {
             self.jump(t);
         }
-        if split && self.change(|e| e.split(pos, frame)) {
-            self.selected = None;
-            self.toast(Note::Info(format!("split at {} · right-click a piece to remove it", math::fmt_time(pos))));
+        if split {
+            if let Some(Selected::Audio { source, .. }) = self.selected {
+                if self.change(|e| e.split_audio(source, pos, duration)) {
+                    self.select_timeline(Some(Selected::Audio { source, at: pos }));
+                    self.toast(Note::Info(format!("split audio at {}", math::fmt_time(pos))));
+                }
+            } else if self.change(|e| e.split(pos, frame)) {
+                self.selected = None;
+                self.toast(Note::Info(format!("split at {} · right-click a piece to remove it", math::fmt_time(pos))));
+            }
         }
         if delete && !self.click_sel.is_empty() {
             let picked = std::mem::take(&mut self.click_sel);
@@ -1209,7 +1219,6 @@ impl ClipApp {
             self.lane_menu = None;
             self.renaming = None;
             self.lane_drag = None;
-            self.audio_range = None;
             self.volume_pop = None;
             self.click_menu = None;
             self.click_sel.clear();
@@ -1380,7 +1389,7 @@ impl eframe::App for ClipApp {
         self.menu_popup(&ctx, &look, self.save_rect);
         self.lane_menu_popup(&ctx, &look);
         self.volume_popup(&ctx, &look);
-        self.audio_range_popup(&ctx);
+        self.track_context_menu();
         self.click_menu_popup(&ctx, &look);
         self.key_menu_popup(&ctx, &look);
         self.keys_sheet(&ctx, &look, body);
@@ -1390,8 +1399,7 @@ impl eframe::App for ClipApp {
         self.cleanup_dialog(&ctx, &look);
 
         if esc && !modal {
-            if self.audio_range.take().is_some() {
-            } else if self.renaming.is_some() {
+            if self.renaming.is_some() {
                 self.renaming = None;
             } else if self.lane_menu.is_some() {
                 self.lane_menu = None;
@@ -1407,6 +1415,8 @@ impl eframe::App for ClipApp {
                 self.menu = false;
             } else if self.cropping.is_some() {
                 self.toggle_crop();
+            } else if matches!(self.selected, Some(Selected::Audio { .. })) {
+                self.select_timeline(None);
             } else if !self.busy() {
                 self.request_close(&ctx);
             }

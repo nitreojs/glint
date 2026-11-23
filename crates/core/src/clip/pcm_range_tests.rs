@@ -8,12 +8,12 @@ fn audio_range_gain_keeps_time_and_fades_across_buffer_boundaries() {
     let mut edit = Edit::new(3 * SECOND, 2);
     let muted = Range { start: SECOND / 2, end: 2 * SECOND };
     let overlap = Range { start: SECOND, end: 3 * SECOND / 2 };
-    assert!(edit.set_range_volume(1, muted, 0));
-    assert!(edit.set_range_volume(1, overlap, 50));
+    assert!(edit.set_range_mix(1, muted, 100, true));
+    assert!(edit.set_range_mix(1, overlap, 50, false));
     let gains = &edit.lanes[1].gains;
     assert_eq!(gains.len(), 3);
     assert!(edit.lanes[0].gains.is_empty());
-    assert_eq!(gains[1], GainRange { range: overlap, volume: 50 });
+    assert_eq!(gains[1], GainRange { range: overlap, volume: 50, muted: false });
 
     let count = frames(3 * SECOND, rate) as usize;
     let mix = |batch: usize| {
@@ -35,6 +35,6 @@ fn audio_range_gain_keeps_time_and_fades_across_buffer_boundaries() {
     assert!(close(sample(5 * SECOND / 4), 0.2));
     assert!(close(sample(9 * SECOND / 4), 0.4));
     assert!(close(sample(muted.start + RAMP / 2), 0.2) || (sample(muted.start + RAMP / 2) - 0.2).abs() < 0.002);
-    assert!(edit.set_range_volume(1, muted, 100));
+    assert!(edit.set_range_mix(1, muted, 100, false));
     assert!(edit.lanes[1].gains.is_empty());
 }

@@ -188,8 +188,8 @@ fn audio_range_gain_survives_export_without_touching_other_tracks_or_duration() 
     let src = fixture("range-gain", "640x360", "30", &["-g", "30"]);
     let out = src.with_file_name(format!("glint-range-gain-out-{}.mp4", std::process::id()));
     let mut edit = Edit::new(3 * SECOND, 2);
-    assert!(edit.set_range_volume(1, Range { start: SECOND, end: 2 * SECOND }, 0));
-    assert!(edit.set_range_volume(1, Range { start: 2 * SECOND, end: 3 * SECOND }, 50));
+    assert!(edit.set_range_mix(1, Range { start: SECOND, end: 2 * SECOND }, 100, true));
+    assert!(edit.set_range_mix(1, Range { start: 2 * SECOND, end: 3 * SECOND }, 50, false));
     let (job, _) = export_to(&src, &edit, &export::Settings::default(), &out);
     let Job::Video(job) = job else { panic!("expected video export") };
     assert_eq!(job.video, Video::Copy);

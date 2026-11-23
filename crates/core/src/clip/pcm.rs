@@ -121,7 +121,7 @@ impl Lane {
             let n = (stop.min(end) - self.start) as usize;
             let (shaped, rest) = rest.split_at_mut(n * 2);
             let fade = frames(RAMP, rate).min((stop - start) / 4).max(1);
-            let delta = gain(g.volume) - 1.0;
+            let delta = if g.muted { -1.0 } else { gain(g.volume) - 1.0 };
             let mut source = self.buf.iter();
             for (i, frame) in shaped.chunks_exact_mut(2).enumerate() {
                 if *level != target {

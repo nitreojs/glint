@@ -66,14 +66,14 @@ pub(super) enum Drag {
     End { head: i64 },
     Head,
     Stretch(Stretch),
-    Audio { lane: usize, start: i64, end: i64 },
     Scroll { grab: f32 },
 }
 
-pub(super) struct AudioRange {
-    lane: usize,
-    range: math::Range,
-    volume: u16,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TrackContext {
+    Group,
+    Merge { right: usize, enabled: bool },
+    Piece { index: usize, removed: bool },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -304,6 +304,7 @@ enum LaneItem {
     Up,
     Down,
     Delete,
+    Remember,
 }
 
 impl LaneItem {
@@ -313,6 +314,7 @@ impl LaneItem {
             LaneItem::Up => "move up",
             LaneItem::Down => "move down",
             LaneItem::Delete => "delete track",
+            LaneItem::Remember => "remember track volume",
         }
     }
 }
@@ -362,11 +364,104 @@ fn shift_press(ui: &Ui) -> Option<egui::Pos2> {
     })
 }
 
-fn audio_span(a: i64, b: i64) -> math::Range {
-    math::Range { start: a.min(b), end: a.max(b) }
-}
-
 impl ClipApp {
+    pub(super) fn toggle_group(&mut self) {
+        self.grouped = !self.grouped;
+        self.select_timeline(None);
+    }
+
+    pub(super) fn track_context_action(&mut self, action: TrackContext) {
+        match action {
+            TrackContext::Group => self.toggle_group(),
+            TrackContext::Merge { right, enabled: true } => {
+                if self.change(|e| e.merge_kept(right)) {
+                    self.select_timeline(None);
+                }
+            }
+            TrackContext::Piece { index, .. } => self.toggle_piece(index),
+            TrackContext::Merge { enabled: false, .. } => {}
+        }
+    }
+
+    pub(super) fn track_context_menu(&mut self) {
+        let Some(hwnd) = self.hwnd else { return };
+        let Some(action) = self.track_context.take() else { return };
+        use glint_shell::menu::{self, Glyph, Item, Menu};
+        let mut items = Vec::with_capacity(3);
+        match action {
+            TrackContext::Group => {}
+            TrackContext::Merge { enabled, .. } => {
+                items.push(Item::command(2, "merge pieces").glyph(Glyph::Trim).enabled(enabled));
+            }
+            TrackContext::Piece { removed, .. } => {
+                let (label, icon) = if removed { ("restore piece", Glyph::Update) } else { ("remove piece", Glyph::Clear) };
+                items.push(Item::command(2, label).glyph(icon));
+            }
+        }
+        if !items.is_empty() && !self.edit.lanes.is_empty() {
+            items.push(Item::separator());
+        }
+        if !self.edit.lanes.is_empty() {
+            let (label, icon) = if self.grouped { ("ungroup tracks", Glyph::Trim) } else { ("group tracks", Glyph::Copy) };
+            items.push(Item::command(1, label).glyph(icon));
+        }
+        if items.is_empty() {
+            return;
+        }
+
+        let menu = Menu { accent: self.accent, header: None, items };
+        match menu::track(hwnd, &menu, false, || None) {
+            Some(1) => self.track_context_action(TrackContext::Group),
+            Some(2) => self.track_context_action(action),
+            _ => {}
+        }
+    }
+
+    pub(super) fn select_timeline(&mut self, selected: Option<Selected>) {
+        if self.selected != selected {
+            self.settle_volume(true);
+            self.volume_pop = None;
+            self.selected = selected;
+        }
+    }
+
+    fn audio_selected_at(&self, lane: &glint_core::clip::edit::Lane) -> Option<i64> {
+        match self.selected {
+            Some(Selected::Audio { source, at }) if !self.grouped && lane.source == Some(source) => Some(at),
+            _ => None,
+        }
+    }
+
+    fn selected_audio_piece(&self, lane: &glint_core::clip::edit::Lane) -> Option<math::Range> {
+        lane.piece(self.audio_selected_at(lane)?, self.duration())
+    }
+
+    fn lane_controls(&self, lane: &glint_core::clip::edit::Lane) -> (u16, bool) {
+        self.selected_audio_piece(lane)
+            .map_or((lane.volume, lane.muted), |piece| lane.piece_mix(piece.start))
+    }
+
+    fn set_control_volume(&mut self, k: usize, volume: u16) -> bool {
+        let lane = &self.edit.lanes[k];
+        if let Some(piece) = self.selected_audio_piece(lane) {
+            self.edit.set_range_mix(k, piece, volume, lane.piece_mix(piece.start).1)
+        } else {
+            self.edit.set_volume(k, volume)
+        }
+    }
+
+    fn toggle_lane_control(&mut self, k: usize) {
+        let lane = &self.edit.lanes[k];
+        if let Some(piece) = self.selected_audio_piece(lane) {
+            let (volume, muted) = lane.piece_mix(piece.start);
+            if self.change(|e| e.set_range_mix(k, piece, volume, !muted)) {
+                self.sync_gains();
+            }
+        } else {
+            self.set_muted(k, !lane.muted);
+        }
+    }
+
     fn parked_piece(&self) -> Option<usize> {
         if self.play != Play::Paused
             || self.edit.segments.len() < 2
@@ -516,7 +611,7 @@ impl ClipApp {
         let light = self.light == Some(true);
 
         let menus = self.sheet || self.menu || self.confirm_delete || self.confirm_cleanup.is_some()
-            || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some() || self.audio_range.is_some();
+            || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| area.contains(*at));
         let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
         let body = ui.interact(Rect::from_min_max(area.min, rows.span.max), Id::unique("clip-track"), Sense::click_and_drag());
@@ -527,15 +622,21 @@ impl ClipApp {
         let chips: Vec<Chip> = (lanes.iter().enumerate())
             .map(|(k, lane)| {
                 let name = lane.name(&info.tracks);
+                let (volume, muted) = self.lane_controls(lane);
                 let name_w = match renaming {
                     Some(r) if r == k => RENAME_W,
                     _ => ui.painter().layout_no_wrap(name.to_string(), medium(12.0), p.t1).size().x,
                 };
-                let extra = if lane.muted { ui.painter().layout_no_wrap(MUTED.into(), sans(12.0), p.t3).size().x + 6.0 } else { 0.0 };
+                let piece = self.selected_audio_piece(lane).is_some();
+                let extra = if muted {
+                    ui.painter().layout_no_wrap(if piece { "· piece muted".into() } else { MUTED.into() }, sans(12.0), p.t3).size().x + 6.0
+                } else { 0.0 };
                 let l = rows.lanes[k];
                 let h = (l.height() - 6.0).min(26.0);
                 let rect = Rect::from_min_size(pos2(l.left() + 8.0, l.center().y - h / 2.0), vec2(h + 6.0 + name_w + extra + 8.0, h));
-                let tip = if lane.muted {
+                let tip = if piece {
+                    "click to mute or unmute the selected piece"
+                } else if muted {
                     "muted: not in the file · click to unmute · drag to reorder"
                 } else {
                     "click to mute: muted sound isn't saved · drag to reorder · right-click for more"
@@ -543,11 +644,11 @@ impl ClipApp {
                 let sense = if renaming == Some(k) { Sense::hover() } else { Sense::click_and_drag() };
                 let cursor = if self.lane_drag.is_some() { CursorIcon::Grabbing } else { CursorIcon::PointingHand };
                 let resp = ui.interact(rect, Id::unique(("clip-lane", k)), sense).on_hover_cursor(cursor).on_hover_text(tip);
-                resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, !lane.muted, format!("sound: {name}")));
+                resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, !muted, format!("sound: {name}")));
                 let zone = Rect::from_min_size(rect.min, vec2(rect.width() + 4.0 + pill_w + 4.0 + h, h));
                 let popped = matches!(self.volume_pop, Some((j, _)) if j == k);
                 let moving = self.nudge.as_ref().is_some_and(|n| n.lane == k);
-                let wanted = lane.volume != FULL_VOLUME || popped || moving || (still && ui.rect_contains_pointer(zone));
+                let wanted = piece || volume != FULL_VOLUME || popped || moving || (still && ui.rect_contains_pointer(zone));
                 let shown = ease(anim(ui, Id::unique(("clip-lane-vol", k)), wanted, 0.18));
                 let full = Rect::from_min_size(pos2(rect.right() + 4.0, rect.top()), vec2(pill_w, h));
                 let vol = Rect::from_min_size(full.min, vec2(pill_w * shown, h));
@@ -555,15 +656,15 @@ impl ClipApp {
                     let r = ui
                         .interact(vol, Id::unique(("clip-lane-volume", k)), Sense::click_and_drag())
                         .on_hover_cursor(CursorIcon::ResizeHorizontal)
-                        .on_hover_text(VOLUME_TIP);
-                    r.widget_info(|| WidgetInfo::slider(true, lane.volume as f64, format!("{name}: volume")));
+                        .on_hover_text(if piece { "piece volume · drag, scroll or click · double-click for 100%" } else { VOLUME_TIP });
+                    r.widget_info(|| WidgetInfo::slider(true, volume as f64, format!("{name}: volume")));
                     r
                 });
                 let dots = Rect::from_min_size(pos2(vol.right() + 4.0 * shown, rect.top()), vec2(h, h));
                 let more = ui
                     .interact(dots, Id::unique(("clip-lane-more", k)), Sense::click())
                     .on_hover_cursor(CursorIcon::PointingHand)
-                    .on_hover_text("rename, move or delete this track");
+                    .on_hover_text("track options");
                 more.widget_info(|| WidgetInfo::labeled(Role::Button, true, format!("{name}: more")));
                 Chip { rect, dots, resp, more, vol, full, shown, vol_resp, zone }
             })
@@ -635,8 +736,8 @@ impl ClipApp {
                     (true, "shift-drag to change speed · park playhead between cuts to pick a piece · right-click to merge")
                 };
                 body.clone().on_hover_text_at_pointer(tip);
-                if can_merge && body.secondary_clicked() && self.change(|e| e.merge_kept(right)) {
-                    self.selected = None;
+                if body.secondary_clicked() {
+                    self.track_context = Some(TrackContext::Merge { right, enabled: can_merge });
                 }
             } else if !segment.removed && segment.speed != Speed::NORMAL
                 && (self.edit.range.start..self.edit.range.end).contains(&t_of(at.x)) {
@@ -648,8 +749,12 @@ impl ClipApp {
                 body.clone().on_hover_text_at_pointer(tip);
                 if !shift && self.drag.is_none() && body.double_clicked() {
                     reset_speed = Some(index);
-                } else if many && body.secondary_clicked() {
-                    self.toggle_piece(index);
+                } else if body.secondary_clicked() {
+                    self.track_context = Some(if many {
+                        TrackContext::Piece { index, removed: segment.removed }
+                    } else {
+                        TrackContext::Group
+                    });
                 }
             } else {
                 let tip = if segment.removed {
@@ -660,8 +765,12 @@ impl ClipApp {
                     "shift-drag an edge to change speed"
                 };
                 body.clone().on_hover_text_at_pointer(tip);
-                if many && body.secondary_clicked() {
-                    self.toggle_piece(index);
+                if body.secondary_clicked() {
+                    self.track_context = Some(if many {
+                        TrackContext::Piece { index, removed: segment.removed }
+                    } else {
+                        TrackContext::Group
+                    });
                 }
             }
         }
@@ -739,7 +848,7 @@ impl ClipApp {
         }
         for (k, chip) in chips.iter().enumerate() {
             if chip.resp.clicked() {
-                self.set_muted(k, !lanes[k].muted);
+                self.toggle_lane_control(k);
             }
             if chip.resp.secondary_clicked() {
                 let at = chip.resp.interact_pointer_pos().unwrap_or(chip.rect.left_bottom());
@@ -760,8 +869,12 @@ impl ClipApp {
             if let Some(r) = &chip.vol_resp {
                 if r.double_clicked() {
                     self.volume_pop = None;
-                    self.change(|e| e.set_volume(k, FULL_VOLUME));
-                    self.sync_gains();
+                    self.settle_volume(true);
+                    let before = self.edit.clone();
+                    if self.set_control_volume(k, FULL_VOLUME) {
+                        self.undo.record(before, &self.edit);
+                        self.sync_gains();
+                    }
                 } else if r.clicked() {
                     let open = matches!(self.volume_pop, Some((j, _)) if j == k);
                     self.volume_pop = (!open).then_some((k, chip.full));
@@ -802,18 +915,12 @@ impl ClipApp {
         let audio_lane = |at: egui::Pos2| rows.lanes.iter().enumerate().position(|(k, row)| {
             row.contains(at) && !chips[k].zone.contains(at) && lanes[k].source.is_some()
         });
-        if !menus && self.drag.is_none() && body.secondary_clicked()
+        if !menus && body.secondary_clicked()
             && let Some(at) = body.interact_pointer_pos()
-            && let Some(lane) = audio_lane(at)
-            && let Some(gain) = lanes[lane].gains.iter().find(|g| (g.range.start..g.range.end).contains(&t_of(at.x)))
+            && rows.lanes.iter().any(|r| r.contains(at))
         {
-            self.audio_range = Some(AudioRange { lane, range: gain.range, volume: gain.volume });
+            self.track_context = Some(TrackContext::Group);
         }
-        let audio_start = if !menus && self.drag.is_none() && body.is_pointer_button_down_on() {
-            shift_press(ui).and_then(|at| audio_lane(at).map(|lane| (lane, t_of(at.x))))
-        } else {
-            None
-        };
         let shift_edge = if !menus && self.drag.is_none() {
             shift_press(ui)
                 .filter(|at| rows.video.contains(*at))
@@ -831,12 +938,7 @@ impl ClipApp {
         let pressed = |r: &Option<Vec<egui::Response>>| {
             r.as_ref().is_some_and(|r| r.iter().any(|r| r.drag_started()))
         };
-        if let Some((lane, start)) = audio_start {
-            self.pause();
-            self.drag = Some(Drag::Audio { lane, start, end: start });
-        } else if matches!(self.drag, Some(Drag::Audio { .. })) {
-            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
-        } else if stretching {
+        if stretching {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         } else if let Some((from, index, kept, edge)) = shift_edge {
             let piece = self.edit.segments[index];
@@ -880,7 +982,11 @@ impl ClipApp {
                 && let Some(at) = body.interact_pointer_pos()
             {
                 let many = self.edit.segments.len() > 1 && rows.span.contains(at);
-                self.selected = many.then(|| Selected::Segment(self.edit.segment_at(t_of(at.x))));
+                let selected = audio_lane(at).filter(|_| !self.grouped).map_or_else(
+                    || many.then(|| Selected::Segment(self.edit.segment_at(t_of(at.x)))),
+                    |lane| Some(Selected::Audio { source: lanes[lane].source.unwrap(), at: t_of(at.x) }),
+                );
+                self.select_timeline(selected);
             }
         }
 
@@ -924,9 +1030,6 @@ impl ClipApp {
                     self.view.start = ((at.x - grab - rows.bar.left()) / rows.bar.width() * dur as f32) as i64;
                     self.view.clamp(dur, min_span);
                 }
-                Drag::Audio { lane, start, .. } => {
-                    self.drag = Some(Drag::Audio { lane, start, end: t_of(at.x) });
-                }
                 Drag::Stretch(_) => {}
             }
         }
@@ -936,9 +1039,6 @@ impl ClipApp {
             !ui.input(|i| i.pointer.any_down())
         };
         if self.drag.is_some() && released {
-            if let Some(Drag::Audio { lane, start, end }) = self.drag && start != end {
-                self.audio_range = Some(AudioRange { lane, range: audio_span(start, end), volume: FULL_VOLUME });
-            }
             if let Some(Drag::Start { head } | Drag::End { head }) = self.drag {
                 self.pos = head;
                 self.seek(head, false);
@@ -1129,15 +1229,16 @@ impl ClipApp {
                     clip.rect_filled(span, 0, p.acc.gamma_multiply(0.2));
                     clip.with_clip_rect(span.intersect(*l)).text(
                         pos2(span.left() + 4.0, span.center().y), egui::Align2::LEFT_CENTER,
-                        if gain.volume == 0 { "silent".into() } else { format!("{}%", gain.volume) }, mono(11.0), p.t1,
+                        if gain.muted || gain.volume == 0 { "silent".into() } else { format!("{}%", gain.volume) }, mono(11.0), p.t1,
                     );
                 }
             }
-            let selected = match self.drag {
-                Some(Drag::Audio { lane, start, end }) if lane == k => Some(audio_span(start, end)),
-                _ => self.audio_range.as_ref().filter(|range| range.lane == k).map(|range| range.range),
-            };
-            if let Some(span) = selected {
+            for &at in lanes[k].cuts.iter() {
+                let x = x_of(at);
+                clip.vline(x, l.y_range(), Stroke::new(1.0, p.t2));
+            }
+            if self.audio_selected_at(&lanes[k]).is_some() {
+                let span = self.selected_audio_piece(&lanes[k]).unwrap_or(math::Range { start: 0, end: source_dur });
                 let span = Rect::from_min_max(pos2(x_of(span.start), l.top()), pos2(x_of(span.end), l.bottom()));
                 clip.rect_stroke(span, 2, Stroke::new(1.0, p.acc), StrokeKind::Inside);
             }
@@ -1246,7 +1347,7 @@ impl ClipApp {
 
         for (k, chip) in chips.iter().enumerate() {
             let fade = fades[k];
-            let muted = lanes[k].muted;
+            let (volume, muted) = self.lane_controls(&lanes[k]);
             let clip = lane_clip(rows.lanes[k]);
             clip.rect_filled(chip.rect, 5, p.ctl.gamma_multiply(0.85 * fade.max(0.6)));
             if self.lane_drag == Some(k) {
@@ -1266,10 +1367,11 @@ impl ClipApp {
                 nw
             };
             if muted {
-                clip.text(pos2(at.x + nw + 6.0, at.y), egui::Align2::LEFT_CENTER, MUTED, sans(12.0), p.t3);
+                let label = if self.selected_audio_piece(&lanes[k]).is_some() { "· piece muted" } else { MUTED };
+                clip.text(pos2(at.x + nw + 6.0, at.y), egui::Align2::LEFT_CENTER, label, sans(12.0), p.t3);
             }
             if chip.shown > 0.01 {
-                let vol = lanes[k].volume;
+                let vol = volume;
                 let popped = matches!(self.volume_pop, Some((j, _)) if j == k);
                 let lit = chip.vol_resp.as_ref().map_or(0.0, |r| anim(ui, r.id.with("hov"), r.hovered() || r.dragged() || popped, 0.12));
                 let pill = lane_clip(chip.vol);
@@ -1399,7 +1501,7 @@ impl ClipApp {
 
     /// Moves lane `k`'s volume by `delta` percent, as part of one gesture.
     fn nudge_volume(&mut self, k: usize, delta: f32, sticky: bool) {
-        let Some(vol) = self.edit.lanes.get(k).map(|l| l.volume) else { return };
+        let Some(vol) = self.edit.lanes.get(k).map(|l| self.lane_controls(l).0) else { return };
         let rest = self.nudge.as_ref().filter(|n| n.lane == k).map_or(0.0, |n| n.rest);
         let (v, rest) = step_volume(vol, rest, delta, sticky);
         self.slide_volume(k, v, rest);
@@ -1411,7 +1513,7 @@ impl ClipApp {
             self.settle_volume(true);
         }
         let before = self.nudge.take().map_or_else(|| self.edit.clone(), |n| n.before);
-        if self.edit.set_volume(k, v) {
+        if self.set_control_volume(k, v) {
             self.sync_gains();
         }
         self.nudge = Some(Nudge { lane: k, before, at: self.now, rest });
@@ -1429,10 +1531,12 @@ impl ClipApp {
     /// The open volume slider: 0 to 200 %, catching at 100 % unless ctrl is held.
     pub(super) fn volume_popup(&mut self, ctx: &egui::Context, look: &Look) {
         let Some((k, anchor)) = self.volume_pop else { return };
-        let Some(lane) = self.edit.lanes.get(k).cloned() else {
+        let Some(lane) = self.edit.lanes.get(k) else {
             self.volume_pop = None;
             return;
         };
+        let (volume, _) = self.lane_controls(lane);
+        let source = lane.source;
         let p = look.p;
         let screen = ctx.content_rect();
         let below = anchor.bottom() + 6.0;
@@ -1447,7 +1551,7 @@ impl ClipApp {
             let resp = ui
                 .interact(track, Id::unique("clip-volume-slider"), Sense::click_and_drag())
                 .on_hover_cursor(CursorIcon::PointingHand);
-            resp.widget_info(|| WidgetInfo::slider(true, lane.volume as f64, "track volume"));
+            resp.widget_info(|| WidgetInfo::slider(true, volume as f64, "volume"));
             let ctrl = ui.input(|i| i.modifiers.ctrl);
             if resp.double_clicked() {
                 set = Some(FULL_VOLUME);
@@ -1463,14 +1567,14 @@ impl ClipApp {
             let lit = anim(ui, resp.id.with("hov"), resp.hovered() || resp.dragged(), 0.1);
             let painter = ui.painter();
             let cy = track.center().y;
-            let kx = track.left() + track.width() * lane.volume as f32 / MAX_VOLUME as f32;
+            let kx = track.left() + track.width() * volume as f32 / MAX_VOLUME as f32;
             let line = Rect::from_min_max(pos2(track.left(), cy - 1.5), pos2(track.right(), cy + 1.5));
             painter.rect_filled(line, 2, p.line2);
-            let fill = lane.source.map_or(p.t2, |s| WAVES[s % WAVES.len()]);
+            let fill = source.map_or(p.t2, |s| WAVES[s % WAVES.len()]);
             painter.rect_filled(Rect::from_min_max(line.min, pos2(kx, line.bottom())), 2, fill);
             painter.vline(full_x, cy - 5.0..=cy + 5.0, Stroke::new(1.0, p.t3));
             painter.circle_filled(pos2(kx, cy), 5.5 + lit, p.t1);
-            let label = format!("{}%", lane.volume);
+            let label = format!("{volume}%");
             painter.text(pos2(rect.right() - 14.0, cy), egui::Align2::RIGHT_CENTER, label, mono(12.0), p.t1);
         });
         if let Some(v) = set {
@@ -1484,36 +1588,6 @@ impl ClipApp {
         });
         if outside {
             self.volume_pop = None;
-        }
-    }
-
-    pub(super) fn audio_range_popup(&mut self, ctx: &egui::Context) {
-        let Some(mut selected) = self.audio_range.take() else { return };
-        let Some(lane) = self.edit.lanes.get(selected.lane) else { return };
-        let name = self.info().map_or("track", |info| lane.name(&info.tracks));
-        let mut open = true;
-        let mut apply = None;
-        egui::Window::new("audio range").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
-            ui.label(format!("{name} · {}–{}", math::fmt_time(selected.range.start), math::fmt_time(selected.range.end)));
-            ui.add(egui::Slider::new(&mut selected.volume, 0..=MAX_VOLUME).suffix("%").text("of track volume"));
-            ui.horizontal(|ui| {
-                if ui.button("mute range").clicked() {
-                    apply = Some(0);
-                }
-                if ui.button("reset range").clicked() {
-                    apply = Some(FULL_VOLUME);
-                }
-                if ui.button("apply").clicked() {
-                    apply = Some(selected.volume);
-                }
-            });
-        });
-        if let Some(volume) = apply {
-            if self.change(|edit| edit.set_range_volume(selected.lane, selected.range, volume)) {
-                self.sync_gains();
-            }
-        } else if open {
-            self.audio_range = Some(selected);
         }
     }
 
@@ -1552,7 +1626,13 @@ impl ClipApp {
             return;
         };
         let p = look.p;
-        let items = [(LaneItem::Rename, true), (LaneItem::Up, k > 0), (LaneItem::Down, k + 1 < n), (LaneItem::Delete, true)];
+        let items = [
+            (LaneItem::Rename, true),
+            (LaneItem::Up, k > 0),
+            (LaneItem::Down, k + 1 < n),
+            (LaneItem::Remember, self.edit.lanes[k].source.is_some()),
+            (LaneItem::Delete, true),
+        ];
         let size = vec2(MENU_W, items.len() as f32 * ITEM_H + 8.0);
         let screen = ctx.content_rect();
         let y = if at.y + size.y > screen.bottom() - 4.0 { anchor.top() - 4.0 - size.y } else { at.y };
@@ -1601,8 +1681,30 @@ impl ClipApp {
             LaneItem::Down => {
                 self.change(|e| e.move_lane(k, k + 1));
             }
+            LaneItem::Remember => {
+                let lane = &self.edit.lanes[k];
+                let name = lane.default_name(&tracks).trim().to_lowercase();
+                let volume = lane.volume;
+                let save = super::Config::load().and_then(|mut cfg| {
+                    cfg.editor_track_volumes.retain(|key, _| key.trim().to_lowercase() != name);
+                    if volume != FULL_VOLUME {
+                        cfg.editor_track_volumes.insert(name.clone(), volume);
+                    }
+                    cfg.save()
+                });
+                match save {
+                    Ok(()) => {
+                        self.saved.track_volumes.insert(name, volume);
+                        self.toast(super::Note::Info(format!("remembered track volume · {volume}%")));
+                    }
+                    Err(err) => self.toast(super::Note::Failed(format!("couldn't remember volume: {err}"))),
+                }
+            }
             LaneItem::Delete => {
                 self.renaming = None;
+                if self.audio_selected_at(&self.edit.lanes[k]).is_some() {
+                    self.select_timeline(None);
+                }
                 self.change(|e| e.delete_lane(k));
                 self.sync_gains();
             }

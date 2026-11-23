@@ -54,7 +54,6 @@ struct SettingsApp {
     updater: Updater,
     /// The audio page's sources, devices and running apps.
     audio: AudioEditor,
-    editor_track_name: String,
     mover: Mover,
     /// What's typed in the custom accent field; `cfg.accent` follows it while it's a colour.
     accent_text: String,
@@ -79,7 +78,6 @@ impl SettingsApp {
             uploaders: Uploaders::load(),
             updater,
             audio: AudioEditor::default(),
-            editor_track_name: String::new(),
             mover: Mover::default(),
             toolbar: ToolbarRows::default(),
         }

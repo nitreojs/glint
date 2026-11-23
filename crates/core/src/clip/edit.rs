@@ -137,6 +137,7 @@ pub struct Lane {
     /// Percent of the track's own loudness, 0 to [`MAX_VOLUME`].
     pub volume: u16,
     pub gains: Arc<[GainRange]>,
+    pub cuts: Arc<[i64]>,
 }
 
 /// A gain relative to the lane volume, over a half-open range on the source clock.
@@ -144,6 +145,7 @@ pub struct Lane {
 pub struct GainRange {
     pub range: Range,
     pub volume: u16,
+    pub muted: bool,
 }
 
 pub const EMPTY_TRACK: &str = "empty";
@@ -152,7 +154,7 @@ pub const MAX_VOLUME: u16 = 200;
 
 impl Lane {
     fn of(source: Option<usize>) -> Lane {
-        Lane { source, name: None, muted: false, volume: FULL_VOLUME, gains: Arc::default() }
+        Lane { source, name: None, muted: false, volume: FULL_VOLUME, gains: Arc::default(), cuts: Arc::default() }
     }
 
     pub fn default_name<'a>(&self, tracks: &'a [Track]) -> &'a str {
@@ -166,6 +168,24 @@ impl Lane {
     /// The volume as a factor on the samples.
     pub fn gain(&self) -> f32 {
         gain(self.volume)
+    }
+
+    pub fn piece(&self, at: i64, duration: i64) -> Option<Range> {
+        if self.cuts.is_empty() {
+            return None;
+        }
+
+        let i = self.cuts.partition_point(|&cut| cut <= at);
+
+        Some(Range {
+            start: self.cuts[..i].last().copied().unwrap_or(0),
+            end: self.cuts.get(i).copied().unwrap_or(duration),
+        })
+    }
+
+    pub fn piece_mix(&self, at: i64) -> (u16, bool) {
+        let i = self.gains.partition_point(|g| g.range.end <= at);
+        self.gains.get(i).filter(|g| g.range.start <= at).map_or((FULL_VOLUME, false), |g| (g.volume, g.muted))
     }
 }
 
@@ -334,7 +354,20 @@ impl Edit {
         changed
     }
 
-    pub fn set_range_volume(&mut self, lane: usize, range: Range, volume: u16) -> bool {
+    pub fn split_audio(&mut self, source: usize, at: i64, duration: i64) -> bool {
+        let Some(lane) = self.lanes.iter_mut().find(|lane| lane.source == Some(source)) else { return false };
+        if !(0 < at && at < duration) {
+            return false;
+        }
+        let Err(index) = lane.cuts.binary_search(&at) else { return false };
+        let mut cuts = lane.cuts.to_vec();
+        cuts.insert(index, at);
+        lane.cuts = cuts.into();
+
+        true
+    }
+
+    pub fn set_range_mix(&mut self, lane: usize, range: Range, volume: u16, muted: bool) -> bool {
         let Some(lane) = self.lanes.get_mut(lane).filter(|lane| lane.source.is_some()) else { return false };
         if range.start < 0 || range.end <= range.start {
             return false;
@@ -354,13 +387,15 @@ impl Edit {
                 }
             }
         }
-        if volume != FULL_VOLUME {
-            next.push(GainRange { range, volume });
+        if volume != FULL_VOLUME || muted {
+            next.push(GainRange { range, volume, muted });
         }
         next.sort_unstable_by_key(|gain| gain.range.start);
         let mut merged: Vec<GainRange> = Vec::with_capacity(next.len());
         for gain in next {
-            if let Some(last) = merged.last_mut().filter(|last| last.volume == gain.volume && last.range.end == gain.range.start) {
+            if let Some(last) = merged.last_mut().filter(|last| {
+                last.volume == gain.volume && last.muted == gain.muted && last.range.end == gain.range.start
+            }) {
                 last.range.end = gain.range.end;
             } else {
                 merged.push(gain);

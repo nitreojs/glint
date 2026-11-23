@@ -52,8 +52,8 @@ then trim it, crop it, mute a track, squeeze it under a size. use `←` and `→
 - **change speed** — `shift+drag` an edge of a kept piece. the other edge stays put, and the clip keeps the same source frames. speed and duration show as you drag; pitch follows speed.
 - **pick a side at a split** — park the playhead in the piece you want, or drag from that side of the split.
 - **undo a stretch or join two pieces** — double-click a retimed piece to go back to `1×`; `ctrl+z` brings its speed back. right-click a split to merge two kept pieces at the same speed.
-- **quiet part of one track** — `shift+drag` across its waveform, then mute the range or set a percentage of the track's volume. right-click that range to change or reset it. nothing else moves.
-- **start with your mix** — under **settings → audio → editor mix defaults**, add the recorded track name and set its volume. preview and export use that default without changing what gets recorded.
+- **quiet part of one track** — right-click the filmstrip or a waveform and choose **ungroup tracks**. click a waveform, park the playhead at each cut, and press `s`. click the piece, then use the usual speaker and volume pill. choose **group tracks** to go back to linked editing without losing your audio edits.
+- **start with your mix** — set the whole track's volume, then choose **remember track volume** in its `…` menu. future clips with that track name use the remembered volume without changing what gets recorded. remember `100%` to clear the default.
 
 glint and afterglow collect waveforms and an overview while recording. for other videos, the editor draws waveforms as the audio comes in. previews are cached on your pc, not in the video.
 
