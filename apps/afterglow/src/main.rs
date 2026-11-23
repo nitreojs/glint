@@ -1,11 +1,8 @@
 #![windows_subsystem = "windows"]
 
-mod addon;
 mod app;
-mod autoclip;
 mod buffer;
 mod config;
-mod events;
 mod gallery;
 mod glint;
 mod mux;

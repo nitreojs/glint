@@ -13,7 +13,6 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::config::Config;
-use crate::events::{self, Watcher};
 use crate::mux;
 
 const SECOND: i64 = 10_000_000;
@@ -55,8 +54,6 @@ pub struct Buffer {
     replay: ReplaySink,
     /// What a save covers (100 ns units).
     length: i64,
-    /// Follows games for their events, with `game_events` on.
-    events: Option<Watcher>,
 }
 
 fn limits(cfg: &Config) -> Limits {
@@ -105,18 +102,13 @@ impl Buffer {
         let sink = replay.clone();
         let starting = start_packets(params, move || Ok(sink), move |r: Result<Outcome, String>| ended.post((generation, r)))?;
         let recorder = starting.wait()?;
-        let events = cfg.game_events.then(|| Watcher::start(cfg.length));
-        Ok(Buffer { recorder, monitor: r, replay, length, events })
+        Ok(Buffer { recorder, monitor: r, replay, length })
     }
 
-    /// A new length or memory cap, for what's buffered already; game events on or off.
+    /// Applies a new length or memory cap to what's buffered already.
     pub fn set_limits(&mut self, cfg: &Config) {
         self.length = cfg.length as i64 * SECOND;
         self.replay.lock().set_limits(limits(cfg));
-        if cfg.game_events != self.events.is_some() {
-            self.events = cfg.game_events.then(|| Watcher::start(cfg.length));
-        }
-        events::keep(cfg.length);
     }
 
     pub fn monitor(&self) -> Rect {
@@ -143,8 +135,8 @@ impl Buffer {
     }
 }
 
-/// Writes `clip` to `dir`/`name`.mp4 (or `name_2.mp4`… when taken) on its own thread, with the
-/// game events it covers; `done` hears `id` with the path or the error.
+/// Writes `clip` to `dir`/`name`.mp4 (or `name_2.mp4`… when taken) on its own thread.
+/// `done` hears `id` with the path or the error.
 pub fn save(id: u64, clip: Clip, dir: PathBuf, name: PathBuf, done: Notify) {
     let worker = std::thread::Builder::new().name(format!("save-{id}")).spawn(move || {
         done.post((id, write(id, clip, &dir.join(name))));
@@ -166,13 +158,9 @@ fn write(id: u64, mut clip: Clip, stem: &Path) -> Result<PathBuf, String> {
     };
     let (path, part) = reserve_output(std::iter::once(named("")).chain((2..).map(|n| named(&format!("_{n}")))))?;
     log(&format!("save #{id}: writing {}", part.display()));
-    let span = clip.wall.map(|wall| (wall, clip.duration));
     let preview = std::mem::take(&mut clip.preview);
     mux::write(clip, &part).map_err(|error| format!("{}: {error}", part.display()))?;
     log(&format!("save #{id}: MP4 finalized"));
-    if let Some((wall, duration)) = span {
-        events::attach(&part, wall, duration);
-    }
     std::fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     preview.save(&path);
     Ok(path)

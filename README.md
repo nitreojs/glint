@@ -81,7 +81,7 @@ every shot and clip in one place. hover to play, search by app or game or day, d
 
 <picture><source media="(prefers-color-scheme: light)" srcset="docs/readme/head-afterglow-light.png"><img src="docs/readme/head-afterglow.png" alt="it was recording the whole time" width="880"></picture>
 
-glint's little sibling for games. it keeps the last minute of your screen and sound; `alt+f10` saves it. clips open in glint's editor. in deadlock it can clip your kills for you (beta).
+glint's little sibling for games. it keeps the last minute of your screen and sound; `alt+f10` saves it. clips open in glint's editor.
 
 **[download afterglow](https://github.com/nitreojs/glint/releases?q=afterglow)**
 

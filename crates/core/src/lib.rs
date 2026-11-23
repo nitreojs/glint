@@ -1,7 +1,6 @@
 pub mod clip;
 pub mod config;
 pub mod diagnostics;
-pub mod events;
 pub mod format;
 pub mod gallery;
 pub mod geom;

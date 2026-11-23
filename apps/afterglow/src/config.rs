@@ -11,8 +11,6 @@ use glint_core::naming::{Names, pattern_problem};
 use glint_core::paths::app_dir_for;
 use serde::Deserialize;
 
-use crate::autoclip::Trigger;
-
 pub const APP: &str = "afterglow";
 /// Lengths the settings offer, in seconds.
 pub const LENGTHS: [u32; 5] = [30, 60, 120, 300, 600];
@@ -48,15 +46,6 @@ pub struct Config {
     pub launch_at_startup: bool,
     /// Where on the recorded monitor notes show.
     pub note_position: Place,
-    /// Follow a supported game's events and save those in a clip with it, as markers for the
-    /// trimmer.
-    pub game_events: bool,
-    /// Keep afterglow's addon installed in Deadlock, which tells the local player's kills,
-    /// deaths and assists ([`crate::addon`]).
-    pub deadlock_addon: bool,
-    /// Save a clip by itself a few seconds after one of `auto_clip_events` ([`crate::autoclip`]).
-    pub auto_clip: bool,
-    pub auto_clip_events: Vec<Trigger>,
     /// What afterglow does about its new releases on GitHub.
     pub update_mode: UpdateMode,
     /// Also take pre-releases.
@@ -83,10 +72,6 @@ impl Default for Config {
             audio_track_names: vec![String::new(); MAX_TRACKS as usize],
             launch_at_startup: false,
             note_position: Place::TopRight,
-            game_events: false,
-            deadlock_addon: false,
-            auto_clip: false,
-            auto_clip_events: vec![Trigger::Kills, Trigger::Streaks, Trigger::Objectives],
             update_mode: UpdateMode::Auto,
             update_beta: false,
         }
@@ -110,7 +95,16 @@ impl Config {
             }
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
-        let mut cfg: Config = toml::from_str(&text).map_err(|e| format!("config.toml: {e}"))?;
+        Self::parse(&text).map_err(|e| format!("config.toml: {e}"))
+    }
+
+    fn parse(text: &str) -> Result<Self, String> {
+        let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        for key in ["game_events", "deadlock_addon", "auto_clip", "auto_clip_events"] {
+            table.remove(key);
+        }
+
+        let mut cfg: Self = table.try_into().map_err(|e: toml::de::Error| e.to_string())?;
         cfg.check()?;
         cfg.audio_track_names.resize(MAX_TRACKS as usize, String::new());
         Ok(cfg)
@@ -240,22 +234,6 @@ launch_at_startup = {autostart}
 # bottom_right.
 note_position = "{place}"
 
-# Follow a supported game (Deadlock, launched with -condebug) and save what happens in it (match
-# phases; kills and respawns where the game logs them, and every match's with deadlock_addon)
-# with each clip, as markers for the trimmer.
-game_events = {game_events}
-
-# Keep afterglow's addon installed in Deadlock: it tells your own kills, deaths and assists, the
-# kill feed and objectives, in every match. Installed beside your other mods (Deadlock Mod Manager
-# lists it), only while the game is closed; false takes it out again.
-deadlock_addon = {deadlock_addon}
-
-# Save a clip by itself a few seconds after these happen in a followed game (game_events), nothing
-# on screen; events close together make one clip: "kills", "streaks" (first blood, kill streaks),
-# "deaths" (all three your own), "objectives" (ones you took), "results" (the match's end).
-auto_clip = {auto_clip}
-auto_clip_events = [{auto_clip_events}]
-
 # Updates from github.com/nitreojs/glint (afterglow's releases), checked soon after start and
 # every hour, signature-checked before they're used: "auto" downloads them in the background and
 # installs on the next start (or when you click the notification), "notify" only tells you,
@@ -283,10 +261,6 @@ audio_track_names = [{names}]
             memory = self.max_memory_mb,
             autostart = self.launch_at_startup,
             place = self.note_position.name(),
-            game_events = self.game_events,
-            deadlock_addon = self.deadlock_addon,
-            auto_clip = self.auto_clip,
-            auto_clip_events = self.auto_clip_events.iter().map(|t| q(t.name())).collect::<Vec<_>>().join(", "),
             update_beta = self.update_beta,
             names = self.audio_track_names.iter().map(|n| q(n)).collect::<Vec<_>>().join(", "),
         )
@@ -381,9 +355,6 @@ mod tests {
             max_memory_mb: 4096,
             launch_at_startup: true,
             note_position: Place::Bottom,
-            game_events: true,
-            auto_clip: true,
-            auto_clip_events: vec![Trigger::Deaths, Trigger::Results],
             buffer: false,
             update_mode: UpdateMode::Notify,
             update_beta: true,
@@ -394,6 +365,16 @@ mod tests {
         edited.audio_sources.push(AudioSource { app: "game.exe".into(), ..AudioSource::new(SourceKind::App, 2) });
         let back: Config = toml::from_str(&edited.render()).unwrap();
         assert_eq!(back, edited);
+    }
+
+    #[test]
+    fn old_game_settings_do_not_prevent_loading_or_disable_other_validation() {
+        let old = "length = 30\nsave_hotkey = 'Alt+F9'\ngame_events = true\ndeadlock_addon = true\nauto_clip = true\nauto_clip_events = ['kills']\n";
+        let cfg = Config::parse(old).unwrap();
+        assert_eq!(cfg.length, 30);
+        assert_eq!(cfg.save_hotkey, "Alt+F9");
+        assert!(!cfg.render().contains("game_events"));
+        assert!(Config::parse(&format!("{old}unexpected = true\n")).is_err());
     }
 
     #[test]

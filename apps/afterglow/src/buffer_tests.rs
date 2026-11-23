@@ -64,6 +64,7 @@ fn saving_a_replay_publishes_both_previews_at_the_final_path() {
     let clip = sink.lock().last(SECOND).unwrap();
 
     let path = write(42, clip, &dir.join("replay")).unwrap();
+    assert!(glint_core::record::mp4::movie_box(&path, b"glev").unwrap().is_none());
     let info = probe(&path).unwrap();
     let cache = Cache::for_file(&path).unwrap();
     let strip = cache.filmstrip().unwrap();
@@ -72,5 +73,9 @@ fn saving_a_replay_publishes_both_previews_at_the_final_path() {
     assert_eq!(&*strip.thumbs[0].rgb, &[1, 2, 3]);
     assert_eq!(waves.len(), 1);
     assert!(waves[0][10..90].iter().all(|&v| v > 165));
+
+    glint_core::record::mp4::set_movie_box(&path, b"glev", br#"{"version":2,"events":[]}"#).unwrap();
+    let old = probe(&path).unwrap();
+    assert_eq!((old.size, old.duration, old.tracks.len()), (info.size, info.duration, info.tracks.len()));
     fs::remove_dir_all(dir).unwrap();
 }
