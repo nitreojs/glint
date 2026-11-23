@@ -37,9 +37,12 @@ pub(super) fn tool_tip(tool: Tool, keys: Keys) -> String {
     if !keys.is_empty() {
         tip = format!("{tip}  ·  {}", keys.join(" / "));
     }
-    if tool == Tool::Image {
-        tip.push_str("  ·  Ctrl+V pastes");
-    }
+    tip.push_str(match tool {
+        Tool::Image => "  ·  Ctrl+V pastes",
+        Tool::Pen => "  ·  shift for a straight line",
+        Tool::Blur | Tool::Pixelate => "  ·  shift+drag to paint",
+        _ => "",
+    });
     tip
 }
 

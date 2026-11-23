@@ -32,6 +32,54 @@ fn picture(w: u32, h: u32) -> Image {
     Image { w, h, px }
 }
 
+#[test]
+fn shift_pen_commits_one_line_to_the_release_point() {
+    let (mut ed, _) = editor();
+    ed.tool = Some(Tool::Pen);
+    ed.mouse_down((50, 50), 0);
+    ed.mouse_move((70, 100));
+    ed.set_mods(false, false, true);
+    ed.mouse_move((100, 70));
+    ed.set_mods(false, false, false);
+    ed.mouse_move((110, 80));
+    assert!(matches!(&ed.drag, Some(Drag::Mark { mark: Mark::Stroke { points, .. }, .. }) if points.contains(&(70.0, 100.0))));
+    ed.set_mods(false, false, true);
+    ed.mouse_up((140, 60));
+
+    assert!(matches!(&ed.marks[..], [Mark::Stroke { points, .. }] if points == &[(50.0, 50.0), (140.0, 60.0)]));
+}
+
+#[test]
+fn painted_effects_match_the_export_without_filling_their_bounding_box() {
+    let painter = Painter::new().unwrap();
+    for tool in [Tool::Blur, Tool::Pixelate] {
+        let (mut ed, _) = editor();
+        let mut bright = Dib::new(ed.area.w, ed.area.h).unwrap();
+        for (i, pixel) in bright.pixels_mut().iter_mut().enumerate() {
+            *pixel = if (i % ed.area.w as usize) % 2 == 0 { 0x00FF_FFFF } else { 0 };
+        }
+        ed.tool = Some(tool);
+        ed.set_mods(false, false, true);
+        ed.mouse_down((64, 60), 0);
+        ed.mouse_move((230, 170));
+        ed.render_view(&bright, &painter, None).unwrap();
+        let pixel = |x: usize, y: usize| y * ed.area.w as usize + x;
+        let changed = pixel(146, 115);
+        let untouched = pixel(65, 160);
+        let view = ed.view.as_ref().unwrap().pixels();
+        let preview = view[changed] & 0x00FF_FFFF;
+        assert_ne!(preview, bright.pixels()[changed]);
+        assert_eq!(view[untouched] & 0x00FF_FFFF, bright.pixels()[untouched]);
+
+        ed.set_mods(false, false, false);
+        ed.mouse_up((230, 170));
+        let (out, rect, _) = ed.pixels(&bright, &painter).unwrap();
+        let pixel = |x: i32, y: i32| ((y - rect.y) * rect.w + x - rect.x) as usize;
+        assert_eq!(out[pixel(146, 115)] & 0x00FF_FFFF, preview);
+        assert_eq!(out[pixel(65, 160)] & 0x00FF_FFFF, bright.pixels()[untouched]);
+    }
+}
+
 /// Held by tests that change what editors remember between shots (the last text style, the
 /// custom colours), so they don't see each other's.
 static MEMORY: std::sync::Mutex<()> = std::sync::Mutex::new(());

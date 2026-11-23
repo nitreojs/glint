@@ -18,6 +18,8 @@ or don't stop there: pens, arrows, boxes, numbered steps, text in any font you h
 
 - make the toolbar yours: hide tools, move them around, give them your keys
 - draw outside the selection and resize it to reframe. only what's inside gets copied or saved. turn on the magnifier if you need it
+- hold `shift` while drawing with the pen for a straight line
+- with **blur** or **pixelate**, drag a box or `shift+drag` to paint just the bits you want
 
 <img src="docs/readme/1-screenshot.avif" alt="taking a screenshot and marking it up" width="880">
 

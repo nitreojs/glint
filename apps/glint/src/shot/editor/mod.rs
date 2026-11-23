@@ -124,7 +124,7 @@ enum Hit {
 enum Drag {
     /// A mark being drawn; `anchor` is where it grows from, `press` where the button went down.
     /// `click` is the rect a release without a drag covers.
-    Mark { mark: Mark, anchor: (i32, i32), press: (i32, i32), click: Option<Rect> },
+    Mark { mark: Mark, anchor: (i32, i32), press: (i32, i32), click: Option<Rect>, freehand: Option<Vec<(f32, f32)>> },
     /// A mark moved (no grip) or resized; `retype`: a release without a move types into it;
     /// `fresh`: it was just pasted, and that undo step covers the move too.
     Edit { index: usize, grip: Option<Grip>, grab: (i32, i32), from: Mark, retype: bool, fresh: bool },
@@ -140,6 +140,12 @@ enum Drag {
     /// The colour picker's square or strip is held; `before` is the picked mark it recolours, as
     /// it was.
     Color { part: Part, before: Option<(usize, Mark)> },
+}
+
+fn push_point(points: &mut Vec<(f32, f32)>, point: (f32, f32)) {
+    if points.last() != Some(&point) {
+        points.push(point);
+    }
 }
 
 #[derive(PartialEq)]
@@ -539,7 +545,7 @@ impl Editor {
         };
         v.push(m.ink(self.scale));
         if edit && m.is_effect() {
-            v.extend(self.marks.iter().filter(|m| m.is_effect()).map(Mark::bbox));
+            v.extend(self.marks.iter().filter(|m| m.is_effect()).map(|m| m.ink(self.scale)));
         }
         v
     }
@@ -689,6 +695,7 @@ impl Editor {
     fn outline(&self, m: &Mark) -> Rect {
         match m {
             Mark::Stroke { width, .. } => m.bbox().inflate((width * self.scale / 2.0 + self.px(4.0)).ceil() as i32),
+            Mark::EffectBrush { .. } => m.ink(self.scale).inflate(self.px(4.0) as i32),
             _ => m.bbox().inflate(self.px(4.0) as i32),
         }
     }
@@ -696,7 +703,7 @@ impl Editor {
     fn picked_extent(&self) -> Option<Rect> {
         let m = self.picked_mark()?;
         Some(match m {
-            Mark::Stroke { .. } => self.outline(m).inflate(2),
+            Mark::Stroke { .. } | Mark::EffectBrush { .. } => self.outline(m).inflate(2),
             Mark::Text { .. } => self.outline(m).inflate(self.px(8.0) as i32 + 1),
             _ => m.bbox().inflate(self.px(8.0) as i32 + 1),
         })
@@ -749,6 +756,10 @@ impl Editor {
         if !self.area.contains(p.0, p.1) {
             return Hit::Outside;
         }
+        if self.shift && matches!(self.tool, Some(Tool::Blur | Tool::Pixelate)) {
+            return Hit::Inside;
+        }
+
         match self.mark_at(at, false) {
             Some(i) => Hit::Mark(i),
             None if s.contains(p.0, p.1) || self.tool.is_some() => Hit::Inside,
@@ -904,9 +915,19 @@ impl Editor {
                 None | Some(Tool::Image) => None,
                 Some(Tool::Text) => return self.start_typing(p),
                 Some(tool) => {
-                    let area = tool.picks_rects();
+                    let brush = self.shift && matches!(tool, Tool::Blur | Tool::Pixelate);
+                    let area = tool.picks_rects() && !brush;
                     let anchor = if area { self.snapped(p, self.snap_threshold()) } else { p };
-                    let mut mark = Mark::new(tool, anchor, self.color, self.strength[tool as usize]);
+                    let strength = self.strength[tool as usize];
+                    let mut mark = if brush {
+                        Mark::EffectBrush {
+                            points: vec![(p.0 as f32, p.1 as f32)],
+                            blur: tool == Tool::Blur,
+                            strength,
+                        }
+                    } else {
+                        Mark::new(tool, anchor, self.color, strength)
+                    };
                     match &mut mark {
                         Mark::Eraser { fill, .. } => *fill = under & 0x00FF_FFFF,
                         Mark::Cursor { sprite, .. } => match &self.arrow {
@@ -917,7 +938,7 @@ impl Editor {
                     }
                     self.refit(&mut mark);
                     let click = if area { self.pick_at(p) } else { None };
-                    Some(Drag::Mark { mark, anchor, press: p, click })
+                    Some(Drag::Mark { mark, anchor, press: p, click, freehand: None })
                 }
             },
             Hit::Typing | Hit::Outside => None,
@@ -941,7 +962,7 @@ impl Editor {
         let before = self.ink();
         let snap = &self.snap;
         match &mut self.drag {
-            Some(Drag::Mark { mark, anchor, press, click }) => {
+            Some(Drag::Mark { mark, anchor, press, click, freehand }) => {
                 let q = (p.0.clamp(b.x, b.right()), p.1.clamp(b.y, b.bottom()));
                 let f = (q.0 as f32, q.1 as f32);
                 if (p.0 - press.0).abs() as f32 > slop || (p.1 - press.1).abs() as f32 > slop {
@@ -949,10 +970,18 @@ impl Editor {
                 }
                 let clicking = click.is_some();
                 match mark {
-                    Mark::Stroke { points, .. } => {
-                        if points.last().is_some_and(|l| (l.0 - f.0).abs() + (l.1 - f.1).abs() >= 1.0) {
-                            points.push(f);
+                    Mark::Stroke { highlight: false, points, .. } if self.shift => {
+                        let path = freehand.get_or_insert_with(|| std::mem::take(points));
+                        push_point(path, f);
+                        points.clear();
+                        points.push(path[0]);
+                        push_point(points, f);
+                    }
+                    Mark::Stroke { points, .. } | Mark::EffectBrush { points, .. } => {
+                        if let Some(path) = freehand.take() {
+                            *points = path;
                         }
+                        push_point(points, f);
                     }
                     Mark::Arrow { to, .. } => *to = f,
                     Mark::Rectangle { rect, .. }
@@ -1056,6 +1085,10 @@ impl Editor {
     }
 
     pub(crate) fn mouse_up(&mut self, p: (i32, i32)) -> Event {
+        if p != self.mouse && matches!(&self.drag, Some(Drag::Mark { mark: Mark::Stroke { .. } | Mark::EffectBrush { .. }, .. })) {
+            self.mouse_move(p);
+        }
+
         match self.drag.take() {
             Some(Drag::Bar(item)) => match self.hit(p) {
                 Hit::Bar(at) if at == item => self.activate(item),
@@ -2213,7 +2246,7 @@ mod tests {
         let cell = |t: Tool| ed.cells.iter().find(|(i, _)| *i == Item::Tool(t)).unwrap().1;
         assert_eq!(cell(Tool::Step).x, cell(Tool::Text).right(), "one group");
         assert_eq!(cell(Tool::Pen).x - cell(Tool::Step).right(), 9, "a separator's gap");
-        assert_eq!(ed.tip(Item::Tool(Tool::Pen)).as_deref(), Some("pen  ·  1 / T"));
+        assert_eq!(ed.tip(Item::Tool(Tool::Pen)).as_deref(), Some("pen  ·  1 / T  ·  shift for a straight line"));
 
         for (vk, tool) in [(0x54, Some(Tool::Pen)), (0x50, Some(Tool::Text)), (0x31, Some(Tool::Pen)), (0x68, Some(Tool::Step))] {
             ed.key(vk, false, false);

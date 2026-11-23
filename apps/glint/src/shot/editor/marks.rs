@@ -165,6 +165,7 @@ pub(super) enum Mark {
     Rectangle { rect: Rect, color: Ink, width: f32 },
     Blur { rect: Rect, radius: f32 },
     Pixelate { rect: Rect, block: f32 },
+    EffectBrush { points: Vec<(f32, f32)>, blur: bool, strength: f32 },
     Eraser { rect: Rect, fill: u32 },
     /// `at` is the top-left corner of its box; `extent` is the box's laid-out size in physical
     /// pixels, padding included. `width` is the wrap width and `height` the box's height inside the
@@ -234,6 +235,8 @@ impl Mark {
             Mark::Rectangle { .. } => Tool::Rectangle,
             Mark::Blur { .. } => Tool::Blur,
             Mark::Pixelate { .. } => Tool::Pixelate,
+            Mark::EffectBrush { blur: true, .. } => Tool::Blur,
+            Mark::EffectBrush { .. } => Tool::Pixelate,
             Mark::Eraser { .. } => Tool::Eraser,
             Mark::Text { .. } => Tool::Text,
             Mark::Step { .. } => Tool::Step,
@@ -244,7 +247,7 @@ impl Mark {
     }
 
     pub(super) fn is_effect(&self) -> bool {
-        matches!(self, Mark::Blur { .. } | Mark::Pixelate { .. })
+        matches!(self, Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::EffectBrush { .. })
     }
 
     pub(super) fn strength(&self) -> Option<f32> {
@@ -252,6 +255,7 @@ impl Mark {
             Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => Some(*width),
             Mark::Blur { radius, .. } => Some(*radius),
             Mark::Pixelate { block, .. } => Some(*block),
+            Mark::EffectBrush { strength, .. } => Some(*strength),
             Mark::Text { size, .. } | Mark::Step { size, .. } | Mark::Cursor { size, .. } => Some(*size),
             Mark::Eraser { .. } | Mark::Grab { .. } | Mark::Image { .. } => None,
         }
@@ -262,6 +266,7 @@ impl Mark {
             Mark::Stroke { width, .. } | Mark::Arrow { width, .. } | Mark::Rectangle { width, .. } => Some(width),
             Mark::Blur { radius, .. } => Some(radius),
             Mark::Pixelate { block, .. } => Some(block),
+            Mark::EffectBrush { strength, .. } => Some(strength),
             Mark::Text { size, .. } | Mark::Step { size, .. } | Mark::Cursor { size, .. } => Some(size),
             Mark::Eraser { .. } | Mark::Grab { .. } | Mark::Image { .. } => None,
         }
@@ -276,6 +281,7 @@ impl Mark {
             | Mark::Step { color, .. } => Some(*color),
             Mark::Blur { .. }
             | Mark::Pixelate { .. }
+            | Mark::EffectBrush { .. }
             | Mark::Eraser { .. }
             | Mark::Cursor { .. }
             | Mark::Grab { .. }
@@ -292,6 +298,7 @@ impl Mark {
             | Mark::Step { color, .. } => Some(color),
             Mark::Blur { .. }
             | Mark::Pixelate { .. }
+            | Mark::EffectBrush { .. }
             | Mark::Eraser { .. }
             | Mark::Cursor { .. }
             | Mark::Grab { .. }
@@ -307,14 +314,14 @@ impl Mark {
             | Mark::Eraser { rect, .. }
             | Mark::Grab { rect, .. }
             | Mark::Image { rect, .. } => Some(rect),
-            Mark::Stroke { .. } | Mark::Arrow { .. } | Mark::Text { .. } | Mark::Step { .. } | Mark::Cursor { .. } => None,
+            Mark::Stroke { .. } | Mark::EffectBrush { .. } | Mark::Arrow { .. } | Mark::Text { .. } | Mark::Step { .. } | Mark::Cursor { .. } => None,
         }
     }
 
     /// Whether the mark is big enough to keep (a click without a drag isn't an arrow).
     pub(super) fn worth_keeping(&self) -> bool {
         match self {
-            Mark::Stroke { .. } | Mark::Step { .. } | Mark::Cursor { .. } | Mark::Image { .. } => true,
+            Mark::Stroke { .. } | Mark::EffectBrush { .. } | Mark::Step { .. } | Mark::Cursor { .. } | Mark::Image { .. } => true,
             Mark::Text { text, .. } => !text.trim().is_empty(),
             Mark::Arrow { from, to, .. } => (from.0 - to.0).abs() >= 3.0 || (from.1 - to.1).abs() >= 3.0,
             Mark::Rectangle { rect, .. }
@@ -327,7 +334,7 @@ impl Mark {
 
     pub(super) fn bbox(&self) -> Rect {
         match self {
-            Mark::Stroke { points, .. } => span(points),
+            Mark::Stroke { points, .. } | Mark::EffectBrush { points, .. } => span(points),
             Mark::Arrow { from, to, .. } => span(&[*from, *to]),
             Mark::Rectangle { rect, .. }
             | Mark::Blur { rect, .. }
@@ -351,6 +358,7 @@ impl Mark {
     pub(super) fn ink(&self, scale: f32) -> Rect {
         let reach = match self {
             Mark::Stroke { width, .. } | Mark::Rectangle { width, .. } => ink_width(*width, scale) / 2.0,
+            Mark::EffectBrush { blur, strength, .. } => brush_radius(*blur, *strength, scale),
             Mark::Arrow { width, .. } => {
                 let w = ink_width(*width, scale);
                 (w / 2.0).max(arrow_head(w, f32::MAX) * 0.55)
@@ -378,7 +386,7 @@ impl Mark {
         let shift = |p: &mut (f32, f32)| *p = (p.0 + dx as f32, p.1 + dy as f32);
         let mut m = self.clone();
         match &mut m {
-            Mark::Stroke { points, .. } => points.iter_mut().for_each(shift),
+            Mark::Stroke { points, .. } | Mark::EffectBrush { points, .. } => points.iter_mut().for_each(shift),
             Mark::Arrow { from, to, .. } => {
                 shift(from);
                 shift(to);
@@ -435,6 +443,7 @@ impl Mark {
         let slop = 4.0 * scale;
         match self {
             Mark::Stroke { points, width, .. } => path_dist(points, p) <= width * scale / 2.0 + slop,
+            Mark::EffectBrush { points, blur, strength } => path_dist(points, p) <= brush_radius(*blur, *strength, scale) + slop,
             Mark::Arrow { from, to, width, .. } => {
                 let (w, len) = (width * scale, dist(*from, *to));
                 let head = arrow_head(w, len);
@@ -461,7 +470,7 @@ impl Mark {
     pub(super) fn grips(&self) -> Vec<(Grip, (f32, f32))> {
         match self {
             // a text's grips go on its outline (see the editor's `grips_of`)
-            Mark::Stroke { .. } | Mark::Text { .. } | Mark::Step { tail: None, .. } | Mark::Cursor { .. } => Vec::new(),
+            Mark::Stroke { .. } | Mark::EffectBrush { .. } | Mark::Text { .. } | Mark::Step { tail: None, .. } | Mark::Cursor { .. } => Vec::new(),
             Mark::Step { tail: Some(t), .. } => vec![(Grip::To, *t)],
             Mark::Arrow { from, to, .. } => vec![(Grip::From, *from), (Grip::To, *to)],
             Mark::Rectangle { rect, .. }
@@ -476,6 +485,10 @@ impl Mark {
     }
 }
 
+pub(super) fn brush_radius(blur: bool, strength: f32, scale: f32) -> f32 {
+    (if blur { strength * 3.0 } else { strength * 1.5 }).max(8.0) * scale
+}
+
 fn span(points: &[(f32, f32)]) -> Rect {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for &(x, y) in points {
@@ -488,7 +501,7 @@ pub(super) fn dist(a: (f32, f32), b: (f32, f32)) -> f32 {
     (a.0 - b.0).hypot(a.1 - b.1)
 }
 
-fn seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+pub(super) fn seg_dist(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (dx, dy) = (b.0 - a.0, b.1 - a.1);
     let len2 = dx * dx + dy * dy;
     let t = if len2 > 0.0 { (((p.0 - a.0) * dx + (p.1 - a.1) * dy) / len2).clamp(0.0, 1.0) } else { 0.0 };
@@ -664,7 +677,7 @@ pub(super) fn draw_mark(
             }
             c.image(&img.px, img.w as usize, (img.w, img.h), box_);
         }
-        Mark::Blur { .. } | Mark::Pixelate { .. } => {}
+        Mark::Blur { .. } | Mark::Pixelate { .. } | Mark::EffectBrush { .. } => {}
     }
 }
 
