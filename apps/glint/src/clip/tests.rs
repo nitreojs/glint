@@ -826,6 +826,44 @@ fn tracks_get_added_moved_deleted_renamed_and_undone_from_the_lanes() {
 }
 
 #[test]
+fn track_menu_button_stays_put_and_menu_padding_does_not_seek() {
+    let mut h = Harness::new(1);
+    let name = h.rect_of("desktop");
+    let dots = pos2(name.right() + 20.0, name.center().y);
+    h.hover(dots);
+    assert!(!h.has("100%"), "hovering the dots alone doesn't open volume");
+    h.hover(name.center());
+    assert!(h.has("100%"));
+    h.click(dots);
+    assert!(h.has("rename"), "the dots still work at the same position");
+
+    let before = h.app.pos;
+    let rename = h.at("rename");
+    h.click(rename - vec2(0.0, 17.0));
+    assert_eq!(h.app.pos, before, "clicking menu padding doesn't seek");
+    assert!(h.has("rename"), "padding is not an outside click");
+}
+
+#[test]
+fn g_toggles_grouping_once_per_press_without_editing_the_clip() {
+    let mut h = Harness::new(1);
+    let before = h.app.edit.clone();
+    h.chord(Key::G, Modifiers::COMMAND, true);
+    assert!(h.app.grouped);
+    h.chord(Key::G, Modifiers::COMMAND, false);
+    h.key(Key::G, true);
+    assert!(!h.app.grouped);
+    h.frame(vec![Event::Key {
+        key: Key::G, physical_key: None, pressed: true, repeat: true, modifiers: Modifiers::NONE,
+    }]);
+    assert!(!h.app.grouped, "holding g does not toggle again");
+    h.key(Key::G, false);
+    h.key(Key::G, true);
+    assert!(h.app.grouped);
+    assert_eq!(h.app.edit, before);
+}
+
+#[test]
 fn arrow_keys_step_each_frame_without_waiting_for_the_decoder() {
     let times = [0, 166_667, 500_000, 1_333_333];
     let video = Samples::new(times.into_iter().map(|at| (at, 40_000, at == 0)).collect());

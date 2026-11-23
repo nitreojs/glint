@@ -27,11 +27,12 @@ const ITEMS: [(Item, &str, &str); 5] = [
 ];
 
 /// The keys sheet: caps, what follows them, what they do.
-const KEYS: [(&[&str], &str, &str); 19] = [
+const KEYS: [(&[&str], &str, &str); 20] = [
     (&["space"], "", "play / pause"),
     (&["←", "→"], "", "step a frame"),
     (&["I", "O"], "", "trim start / end here"),
     (&["S"], "", "cut here"),
+    (&["G"], "", "group / ungroup tracks"),
     (&["delete"], "", "remove the selected piece or clicks"),
     (&["M"], "", "add marker"),
     (&["[", "]"], "", "previous / next marker"),

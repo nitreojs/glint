@@ -1136,6 +1136,20 @@ impl ClipApp {
                 i.consume_key(cmd, Key::Z),
             )
         });
+        let group = ctx.input_mut(|input| {
+            let pressed = input.events.iter().any(|event| matches!(event,
+                Event::Key { key: Key::G, pressed: true, repeat: false, modifiers: Modifiers::NONE, .. }
+            ));
+            if pressed {
+                input.consume_key(none, Key::G);
+            }
+
+            pressed
+        });
+        if group && !self.edit.lanes.is_empty() && self.drag.is_none() {
+            self.lane_menu = None;
+            self.toggle_group();
+        }
         let (crop, fit, actual, enter, save_as, upload, keys, copy) = ctx.input_mut(|i| {
             let question = i.events.iter().any(|e| matches!(e, Event::Text(t) if t == "?"));
             (

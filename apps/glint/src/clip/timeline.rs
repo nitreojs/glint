@@ -646,12 +646,14 @@ impl ClipApp {
                 let cursor = if self.lane_drag.is_some() { CursorIcon::Grabbing } else { CursorIcon::PointingHand };
                 let resp = ui.interact(rect, Id::unique(("clip-lane", k)), sense).on_hover_cursor(cursor).on_hover_text(tip);
                 resp.widget_info(|| WidgetInfo::selected(Role::CheckBox, true, !muted, format!("sound: {name}")));
-                let zone = Rect::from_min_size(rect.min, vec2(rect.width() + 4.0 + pill_w + 4.0 + h, h));
+                let dots = Rect::from_min_size(pos2(rect.right() + 4.0, rect.top()), vec2(h, h));
+                let full = Rect::from_min_size(pos2(dots.right() + 4.0, rect.top()), vec2(pill_w, h));
+                let zone = rect.union(full);
                 let popped = matches!(self.volume_pop, Some((j, _)) if j == k);
                 let moving = self.nudge.as_ref().is_some_and(|n| n.lane == k);
-                let wanted = piece || volume != FULL_VOLUME || popped || moving || (still && ui.rect_contains_pointer(zone));
+                let volume_hover = still && ui.rect_contains_pointer(zone) && !ui.rect_contains_pointer(dots);
+                let wanted = piece || volume != FULL_VOLUME || popped || moving || volume_hover;
                 let shown = ease(anim(ui, Id::unique(("clip-lane-vol", k)), wanted, 0.18));
-                let full = Rect::from_min_size(pos2(rect.right() + 4.0, rect.top()), vec2(pill_w, h));
                 let vol = Rect::from_min_size(full.min, vec2(pill_w * shown, h));
                 let vol_resp = (shown > 0.5 && renaming != Some(k)).then(|| {
                     let r = ui
@@ -661,7 +663,6 @@ impl ClipApp {
                     r.widget_info(|| WidgetInfo::slider(true, volume as f64, format!("{name}: volume")));
                     r
                 });
-                let dots = Rect::from_min_size(pos2(vol.right() + 4.0 * shown, rect.top()), vec2(h, h));
                 let more = ui
                     .interact(dots, Id::unique(("clip-lane-more", k)), Sense::click())
                     .on_hover_cursor(CursorIcon::PointingHand)
@@ -1004,7 +1005,7 @@ impl ClipApp {
         {
             let grab = if thumb.x_range().contains(at.x) { at.x - thumb.left() } else { thumb.width() / 2.0 };
             self.drag = Some(Drag::Scroll { grab });
-        } else if reset_speed.is_none() && (body.drag_started() || body.clicked()) {
+        } else if !menus && reset_speed.is_none() && (body.drag_started() || body.clicked()) {
             self.drag = Some(Drag::Head);
             self.click_focus = false;
             self.click_sel.clear();
@@ -1672,7 +1673,12 @@ impl ClipApp {
         let rect = Rect::from_min_size(pos2(at.x.min(screen.right() - 4.0 - size.x), y), size);
         let red = super::overlay::danger(self.light == Some(true));
         let mut picked = None;
-        egui::Area::new(Id::unique("clip-lane-menu")).order(Order::Foreground).fixed_pos(rect.min).show(ctx, |ui| {
+        let popup = egui::Area::new(Id::unique("clip-lane-menu"))
+            .order(Order::Foreground)
+            .fixed_pos(rect.min)
+            .sense(Sense::click_and_drag());
+        popup.show(ctx, |ui| {
+            ui.set_min_size(rect.size());
             ui.painter().rect(rect, 8, p.surf, Stroke::new(1.0, p.line2), StrokeKind::Inside);
             let mut y = rect.top() + 4.0;
             for (i, (item, on)) in items.into_iter().enumerate() {
@@ -1691,6 +1697,9 @@ impl ClipApp {
                 };
                 item.paint_icon(painter, pos2(r.left() + 14.0, r.center().y), color, self.grouped);
                 painter.text(pos2(r.left() + 29.0, r.center().y), egui::Align2::LEFT_CENTER, label, sans(13.0), color);
+                if matches!(item, LaneItem::Group) {
+                    painter.text(r.right_center() - vec2(10.0, 0.0), egui::Align2::RIGHT_CENTER, "g", mono(11.0), p.t3);
+                }
                 if on && resp.clicked() {
                     picked = Some(item);
                 }
