@@ -172,13 +172,6 @@ impl Harness {
         self.settle();
     }
 
-    fn choose_track_context(&mut self, at: Pos2) {
-        self.right_click(at);
-        let action = self.app.track_context.take().expect("track context menu");
-        self.app.track_context_action(action);
-        self.settle();
-    }
-
     fn drag(&mut self, from: Pos2, to: Pos2) {
         let button = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: Default::default() };
         self.frame(vec![Event::PointerMoved(from), button(from, true)]);
@@ -384,20 +377,20 @@ fn right_click_toggles_pieces_and_only_merges_kept_neighbors_at_a_split() {
         assert!((label.left() - pointer.x).abs() < 32.0 && label.top() >= pointer.y, "{label:?} at {pointer:?}");
     }
     h.click(at(0.25));
-    h.choose_track_context(at(0.75));
+    h.right_click(at(0.75));
     assert!(!h.app.edit.segments[0].removed && h.app.edit.segments[1].removed);
     let with_removed = h.app.edit.segments.clone();
-    h.choose_track_context(seam);
+    h.right_click(seam);
     assert_eq!(h.app.edit.segments, with_removed, "a blocked seam click doesn't merge or toggle");
 
-    h.choose_track_context(at(0.25));
+    h.right_click(at(0.25));
     assert!(!h.app.edit.segments[0].removed, "the last kept piece cannot be removed");
-    h.choose_track_context(at(0.75));
+    h.right_click(at(0.75));
     assert!(!h.app.edit.segments[1].removed);
     let split = h.app.edit.segments.clone();
     assert_eq!(h.app.edit.kept(), retained);
 
-    h.choose_track_context(seam);
+    h.right_click(seam);
     assert_eq!(h.app.edit.segments.len(), 1);
     assert_eq!(h.app.edit.kept(), retained, "merging doesn't change the retained duration");
 
@@ -457,7 +450,7 @@ fn shift_drag_at_either_side_of_a_split_stretches_only_the_piece_under_the_press
         expected.segments[piece_index].speed = speed;
         assert_eq!(h.app.edit, expected, "source bounds and all other edits stay unchanged");
         h.settle();
-        h.choose_track_context(pos2(h.app.view.x(map.to_edit(seam), left, width) + 2.0, y));
+        h.right_click(pos2(h.app.view.x(map.to_edit(seam), left, width) + 2.0, y));
         assert_eq!(h.app.edit, expected, "pieces at different speeds cannot merge");
 
         assert!(h.app.undo.undo(&mut h.app.edit));
@@ -1168,7 +1161,8 @@ fn ungrouped_audio_splits_reuse_lane_controls_and_survive_regrouping() {
     h.key(Key::S, false);
     h.undo();
 
-    h.choose_track_context(middle);
+    h.right_click(h.at(name));
+    h.click(h.at("ungroup tracks"));
     assert!(!h.app.grouped);
     for at in [12, 20] {
         h.click(pos2(x(at * SECOND), y));
@@ -1176,16 +1170,17 @@ fn ungrouped_audio_splits_reuse_lane_controls_and_survive_regrouping() {
         h.key(Key::S, false);
     }
     h.click(middle);
-    h.wheel(h.at(name), -2.0);
+    h.wheel(middle, -2.0);
     assert_eq!(h.volumes(), [100, 100]);
     assert_eq!(h.app.edit.lanes[1].piece_mix(16 * SECOND), (90, false));
-    h.click(h.at(name));
+    h.key(Key::Delete, true);
     assert_eq!(h.app.edit.lanes[1].piece_mix(16 * SECOND), (90, true));
-    h.click(h.at(name));
+    h.right_click(middle);
     assert_eq!(h.app.edit.lanes[1].piece_mix(16 * SECOND), (90, false));
-    h.click(h.at(name));
+    h.key(Key::Backspace, true);
 
-    h.choose_track_context(middle);
+    h.right_click(h.at(name));
+    h.click(h.at("group tracks"));
     assert!(h.app.grouped);
     let Some(Job::Video(job)) = h.app.job() else { panic!() };
     assert_eq!(job.pieces.iter().map(|piece| piece.len()).sum::<i64>(), 42 * SECOND);
@@ -1196,6 +1191,17 @@ fn ungrouped_audio_splits_reuse_lane_controls_and_survive_regrouping() {
     assert!((gain.range.end - 20 * SECOND).abs() < SECOND / 10);
     h.undo();
     assert_eq!(h.app.edit.lanes[1].piece_mix(16 * SECOND), (90, false));
+
+    h.right_click(h.at(name));
+    h.click(h.at("ungroup tracks"));
+    let seam = pos2(x(12 * SECOND), y);
+    h.right_click(seam);
+    assert_eq!(h.app.edit.lanes[1].cuts.len(), 2, "different gains cannot merge by accident");
+    h.click(middle);
+    h.wheel(middle, 2.0);
+    h.right_click(seam);
+    let [cut] = &*h.app.edit.lanes[1].cuts else { panic!("the first seam should be gone") };
+    assert!((*cut - 20 * SECOND).abs() < SECOND / 10);
 }
 
 impl Harness {

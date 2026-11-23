@@ -367,6 +367,20 @@ impl Edit {
         true
     }
 
+    pub fn merge_audio(&mut self, index: usize, at: i64) -> bool {
+        let Some(lane) = self.lanes.get_mut(index) else { return false };
+        let Ok(cut) = lane.cuts.binary_search(&at) else { return false };
+        if lane.piece_mix(at - 1) != lane.piece_mix(at) {
+            return false;
+        }
+
+        let mut cuts = lane.cuts.to_vec();
+        cuts.remove(cut);
+        lane.cuts = cuts.into();
+
+        true
+    }
+
     pub fn set_range_mix(&mut self, lane: usize, range: Range, volume: u16, muted: bool) -> bool {
         let Some(lane) = self.lanes.get_mut(lane).filter(|lane| lane.source.is_some()) else { return false };
         if range.start < 0 || range.end <= range.start {

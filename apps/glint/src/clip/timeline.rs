@@ -69,13 +69,6 @@ pub(super) enum Drag {
     Scroll { grab: f32 },
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TrackContext {
-    Group,
-    Merge { right: usize, enabled: bool },
-    Piece { index: usize, removed: bool },
-}
-
 #[derive(Clone, Copy, PartialEq)]
 enum Edge {
     Left,
@@ -305,16 +298,18 @@ enum LaneItem {
     Down,
     Delete,
     Remember,
+    Group,
 }
 
 impl LaneItem {
-    fn label(self) -> &'static str {
+    fn label(self, grouped: bool) -> &'static str {
         match self {
             LaneItem::Rename => "rename",
             LaneItem::Up => "move up",
             LaneItem::Down => "move down",
             LaneItem::Delete => "delete track",
             LaneItem::Remember => "remember track volume",
+            LaneItem::Group => if grouped { "ungroup tracks" } else { "group tracks" },
         }
     }
 }
@@ -370,50 +365,17 @@ impl ClipApp {
         self.select_timeline(None);
     }
 
-    pub(super) fn track_context_action(&mut self, action: TrackContext) {
-        match action {
-            TrackContext::Group => self.toggle_group(),
-            TrackContext::Merge { right, enabled: true } => {
-                if self.change(|e| e.merge_kept(right)) {
-                    self.select_timeline(None);
-                }
-            }
-            TrackContext::Piece { index, .. } => self.toggle_piece(index),
-            TrackContext::Merge { enabled: false, .. } => {}
-        }
-    }
-
     pub(super) fn track_context_menu(&mut self) {
         let Some(hwnd) = self.hwnd else { return };
-        let Some(action) = self.track_context.take() else { return };
-        use glint_shell::menu::{self, Glyph, Item, Menu};
-        let mut items = Vec::with_capacity(3);
-        match action {
-            TrackContext::Group => {}
-            TrackContext::Merge { enabled, .. } => {
-                items.push(Item::command(2, "merge pieces").glyph(Glyph::Trim).enabled(enabled));
-            }
-            TrackContext::Piece { removed, .. } => {
-                let (label, icon) = if removed { ("restore piece", Glyph::Update) } else { ("remove piece", Glyph::Clear) };
-                items.push(Item::command(2, label).glyph(icon));
-            }
-        }
-        if !items.is_empty() && !self.edit.lanes.is_empty() {
-            items.push(Item::separator());
-        }
-        if !self.edit.lanes.is_empty() {
-            let (label, icon) = if self.grouped { ("ungroup tracks", Glyph::Trim) } else { ("group tracks", Glyph::Copy) };
-            items.push(Item::command(1, label).glyph(icon));
-        }
-        if items.is_empty() {
+        if !std::mem::take(&mut self.track_context) || self.edit.lanes.is_empty() {
             return;
         }
 
-        let menu = Menu { accent: self.accent, header: None, items };
-        match menu::track(hwnd, &menu, false, || None) {
-            Some(1) => self.track_context_action(TrackContext::Group),
-            Some(2) => self.track_context_action(action),
-            _ => {}
+        use glint_shell::menu::{self, Glyph, Item, Menu};
+        let (label, icon) = if self.grouped { ("ungroup tracks", Glyph::Trim) } else { ("group tracks", Glyph::Copy) };
+        let menu = Menu { accent: self.accent, header: None, items: vec![Item::command(1, label).glyph(icon)] };
+        if menu::track(hwnd, &menu, false, || None) == Some(1) {
+            self.toggle_group();
         }
     }
 
@@ -452,13 +414,19 @@ impl ClipApp {
 
     fn toggle_lane_control(&mut self, k: usize) {
         let lane = &self.edit.lanes[k];
-        if let Some(piece) = self.selected_audio_piece(lane) {
-            let (volume, muted) = lane.piece_mix(piece.start);
-            if self.change(|e| e.set_range_mix(k, piece, volume, !muted)) {
-                self.sync_gains();
-            }
+        if let Some(at) = self.audio_selected_at(lane).filter(|_| !lane.cuts.is_empty()) {
+            self.silence_audio_piece(k, at, true);
         } else {
             self.set_muted(k, !lane.muted);
+        }
+    }
+
+    pub(super) fn silence_audio_piece(&mut self, k: usize, at: i64, toggle: bool) {
+        let lane = &self.edit.lanes[k];
+        let Some(piece) = lane.piece(at, self.duration()) else { return };
+        let (volume, muted) = lane.piece_mix(piece.start);
+        if self.change(|edit| edit.set_range_mix(k, piece, volume, !muted || !toggle)) {
+            self.sync_gains();
         }
     }
 
@@ -670,6 +638,17 @@ impl ClipApp {
             })
             .collect();
         let over_head = hover.is_some_and(|at| chips.iter().any(|c| c.zone.contains(at)));
+        let wheel_lane = hover.filter(|_| !ctrl && !menus && !stretching && self.volume_pop.is_none()).and_then(|at| {
+            rows.lanes.iter().enumerate().position(|(k, row)| {
+                if chips[k].zone.contains(at) {
+                    return true;
+                }
+                row.contains(at) && self.selected_audio_piece(&lanes[k]).is_some_and(|piece| {
+                    let x = |t| self.view.x(map.to_edit(t), inner.left(), inner.width());
+                    (x(piece.start)..x(piece.end)).contains(&at.x)
+                })
+            })
+        });
         if let Some(at) = hover
             && !menus
             && !stretching
@@ -681,10 +660,13 @@ impl ClipApp {
                 let frac = ((at.x - inner.left()) / inner.width()).clamp(0.0, 1.0) as f64;
                 let anchor = self.view.start + (frac * self.view.span as f64) as i64;
                 self.view.zoom(anchor, frac, zoom as f64, dur, min_span);
-            } else if self.view.span < dur && scroll.x + scroll.y != 0.0 {
-                let shift = (scroll.x + scroll.y) as f64 / inner.width() as f64 * self.view.span as f64;
-                self.view.start -= shift as i64;
-                self.view.clamp(dur, min_span);
+            } else {
+                let pan = scroll.x + if wheel_lane.is_none() { scroll.y } else { 0.0 };
+                if self.view.span < dur && pan != 0.0 {
+                    let shift = (pan as f64 / inner.width() as f64 * self.view.span as f64) as i64;
+                    self.view.start -= shift;
+                    self.view.clamp(dur, min_span);
+                }
             }
         }
 
@@ -736,8 +718,8 @@ impl ClipApp {
                     (true, "shift-drag to change speed · park playhead between cuts to pick a piece · right-click to merge")
                 };
                 body.clone().on_hover_text_at_pointer(tip);
-                if body.secondary_clicked() {
-                    self.track_context = Some(TrackContext::Merge { right, enabled: can_merge });
+                if can_merge && body.secondary_clicked() && self.change(|e| e.merge_kept(right)) {
+                    self.select_timeline(None);
                 }
             } else if !segment.removed && segment.speed != Speed::NORMAL
                 && (self.edit.range.start..self.edit.range.end).contains(&t_of(at.x)) {
@@ -750,11 +732,11 @@ impl ClipApp {
                 if !shift && self.drag.is_none() && body.double_clicked() {
                     reset_speed = Some(index);
                 } else if body.secondary_clicked() {
-                    self.track_context = Some(if many {
-                        TrackContext::Piece { index, removed: segment.removed }
+                    if many {
+                        self.toggle_piece(index);
                     } else {
-                        TrackContext::Group
-                    });
+                        self.track_context = true;
+                    }
                 }
             } else {
                 let tip = if segment.removed {
@@ -766,11 +748,11 @@ impl ClipApp {
                 };
                 body.clone().on_hover_text_at_pointer(tip);
                 if body.secondary_clicked() {
-                    self.track_context = Some(if many {
-                        TrackContext::Piece { index, removed: segment.removed }
+                    if many {
+                        self.toggle_piece(index);
                     } else {
-                        TrackContext::Group
-                    });
+                        self.track_context = true;
+                    }
                 }
             }
         }
@@ -882,7 +864,7 @@ impl ClipApp {
                     self.nudge_volume(k, r.drag_delta().x, true);
                 }
             }
-            if !menus && !ctrl && ui.rect_contains_pointer(chip.zone) {
+            if wheel_lane == Some(k) && ui.input(|i| i.zoom_delta()) == 1.0 {
                 let wheel = ui.input(|i| i.smooth_scroll_delta.y);
                 if wheel != 0.0 {
                     self.nudge_volume(k, wheel / WHEEL_PX, false);
@@ -919,7 +901,24 @@ impl ClipApp {
             && let Some(at) = body.interact_pointer_pos()
             && rows.lanes.iter().any(|r| r.contains(at))
         {
-            self.track_context = Some(TrackContext::Group);
+            if let Some(k) = audio_lane(at).filter(|&k| !self.grouped && !self.edit.lanes[k].cuts.is_empty()) {
+                let lane = &self.edit.lanes[k];
+                let cut = lane.cuts.iter().copied()
+                    .map(|cut| (cut, (x_of(cut) - at.x).abs()))
+                    .filter(|&(_, distance)| distance <= 5.0)
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((cut, _)) = cut {
+                    if lane.piece_mix(cut - 1) != lane.piece_mix(cut) {
+                        self.toast(super::Note::Info("match piece volume and mute to merge".into()));
+                    } else {
+                        self.change(|edit| edit.merge_audio(k, cut));
+                    }
+                } else {
+                    self.silence_audio_piece(k, t_of(at.x), true);
+                }
+            } else {
+                self.track_context = true;
+            }
         }
         let shift_edge = if !menus && self.drag.is_none() {
             shift_press(ui)
@@ -1218,6 +1217,11 @@ impl ClipApp {
                 }
                 continue;
             };
+            if self.audio_selected_at(&lanes[k]).is_some() {
+                let piece = self.selected_audio_piece(&lanes[k]).unwrap_or(math::Range { start: 0, end: source_dur });
+                let span = Rect::from_min_max(pos2(x_of(piece.start), l.top()), pos2(x_of(piece.end), l.bottom()));
+                clip.rect_filled(span, 0, p.acc.gamma_multiply(0.14));
+            }
             if let Some(peaks) = self.peaks.get(source).filter(|p| !p.is_empty()) {
                 let wave = Waveform::recorded(ui.ctx(), look, &self.path, source, lanes[k].volume, lanes[k].muted);
                 let rect = l.with_min_x(x_start).with_max_x(stop);
@@ -1236,11 +1240,6 @@ impl ClipApp {
             for &at in lanes[k].cuts.iter() {
                 let x = x_of(at);
                 clip.vline(x, l.y_range(), Stroke::new(1.0, p.t2));
-            }
-            if self.audio_selected_at(&lanes[k]).is_some() {
-                let span = self.selected_audio_piece(&lanes[k]).unwrap_or(math::Range { start: 0, end: source_dur });
-                let span = Rect::from_min_max(pos2(x_of(span.start), l.top()), pos2(x_of(span.end), l.bottom()));
-                clip.rect_stroke(span, 2, Stroke::new(1.0, p.acc), StrokeKind::Inside);
             }
         }
 
@@ -1631,6 +1630,7 @@ impl ClipApp {
             (LaneItem::Up, k > 0),
             (LaneItem::Down, k + 1 < n),
             (LaneItem::Remember, self.edit.lanes[k].source.is_some()),
+            (LaneItem::Group, true),
             (LaneItem::Delete, true),
         ];
         let size = vec2(MENU_W, items.len() as f32 * ITEM_H + 8.0);
@@ -1646,7 +1646,8 @@ impl ClipApp {
                 let r = Rect::from_min_size(pos2(rect.left() + 4.0, y), vec2(MENU_W - 8.0, ITEM_H));
                 let resp = ui.interact(r, Id::unique(("clip-lane-menu-item", i)), if on { Sense::click() } else { Sense::hover() });
                 let resp = if on { resp.on_hover_cursor(CursorIcon::PointingHand) } else { resp };
-                resp.widget_info(|| WidgetInfo::labeled(Role::MenuItem, on, item.label()));
+                let label = item.label(self.grouped);
+                resp.widget_info(|| WidgetInfo::labeled(Role::MenuItem, on, label));
                 let hov = anim(ui, resp.id.with("hov"), on && resp.hovered(), 0.1);
                 let painter = ui.painter();
                 painter.rect_filled(r, 5, p.ctlh.gamma_multiply(hov));
@@ -1655,7 +1656,7 @@ impl ClipApp {
                     (LaneItem::Delete, _) => red,
                     _ => mix(p.t2, p.t1, hov),
                 };
-                painter.text(pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, item.label(), sans(13.0), color);
+                painter.text(pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, label, sans(13.0), color);
                 if on && resp.clicked() {
                     picked = Some(item);
                 }
@@ -1681,6 +1682,7 @@ impl ClipApp {
             LaneItem::Down => {
                 self.change(|e| e.move_lane(k, k + 1));
             }
+            LaneItem::Group => self.toggle_group(),
             LaneItem::Remember => {
                 let lane = &self.edit.lanes[k];
                 let name = lane.default_name(&tracks).trim().to_lowercase();

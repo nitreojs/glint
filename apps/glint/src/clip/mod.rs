@@ -351,7 +351,7 @@ struct ClipApp {
     /// The lane whose volume slider is open, under the volume pill at that rect.
     volume_pop: Option<(usize, Rect)>,
     grouped: bool,
-    track_context: Option<timeline::TrackContext>,
+    track_context: bool,
     nudge: Option<Nudge>,
     playhead: Glide,
     trim: [Glide; 2],
@@ -479,7 +479,7 @@ impl ClipApp {
             lane_drag: None,
             volume_pop: None,
             grouped: true,
-            track_context: None,
+            track_context: false,
             nudge: None,
             playhead: Glide::new(0),
             trim: [Glide::new(0), Glide::new(duration)],
@@ -1208,6 +1208,11 @@ impl ClipApp {
                     self.selected = None;
                 }
                 Some(Selected::Segment(i)) => self.toggle_piece(i),
+                Some(Selected::Audio { source, at }) => {
+                    if let Some(k) = self.edit.lanes.iter().position(|lane| lane.source == Some(source)) {
+                        self.silence_audio_piece(k, at, false);
+                    }
+                }
                 _ => {}
             }
         }
