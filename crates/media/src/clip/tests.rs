@@ -184,6 +184,36 @@ fn max_volume(path: &Path, track: usize) -> f64 {
 
 #[test]
 #[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
+fn audio_range_gain_survives_export_without_touching_other_tracks_or_duration() {
+    let src = fixture("range-gain", "640x360", "30", &["-g", "30"]);
+    let out = src.with_file_name(format!("glint-range-gain-out-{}.mp4", std::process::id()));
+    let mut edit = Edit::new(3 * SECOND, 2);
+    assert!(edit.set_range_volume(1, Range { start: SECOND, end: 2 * SECOND }, 0));
+    assert!(edit.set_range_volume(1, Range { start: 2 * SECOND, end: 3 * SECOND }, 50));
+    let (job, _) = export_to(&src, &edit, &export::Settings::default(), &out);
+    let Job::Video(job) = job else { panic!("expected video export") };
+    assert_eq!(job.video, Video::Copy);
+    assert!(job.copies(&job.tracks[0]) && !job.copies(&job.tracks[1]));
+    let peak = |track, at| {
+        let pcm = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-ss", at, "-i"]).arg(&out)
+            .args(["-map", track, "-t", "0.2", "-f", "s16le", "-"]).output().unwrap();
+        assert!(pcm.status.success() && !pcm.stdout.is_empty());
+        pcm.stdout.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]).unsigned_abs()).max().unwrap()
+    };
+    let normal = peak("0:a:1", "0.4");
+    let muted = peak("0:a:1", "1.4");
+    let quieter = peak("0:a:1", "2.4");
+    assert!(normal > 2_000 && muted < 10 && quieter.abs_diff(normal / 2) < normal / 10);
+    assert!(peak("0:a:0", "1.4") > 2_000);
+    let duration: f64 = probe(&out, "format=duration")[0].parse().unwrap();
+    assert!((duration - 3.0).abs() < 0.05);
+    std::fs::remove_file(src).unwrap();
+    std::fs::remove_file(out).unwrap();
+}
+
+#[test]
+#[ignore = "needs ffmpeg and ffprobe on PATH; writes and deletes temp files"]
 fn deleted_reordered_renamed_and_empty_tracks_come_out_as_shown() {
     let src = fixture("lanes", "640x360", "30", &["-g", "30", "-filter:a:1", "volume=0.1"]);
     let info = {

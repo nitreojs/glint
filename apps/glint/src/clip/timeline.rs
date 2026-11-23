@@ -66,7 +66,14 @@ pub(super) enum Drag {
     End { head: i64 },
     Head,
     Stretch(Stretch),
+    Audio { lane: usize, start: i64, end: i64 },
     Scroll { grab: f32 },
+}
+
+pub(super) struct AudioRange {
+    lane: usize,
+    range: math::Range,
+    volume: u16,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -355,6 +362,10 @@ fn shift_press(ui: &Ui) -> Option<egui::Pos2> {
     })
 }
 
+fn audio_span(a: i64, b: i64) -> math::Range {
+    math::Range { start: a.min(b), end: a.max(b) }
+}
+
 impl ClipApp {
     fn parked_piece(&self) -> Option<usize> {
         if self.play != Play::Paused
@@ -505,7 +516,7 @@ impl ClipApp {
         let light = self.light == Some(true);
 
         let menus = self.sheet || self.menu || self.confirm_delete || self.confirm_cleanup.is_some()
-            || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some();
+            || self.lane_menu.is_some() || self.click_menu.is_some() || self.key_menu.is_some() || self.audio_range.is_some();
         let hover = ui.input(|i| i.pointer.hover_pos()).filter(|at| area.contains(*at));
         let (ctrl, shift) = ui.input(|i| (i.modifiers.ctrl, i.modifiers.shift));
         let body = ui.interact(Rect::from_min_max(area.min, rows.span.max), Id::unique("clip-track"), Sense::click_and_drag());
@@ -788,6 +799,21 @@ impl ClipApp {
         }
 
         let head = self.pos;
+        let audio_lane = |at: egui::Pos2| rows.lanes.iter().enumerate().position(|(k, row)| {
+            row.contains(at) && !chips[k].zone.contains(at) && lanes[k].source.is_some()
+        });
+        if !menus && self.drag.is_none() && body.secondary_clicked()
+            && let Some(at) = body.interact_pointer_pos()
+            && let Some(lane) = audio_lane(at)
+            && let Some(gain) = lanes[lane].gains.iter().find(|g| (g.range.start..g.range.end).contains(&t_of(at.x)))
+        {
+            self.audio_range = Some(AudioRange { lane, range: gain.range, volume: gain.volume });
+        }
+        let audio_start = if !menus && self.drag.is_none() && body.is_pointer_button_down_on() {
+            shift_press(ui).and_then(|at| audio_lane(at).map(|lane| (lane, t_of(at.x))))
+        } else {
+            None
+        };
         let shift_edge = if !menus && self.drag.is_none() {
             shift_press(ui)
                 .filter(|at| rows.video.contains(*at))
@@ -805,7 +831,12 @@ impl ClipApp {
         let pressed = |r: &Option<Vec<egui::Response>>| {
             r.as_ref().is_some_and(|r| r.iter().any(|r| r.drag_started()))
         };
-        if stretching {
+        if let Some((lane, start)) = audio_start {
+            self.pause();
+            self.drag = Some(Drag::Audio { lane, start, end: start });
+        } else if matches!(self.drag, Some(Drag::Audio { .. })) {
+            ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+        } else if stretching {
             ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
         } else if let Some((from, index, kept, edge)) = shift_edge {
             let piece = self.edit.segments[index];
@@ -893,6 +924,9 @@ impl ClipApp {
                     self.view.start = ((at.x - grab - rows.bar.left()) / rows.bar.width() * dur as f32) as i64;
                     self.view.clamp(dur, min_span);
                 }
+                Drag::Audio { lane, start, .. } => {
+                    self.drag = Some(Drag::Audio { lane, start, end: t_of(at.x) });
+                }
                 Drag::Stretch(_) => {}
             }
         }
@@ -902,6 +936,9 @@ impl ClipApp {
             !ui.input(|i| i.pointer.any_down())
         };
         if self.drag.is_some() && released {
+            if let Some(Drag::Audio { lane, start, end }) = self.drag && start != end {
+                self.audio_range = Some(AudioRange { lane, range: audio_span(start, end), volume: FULL_VOLUME });
+            }
             if let Some(Drag::Start { head } | Drag::End { head }) = self.drag {
                 self.pos = head;
                 self.seek(head, false);
@@ -1084,7 +1121,25 @@ impl ClipApp {
             if let Some(peaks) = self.peaks.get(source).filter(|p| !p.is_empty()) {
                 let wave = Waveform::recorded(ui.ctx(), look, &self.path, source, lanes[k].volume, lanes[k].muted);
                 let rect = l.with_min_x(x_start).with_max_x(stop);
-                wave.paint(&clip, rect, peaks, t_of);
+                wave.paint(&clip, rect, peaks, t_of, &lanes[k].gains);
+            }
+            for gain in lanes[k].gains.iter() {
+                let span = Rect::from_min_max(pos2(x_of(gain.range.start), l.top()), pos2(x_of(gain.range.end), l.bottom()));
+                if span.intersects(inner) {
+                    clip.rect_filled(span, 0, p.acc.gamma_multiply(0.2));
+                    clip.with_clip_rect(span.intersect(*l)).text(
+                        pos2(span.left() + 4.0, span.center().y), egui::Align2::LEFT_CENTER,
+                        if gain.volume == 0 { "silent".into() } else { format!("{}%", gain.volume) }, mono(11.0), p.t1,
+                    );
+                }
+            }
+            let selected = match self.drag {
+                Some(Drag::Audio { lane, start, end }) if lane == k => Some(audio_span(start, end)),
+                _ => self.audio_range.as_ref().filter(|range| range.lane == k).map(|range| range.range),
+            };
+            if let Some(span) = selected {
+                let span = Rect::from_min_max(pos2(x_of(span.start), l.top()), pos2(x_of(span.end), l.bottom()));
+                clip.rect_stroke(span, 2, Stroke::new(1.0, p.acc), StrokeKind::Inside);
             }
         }
 
@@ -1429,6 +1484,36 @@ impl ClipApp {
         });
         if outside {
             self.volume_pop = None;
+        }
+    }
+
+    pub(super) fn audio_range_popup(&mut self, ctx: &egui::Context) {
+        let Some(mut selected) = self.audio_range.take() else { return };
+        let Some(lane) = self.edit.lanes.get(selected.lane) else { return };
+        let name = self.info().map_or("track", |info| lane.name(&info.tracks));
+        let mut open = true;
+        let mut apply = None;
+        egui::Window::new("audio range").collapsible(false).resizable(false).open(&mut open).show(ctx, |ui| {
+            ui.label(format!("{name} · {}–{}", math::fmt_time(selected.range.start), math::fmt_time(selected.range.end)));
+            ui.add(egui::Slider::new(&mut selected.volume, 0..=MAX_VOLUME).suffix("%").text("of track volume"));
+            ui.horizontal(|ui| {
+                if ui.button("mute range").clicked() {
+                    apply = Some(0);
+                }
+                if ui.button("reset range").clicked() {
+                    apply = Some(FULL_VOLUME);
+                }
+                if ui.button("apply").clicked() {
+                    apply = Some(selected.volume);
+                }
+            });
+        });
+        if let Some(volume) = apply {
+            if self.change(|edit| edit.set_range_volume(selected.lane, selected.range, volume)) {
+                self.sync_gains();
+            }
+        } else if open {
+            self.audio_range = Some(selected);
         }
     }
 

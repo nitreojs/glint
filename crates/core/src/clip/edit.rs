@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use super::clicks::Clicks;
 use super::crop::Crop;
 use super::info::Track;
@@ -134,6 +136,14 @@ pub struct Lane {
     pub muted: bool,
     /// Percent of the track's own loudness, 0 to [`MAX_VOLUME`].
     pub volume: u16,
+    pub gains: Arc<[GainRange]>,
+}
+
+/// A gain relative to the lane volume, over a half-open range on the source clock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GainRange {
+    pub range: Range,
+    pub volume: u16,
 }
 
 pub const EMPTY_TRACK: &str = "empty";
@@ -142,7 +152,7 @@ pub const MAX_VOLUME: u16 = 200;
 
 impl Lane {
     fn of(source: Option<usize>) -> Lane {
-        Lane { source, name: None, muted: false, volume: FULL_VOLUME }
+        Lane { source, name: None, muted: false, volume: FULL_VOLUME, gains: Arc::default() }
     }
 
     pub fn default_name<'a>(&self, tracks: &'a [Track]) -> &'a str {
@@ -322,6 +332,46 @@ impl Edit {
         let changed = l.volume != volume;
         l.volume = volume;
         changed
+    }
+
+    pub fn set_range_volume(&mut self, lane: usize, range: Range, volume: u16) -> bool {
+        let Some(lane) = self.lanes.get_mut(lane).filter(|lane| lane.source.is_some()) else { return false };
+        if range.start < 0 || range.end <= range.start {
+            return false;
+        }
+
+        let volume = volume.min(MAX_VOLUME);
+        let mut next = Vec::with_capacity(lane.gains.len() + 2);
+        for gain in lane.gains.iter().copied() {
+            if gain.range.end <= range.start || gain.range.start >= range.end {
+                next.push(gain);
+            } else {
+                if gain.range.start < range.start {
+                    next.push(GainRange { range: Range { end: range.start, ..gain.range }, ..gain });
+                }
+                if gain.range.end > range.end {
+                    next.push(GainRange { range: Range { start: range.end, ..gain.range }, ..gain });
+                }
+            }
+        }
+        if volume != FULL_VOLUME {
+            next.push(GainRange { range, volume });
+        }
+        next.sort_unstable_by_key(|gain| gain.range.start);
+        let mut merged: Vec<GainRange> = Vec::with_capacity(next.len());
+        for gain in next {
+            if let Some(last) = merged.last_mut().filter(|last| last.volume == gain.volume && last.range.end == gain.range.start) {
+                last.range.end = gain.range.end;
+            } else {
+                merged.push(gain);
+            }
+        }
+        if *lane.gains == merged[..] {
+            return false;
+        }
+
+        lane.gains = merged.into();
+        true
     }
 
     pub fn rename(&mut self, lane: usize, name: &str, tracks: &[Track]) -> bool {
@@ -615,7 +665,7 @@ mod tests {
         let before = e.clone();
         assert_eq!(e.add_empty(), 2);
         u.record(before, &e);
-        assert_eq!(e.lanes[2], Lane { source: None, name: None, muted: false, volume: FULL_VOLUME });
+        assert_eq!(e.lanes[2], Lane::of(None));
         assert_eq!(names(&e), ["desktop", "voice", EMPTY_TRACK]);
 
         let before = e.clone();

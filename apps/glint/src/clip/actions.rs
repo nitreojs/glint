@@ -19,6 +19,8 @@ pub(super) struct Saved {
     pub rect: Option<[i32; 4]>,
     pub volume: f32,
     pub export: Settings,
+    #[serde(skip)]
+    pub track_volumes: std::collections::BTreeMap<String, u16>,
     /// The export panel's "more options" are open.
     pub more: bool,
     /// The retired all / unmuted / mix audio choice: muted lanes now decide, and "mix" became `combine`.
@@ -28,7 +30,7 @@ pub(super) struct Saved {
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { rect: None, volume: 1.0, export: Settings::default(), more: false, legacy_audio: None }
+        Saved { rect: None, volume: 1.0, export: Settings::default(), track_volumes: Default::default(), more: false, legacy_audio: None }
     }
 }
 

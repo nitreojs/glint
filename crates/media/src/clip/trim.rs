@@ -169,6 +169,7 @@ struct Input {
     channels: usize,
     lane: Lane,
     gain: f32,
+    ranges: std::sync::Arc<[glint_core::clip::edit::GainRange]>,
 }
 
 /// One AAC track made from decoded sound. The lanes hold absolute source frames; the writer runs
@@ -292,7 +293,8 @@ impl Mixdown {
             let first = self.source.mix(window, &mut self.scratch, |_, fresh| {
                 fresh.fill(0.0);
                 for i in &mut self.inputs {
-                    i.lane.take_into(fresh, i.gain);
+                    let mut level = i.gain;
+                    i.lane.take_shaped(fresh, &mut level, i.gain, 0.0, &i.ranges, self.rate);
                 }
 
                 Ok(())
@@ -459,7 +461,7 @@ fn run(
                     }
                 };
                 let mix = &mut mixes[m];
-                mix.inputs.push(Input { channels, lane: Lane::new(0), gain: gain(t.volume) });
+                mix.inputs.push(Input { channels, lane: Lane::new(0), gain: gain(t.volume), ranges: t.gains.clone() });
                 Target::Mix(m, mix.inputs.len() - 1)
             });
         }

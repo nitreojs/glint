@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 
+use super::edit::{GainRange, gain};
 use super::math::SECOND;
 
 const SLACK: i64 = 2;
@@ -92,7 +93,60 @@ impl Lane {
         self.buf.drain(..n);
         self.start += out.len() as i64 / 2;
     }
+
+    pub fn take_shaped(
+        &mut self,
+        out: &mut [f32],
+        level: &mut f32,
+        target: f32,
+        step: f32,
+        gains: &[GainRange],
+        rate: u32,
+    ) {
+        let end = self.start + (out.len() / 2) as i64;
+        let first = gains.partition_point(|g| frames(g.range.end, rate) <= self.start);
+        let mut tail = out;
+        for g in &gains[first..] {
+            let start = frames(g.range.start, rate);
+            let stop = frames(g.range.end, rate);
+            if start >= end {
+                break;
+            }
+            if stop <= self.start || stop <= start {
+                continue;
+            }
+            let before = (start - self.start).max(0) as usize * 2;
+            let (plain, rest) = tail.split_at_mut(before);
+            self.take_ramped(plain, level, target, step);
+            let n = (stop.min(end) - self.start) as usize;
+            let (shaped, rest) = rest.split_at_mut(n * 2);
+            let fade = frames(RAMP, rate).min((stop - start) / 4).max(1);
+            let delta = gain(g.volume) - 1.0;
+            let mut source = self.buf.iter();
+            for (i, frame) in shaped.chunks_exact_mut(2).enumerate() {
+                if *level != target {
+                    *level = if *level < target { (*level + step).min(target) } else { (*level - step).max(target) };
+                }
+                let at = self.start + i as i64;
+                let distance = (at - start + 1).min(stop - at);
+                let factor = if distance >= fade { 1.0 + delta } else { 1.0 + delta * distance as f32 / fade as f32 };
+                if let (Some(l), Some(r)) = (source.next(), source.next()) {
+                    let volume = *level * factor;
+                    frame[0] += l * volume;
+                    frame[1] += r * volume;
+                }
+            }
+            self.buf.drain(..(n * 2).min(self.buf.len()));
+            self.start += n as i64;
+            tail = rest;
+        }
+        self.take_ramped(tail, level, target, step);
+    }
 }
+
+#[cfg(test)]
+#[path = "pcm_range_tests.rs"]
+mod range_tests;
 
 /// The per-frame step that slides a gain by 1.0 over [`RAMP`].
 pub fn ramp_step(rate: u32) -> f32 {

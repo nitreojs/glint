@@ -1134,6 +1134,46 @@ fn a_lanes_volume_shows_off_100_and_moves_by_wheel_drag_and_slider_one_undo_each
     assert_eq!(h.volumes(), [100, 50]);
 }
 
+#[test]
+fn editor_track_defaults_match_names_not_lane_order() {
+    let mut info = info(2, None, None);
+    info.tracks.swap(0, 1);
+    info.tracks[1].name = "DESKTOP".into();
+    let mut saved = Saved::default();
+    saved.track_volumes = std::collections::BTreeMap::from([("desktop".into(), 0), ("spotifast.exe".into(), 70)]);
+    let opened = Opened { path: PathBuf::new(), info: Ok(info), index: None };
+    let app = ClipApp::new(Some(opened), 60, AfterTrim::KeepBoth, String::new(), saved, [0; 3]);
+    let Some(Job::Video(job)) = app.job() else { panic!() };
+    assert_eq!(job.tracks.iter().map(|t| (t.name.as_str(), t.volume)).collect::<Vec<_>>(), [("spotifast.exe", 70), ("DESKTOP", 0)]);
+    assert!(app.edit.lanes.iter().all(|lane| !lane.muted));
+}
+
+#[test]
+fn shift_drag_mutes_only_the_selected_audio_range_and_is_undoable() {
+    let mut h = Harness::new(2);
+    let x = h.timeline_x();
+    let y = h.at("spotifast.exe").y;
+    let from = pos2(x(12 * SECOND), y);
+    let to = pos2(x(20 * SECOND), y);
+    let modifiers = Modifiers::SHIFT;
+    let pointer = |pos, pressed| Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers };
+    h.frame(vec![Event::ModifiersChanged(modifiers), Event::PointerMoved(from), pointer(from, true)]);
+    h.frame(vec![Event::PointerMoved(to)]);
+    h.frame(vec![pointer(to, false), Event::ModifiersChanged(Modifiers::NONE)]);
+    h.settle();
+    h.click(h.at("mute range"));
+
+    let Some(Job::Video(job)) = h.app.job() else { panic!() };
+    assert_eq!(job.pieces.iter().map(|piece| piece.len()).sum::<i64>(), 42 * SECOND);
+    assert!(job.tracks[0].gains.is_empty());
+    let [gain] = &*job.tracks[1].gains else { panic!("expected one edited audio range") };
+    assert_eq!(gain.volume, 0);
+    assert!((gain.range.start - 12 * SECOND).abs() < SECOND / 10);
+    assert!((gain.range.end - 20 * SECOND).abs() < SECOND / 10);
+    h.undo();
+    assert!(h.app.edit.lanes[1].gains.is_empty());
+}
+
 impl Harness {
     /// The last text drawn as `text`: the export panel's lines come after its rows.
     fn at_last(&self, text: &str) -> Pos2 {

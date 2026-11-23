@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -50,6 +51,7 @@ pub struct Config {
     pub keystrokes_mode: ClickMode,
     pub audio_sources: Vec<AudioSource>,
     pub audio_track_names: Vec<String>,
+    pub editor_track_volumes: BTreeMap<String, u16>,
     pub countdown: u32,
     pub indicator_inside: IndicatorInside,
     pub open_trimmer: bool,
@@ -238,6 +240,7 @@ impl Default for Config {
             keystrokes_mode: ClickMode::Editable,
             audio_sources: audio::default_sources(),
             audio_track_names: vec![String::new(); audio::MAX_TRACKS as usize],
+            editor_track_volumes: BTreeMap::new(),
             countdown: 0,
             indicator_inside: IndicatorInside::Hide,
             open_trimmer: false,
@@ -517,6 +520,8 @@ keystrokes_mode = "{keystrokes_mode}"
 {audio_sources}
 # Names players show for tracks 1-6; "" names a track after its sources ("mix", "desktop", ...).
 {audio_track_names}
+# Default editor volume by recorded track name (0-200%); does not change recordings.
+editor_track_volumes = {{{editor_track_volumes}}}
 
 # Seconds to count down after selecting a region before recording starts (0 = none).
 countdown = {countdown}
@@ -610,6 +615,9 @@ update_beta = {update_beta}
             keystrokes_mode = keystrokes_mode,
             audio_sources = audio::render_sources(&self.audio_sources),
             audio_track_names = audio::render_track_names(&self.audio_track_names),
+            editor_track_volumes = self.editor_track_volumes.iter()
+                .map(|(name, volume)| format!("{} = {volume}", q(name)))
+                .collect::<Vec<_>>().join(", "),
             countdown = self.countdown,
             open_trimmer = self.open_trimmer,
             screenshot_quality = self.screenshot_quality,
@@ -712,6 +720,7 @@ mod tests {
                 AudioSource { enabled: false, tracks: vec![4], ..AudioSource::new(audio::SourceKind::Mic, 2) },
             ],
             audio_track_names: ["all", "", "", "voice", "", ""].map(String::from).to_vec(),
+            editor_track_volumes: BTreeMap::from([("voice \"chat\"".into(), 70), ("desktop".into(), 0)]),
             countdown: 5,
             indicator_inside: IndicatorInside::Show,
             open_trimmer: true,

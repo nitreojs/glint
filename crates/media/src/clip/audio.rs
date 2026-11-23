@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use glint_core::clip::edit::{Speed, TimedRange};
+use glint_core::clip::edit::{GainRange, Speed, TimedRange};
 use glint_core::clip::math::{Range, SECOND};
 use glint_core::clip::pcm::{self, Lane};
 use glint_core::log::log;
@@ -22,6 +22,7 @@ const WAVE_FORMAT_IEEE_FLOAT: u16 = 3;
 pub struct Gains {
     volume: AtomicU32,
     tracks: Vec<AtomicU32>,
+    ranges: Mutex<Vec<Arc<[GainRange]>>>,
 }
 
 impl Gains {
@@ -29,6 +30,7 @@ impl Gains {
         Gains {
             volume: AtomicU32::new(volume.to_bits()),
             tracks: (0..tracks).map(|_| AtomicU32::new(1f32.to_bits())).collect(),
+            ranges: Mutex::new(vec![Arc::default(); tracks]),
         }
     }
 
@@ -39,6 +41,12 @@ impl Gains {
     pub fn set_track(&self, i: usize, g: f32) {
         if let Some(t) = self.tracks.get(i) {
             t.store(g.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_ranges(&self, i: usize, ranges: Arc<[GainRange]>) {
+        if let Some(track) = self.ranges.lock().unwrap().get_mut(i) {
+            *track = ranges;
         }
     }
 
@@ -268,13 +276,11 @@ impl Source {
 
         out.fill(0.0);
         let step = pcm::ramp_step(self.rate);
+        let ranges = gains.ranges.lock().unwrap();
         for (i, tr) in self.tracks.iter_mut().enumerate() {
             if let Some(tr) = tr {
-                tr.lane.take_ramped(out, &mut tr.gain, gains.get(i), step);
+                tr.lane.take_shaped(out, &mut tr.gain, gains.get(i), step, &ranges[i], self.rate);
             }
-        }
-        for s in out.iter_mut() {
-            *s = pcm::soft_clip(*s);
         }
         Ok(())
     }
@@ -304,8 +310,9 @@ impl Mixer {
         src: &mut Source,
         gains: &Gains,
         mixed: &mut Vec<f32>,
-        mut out: &mut [f32],
+        out_all: &mut [f32],
     ) -> Result<(), String> {
+        let mut out = &mut *out_all;
         while !out.is_empty() {
             let Some(&piece) = self.pieces.get(self.index) else {
                 out.fill(0.0);
@@ -336,6 +343,9 @@ impl Mixer {
                 self.index += 1;
                 self.offset = end;
             }
+        }
+        for sample in out_all {
+            *sample = pcm::soft_clip(*sample);
         }
 
         Ok(())

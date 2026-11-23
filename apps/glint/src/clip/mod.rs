@@ -113,7 +113,8 @@ pub fn run(path: Option<PathBuf>) {
     .unwrap_or((None, false));
     let cfg = Config::load().unwrap_or_default();
     let accent = cfg.accent_rgb();
-    let saved = Saved::load();
+    let mut saved = Saved::load();
+    saved.track_volumes = cfg.editor_track_volumes.into_iter().map(|(name, volume)| (name.trim().to_lowercase(), volume)).collect();
     let name = file.as_ref().and_then(|f| f.path.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let background = std::env::var_os(glint_ui::gallery::BACKGROUND_EDITOR).is_some_and(|v| v == "1");
     let options = eframe::NativeOptions {
@@ -348,6 +349,7 @@ struct ClipApp {
     lane_drag: Option<usize>,
     /// The lane whose volume slider is open, under the volume pill at that rect.
     volume_pop: Option<(usize, Rect)>,
+    audio_range: Option<timeline::AudioRange>,
     nudge: Option<Nudge>,
     playhead: Glide,
     trim: [Glide; 2],
@@ -401,7 +403,14 @@ impl ClipApp {
         let keys = info.as_ref().ok().and_then(|i| i.keys.as_ref()).map(Keys::new);
         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let file_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
-        let edit = Edit { clicks, keys, ..Edit::new(duration, tracks) };
+        let mut edit = Edit { clicks, keys, ..Edit::new(duration, tracks) };
+        if let Ok(info) = &info {
+            for (lane, track) in edit.lanes.iter_mut().zip(&info.tracks) {
+                if let Some(&volume) = saved.track_volumes.get(&track.name.trim().to_lowercase()) {
+                    lane.volume = volume.min(glint_core::clip::edit::MAX_VOLUME);
+                }
+            }
+        }
         let custom_mb = match saved.export.target_mb {
             Some(mb) if !export::TARGETS_MB.contains(&mb) => mb.to_string(),
             _ => String::new(),
@@ -467,6 +476,7 @@ impl ClipApp {
             renaming: None,
             lane_drag: None,
             volume_pop: None,
+            audio_range: None,
             nudge: None,
             playhead: Glide::new(0),
             trim: [Glide::new(0), Glide::new(duration)],
@@ -534,8 +544,9 @@ impl ClipApp {
         let Some(a) = &self.audio else { return };
         a.gains.set_volume(self.saved.volume);
         for k in 0..self.info().map_or(0, |i| i.tracks.len()) {
-            let heard = self.edit.lanes.iter().filter(|l| l.source == Some(k) && !l.muted);
-            a.gains.set_track(k, heard.map(|l| l.gain()).sum());
+            let lane = self.edit.lanes.iter().find(|l| l.source == Some(k) && !l.muted);
+            a.gains.set_track(k, lane.map_or(0.0, |l| l.gain()));
+            a.gains.set_ranges(k, lane.map_or_else(Arc::default, |l| l.gains.clone()));
         }
     }
 
@@ -1198,6 +1209,7 @@ impl ClipApp {
             self.lane_menu = None;
             self.renaming = None;
             self.lane_drag = None;
+            self.audio_range = None;
             self.volume_pop = None;
             self.click_menu = None;
             self.click_sel.clear();
@@ -1368,6 +1380,7 @@ impl eframe::App for ClipApp {
         self.menu_popup(&ctx, &look, self.save_rect);
         self.lane_menu_popup(&ctx, &look);
         self.volume_popup(&ctx, &look);
+        self.audio_range_popup(&ctx);
         self.click_menu_popup(&ctx, &look);
         self.key_menu_popup(&ctx, &look);
         self.keys_sheet(&ctx, &look, body);
@@ -1377,7 +1390,8 @@ impl eframe::App for ClipApp {
         self.cleanup_dialog(&ctx, &look);
 
         if esc && !modal {
-            if self.renaming.is_some() {
+            if self.audio_range.take().is_some() {
+            } else if self.renaming.is_some() {
                 self.renaming = None;
             } else if self.lane_menu.is_some() {
                 self.lane_menu = None;

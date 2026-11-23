@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use super::clicks::ClickLook;
 use super::crop::Crop;
-use super::edit::{Edit, FULL_VOLUME, Speed, TimedRange};
+use super::edit::{Edit, FULL_VOLUME, GainRange, Speed, TimedRange};
 use super::index::{Index, Samples};
 use super::info::{Info, Snap};
 use super::keys::KeyLook;
@@ -303,6 +305,7 @@ pub struct Sound {
     pub name: String,
     /// Percent, as the lane's [`crate::clip::edit::Lane::volume`].
     pub volume: u16,
+    pub gains: Arc<[GainRange]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -413,6 +416,7 @@ impl VideoJob {
         t.source.is_some()
             && !self.combine
             && t.volume == FULL_VOLUME
+            && !t.gains.iter().any(|gain| self.pieces.iter().any(|p| gain.range.start < p.end && p.lead < gain.range.end))
             && self.pieces.iter().all(|p| p.speed == Speed::NORMAL && p.key == p.lead)
     }
 
@@ -432,7 +436,7 @@ impl VideoJob {
 pub(super) fn sounds(edit: &Edit, info: &Info) -> Vec<Sound> {
     (edit.lanes.iter())
         .filter(|l| !l.muted && l.source.is_none_or(|k| k < info.tracks.len()))
-        .map(|l| Sound { source: l.source, name: l.name(&info.tracks).to_string(), volume: l.volume })
+        .map(|l| Sound { source: l.source, name: l.name(&info.tracks).to_string(), volume: l.volume, gains: l.gains.clone() })
         .collect()
 }
 
@@ -815,8 +819,8 @@ mod tests {
         let Job::Video(v) = &job else { panic!() };
         assert_eq!(v.video, Video::Copy);
         let want = [
-            Sound { source: None, name: "empty".into(), volume: FULL_VOLUME },
-            Sound { source: Some(1), name: "voice".into(), volume: FULL_VOLUME },
+            Sound { source: None, name: "empty".into(), volume: FULL_VOLUME, gains: Arc::default() },
+            Sound { source: Some(1), name: "voice".into(), volume: FULL_VOLUME, gains: Arc::default() },
         ];
         assert_eq!(v.tracks, want);
         assert!(!v.combine);
