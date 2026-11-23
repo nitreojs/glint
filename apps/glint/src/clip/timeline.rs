@@ -312,6 +312,39 @@ impl LaneItem {
             LaneItem::Group => if grouped { "ungroup tracks" } else { "group tracks" },
         }
     }
+
+    fn paint_icon(self, painter: &Painter, center: egui::Pos2, color: Color32, grouped: bool) {
+        let line = Stroke::new(1.35, color);
+        let at = |x, y| center + vec2(x, y);
+        let rect = |x, y, w, h| Rect::from_min_size(at(x, y), vec2(w, h));
+        let segment = |a, b| painter.line_segment([a, b], line);
+        match self {
+            Self::Rename => {
+                painter.add(Shape::closed_line(vec![at(-5.0, 5.0), at(-4.0, 1.0), at(2.5, -5.5), at(5.5, -2.5), at(-1.0, 4.0)], line));
+                segment(at(1.0, -4.0), at(4.0, -1.0));
+            }
+            Self::Up | Self::Down => {
+                let dir = if matches!(self, Self::Up) { -1.0 } else { 1.0 };
+                segment(at(0.0, -5.0 * dir), at(0.0, 5.0 * dir));
+                painter.add(Shape::line(vec![at(-4.0, dir), at(0.0, 5.0 * dir), at(4.0, dir)], line));
+            }
+            Self::Remember => {
+                painter.rect_stroke(rect(-5.5, -5.5, 11.0, 11.0), 1, line, StrokeKind::Inside);
+                painter.rect_stroke(rect(-2.5, 0.0, 5.0, 5.5), 0, line, StrokeKind::Inside);
+                segment(at(0.0, -5.0), at(0.0, -2.5));
+            }
+            Self::Group => {
+                let gap = if grouped { 2.0 } else { 0.0 };
+                painter.rect_stroke(rect(-6.0, -4.0 - gap, 8.0, 5.0), 1, line, StrokeKind::Inside);
+                painter.rect_stroke(rect(-2.0, -1.0 + gap, 8.0, 5.0), 1, line, StrokeKind::Inside);
+            }
+            Self::Delete => {
+                segment(at(-6.0, -3.0), at(6.0, -3.0));
+                painter.add(Shape::line(vec![at(-4.0, -3.0), at(-3.0, 5.0), at(3.0, 5.0), at(4.0, -3.0)], line));
+                painter.add(Shape::line(vec![at(-2.0, -3.0), at(-2.0, -5.5), at(2.0, -5.5), at(2.0, -3.0)], line));
+            }
+        }
+    }
 }
 
 fn rows(area: Rect, lanes: usize, lane: f32, clicks: bool, keys: bool) -> Rows {
@@ -1656,7 +1689,8 @@ impl ClipApp {
                     (LaneItem::Delete, _) => red,
                     _ => mix(p.t2, p.t1, hov),
                 };
-                painter.text(pos2(r.left() + 10.0, r.center().y), egui::Align2::LEFT_CENTER, label, sans(13.0), color);
+                item.paint_icon(painter, pos2(r.left() + 14.0, r.center().y), color, self.grouped);
+                painter.text(pos2(r.left() + 29.0, r.center().y), egui::Align2::LEFT_CENTER, label, sans(13.0), color);
                 if on && resp.clicked() {
                     picked = Some(item);
                 }

@@ -1184,7 +1184,6 @@ impl ClipApp {
             if let Some(Selected::Audio { source, .. }) = self.selected {
                 if self.change(|e| e.split_audio(source, pos, duration)) {
                     self.select_timeline(Some(Selected::Audio { source, at: pos }));
-                    self.toast(Note::Info(format!("split audio at {}", math::fmt_time(pos))));
                 }
             } else if self.change(|e| e.split(pos, frame)) {
                 self.selected = None;
